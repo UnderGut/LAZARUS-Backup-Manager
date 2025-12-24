@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="main_menu.png" alt="LAZARUS main menu">
+</p>
+
 # 🛡️ LAZARUS Backup Manager
 
 ![Bash](https://img.shields.io/badge/Language-Bash-4EAA25?style=flat-square)
