@@ -19,7 +19,7 @@ CHAT_ID=""
 TG_MESSAGE_THREAD_ID=""
 DB_USER="postgres"
 IGNORE_MISMATCH="false"
-EXCLUDE_DIRS="" 
+EXCLUDE_DIRS="uploads" # По умолчанию исключаем uploads
 
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
