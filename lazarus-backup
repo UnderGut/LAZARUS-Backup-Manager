@@ -1,0 +1,786 @@
+#!/bin/bash
+
+# --- НАСТРОЙКИ ---
+VERSION="4.3.0-release"
+SCRIPT_NAME="lazarus"
+INSTALL_DIR="/opt/lazarus-backup"
+BACKUP_DIR="$INSTALL_DIR/backup"
+CONFIG_FILE="$INSTALL_DIR/config.env"
+SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
+RETAIN_BACKUPS_DAYS=7
+
+# --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА ---
+KEYWORDS=("remnawave" "telegram-shop")
+
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+BOT_PATH=""
+BOT_TOKEN=""
+CHAT_ID=""
+TG_MESSAGE_THREAD_ID=""
+DB_USER="postgres"
+IGNORE_MISMATCH="false"
+
+# Значения по умолчанию
+BOT_CONTAINER_NAME="" 
+DB_CONTAINER_NAME=""
+DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
+DEFAULT_DB_NAME="remnawave-telegram-shop-db"
+DB_VOLUME_NAME="remnawave-telegram-shop-db-data"
+DB_SERVICE_NAME="db" 
+
+# Статусы расписаний
+SCHEDULE_FULL="Выкл"
+SCHEDULE_DB="Выкл"
+SCHEDULE_FILES="Выкл"
+
+# Цвета
+if [[ -t 0 ]]; then
+    RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; GRAY=$'\e[90m'; CYAN=$'\e[36m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
+else
+    RED=""; GREEN=""; YELLOW=""; GRAY=""; CYAN=""; RESET=""; BOLD=""
+fi
+
+# --- ФУНКЦИИ ИНТЕРФЕЙСА ---
+
+print_message() {
+    local type="$1"; local message="$2"; local color_code="$RESET"
+    case "$type" in
+        "INFO") color_code="$GRAY" ;;
+        "SUCCESS") color_code="$GREEN" ;;
+        "WARN") color_code="$YELLOW" ;;
+        "ERROR") color_code="$RED" ;;
+        "ACTION") color_code="$CYAN" ;;
+    esac
+    echo -e "${color_code}[$type]${RESET} $message"
+}
+
+escape_markdown_v2() {
+    echo "$1" | sed -e 's/\\/\\\\/g' -e 's/_/\\_/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' \
+        -e 's/(/\\(/g' -e 's/)/\\)/g' -e 's/~/\~/g' -e 's/`/\\`/g' -e 's/>/\\>/g' \
+        -e 's/#/\\#/g' -e 's/+/\\+/g' -e 's/-/\\-/g' -e 's/=/\\=/g' -e 's/|/\\|/g' \
+        -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\!/g'
+}
+
+# --- СИСТЕМА УСТАНОВКИ ---
+
+install_script() {
+    if [[ "$EUID" -ne 0 ]]; then
+        echo -e "${RED}Ошибка: Запустите скрипт с правами root (sudo)!${RESET}"
+        exit 1
+    fi
+
+    local CURRENT_SCRIPT_PATH=$(realpath "$0")
+    local INSTALLED_SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+
+    if [[ "$CURRENT_SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ]]; then
+        echo -e "${CYAN}--- УСТАНОВКА LAZARUS BACKUP ---${RESET}"
+        if [[ ! -d "$INSTALL_DIR" ]]; then
+            mkdir -p "$INSTALL_DIR"
+            print_message "SUCCESS" "Создана папка: $INSTALL_DIR"
+        fi
+        cp "$CURRENT_SCRIPT_PATH" "$INSTALLED_SCRIPT_PATH"
+        chmod +x "$INSTALLED_SCRIPT_PATH"
+        
+        if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then rm -f "$SYMLINK_PATH"; fi
+        ln -s "$INSTALLED_SCRIPT_PATH" "$SYMLINK_PATH"
+        
+        print_message "SUCCESS" "Установка завершена. Запуск..."
+        echo ""
+        exec "$INSTALLED_SCRIPT_PATH"
+        exit 0
+    fi
+}
+
+# --- УДАЛЕНИЕ СКРИПТА ---
+
+uninstall_script() {
+    clear
+    echo -e "${RED}${BOLD}УДАЛЕНИЕ СКРИПТА${RESET}"
+    echo "Вы собираетесь удалить LAZARUS Backup Manager."
+    echo ""
+    
+    read -erp "Напишите 'yes' для подтверждения (Enter - Отмена): " confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        print_message "INFO" "Удаление отменено."
+        read -erp "Enter..." dummy
+        return
+    fi
+
+    echo ""
+    read -erp "Удалить все сохраненные бэкапы с диска? (y/N): " del_backups
+
+    (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME") | crontab -
+    print_message "SUCCESS" "Задачи Cron удалены."
+
+    rm -f "$SYMLINK_PATH"
+    print_message "SUCCESS" "Симлинк удален."
+
+    if [[ "$del_backups" =~ ^[Yy]$ ]]; then
+        rm -rf "$INSTALL_DIR"
+        print_message "SUCCESS" "Скрипт, конфиг и БЭКАПЫ полностью удалены."
+    else
+        rm -f "$INSTALL_DIR/$SCRIPT_NAME" "$CONFIG_FILE"
+        rmdir "$BACKUP_DIR" 2>/dev/null
+        rmdir "$INSTALL_DIR" 2>/dev/null
+        print_message "SUCCESS" "Скрипт удален."
+        if [[ -d "$BACKUP_DIR" ]]; then
+            print_message "WARN" "Ваши бэкапы остались в папке: $BACKUP_DIR"
+        fi
+    fi
+    echo ""
+    exit 0
+}
+
+# --- ЯДРО ИНТЕЛЛЕКТУАЛЬНОГО ПОИСКА ---
+
+scan_system_for_bot() {
+    FOUND_PATH=""
+    FOUND_BOT=""
+    FOUND_DB=""
+
+    # 1. ПОИСК ПО ЗАПУЩЕННЫМ КОНТЕЙНЕРАМ (Метод "По образу")
+    local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
+    
+    for container in $running_containers; do
+        local c_name=$(echo "$container" | cut -d'|' -f1)
+        local c_image=$(echo "$container" | cut -d'|' -f2)
+        
+        for key in "${KEYWORDS[@]}"; do
+            if [[ "$c_image" == *"$key"* ]]; then
+                FOUND_BOT="$c_name"
+                local work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name")
+                if [[ -n "$work_dir" && -d "$work_dir" ]]; then
+                    FOUND_PATH="$work_dir"
+                fi
+                break 2
+            fi
+        done
+    done
+
+    # 2. ПОИСК ПО ФАЙЛОВОЙ СИСТЕМЕ (Резерв)
+    if [[ -z "$FOUND_PATH" ]]; then
+        local search_dirs=("/opt" "/home" "/root")
+        local compose_files=$(find "${search_dirs[@]}" -maxdepth 4 -name "docker-compose.yml" -o -name "compose.yaml" 2>/dev/null)
+        
+        for file in $compose_files; do
+            if grep -qE "image:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" || grep -qE "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file"; then
+                FOUND_PATH=$(dirname "$file")
+                FOUND_BOT=$(grep "container_name:" "$file" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                break
+            fi
+        done
+    fi
+
+    # 3. ПОИСК БАЗЫ ДАННЫХ
+    if [[ -n "$FOUND_PATH" ]]; then
+        if cd "$FOUND_PATH" 2>/dev/null; then
+            local db_services=("db" "postgres" "database" "postgresql")
+            for svc in "${db_services[@]}"; do
+                local db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2>/dev/null)
+                if [[ -n "$db_c" ]]; then
+                    FOUND_DB="$db_c"
+                    break
+                fi
+            done
+            cd - >/dev/null
+        fi
+    fi
+}
+
+# --- ФУНКЦИИ ВЕРСИИ И ПОИСКА ---
+
+get_raw_bot_version() {
+    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker container inspect -f '{{.State.Running}}' "$BOT_CONTAINER_NAME" &>/dev/null; then
+        local full_image=$(docker inspect -f '{{.Config.Image}}' "$BOT_CONTAINER_NAME")
+        local ver="${full_image##*:}"
+        echo "${ver:-Unknown}"
+    else
+        echo ""
+    fi
+}
+
+get_bot_version_display() {
+    local ver=$(get_raw_bot_version)
+    if [[ -n "$ver" ]]; then echo "$ver"; else echo "Не определена / Остановлен"; fi
+}
+
+detect_bot_installation() {
+    print_message "INFO" "Запуск интеллектуального поиска..."
+    
+    scan_system_for_bot 
+
+    if [[ -n "$FOUND_PATH" ]]; then
+        echo ""; print_message "SUCCESS" "Обнаружена установка!"
+        echo -e "   Путь:      ${BOLD}$FOUND_PATH${RESET}"
+        [[ -n "$FOUND_BOT" ]] && echo -e "   Бот:       ${BOLD}$FOUND_BOT${RESET}"
+        [[ -n "$FOUND_DB" ]]  && echo -e "   БД:        ${BOLD}$FOUND_DB${RESET}"
+        echo ""
+        
+        read -erp "Использовать эти настройки? (Y/n): " confirm
+        if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
+            BOT_PATH="$FOUND_PATH"
+            if [[ -n "$FOUND_BOT" ]]; then BOT_CONTAINER_NAME="$FOUND_BOT"; fi
+            if [[ -n "$FOUND_DB" ]]; then DB_CONTAINER_NAME="$FOUND_DB"; fi
+            save_config; print_message "SUCCESS" "Настройки сохранены."; return 0
+        fi
+    fi
+    print_message "WARN" "Авто-поиск не дал результата. Введите данные вручную в Настройках."
+    return 1
+}
+
+# --- ПРОВЕРКА НЕСООТВЕТСТВИЙ ---
+
+check_config_mismatch() {
+    if [[ -n "$BOT_CONTAINER_NAME" && "$IGNORE_MISMATCH" != "true" ]]; then
+        if ! docker inspect "$BOT_CONTAINER_NAME" &>/dev/null; then
+            scan_system_for_bot
+            if [[ -n "$FOUND_BOT" && "$FOUND_BOT" != "$BOT_CONTAINER_NAME" ]]; then
+                echo ""
+                print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден, но найден '$FOUND_BOT'."
+                echo -e " ${GREEN}Предлагаю обновить настройки.${RESET}"
+                read -erp "Обновить? (Y/n): " upd
+                if [[ -z "$upd" || "$upd" =~ ^[Yy]$ ]]; then
+                    BOT_CONTAINER_NAME="$FOUND_BOT"
+                    [[ -n "$FOUND_DB" ]] && DB_CONTAINER_NAME="$FOUND_DB"
+                    [[ -n "$FOUND_PATH" ]] && BOT_PATH="$FOUND_PATH"
+                    save_config
+                    print_message "SUCCESS" "Обновлено."
+                    sleep 1
+                else
+                    IGNORE_MISMATCH="true"
+                    save_config
+                fi
+            fi
+        fi
+    fi
+}
+
+ensure_bot_path() {
+    if [[ -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then
+        echo ""; print_message "WARN" "Настройки контейнеров пусты."
+        detect_bot_installation
+        load_or_create_config 
+    fi
+
+    local path_valid=false
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && ( -f "$BOT_PATH/docker-compose.yml" || -f "$BOT_PATH/compose.yaml" ) ]]; then path_valid=true; fi
+    local container_valid=false
+    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker inspect "$BOT_CONTAINER_NAME" &>/dev/null; then container_valid=true; fi
+    local db_valid=false
+    if [[ -n "$DB_CONTAINER_NAME" ]] && docker inspect "$DB_CONTAINER_NAME" &>/dev/null; then db_valid=true; fi
+
+    if [[ "$path_valid" == "false" || "$container_valid" == "false" || "$db_valid" == "false" ]]; then
+        if [[ "$path_valid" == "false" ]]; then
+            detect_bot_installation
+            load_or_create_config
+            if [[ -n "$BOT_PATH" ]]; then path_valid=true; fi
+            if [[ -n "$BOT_CONTAINER_NAME" ]]; then container_valid=true; fi
+            if [[ -n "$DB_CONTAINER_NAME" ]]; then db_valid=true; fi
+        fi
+
+        if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+            echo ""; print_message "ACTION" "Укажите путь к папке бота вручную."
+            read -erp "Путь (Enter для '$DEFAULT_BOT_PATH'): " input_path
+            BOT_PATH="${input_path:-$DEFAULT_BOT_PATH}"
+            if [[ ! -d "$BOT_PATH" ]]; then print_message "ERROR" "Папка не найдена!"; return 1; fi
+            save_config
+        fi
+
+        if [[ -z "$BOT_CONTAINER_NAME" ]] || ! docker inspect "$BOT_CONTAINER_NAME" &>/dev/null; then
+            echo ""; print_message "WARN" "Контейнер бота не определен."
+            print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
+            read -erp "Имя: " input_name
+            if [[ -n "$input_name" ]]; then BOT_CONTAINER_NAME="$input_name"; else BOT_CONTAINER_NAME="shopbot"; fi
+            save_config
+        fi
+
+        if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" &>/dev/null; then
+            echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
+            print_message "ACTION" "Введите имя контейнера БД (или Enter для '$DEFAULT_DB_NAME')."
+            read -erp "Имя БД: " input_db
+            if [[ -n "$input_db" ]]; then DB_CONTAINER_NAME="$input_db"; else DB_CONTAINER_NAME="$DEFAULT_DB_NAME"; fi
+            save_config
+        fi
+    fi
+    return 0
+}
+
+save_config() {
+    mkdir -p "$INSTALL_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+TG_MESSAGE_THREAD_ID="$TG_MESSAGE_THREAD_ID"
+BOT_PATH="$BOT_PATH"
+DB_USER="$DB_USER"
+SCHEDULE_FULL="$SCHEDULE_FULL"
+SCHEDULE_DB="$SCHEDULE_DB"
+SCHEDULE_FILES="$SCHEDULE_FILES"
+RETAIN_BACKUPS_DAYS="$RETAIN_BACKUPS_DAYS"
+BOT_CONTAINER_NAME="$BOT_CONTAINER_NAME"
+DB_CONTAINER_NAME="$DB_CONTAINER_NAME"
+IGNORE_MISMATCH="$IGNORE_MISMATCH"
+EOF
+    chmod 600 "$CONFIG_FILE"
+}
+
+load_or_create_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
+    if [[ -z "$RETAIN_BACKUPS_DAYS" ]]; then RETAIN_BACKUPS_DAYS=7; fi
+    if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
+    mkdir -p "$BACKUP_DIR"
+
+    local updated=false
+    if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+        echo ""; print_message "WARN" "Настройки Telegram не найдены."
+        [[ -z "$BOT_TOKEN" ]] && read -erp " Введите Bot Token: " BOT_TOKEN
+        [[ -z "$CHAT_ID" ]] && read -erp " Введите Chat ID: " CHAT_ID
+        [[ -z "$TG_MESSAGE_THREAD_ID" ]] && read -erp " Введите ID топика (или Enter): " TG_MESSAGE_THREAD_ID
+        updated=true
+    fi
+    
+    if [[ -z "$BOT_PATH" || -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then 
+        detect_bot_installation
+    fi
+    
+    if $updated; then save_config; fi
+}
+
+send_telegram_document() {
+    local file_path="$1"; local caption="$2"
+    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
+    
+    print_message "INFO" "Отправка в Telegram..."
+    
+    local form_params=(-F chat_id="$CHAT_ID" -F document=@"$file_path" -F parse_mode="MarkdownV2" -F caption="$(escape_markdown_v2 "$caption")")
+    [[ -n "$TG_MESSAGE_THREAD_ID" ]] && form_params+=(-F message_thread_id="$TG_MESSAGE_THREAD_ID")
+    
+    local http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" "${form_params[@]}")
+    
+    if [[ "$http_code" == "200" ]]; then
+        print_message "SUCCESS" "Успешно отправлено в Telegram."
+    else
+        local file_size=$(stat -c%s "$file_path" 2>/dev/null || echo 0)
+        
+        if [[ $file_size -ge 52428800 ]]; then
+            print_message "ERROR" "Файл >50MB. Telegram API отклонил отправку."
+            local error_msg="⚠️ *Ошибка отправки бэкапа*
+
+Файл занимает больше 50 МБ\. Telegram Bot API не позволяет загружать такие файлы напрямую\.
+
+📂 *Бэкап сохранен локально:*
+\`$(basename "$file_path")\`"
+            
+            local thread_param=""
+            [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
+
+            curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                -d chat_id="$CHAT_ID" \
+                -d text="$error_msg" \
+                -d parse_mode="MarkdownV2" \
+                $thread_param >/dev/null
+        else
+            print_message "ERROR" "Не удалось отправить в Telegram (HTTP код: $http_code)."
+        fi
+    fi
+}
+
+# --- БЭКАП ---
+
+create_backup() {
+    local TYPE="$1"
+    local TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
+    local FILE_DB="db_${TIMESTAMP}.sql.gz"
+    local FILE_DIR="dir_${TIMESTAMP}.tar.gz"
+    local FILE_VERSION="bot_version.txt"
+    local FILE_FINAL=""
+    local BACKUP_TAG=""
+    local HAS_ERROR=0
+
+    if [[ "$TYPE" != "db_only" ]]; then if ! ensure_bot_path; then return; fi; fi
+    if [[ "$TYPE" == "db_only" || "$TYPE" == "full" ]]; then
+        if [[ -z "$DB_CONTAINER_NAME" ]]; then ensure_bot_path; fi
+    fi
+
+    local CURRENT_VER=$(get_raw_bot_version)
+    echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
+
+    # Дамп БД
+    if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
+        print_message "INFO" "Дамп базы данных ($DB_CONTAINER_NAME)..."
+        if ! docker container inspect -f '{{.State.Running}}' "$DB_CONTAINER_NAME" &>/dev/null; then
+             print_message "ERROR" "Контейнер DB ($DB_CONTAINER_NAME) не запущен или не найден!"
+             HAS_ERROR=1
+        else
+            if ! docker exec "$DB_CONTAINER_NAME" pg_dumpall -c -U "$DB_USER" 2>/dev/null | gzip -9 > "$BACKUP_DIR/$FILE_DB"; then
+                print_message "ERROR" "Ошибка дампа БД."
+                HAS_ERROR=1
+            fi
+        fi
+    fi
+
+    if [[ $HAS_ERROR -eq 1 ]]; then rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION"; return; fi
+
+    # Упаковка
+    if [[ "$TYPE" == "db_only" ]]; then
+        FILE_FINAL="lazarus_db_${TIMESTAMP}.tar.gz"
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB"
+        BACKUP_TAG="#db_only"
+        rm -f "$BACKUP_DIR/$FILE_DB"
+    elif [[ "$TYPE" == "files_only" ]]; then
+        FILE_FINAL="lazarus_files_${TIMESTAMP}.tar.gz"
+        print_message "INFO" "Архивация файлов..."
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" --exclude="*.log" --exclude=".git" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        BACKUP_TAG="#files_only"
+    else # FULL
+        FILE_FINAL="lazarus_full_${TIMESTAMP}.tar.gz"
+        print_message "INFO" "Архивация файлов..."
+        tar -czf "$BACKUP_DIR/$FILE_DIR" --exclude="*.log" --exclude=".git" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
+        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
+        BACKUP_TAG="#full_backup"
+    fi
+
+    cp "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_FINAL.version"
+    rm -f "$BACKUP_DIR/$FILE_VERSION"
+    
+    local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
+    print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
+    
+    local VER_MSG=""; [[ -n "$CURRENT_VER" ]] && VER_MSG=$'\n🏷 Версия: '"$CURRENT_VER"
+    local CAPTION=$'💾 '"$BACKUP_TAG"$'\n📅 '"${TIMESTAMP//_/ }"$'\n📏 Размер: '"$SIZE""$VER_MSG"
+    
+    send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
+
+    find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -delete
+    find "$BACKUP_DIR" -name "lazarus*.tar.gz.version" -mtime +$RETAIN_BACKUPS_DAYS -delete
+}
+
+# --- ВОССТАНОВЛЕНИЕ ---
+
+select_backup_file() {
+    local FILTER_PREFIX="$1"; local TITLE="$2"
+    local show_limit=5; local show_filenames=false
+
+    while true; do
+        if ! compgen -G "$BACKUP_DIR/${FILTER_PREFIX}_*.tar.gz" > /dev/null; then
+            print_message "WARN" "Файлов типа '${TITLE}' не найдено."; read -erp "Enter..." dummy; return 1
+        fi
+        
+        local files_unsorted=("$BACKUP_DIR/${FILTER_PREFIX}_"*.tar.gz)
+        IFS=$'\n' sorted_backups=($(sort -r <<<"${files_unsorted[*]}"))
+        unset IFS
+        
+        local total_count=${#sorted_backups[@]}
+        local CURRENT_VER=$(get_raw_bot_version)
+
+        clear; echo -e "${GREEN}Восстановление: ${BOLD}${TITLE}${RESET}"
+        echo -e "Всего файлов: ${CYAN}${total_count}${RESET}"; echo ""
+
+        local loop_limit=$show_limit
+        local show_all=false 
+        
+        if [[ "$loop_limit" -lt "$total_count" ]]; then show_all=false; else show_all=true; fi
+        
+        if [[ $loop_limit -gt $total_count ]]; then loop_limit=$total_count; fi
+
+        for (( i=0; i<loop_limit; i++ )); do
+            local file="${sorted_backups[$i]}"
+            local filename=$(basename "$file")
+            
+            local CACHE_FILE="${file}.version"
+            local B_VER=""
+            if [[ -f "$CACHE_FILE" ]]; then B_VER=$(cat "$CACHE_FILE")
+            else
+                B_VER=$(tar -xzf "$file" -O bot_version.txt 2>/dev/null)
+                if [[ -n "$B_VER" ]]; then echo "$B_VER" > "$CACHE_FILE"; else echo "?" > "$CACHE_FILE"; B_VER="?"; fi
+            fi
+            local VER_STR=""
+            if [[ "$B_VER" == "Unknown" || "$B_VER" == "" ]]; then VER_STR="${GRAY}[Н/Д]${RESET}"
+            elif [[ "$B_VER" == "?" ]]; then VER_STR="${GRAY}[Legacy]${RESET}"
+            elif [[ -z "$CURRENT_VER" ]]; then VER_STR="${GRAY}[v$B_VER]${RESET}"
+            elif [[ "$B_VER" == "$CURRENT_VER" ]]; then VER_STR="${GREEN}[v$B_VER]${RESET}"
+            else VER_STR="${RED}[v$B_VER]${RESET}"; fi
+
+            if [[ "$show_filenames" == "true" ]]; then
+                printf " %2d. %s %s\n" "$((i+1))" "$filename" "$VER_STR"
+            else
+                if [[ $filename =~ _([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})_([0-9]{2}) ]]; then
+                    local date_part="${BASH_REMATCH[1]}"
+                    local time_part="${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+                    local d_d=${date_part:8:2}; local d_m=${date_part:5:2}
+                    local pretty_date="$d_d.$d_m $time_part"
+                    local fsize=$(du -h "$file" | awk '{print $1}')
+                    printf " %2d. %s | %5s | %s\n" "$((i+1))" "${BOLD}$pretty_date${RESET}" "$fsize" "$VER_STR"
+                else
+                    printf " %2d. %s %s\n" "$((i+1))" "$filename" "$VER_STR"
+                fi
+            fi
+        done
+
+        echo ""
+        if [[ $total_count -gt 5 ]]; then
+            if [[ $loop_limit -lt $total_count ]]; then
+                 echo -e " ${BOLD}6. Показать все остальные ($((total_count - 5)) шт)...${RESET}"
+            else
+                 echo -e " ${BOLD}6. Свернуть список (показать 5)${RESET}"
+            fi
+        fi
+
+        if [[ "$show_filenames" == "false" ]]; then
+            echo -e " 7. Показать имена файлов"; 
+        else
+            echo -e " 7. Показать дату и размер"; 
+        fi
+        echo " 0. Назад"; echo ""
+        read -erp "Номер (Enter - Назад): " choice
+        
+        if [[ -z "$choice" || "$choice" == "0" ]]; then return 1
+        elif [[ "$choice" == "6" ]]; then 
+            if [[ $loop_limit -lt $total_count ]]; then loop_limit=$total_count; else loop_limit=5; fi
+            show_limit=$loop_limit
+            continue
+        elif [[ "$choice" == "7" ]]; then 
+            if [[ "$show_filenames" == "false" ]]; then show_filenames=true; else show_filenames=false; fi
+            continue
+        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -le "$total_count" ]]; then SELECTED_FILE="${sorted_backups[$((choice-1))]}"; return 0
+        else print_message "ERROR" "Неверный выбор."; sleep 1; fi
+    done
+}
+
+execute_restore() {
+    local MODE="$1"; local FILE="$2"
+    echo ""; print_message "WARN" "ВНИМАНИЕ: Текущие данные будут перезаписаны!"
+    read -erp "Продолжить? (y/n): " confirm; [[ "$confirm" != "y" ]] && return
+
+    local TMP_DIR="$BACKUP_DIR/restore_tmp_$$"
+    mkdir -p "$TMP_DIR"
+    print_message "INFO" "Распаковка..."
+    tar -xzf "$FILE" -C "$TMP_DIR"
+
+    local DB_DUMP=$(find "$TMP_DIR" -name "db_*.sql.gz" | head -1)
+    local DIR_ARC=$(find "$TMP_DIR" -name "dir_*.tar.gz" | head -1)
+
+    if [[ "$MODE" == "full" && -n "$DIR_ARC" ]]; then
+        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi
+        print_message "INFO" "Остановка контейнеров..."
+        cd "$BOT_PATH" && docker compose down 2>/dev/null
+        print_message "INFO" "Очистка папки..."
+        rm -rf "$BOT_PATH"/*
+        print_message "INFO" "Извлечение файлов..."
+        tar -xzf "$DIR_ARC" -C "$(dirname "$BOT_PATH")"
+        docker volume rm "$DB_VOLUME_NAME" 2>/dev/null || true
+        print_message "INFO" "Запуск БД..."
+        docker compose up -d "$DB_SERVICE_NAME"
+        sleep 5
+    fi
+
+    if [[ -n "$DB_DUMP" ]]; then
+        print_message "INFO" "Импорт базы данных..."
+        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi 
+        zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" psql -U "$DB_USER" -d postgres >/dev/null 2>&1
+    fi
+
+    if [[ "$MODE" == "full" ]]; then
+        print_message "INFO" "Запуск всех контейнеров..."
+        cd "$BOT_PATH" && docker compose up -d
+    fi
+
+    rm -rf "$TMP_DIR"
+    print_message "SUCCESS" "Восстановление успешно завершено."
+    read -erp "Нажмите Enter..." dummy
+}
+
+# --- МЕНЮШКИ ---
+
+menu_manual_backup() {
+    while true; do
+        clear; echo -e "${GREEN}Создание ручного бэкапа${RESET}"
+        echo " 1. Полный бэкап (БД + Файлы)"
+        echo " 2. Только База Данных"
+        echo " 3. Только Файлы"
+        echo " 0. Назад"
+        echo ""
+        read -erp "Ваш выбор (Enter - Назад): " m_choice
+        [[ -z "$m_choice" ]] && return
+        
+        case $m_choice in
+            1) create_backup "full"; read -erp "Enter..." dummy; return ;;
+            2) create_backup "db_only"; read -erp "Enter..." dummy; return ;;
+            3) create_backup "files_only"; read -erp "Enter..." dummy; return ;;
+            0) return ;;
+        esac
+    done
+}
+
+menu_restore() {
+    while true; do
+        clear; echo -e "${GREEN}Меню восстановления${RESET}"
+        echo " 1. Полный бэкап (Файлы + БД)"
+        echo " 2. Только База Данных"
+        echo " 3. Только Файлы"
+        echo " 0. Назад"
+        echo ""
+        read -erp "Выбор (Enter - Назад): " r_choice
+        [[ -z "$r_choice" ]] && return
+
+        local SELECTED_FILE=""
+        case $r_choice in
+            1) if select_backup_file "lazarus_full" "Полные бэкапы"; then execute_restore "full" "$SELECTED_FILE"; fi ;;
+            2) if select_backup_file "lazarus_db" "Бэкапы БД"; then execute_restore "db_only" "$SELECTED_FILE"; fi ;;
+            3) if select_backup_file "lazarus_files" "Бэкапы Файлов"; then 
+                   echo ""; print_message "WARN" "Будут перезаписаны файлы в папке бота!"
+                   read -erp "Продолжить? (y/n): " cf
+                   if [[ "$cf" == "y" ]]; then 
+                       if ensure_bot_path; then tar -xzf "$SELECTED_FILE" -C "$(dirname "$BOT_PATH")"; print_message "SUCCESS" "Файлы распакованы."; read -erp "Enter..." dummy; fi
+                   fi
+               fi ;;
+            0) return ;;
+        esac
+    done
+}
+
+setup_cron_task() {
+    local TASK_TYPE="$1"; local JOB_CMD=""; local JOB_ID=""
+    if [[ "$TASK_TYPE" == "db" ]]; then JOB_CMD="$SYMLINK_PATH backup_db"; JOB_ID="# LAZARUS-JOB-DB"
+    elif [[ "$TASK_TYPE" == "files" ]]; then if ! ensure_bot_path; then return; fi; JOB_CMD="$SYMLINK_PATH backup_files"; JOB_ID="# LAZARUS-JOB-FILES"
+    elif [[ "$TASK_TYPE" == "full" ]]; then if ! ensure_bot_path; then return; fi; JOB_CMD="$SYMLINK_PATH backup_full"; JOB_ID="# LAZARUS-JOB-FULL"; fi
+
+    clear; echo -e "${GREEN}Настройка периода: ${BOLD}${TASK_TYPE^^}${RESET}"
+    echo " 1. Ежечасно"
+    echo " 2. Ежедневно (04:00)"
+    echo " 3. Еженедельно"
+    echo " 4. Свое время"
+    echo " 5. Каждые N минут"
+    echo " 6. Отключить"
+    echo ""
+    read -erp "Выбор (Enter - Назад): " c
+    [[ -z "$c" ]] && return
+    
+    local NEW_CRON_LINES=""; local DISPLAY_TIME=""
+
+    case $c in
+        1) NEW_CRON_LINES="0 * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Ежечасно" ;;
+        2) NEW_CRON_LINES="0 4 * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Ежедневно 04:00" ;;
+        3) NEW_CRON_LINES="0 4 * * 1 $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Еженедельно" ;;
+        4) echo "Время (ЧЧ:ММ) через пробел:"; read -erp "> " times_input
+           if [[ -z "$times_input" ]]; then print_message "ERROR" "Время не введено!"; sleep 1; return; fi
+           for t in $times_input; do if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then h=$((10#${BASH_REMATCH[1]})); m=$((10#${BASH_REMATCH[2]})); NEW_CRON_LINES+="$m $h * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"$'\n'; fi; done; DISPLAY_TIME="Свое: $times_input" ;;
+        5) read -erp "Введите интервал (минут): " interval
+           if [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] && [ "$interval" -lt 60 ]; then
+               NEW_CRON_LINES="*/$interval * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+               DISPLAY_TIME="Каждые $interval мин"
+           else print_message "ERROR" "Введите число от 1 до 59."; sleep 1; return; fi ;;
+        6) DISPLAY_TIME="Выкл" ;;
+        *) return ;;
+    esac
+
+    local CURRENT_CRON=$(crontab -l 2>/dev/null | grep -v "$JOB_ID")
+    if [[ "$DISPLAY_TIME" != "Выкл" && -n "$NEW_CRON_LINES" ]]; then echo -e "$CURRENT_CRON\n$NEW_CRON_LINES" | crontab -
+    else echo "$CURRENT_CRON" | crontab -; fi
+
+    if [[ "$TASK_TYPE" == "full" ]]; then SCHEDULE_FULL="$DISPLAY_TIME"; fi
+    if [[ "$TASK_TYPE" == "db" ]];   then SCHEDULE_DB="$DISPLAY_TIME"; fi
+    if [[ "$TASK_TYPE" == "files" ]]; then SCHEDULE_FILES="$DISPLAY_TIME"; fi
+    save_config; print_message "SUCCESS" "Расписание обновлено!"; sleep 1
+}
+
+menu_automation() {
+    while true; do
+        clear; echo -e "${GREEN}Настройка Автоматического Бекапа${RESET}"
+        echo -e " 1. Полный бекап [${YELLOW}${SCHEDULE_FULL}${RESET}]"
+        echo -e " 2. Только База  [${YELLOW}${SCHEDULE_DB}${RESET}]"
+        echo -e " 3. Только Файлы [${YELLOW}${SCHEDULE_FILES}${RESET}]"
+        echo " 0. Назад"
+        echo ""
+        read -erp "Выбор (Enter - Назад): " ac
+        [[ -z "$ac" ]] && return
+        case $ac in 1) setup_cron_task "full" ;; 2) setup_cron_task "db" ;; 3) setup_cron_task "files" ;; 0) return ;; esac
+    done
+}
+
+menu_settings() {
+    while true; do
+        clear; echo -e "${GREEN}Настройки скрипта${RESET}"
+        local MASKED_TOKEN="${BOT_TOKEN:0:5}.......${BOT_TOKEN: -5}"; [[ ${#BOT_TOKEN} -lt 10 ]] && MASKED_TOKEN="*******"
+        echo -e " 1. Путь к боту:      ${CYAN}${BOT_PATH}${RESET}"
+        echo -e " 2. Telegram Token:   ${CYAN}${MASKED_TOKEN}${RESET}"
+        echo -e " 3. Chat ID:          ${CYAN}${CHAT_ID}${RESET}"
+        echo -e " 4. Thread ID:        ${CYAN}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
+        echo -e " 5. Пользователь БД:  ${CYAN}${DB_USER}${RESET}"
+        echo -e " 6. Хранить бэкапы:   ${CYAN}${RETAIN_BACKUPS_DAYS} дней${RESET}"
+        echo -e " 7. Имя контейнера:   ${CYAN}${BOT_CONTAINER_NAME}${RESET}"
+        echo -e " 8. Контейнер БД:     ${CYAN}${DB_CONTAINER_NAME}${RESET}"
+        echo " 0. Назад"
+        echo ""
+        read -erp "Что изменить (Enter - Назад): " s
+        [[ -z "$s" ]] && return
+        
+        case $s in
+            1) read -erp "Новый путь: " np; if [[ -n "$np" ]]; then if [[ -d "$np" ]]; then BOT_PATH="$np"; save_config; print_message "SUCCESS" "Сохранено"; else print_message "ERROR" "Папка не найдена!"; fi; fi ;;
+            2) read -erp "Новый Token: " nt; if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            3) read -erp "Новый Chat ID: " nid; if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            4) read -erp "Новый Thread ID: " ntid; TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
+            5) read -erp "Новый DB User: " ndb; if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            6) read -erp "Дней хранения: " nd; if [[ "$nd" =~ ^[0-9]+$ ]]; then RETAIN_BACKUPS_DAYS="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            7) read -erp "Имя контейнера бота: " nc; if [[ -n "$nc" ]]; then BOT_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            8) read -erp "Имя контейнера БД: " nc; if [[ -n "$nc" ]]; then DB_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            0) return ;;
+        esac; if [[ -n "$s" ]]; then sleep 1; fi
+    done
+}
+
+cleanup_old_backups() {
+    clear; echo -e "${RED}Очистка старых бэкапов${RESET}"; echo "Поиск файлов старше $RETAIN_BACKUPS_DAYS дней..."
+    local COUNT=$(find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS | wc -l)
+    if [[ "$COUNT" -eq 0 ]]; then print_message "INFO" "Файлов не найдено."; read -erp "Enter..." dummy; return; fi
+    find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -print
+    echo ""; print_message "WARN" "Найдено файлов: $COUNT"; read -erp "Удалить? (y/n): " c
+    if [[ "$c" == "y" ]]; then
+        find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -delete
+        find "$BACKUP_DIR" -name "lazarus_*.tar.gz.version" -mtime +$RETAIN_BACKUPS_DAYS -delete
+        print_message "SUCCESS" "Очищено."; else print_message "INFO" "Отменено."; fi
+    read -erp "Enter..." dummy
+}
+
+# --- MAIN LOOP ---
+install_script
+load_or_create_config
+check_config_mismatch # Проверка при запуске
+
+case "$1" in
+    backup_full) create_backup "full" ;;
+    backup_db)   create_backup "db_only" ;;
+    backup_files) create_backup "files_only" ;;
+    restore) menu_restore ;;
+    *)
+        while true; do
+            BOT_VERSION=$(get_bot_version_display)
+            clear
+            echo -e "${GREEN}${BOLD}LAZARUS Backup Manager v${VERSION}${RESET}"
+            echo -e "Версия бота: ${CYAN}${BOT_VERSION}${RESET}"
+            echo ""
+            echo -e "Статусы авто-бекапа:"
+            echo -e " • Full:  ${YELLOW}${SCHEDULE_FULL}${RESET}"
+            echo -e " • DB:    ${YELLOW}${SCHEDULE_DB}${RESET}"
+            echo -e " • Files: ${YELLOW}${SCHEDULE_FILES}${RESET}"
+            echo ""
+            echo " --- ДЕЙСТВИЯ ---"
+            echo " 1. Ручной бекап (Full / DB / Files)"
+            echo " 2. Настроить авто-бекап"
+            echo " 3. Восстановить из бекапа"
+            echo " 4. Настройки (Пути / Токены / Ротация)"
+            echo " 5. Удалить старые бэкапы (>${RETAIN_BACKUPS_DAYS} дней)"
+            echo ""
+            echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
+            echo " 0. Выход"
+            echo ""
+            read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
+            case $opt in
+                1) menu_manual_backup ;; 2) menu_automation ;; 3) menu_restore ;; 
+                4) menu_settings ;; 5) cleanup_old_backups ;; 666) uninstall_script ;; 0) exit 0 ;;
+            esac
+        done
+        ;;
+esac
