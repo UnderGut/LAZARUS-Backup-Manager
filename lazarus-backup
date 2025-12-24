@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.4.1-flexible-exclude"
+VERSION="4.4.3-safe-exclude"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -10,7 +10,7 @@ SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
 RETAIN_BACKUPS_DAYS=7
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА ---
-KEYWORDS=("remnawave" "telegram-shop" "shop-bot" "shopbot")
+KEYWORDS=("telegram-shop" "shop-bot" "shopbot")
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 BOT_PATH=""
@@ -19,7 +19,7 @@ CHAT_ID=""
 TG_MESSAGE_THREAD_ID=""
 DB_USER="postgres"
 IGNORE_MISMATCH="false"
-EXCLUDE_DIRS="uploads" # По умолчанию исключаем uploads
+EXCLUDE_DIRS="" 
 
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
@@ -331,7 +331,7 @@ load_or_create_config() {
     if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
     if [[ -z "$RETAIN_BACKUPS_DAYS" ]]; then RETAIN_BACKUPS_DAYS=7; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
-    if [[ -z "$EXCLUDE_DIRS" ]]; then EXCLUDE_DIRS="uploads"; fi # Default value
+    # EXCLUDE_DIRS может быть пустым, это нормально
     mkdir -p "$BACKUP_DIR"
 
     local updated=false
@@ -429,9 +429,10 @@ create_backup() {
     IFS=' ' read -r -a EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
     EXCLUDE_FLAGS=()
     for ex in "${EXCLUDE_ARRAY[@]}"; do
-        EXCLUDE_FLAGS+=(--exclude="$ex")
+        if [[ -n "$ex" ]]; then
+            EXCLUDE_FLAGS+=(--exclude="$ex")
+        fi
     done
-    # Добавляем стандартные исключения
     EXCLUDE_FLAGS+=(--exclude="*.log" --exclude=".git")
 
     # Упаковка
@@ -443,13 +444,11 @@ create_backup() {
     elif [[ "$TYPE" == "files_only" ]]; then
         FILE_FINAL="lazarus_files_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов..."
-        # Используем массив флагов
         tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
         BACKUP_TAG="#files_only"
     else # FULL
         FILE_FINAL="lazarus_full_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов..."
-        # Используем массив флагов
         tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
         tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
@@ -726,7 +725,7 @@ menu_settings() {
         echo -e " 6. Хранить бэкапы:   ${CYAN}${RETAIN_BACKUPS_DAYS} дней${RESET}"
         echo -e " 7. Имя контейнера:   ${CYAN}${BOT_CONTAINER_NAME}${RESET}"
         echo -e " 8. Контейнер БД:     ${CYAN}${DB_CONTAINER_NAME}${RESET}"
-        echo -e " 9. Исключить папки:  ${CYAN}${EXCLUDE_DIRS}${RESET}"
+        echo -e " 9. Исключить папки:  ${CYAN}${EXCLUDE_DIRS:-Нет}${RESET}"
         echo " 0. Назад"
         echo ""
         read -erp "Что изменить (Enter - Назад): " s
@@ -741,7 +740,18 @@ menu_settings() {
             6) read -erp "Дней хранения: " nd; if [[ "$nd" =~ ^[0-9]+$ ]]; then RETAIN_BACKUPS_DAYS="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
             7) read -erp "Имя контейнера бота: " nc; if [[ -n "$nc" ]]; then BOT_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
             8) read -erp "Имя контейнера БД: " nc; if [[ -n "$nc" ]]; then DB_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            9) read -erp "Папки для исключения (через пробел): " ed; EXCLUDE_DIRS="$ed"; save_config; print_message "SUCCESS" "Сохранено" ;;
+            9) read -erp "Исключить (например: uploads/cache node_modules): " ed; 
+               if [[ -n "$ed" ]]; then 
+                   EXCLUDE_DIRS="$ed"
+                   save_config
+                   print_message "SUCCESS" "Сохранено"
+               else
+                   # Если пользователь просто нажал Enter (не хотел менять или хотел очистить)
+                   if [[ -n "$EXCLUDE_DIRS" ]]; then
+                        read -erp "Очистить список исключений? (y/N): " clr
+                        if [[ "$clr" =~ ^[Yy]$ ]]; then EXCLUDE_DIRS=""; save_config; print_message "SUCCESS" "Очищено"; fi
+                   fi
+               fi ;;
             0) return ;;
         esac; if [[ -n "$s" ]]; then sleep 1; fi
     done
