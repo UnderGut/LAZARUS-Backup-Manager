@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.7.1-smart-suggestions"
+VERSION="4.7.3-hybrid-style"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -193,7 +193,7 @@ scan_system_for_bot() {
         local c_name=$(echo "$container" | cut -d'|' -f1)
         local c_image=$(echo "$container" | cut -d'|' -f2)
         
-        # Фильтр панели
+        # --- ФИЛЬТР: ИГНОРИРОВАНИЕ ПАНЕЛИ ---
         if [[ "$c_image" == *"remnawave/backend"* ]]; then continue; fi
         if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then continue; fi
         if [[ "$c_name" == "remnawave" ]]; then continue; fi
@@ -442,7 +442,6 @@ create_backup() {
     local FILE_DIR="dir_${TIMESTAMP}.tar.gz"
     local FILE_VERSION="bot_version.txt"
     local FILE_FINAL=""
-    local BACKUP_TAG=""
     local HAS_ERROR=0
     local SKIP_INFO=""
     local SKIP_FILE="$BACKUP_DIR/skipped_files.txt"
