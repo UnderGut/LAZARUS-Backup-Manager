@@ -6,7 +6,7 @@
 
 ![Bash](https://img.shields.io/badge/Language-Bash-4EAA25?style=flat-square)
 ![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)
-![Version](https://img.shields.io/badge/version-v4.4.3-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-v4.6.1-blue?style=flat-square)
 
 **Lazarus** — продвинутая автоматизированная система для управления жизненным циклом резервных копий **Remnawave Telegram Shop Bot**.
 
