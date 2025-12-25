@@ -1,14 +1,13 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.7.3-hybrid-style"
+VERSION="4.12.0-features"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
 REMOTE_URL="https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup"
-RETAIN_BACKUPS_DAYS=7
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА ---
 KEYWORDS=("remnawave" "telegram-shop" "shop-bot" "shopbot")
@@ -23,6 +22,28 @@ IGNORE_MISMATCH="false"
 EXCLUDE_DIRS=""
 MAX_FILE_SIZE_MB="1"
 
+# Переключатели отправки
+SEND_TO_TELEGRAM="true"
+SEND_TO_REMOTE="true"
+
+# Настройки ротации (по количеству)
+MAX_BACKUPS_COUNT="100"
+
+# Удалять старые бэкапы: "time" или "count" (по умолчанию time)
+DELETE_MODE="time"
+# Срок хранения в днях при режиме time (по умолчанию 7 дней)
+RETENTION_DAYS="7"
+
+# Настройки удаленного хранилища
+REMOTE_STORAGE_TYPE="off" # off, ftp, webdav
+REMOTE_STORAGE_URL=""
+REMOTE_STORAGE_USER=""
+REMOTE_STORAGE_PASS=""
+REMOTE_UPLOAD_STATUS_TEXT=""
+
+# Настройки шифрования
+BACKUP_PASSWORD=""
+
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
 DB_CONTAINER_NAME=""
@@ -36,6 +57,18 @@ SCHEDULE_FULL="Выкл"
 SCHEDULE_DB="Выкл"
 SCHEDULE_FILES="Выкл"
 
+# Флаг интерактивного режима
+IS_INTERACTIVE=true
+if [[ ! -t 0 ]]; then IS_INTERACTIVE=false; fi
+
+# Авто-подтверждение для неинтерактивного запуска (например, cron --yes)
+AUTO_CONFIRM="false"
+
+# Лог-файл для подробных логов
+LOG_FILE="/var/log/lazarus_backup.log"
+LOCK_FILE="/var/run/lazarus.lock"
+TEMP_DIRS=()
+
 # Цвета
 if [[ -t 0 ]]; then
     RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; GRAY=$'\e[90m'; CYAN=$'\e[36m'; MAGENTA=$'\e[35m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
@@ -43,7 +76,80 @@ else
     RED=""; GREEN=""; YELLOW=""; GRAY=""; CYAN=""; MAGENTA=""; RESET=""; BOLD=""
 fi
 
+# --- SYSTEM & CLEANUP ---
+
+cleanup() {
+    local exit_code=$?
+    # Remove lock file if we own it
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    # Remove temp dirs
+    for dir in "${TEMP_DIRS[@]}"; do
+        if [[ -d "$dir" ]]; then rm -rf "$dir"; fi
+    done
+    
+    exit "$exit_code"
+}
+
+trap cleanup EXIT INT TERM
+
+acquire_lock() {
+    # Only acquire lock for non-interactive backup commands
+    if [[ "$IS_INTERACTIVE" == "true" ]]; then return 0; fi
+
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            log_message "ERROR" "Concurrent execution attempt blocked (PID: $lock_pid is running)"
+            echo "Lazarus is already running (PID: $lock_pid). Exiting." >&2
+            exit 1
+        else
+            # Stale lock
+            echo "$$" > "$LOCK_FILE"
+        fi
+    else
+        # Check if we can write to lock file (might not be root)
+        if touch "$LOCK_FILE" 2>/dev/null; then
+            echo "$$" > "$LOCK_FILE"
+        else
+            # Fallback to tmp if /var/run is not writable
+            LOCK_FILE="/tmp/lazarus.lock"
+            echo "$$" > "$LOCK_FILE"
+        fi
+    fi
+}
+
 # --- ФУНКЦИИ ИНТЕРФЕЙСА ---
+
+escape_markdown_v2() {
+    echo "$1" | sed -e 's/\\/\\\\/g' -e 's/_/\\_/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' \
+        -e 's/(/\\(/g' -e 's/)/\\)/g' -e 's/~/\~/g' -e 's/`/\\`/g' -e 's/>/\\>/g' \
+        -e 's/#/\\#/g' -e 's/+/\\+/g' -e 's/-/\\-/g' -e 's/=/\\=/g' -e 's/|/\\|/g' \
+        -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\!/g'
+}
+
+send_telegram_notification() {
+    local msg="$1"
+    if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+        if command -v curl >/dev/null 2>&1; then
+            local escaped_msg
+            escaped_msg=$(escape_markdown_v2 "$msg")
+            local thread_param=""
+            [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
+            
+            curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                -d chat_id="$CHAT_ID" \
+                -d parse_mode="MarkdownV2" \
+                -d text="🚨 *Lazarus Error* 🚨%0A%0A${escaped_msg}" \
+                $thread_param >/dev/null 2>&1 || true
+        fi
+    fi
+}
 
 print_message() {
     local type="$1"; local message="$2"; local color_code="$RESET"
@@ -55,13 +161,67 @@ print_message() {
         "ACTION") color_code="$CYAN" ;;
     esac
     echo -e "${color_code}[$type]${RESET} $message"
+
+    if [[ "$type" == "ERROR" ]]; then
+        send_telegram_notification "$message"
+    fi
 }
 
-escape_markdown_v2() {
-    echo "$1" | sed -e 's/\\/\\\\/g' -e 's/_/\\_/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' \
-        -e 's/(/\\(/g' -e 's/)/\\)/g' -e 's/~/\~/g' -e 's/`/\\`/g' -e 's/>/\\>/g' \
-        -e 's/#/\\#/g' -e 's/+/\\+/g' -e 's/-/\\-/g' -e 's/=/\\=/g' -e 's/|/\\|/g' \
-        -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\!/g'
+log_message() {
+    # Level, Message
+    local level="$1"; local message="$2"
+    # Ensure log dir exists and file is writable
+    local logdir
+    logdir=$(dirname "$LOG_FILE")
+    if [[ ! -d "$logdir" ]]; then mkdir -p "$logdir" 2>/dev/null || true; fi
+    if [[ ! -f "$LOG_FILE" ]]; then touch "$LOG_FILE" 2>/dev/null || true; fi
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$ts] [$level] $message" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+rotate_internal_log() {
+    # Rotate log if > 10MB
+    local MAX_LOG_SIZE=$((10 * 1024 * 1024))
+    if [[ -f "$LOG_FILE" ]]; then
+        local size
+        size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        if [[ "$size" -gt "$MAX_LOG_SIZE" ]]; then
+            mv "$LOG_FILE" "${LOG_FILE}.old"
+            echo "Log rotated on $(date)" > "$LOG_FILE"
+        fi
+    fi
+}
+
+check_dependencies() {
+    local deps=("tar" "gzip" "openssl" "docker" "find" "du" "date")
+    local missing=()
+    
+    # Check for curl OR wget
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        missing+=("curl (or wget)")
+    fi
+
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    # Check for docker compose (v2)
+    if command -v docker >/dev/null 2>&1; then
+        if ! docker compose version >/dev/null 2>&1; then
+             echo -e "${RED}[ERROR]${RESET} 'docker compose' plugin is required but not found."
+             echo -e "${CYAN}[ACTION]${RESET} Please install docker-compose-plugin (v2)."
+             exit 1
+        fi
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "${RED}[ERROR]${RESET} Missing dependencies: ${missing[*]}"
+        echo -e "${CYAN}[ACTION]${RESET} Please install them (e.g., apt install ${missing[*]})"
+        exit 1
+    fi
 }
 
 # --- СИСТЕМА ОБНОВЛЕНИЯ ---
@@ -87,6 +247,9 @@ check_for_updates() {
         read -erp "Enter..." dummy; return
     fi
 
+    local V_LOCAL=$(echo "$VERSION" | cut -d'-' -f1)
+    local V_REMOTE=$(echo "$REMOTE_VERSION" | cut -d'-' -f1)
+
     echo -e "Текущая версия: ${BOLD}$VERSION${RESET}"
     echo -e "Актуальная версия: ${BOLD}$REMOTE_VERSION${RESET}"
     echo ""
@@ -94,24 +257,46 @@ check_for_updates() {
     if [[ "$VERSION" == "$REMOTE_VERSION" ]]; then
         print_message "SUCCESS" "У вас установлена последняя версия."
         read -erp "Enter..." dummy
-    else
+        return
+    fi
+
+    local IS_UPGRADE=false
+    if [[ "$(printf '%s\n' "$V_LOCAL" "$V_REMOTE" | sort -V | head -n1)" == "$V_LOCAL" && "$V_LOCAL" != "$V_REMOTE" ]]; then
+        IS_UPGRADE=true
+    fi
+
+    if [[ "$IS_UPGRADE" == "true" ]]; then
         print_message "WARN" "Доступно обновление!"
         read -erp "Обновить скрипт сейчас? (y/N): " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
-            if echo "$REMOTE_CONTENT" | head -n 1 | grep -q "^#!/bin/bash"; then
-                echo "$REMOTE_CONTENT" > "$INSTALL_DIR/$SCRIPT_NAME"
-                chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
-                print_message "SUCCESS" "Обновление завершено! Перезапуск..."
-                sleep 1
-                exec "$INSTALL_DIR/$SCRIPT_NAME"
-            else
-                print_message "ERROR" "Ошибка загрузки файла обновления. Отмена."
-                read -erp "Enter..." dummy
-            fi
+            perform_update "$REMOTE_CONTENT"
         else
             print_message "INFO" "Обновление отменено."
             read -erp "Enter..." dummy
         fi
+    else
+        echo -e "${YELLOW}⚠️ Внимание: Версия на сервере старее или такая же.${RESET}"
+        read -erp "Все равно загрузить версию с сервера? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            perform_update "$REMOTE_CONTENT"
+        else
+            print_message "INFO" "Отменено."
+            read -erp "Enter..." dummy
+        fi
+    fi
+}
+
+perform_update() {
+    local CONTENT="$1"
+    if echo "$CONTENT" | head -n 1 | grep -q "^#!/bin/bash"; then
+        echo "$CONTENT" > "$INSTALL_DIR/$SCRIPT_NAME"
+        chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
+        print_message "SUCCESS" "Обновление завершено! Перезапуск..."
+        sleep 1
+        exec "$INSTALL_DIR/$SCRIPT_NAME"
+    else
+        print_message "ERROR" "Ошибка загрузки файла обновления. Отмена."
+        read -erp "Enter..." dummy
     fi
 }
 
@@ -183,17 +368,13 @@ install_script() {
 # --- ЯДРО ИНТЕЛЛЕКТУАЛЬНОГО ПОИСКА ---
 
 scan_system_for_bot() {
-    FOUND_PATH=""
-    FOUND_BOT=""
-    FOUND_DB=""
-
+    FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
     local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
     
     for container in $running_containers; do
         local c_name=$(echo "$container" | cut -d'|' -f1)
         local c_image=$(echo "$container" | cut -d'|' -f2)
         
-        # --- ФИЛЬТР: ИГНОРИРОВАНИЕ ПАНЕЛИ ---
         if [[ "$c_image" == *"remnawave/backend"* ]]; then continue; fi
         if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then continue; fi
         if [[ "$c_name" == "remnawave" ]]; then continue; fi
@@ -204,9 +385,7 @@ scan_system_for_bot() {
             if [[ "$c_image" == *"$key"* ]]; then
                 FOUND_BOT="$c_name"
                 local work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name")
-                if [[ -n "$work_dir" && -d "$work_dir" ]]; then
-                    FOUND_PATH="$work_dir"
-                fi
+                if [[ -n "$work_dir" && -d "$work_dir" ]]; then FOUND_PATH="$work_dir"; fi
                 break 2
             fi
         done
@@ -215,7 +394,6 @@ scan_system_for_bot() {
     if [[ -z "$FOUND_PATH" ]]; then
         local search_dirs=("/opt" "/home" "/root")
         local compose_files=$(find "${search_dirs[@]}" -maxdepth 4 -name "docker-compose.yml" -o -name "compose.yaml" 2>/dev/null)
-        
         for file in $compose_files; do
             if grep -q "remnawave/backend" "$file"; then continue; fi
             if grep -qE "image:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" || grep -qE "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file"; then
@@ -231,10 +409,7 @@ scan_system_for_bot() {
             local db_services=("db" "postgres" "database" "postgresql")
             for svc in "${db_services[@]}"; do
                 local db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2>/dev/null)
-                if [[ -n "$db_c" && "$db_c" != "remnawave-db" ]]; then
-                    FOUND_DB="$db_c"
-                    break
-                fi
+                if [[ -n "$db_c" && "$db_c" != "remnawave-db" ]]; then FOUND_DB="$db_c"; break; fi
             done
             cd - >/dev/null
         fi
@@ -361,21 +536,35 @@ DB_USER="$DB_USER"
 SCHEDULE_FULL="$SCHEDULE_FULL"
 SCHEDULE_DB="$SCHEDULE_DB"
 SCHEDULE_FILES="$SCHEDULE_FILES"
-RETAIN_BACKUPS_DAYS="$RETAIN_BACKUPS_DAYS"
+MAX_BACKUPS_COUNT="$MAX_BACKUPS_COUNT"
 BOT_CONTAINER_NAME="$BOT_CONTAINER_NAME"
 DB_CONTAINER_NAME="$DB_CONTAINER_NAME"
 IGNORE_MISMATCH="$IGNORE_MISMATCH"
 EXCLUDE_DIRS="$EXCLUDE_DIRS"
 MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB"
+REMOTE_STORAGE_TYPE="$REMOTE_STORAGE_TYPE"
+REMOTE_STORAGE_URL="$REMOTE_STORAGE_URL"
+REMOTE_STORAGE_USER="$REMOTE_STORAGE_USER"
+REMOTE_STORAGE_PASS="$REMOTE_STORAGE_PASS"
+BACKUP_PASSWORD="$BACKUP_PASSWORD"
+SEND_TO_TELEGRAM="$SEND_TO_TELEGRAM"
+SEND_TO_REMOTE="$SEND_TO_REMOTE"
+DELETE_MODE="$DELETE_MODE"
+RETENTION_DAYS="$RETENTION_DAYS"
 EOF
     chmod 600 "$CONFIG_FILE"
 }
 
 load_or_create_config() {
     if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
-    if [[ -z "$RETAIN_BACKUPS_DAYS" ]]; then RETAIN_BACKUPS_DAYS=7; fi
+    if [[ -z "$MAX_BACKUPS_COUNT" ]]; then MAX_BACKUPS_COUNT=100; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
     if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
+    if [[ -z "$REMOTE_STORAGE_TYPE" ]]; then REMOTE_STORAGE_TYPE="off"; fi
+    if [[ -z "$SEND_TO_TELEGRAM" ]]; then SEND_TO_TELEGRAM="true"; fi
+    if [[ -z "$SEND_TO_REMOTE" ]]; then SEND_TO_REMOTE="true"; fi
+    if [[ -z "$DELETE_MODE" ]]; then DELETE_MODE="time"; fi
+    if [[ -z "$RETENTION_DAYS" ]]; then RETENTION_DAYS="7"; fi
     mkdir -p "$BACKUP_DIR"
 
     local updated=false
@@ -395,6 +584,11 @@ load_or_create_config() {
 }
 
 send_telegram_document() {
+    if [[ "$SEND_TO_TELEGRAM" != "true" ]]; then
+        print_message "INFO" "Отправка в Telegram отключена в настройках."
+        return
+    fi
+
     local file_path="$1"; local caption="$2"
     [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
     
@@ -433,18 +627,331 @@ send_telegram_document() {
     fi
 }
 
+send_telegram_text() {
+    # send simple text message to configured chat
+    local text="$1"
+    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
+    local thread_param=""
+    [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
+    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$text" \
+        -d parse_mode="MarkdownV2" $thread_param >/dev/null 2>&1
+}
+
+test_telegram_connection() {
+    print_message "INFO" "Проверка связи с Telegram API..."
+    local res=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getMe")
+    if [[ "$res" == *'"ok":true'* ]]; then
+        local bot_user=$(echo "$res" | grep -o '"username":"[^"]*"' | cut -d'"' -f4)
+        print_message "SUCCESS" "Успех! Бот: @$bot_user"
+    else
+        print_message "ERROR" "Ошибка подключения. Проверьте токен."
+    fi
+    read -erp "Enter..." dummy
+}
+
+validate_remote_connection() {
+    local type="$1"; local url="$2"; local user="$3"; local pass="$4"
+    print_message "INFO" "Тестирование подключения ($type)..."
+    local base_url="${url%/}"; local curl_cmd=(curl -s -m 10)
+    [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
+
+    if [[ "$type" == "ftp" ]]; then
+        if "${curl_cmd[@]}" --list-only "$base_url/" >/dev/null 2>&1; then return 0; else return 1; fi
+    elif [[ "$type" == "webdav" ]]; then
+        local http_code=$("${curl_cmd[@]}" -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2>/dev/null)
+        if [[ "$http_code" =~ ^(200|207|301|405)$ ]]; then return 0; else return 1; fi
+    elif [[ "$type" == "rclone" ]]; then
+        # For rclone, url is the remote name (e.g. "gdrive:")
+        if rclone listremotes | grep -q "^${url%:}\+:$"; then return 0; fi
+        if rclone lsd "$url" >/dev/null 2>&1; then return 0; else return 1; fi
+    fi
+    return 1
+}
+
+upload_to_remote() {
+    if [[ "$SEND_TO_REMOTE" != "true" ]]; then return; fi
+    local file_path="$1"; local filename=$(basename "$file_path")
+    REMOTE_UPLOAD_STATUS_TEXT="" 
+
+    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then return; fi
+
+    print_message "INFO" "Загрузка на удаленный сервер ($REMOTE_STORAGE_TYPE)..." >&2
+
+    if [[ "$REMOTE_STORAGE_TYPE" == "rclone" ]]; then
+        # Rclone upload
+        if ! command -v rclone >/dev/null 2>&1; then
+             print_message "ERROR" "Rclone не установлен!"
+             return
+        fi
+        local dest="${REMOTE_STORAGE_URL%/}"
+        if rclone copy "$file_path" "$dest" --progress; then
+             print_message "SUCCESS" "Файл успешно загружен (rclone)."
+             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: OK'
+             log_message "SUCCESS" "Uploaded $file_path to rclone:$dest"
+        else
+             print_message "ERROR" "Ошибка загрузки rclone."
+             log_message "ERROR" "Failed upload $file_path to rclone:$dest"
+        fi
+        return
+    fi
+
+    local upload_url="${REMOTE_STORAGE_URL%/}/$filename"
+    local curl_cmd=(curl -# -o /dev/null -w "%{http_code}" -m 300 -T "$file_path")
+    
+    [[ -n "$REMOTE_STORAGE_USER" ]] && curl_cmd+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
+    [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && curl_cmd+=("$upload_url")
+    [[ "$REMOTE_STORAGE_TYPE" == "webdav" ]] && curl_cmd+=("$upload_url")
+
+    local http_code=""
+    if [[ "$IS_INTERACTIVE" == "true" ]]; then
+        http_code=$("${curl_cmd[@]}")
+    else
+        curl_cmd[1]="-s"
+        http_code=$("${curl_cmd[@]}")
+    fi
+
+    if [[ "$http_code" =~ ^(200|201|204|226)$ ]]; then
+        print_message "SUCCESS" "Файл успешно загружен в хранилище." >&2
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: OK'; else REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: OK'; fi
+        log_message "SUCCESS" "Uploaded $file_path to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code"
+    else
+        print_message "ERROR" "Ошибка загрузки (Код: $http_code)." >&2
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: Ошибка'; else REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: Ошибка'; fi
+        log_message "ERROR" "Failed upload $file_path to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code"
+    fi
+}
+
+configure_remote_storage() {
+    clear; echo -e "${CYAN}Настройка удаленного хранилища${RESET}"
+    echo "1. Тип: FTP"
+    echo "2. Тип: WebDAV"
+    echo "3. Тип: Rclone (требуется установленный rclone)"
+    echo "4. Отключить"
+    echo ""; read -erp "Выбор: " r_type
+    
+    local new_type="off"
+    case $r_type in
+        1) new_type="ftp" ;; 2) new_type="webdav" ;; 3) new_type="rclone" ;;
+        4) REMOTE_STORAGE_TYPE="off"; save_config; print_message "SUCCESS" "Отключено."; return ;;
+        *) return ;;
+    esac
+
+    if [[ "$new_type" == "rclone" ]]; then
+        echo ""; echo "Введите имя remote и путь (как в rclone), например: gdrive:backups"
+        read -erp "Rclone path: " input_url
+        input_user=""; input_pass=""
+    else
+        echo ""; echo "Пример URL: ftp://backup.server.com/folder  |  https://webdav.yandex.ru"; echo ""
+        read -erp "URL сервера: " input_url
+        read -erp "Пользователь: " input_user
+        read -s -erp "Пароль: " input_pass; echo ""
+    fi
+
+    if validate_remote_connection "$new_type" "$input_url" "$input_user" "$input_pass"; then
+        print_message "SUCCESS" "Соединение установлено!"
+        REMOTE_STORAGE_TYPE="$new_type"; REMOTE_STORAGE_URL="$input_url"; REMOTE_STORAGE_USER="$input_user"; REMOTE_STORAGE_PASS="$input_pass"
+        save_config; print_message "SUCCESS" "Настройки сохранены."
+    else
+        print_message "ERROR" "Не удалось подключиться к серверу!"
+        read -erp "Сохранить настройки несмотря на ошибку? (y/N): " force_save
+        if [[ "$force_save" =~ ^[Yy]$ ]]; then
+            REMOTE_STORAGE_TYPE="$new_type"; REMOTE_STORAGE_URL="$input_url"; REMOTE_STORAGE_USER="$input_user"; REMOTE_STORAGE_PASS="$input_pass"
+            save_config; print_message "WARN" "Настройки сохранены (но соединение не проверено)."
+        else
+            print_message "INFO" "Отмена сохранения."
+        fi
+    fi
+    sleep 1
+}
+
+# --- РОТАЦИЯ (УДАЛЕНИЕ ЛИШНИХ) ---
+
+rotate_backups_by_count() {
+    local PREFIX="$1"
+    local LABEL="$2"
+    local PERFORM_DELETE="$3" 
+    
+    # СТРОГИЙ ПОИСК (Только архивы), сортировка по времени (старые в начале)
+    # Используем ls -1tr для сортировки по времени и while read для безопасности имен с пробелами
+    local files=()
+    while IFS= read -r f; do
+        files+=("$f")
+    done < <(ls -1tr "$BACKUP_DIR"/${PREFIX}_*.tar.gz "$BACKUP_DIR"/${PREFIX}_*.tar.gz.enc 2>/dev/null)
+    
+    local count=${#files[@]}
+    local diff=$((count - MAX_BACKUPS_COUNT))
+    
+    if [[ $diff -gt 0 ]]; then
+        if [[ "$PERFORM_DELETE" == "true" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo -e "${YELLOW}[DRY-RUN] Категория '$LABEL': было бы удалено $diff старых файлов (лимит $MAX_BACKUPS_COUNT).${RESET}"
+                log_message "INFO" "[DRY_RUN] Would delete $diff files (count-based rotation, prefix=$PREFIX, limit=$MAX_BACKUPS_COUNT)"
+                echo "$diff"
+                return 0
+            fi
+            echo -e "${YELLOW}Очистка категории '$LABEL' (удаление $diff старых файлов):${RESET}"
+            for (( i=0; i<diff; i++ )); do
+                local file_to_del="${files[$i]}"
+                if [[ -f "$file_to_del" ]]; then
+                    rm -f "$file_to_del"
+                    rm -f "$file_to_del.version"
+                    echo "  🗑 Удален: $(basename "$file_to_del")"
+                    log_message "INFO" "Deleted $file_to_del (count-based rotation, prefix=$PREFIX)"
+                fi
+            done
+            echo "$diff"
+            return 0
+        else
+            echo -e " $LABEL: Найдено $count (Лимит $MAX_BACKUPS_COUNT) -> ${RED}Кандидаты на удаление: $diff шт.${RESET}"
+            echo "$diff"
+            return 0
+        fi
+        return 0
+    else
+        if [[ "$PERFORM_DELETE" != "true" ]]; then
+            echo -e " $LABEL: Найдено $count (Лимит $MAX_BACKUPS_COUNT) -> ${GREEN}OK${RESET}"
+        fi
+        echo "0"
+        return 0
+    fi
+}
+
+rotate_backups_by_age() {
+    local PREFIX="$1"
+    local LABEL="$2"
+    local DAYS="$3"
+    local PERFORM_DELETE="$4"
+
+    # Ищем только архивы (включая .enc)
+    local pattern1="$BACKUP_DIR/${PREFIX}_*.tar.gz"
+    local pattern2="$BACKUP_DIR/${PREFIX}_*.tar.gz.enc"
+
+    # Найдём файлы старше DAYS дней
+    local files=()
+    # find -mtime +N означает "строго больше N дней". Чтобы RETENTION_DAYS=N означал
+    # "удалять файлы старше N дней", используем -mtime +$((N-1)). Для N==0 — будем
+    # удалять все подходящие файлы.
+    # Собираем аргументы find без eval
+    local find_args=("$BACKUP_DIR" -maxdepth 1 \( -name "${PREFIX}_*.tar.gz" -o -name "${PREFIX}_*.tar.gz.enc" \) -type f)
+    if [[ "$DAYS" -le 0 ]]; then
+        # Если 0 или меньше - не удаляем ничего (защита от полной очистки)
+        return 0
+    else
+        local nd=$((DAYS - 1))
+        find_args+=( -mtime +"$nd" )
+    fi
+    find_args+=( -print0 )
+    while IFS= read -r -d $'\0' f; do files+=("$f"); done < <(find "${find_args[@]}" 2>/dev/null)
+
+    local count=${#files[@]}
+
+    if [[ $count -gt 0 ]]; then
+        if [[ "$PERFORM_DELETE" == "true" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo -e "${YELLOW}[DRY-RUN] Категория '$LABEL': было бы удалено $count файлов старше $DAYS дней.${RESET}"
+                log_message "INFO" "[DRY_RUN] Would delete $count files (age-based rotation, prefix=$PREFIX, days=$DAYS)"
+                echo "$count"
+                return 0
+            fi
+            echo -e "${YELLOW}Очистка категории '$LABEL' (удаление $count файлов старше $DAYS дней):${RESET}"
+            for f in "${files[@]}"; do
+                if [[ -f "$f" ]]; then
+                    rm -f "$f"
+                    rm -f "$f.version"
+                    echo "  🗑 Удален: $(basename "$f")"
+                    log_message "INFO" "Deleted $f (age-based rotation, prefix=$PREFIX, days=$DAYS)"
+                fi
+            done
+            echo "$count"
+            return 0
+        else
+            echo -e " $LABEL: Найдено $count файлов старше $DAYS дней -> ${RED}Кандидаты на удаление: $count шт.${RESET}"
+            echo "$count"
+            return 0
+        fi
+        return 0
+    else
+        if [[ "$PERFORM_DELETE" != "true" ]]; then
+            echo -e " $LABEL: Нет файлов старше $DAYS дней -> ${GREEN}OK${RESET}"
+        fi
+        echo "0"
+        return 0
+    fi
+}
+
+uninstall_script() {
+    if [[ "$EUID" -ne 0 ]]; then
+        print_message "ERROR" "Uninstall requires root (sudo)."
+        return 1
+    fi
+    echo ""
+    print_message "WARN" "Удаление скрипта и данных установки будет выполнено.";
+    read -erp "Продолжить? (y/N): " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then print_message "INFO" "Отменено."; return 0; fi
+
+    # remove symlink
+    if [[ -L "$SYMLINK_PATH" ]]; then
+        rm -f "$SYMLINK_PATH" && log_message "INFO" "Removed symlink $SYMLINK_PATH"
+    fi
+    # remove installed script
+    if [[ -f "$INSTALL_DIR/$SCRIPT_NAME" ]]; then
+        rm -f "$INSTALL_DIR/$SCRIPT_NAME" && log_message "INFO" "Removed $INSTALL_DIR/$SCRIPT_NAME"
+    fi
+    # remove config and backups (ask)
+    if [[ -d "$INSTALL_DIR" ]]; then
+        read -erp "Удалить папку $INSTALL_DIR и все бэкапы? (y/N): " r2
+        if [[ "$r2" =~ ^[Yy]$ ]]; then
+            rm -rf "$INSTALL_DIR" && log_message "INFO" "Removed $INSTALL_DIR"
+        else
+            log_message "INFO" "Preserved $INSTALL_DIR"
+        fi
+    fi
+    # try to remove cron entries
+    crontab -l 2>/dev/null | grep -v "# LAZARUS-JOB-" | crontab - 2>/dev/null || true
+    log_message "INFO" "Attempted to remove cron entries for lazarus"
+    print_message "SUCCESS" "Uninstall finished."
+}
+
 # --- БЭКАП ---
 
 create_backup() {
     local TYPE="$1"
+    
+    acquire_lock
+
+    if [[ -z "$BACKUP_PASSWORD" && "$IS_INTERACTIVE" == "true" ]]; then
+        clear
+        echo -e "${RED}${BOLD}⚠️ ВНИМАНИЕ: Пароль шифрования не установлен!${RESET}"
+        echo "Файл бэкапа не будет зашифрован. Данные могут быть доступны третьим лицам."
+        echo ""
+        echo " 1. Продолжить без шифрования"
+        echo " 2. Установить пароль сейчас"
+        echo " 0. Отмена"
+        echo ""
+        read -erp "Ваш выбор: " enc_choice
+        case $enc_choice in
+            1) ;; 
+            2) read -s -erp "Введите пароль шифрования: " np
+               echo ""; if [[ -n "$np" ]]; then BACKUP_PASSWORD="$np"; save_config; print_message "SUCCESS" "Пароль установлен."; else print_message "ERROR" "Пустой пароль. Отмена."; return; fi ;;
+            *) print_message "INFO" "Бэкап отменен."; return ;;
+        esac
+    fi
+
     local TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
+    
+    # Create temp dir for atomic operations
+    local TMP_WORK_DIR=$(mktemp -d)
+    TEMP_DIRS+=("$TMP_WORK_DIR")
+    
     local FILE_DB="db_${TIMESTAMP}.sql.gz"
     local FILE_DIR="dir_${TIMESTAMP}.tar.gz"
     local FILE_VERSION="bot_version.txt"
     local FILE_FINAL=""
     local HAS_ERROR=0
     local SKIP_INFO=""
-    local SKIP_FILE="$BACKUP_DIR/skipped_files.txt"
+    local SKIP_FILE="$TMP_WORK_DIR/skipped_files.txt"
 
     if [[ "$TYPE" != "db_only" ]]; then if ! ensure_bot_path; then return; fi; fi
     if [[ "$TYPE" == "db_only" || "$TYPE" == "full" ]]; then
@@ -452,45 +959,35 @@ create_backup() {
     fi
 
     local CURRENT_VER=$(get_raw_bot_version)
-    echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
+    echo "${CURRENT_VER:-Unknown}" > "$TMP_WORK_DIR/$FILE_VERSION"
 
-    # Дамп БД
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
         print_message "INFO" "Дамп базы данных ($DB_CONTAINER_NAME)..."
         if ! docker container inspect -f '{{.State.Running}}' "$DB_CONTAINER_NAME" &>/dev/null; then
              print_message "ERROR" "Контейнер DB ($DB_CONTAINER_NAME) не запущен или не найден!"
              HAS_ERROR=1
         else
-            if ! docker exec "$DB_CONTAINER_NAME" pg_dumpall -c -U "$DB_USER" 2>/dev/null | gzip -9 > "$BACKUP_DIR/$FILE_DB"; then
+            # Use pipefail to catch pg_dump errors
+            if ! (set -o pipefail; docker exec "$DB_CONTAINER_NAME" pg_dumpall -c -U "$DB_USER" 2>/dev/null | gzip -9 > "$TMP_WORK_DIR/$FILE_DB"); then
                 print_message "ERROR" "Ошибка дампа БД."
                 HAS_ERROR=1
             fi
         fi
     fi
 
-    if [[ $HAS_ERROR -eq 1 ]]; then rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION"; return; fi
+    if [[ $HAS_ERROR -eq 1 ]]; then return; fi
 
-    # --- ЛОГИКА ИСКЛЮЧЕНИЙ ---
     IFS=' ' read -r -a EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
     EXCLUDE_FLAGS=()
-    for ex in "${EXCLUDE_ARRAY[@]}"; do
-        if [[ -n "$ex" ]]; then EXCLUDE_FLAGS+=(--exclude="$ex"); fi
-    done
+    for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then EXCLUDE_FLAGS+=(--exclude="$ex"); fi; done
     EXCLUDE_FLAGS+=(--exclude="*.log" --exclude=".git" --exclude="private-remnawave-*.tar")
 
-    # --- ЛОГИКА БОЛЬШИХ ФАЙЛОВ ---
     if [[ "$TYPE" != "db_only" ]]; then
         : > "$SKIP_FILE"
-        
         local FIND_CMD="find ."
-        for ex in "${EXCLUDE_ARRAY[@]}"; do
-            if [[ -n "$ex" ]]; then FIND_CMD+=" -path './$ex' -prune -o"; fi
-        done
+        for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then FIND_CMD+=" -path './$ex' -prune -o"; fi; done
         FIND_CMD+=" -type f -size +${MAX_FILE_SIZE_MB}M -print"
-        
-        cd "$BOT_PATH"
-        eval "$FIND_CMD" > "$SKIP_FILE"
-        
+        cd "$BOT_PATH"; eval "$FIND_CMD" > "$SKIP_FILE"
         local SKIP_COUNT=$(wc -l < "$SKIP_FILE")
         if [[ "$SKIP_COUNT" -gt 0 ]]; then
             local SKIP_SIZE=$(du -ch --files0-from=<(tr '\n' '\0' < "$SKIP_FILE") | tail -1 | cut -f1)
@@ -500,63 +997,95 @@ create_backup() {
         fi
     fi
 
-    # Упаковка
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="lazarus_db_${TIMESTAMP}.tar.gz"
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB"
-        rm -f "$BACKUP_DIR/$FILE_DB"
+        tar -czf "$TMP_WORK_DIR/$FILE_FINAL" -C "$TMP_WORK_DIR" "$FILE_VERSION" "$FILE_DB"
     elif [[ "$TYPE" == "files_only" ]]; then
         FILE_FINAL="lazarus_files_${TIMESTAMP}.tar.gz"
-        print_message "INFO" "Архивация файлов..."
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
-    else # FULL
+        print_message "INFO" "Архивация файлов (это может занять время)..."
+        tar -czf "$TMP_WORK_DIR/$FILE_FINAL" -C "$TMP_WORK_DIR" "$FILE_VERSION" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+    else 
         FILE_FINAL="lazarus_full_${TIMESTAMP}.tar.gz"
-        print_message "INFO" "Архивация файлов..."
-        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
-        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
+        print_message "INFO" "Архивация файлов (это может занять время)..."
+        tar -czf "$TMP_WORK_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        tar -czf "$TMP_WORK_DIR/$FILE_FINAL" -C "$TMP_WORK_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
     fi
 
-    # --- ЧИСТКА ПОСЛЕ БЭКАПА ---
-    rm -f "$SKIP_FILE"
+    local ENC_STATUS="🔓 Unencrypted"
+    if [[ -z "$BACKUP_PASSWORD" && "$IS_INTERACTIVE" == "false" ]]; then ENC_STATUS="⚠️ NO PASSWORD"; fi
 
-    cp "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_FINAL.version"
-    rm -f "$BACKUP_DIR/$FILE_VERSION"
+    if [[ -n "$BACKUP_PASSWORD" ]]; then
+        print_message "INFO" "Шифрование архива (это может занять время)..."
+        # Pass password via env var to avoid process listing leak
+        export LAZARUS_ENC_PASS="$BACKUP_PASSWORD"
+        openssl enc -aes-256-cbc -salt -pbkdf2 -in "$TMP_WORK_DIR/$FILE_FINAL" -out "$TMP_WORK_DIR/${FILE_FINAL}.enc" -pass env:LAZARUS_ENC_PASS
+        local enc_res=$?
+        unset LAZARUS_ENC_PASS
+        
+        if [[ $enc_res -eq 0 ]]; then
+            rm "$TMP_WORK_DIR/$FILE_FINAL"
+            FILE_FINAL="${FILE_FINAL}.enc"
+            ENC_STATUS="🔒 Encrypted"
+            print_message "SUCCESS" "Архив зашифрован."
+        else
+            print_message "ERROR" "Ошибка шифрования! Отправка незашифрованного файла."
+        fi
+    fi
+
+    # Move final file to BACKUP_DIR
+    mv "$TMP_WORK_DIR/$FILE_FINAL" "$BACKUP_DIR/$FILE_FINAL"
+    local FINAL_VERSION_FILE="$BACKUP_DIR/$FILE_FINAL.version"
+    cp "$TMP_WORK_DIR/$FILE_VERSION" "$FINAL_VERSION_FILE"
     
+    # --- VERIFY ARCHIVE ---
+    print_message "INFO" "Проверка целостности архива..."
+    local VERIFY_OK="false"
+    if [[ "$FILE_FINAL" == *".enc" ]]; then
+        # For encrypted files, we can't easily verify without decrypting. 
+        # We assume openssl exit code 0 was enough, or we could decrypt to /dev/null
+        export LAZARUS_VERIFY_PASS="$BACKUP_PASSWORD"
+        if openssl enc -d -aes-256-cbc -pbkdf2 -in "$BACKUP_DIR/$FILE_FINAL" -pass env:LAZARUS_VERIFY_PASS | gzip -t 2>/dev/null; then
+             VERIFY_OK="true"
+        fi
+        unset LAZARUS_VERIFY_PASS
+    else
+        if gzip -t "$BACKUP_DIR/$FILE_FINAL" 2>/dev/null; then
+             VERIFY_OK="true"
+        fi
+    fi
+
+    if [[ "$VERIFY_OK" == "true" ]]; then
+        print_message "SUCCESS" "Архив валиден."
+    else
+        print_message "ERROR" "Архив поврежден! (Verification failed)"
+        # We do not delete it, just warn
+    fi
+
     local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
     print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
+    log_message "SUCCESS" "Backup created: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS, verify=$VERIFY_OK)"
+
+    upload_to_remote "$BACKUP_DIR/$FILE_FINAL"
     
-    # --- НОВЫЙ ФОРМАТ СООБЩЕНИЯ В TELEGRAM ---
     local DISPLAY_DATE=$(date "+%d.%m.%Y %H:%M:%S")
-    local HASHTAG=""
-    local TYPE_NAME=""
+    local HASHTAG=""; local TYPE_NAME=""; local ROTATION_KEY=""
     
     case "$TYPE" in
-        "full")
-            HASHTAG="💾 #full_backup"
-            TYPE_NAME="📦 Полный бэкап"
-            ;;
-        "db_only")
-            HASHTAG="💾 #db_only"
-            TYPE_NAME="🗄 Дамп базы данных"
-            ;;
-        "files_only")
-            HASHTAG="💾 #files_only"
-            TYPE_NAME="📂 Файлы бота"
-            ;;
+        "full") HASHTAG="💾 #full_backup"; TYPE_NAME="📦 Полный бэкап"; ROTATION_KEY="Полные бэкапы" ;;
+        "db_only") HASHTAG="💾 #db_only"; TYPE_NAME="🗄 Дамп базы данных"; ROTATION_KEY="Базы данных" ;;
+        "files_only") HASHTAG="💾 #files_only"; TYPE_NAME="📂 Файлы бота"; ROTATION_KEY="Архивы файлов" ;;
     esac
 
     local VER_MSG=""; [[ -n "$CURRENT_VER" ]] && VER_MSG=" | 🏷 v${CURRENT_VER}"
-    
     local CAPTION="${HASHTAG}
 📅 ${DISPLAY_DATE}
 ${TYPE_NAME}
-📏 ${SIZE}${VER_MSG}${SKIP_INFO}"
+📏 ${SIZE}${VER_MSG}
+${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     
     send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
 
-    find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -delete
-    find "$BACKUP_DIR" -name "lazarus*.tar.gz.version" -mtime +$RETAIN_BACKUPS_DAYS -delete
+    rotate_backups_by_count "lazarus_$TYPE" "$ROTATION_KEY" "true"
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
@@ -566,25 +1095,30 @@ select_backup_file() {
     local show_limit=5; local show_filenames=false
 
     while true; do
-        if ! compgen -G "$BACKUP_DIR/${FILTER_PREFIX}_*.tar.gz" > /dev/null; then
+        local files_raw=("$BACKUP_DIR/${FILTER_PREFIX}_"*.tar.gz*)
+        local valid_files=()
+        for f in "${files_raw[@]}"; do
+            if [[ ! -e "$f" ]]; then continue; fi 
+            if [[ "$f" == *".version" ]]; then continue; fi
+            if [[ ! "$f" =~ \.tar\.gz(\.enc)?$ ]]; then continue; fi
+            valid_files+=("$f")
+        done
+        
+        local total_count=${#valid_files[@]}
+        
+        if [[ "$total_count" -eq 0 ]]; then
             print_message "WARN" "Файлов типа '${TITLE}' не найдено."; read -erp "Enter..." dummy; return 1
         fi
         
-        local files_unsorted=("$BACKUP_DIR/${FILTER_PREFIX}_"*.tar.gz)
-        IFS=$'\n' sorted_backups=($(sort -r <<<"${files_unsorted[*]}"))
+        IFS=$'\n' sorted_backups=($(sort -r <<<"${valid_files[*]}"))
         unset IFS
         
-        local total_count=${#sorted_backups[@]}
         local CURRENT_VER=$(get_raw_bot_version)
 
         clear; echo -e "${GREEN}Восстановление: ${BOLD}${TITLE}${RESET}"
         echo -e "Всего файлов: ${CYAN}${total_count}${RESET}"; echo ""
 
         local loop_limit=$show_limit
-        local show_all=false 
-        
-        if [[ "$loop_limit" -lt "$total_count" ]]; then show_all=false; else show_all=true; fi
-        
         if [[ $loop_limit -gt $total_count ]]; then loop_limit=$total_count; fi
 
         for (( i=0; i<loop_limit; i++ )); do
@@ -595,9 +1129,14 @@ select_backup_file() {
             local B_VER=""
             if [[ -f "$CACHE_FILE" ]]; then B_VER=$(cat "$CACHE_FILE")
             else
-                B_VER=$(tar -xzf "$file" -O bot_version.txt 2>/dev/null)
+                if [[ "$file" != *".enc" ]]; then
+                    B_VER=$(tar -xzf "$file" -O bot_version.txt 2>/dev/null)
+                fi
                 if [[ -n "$B_VER" ]]; then echo "$B_VER" > "$CACHE_FILE"; else echo "?" > "$CACHE_FILE"; B_VER="?"; fi
             fi
+            
+            local ENC_MARK=""; [[ "$file" == *".enc" ]] && ENC_MARK="${RED}[ENC]${RESET} "
+            
             local VER_STR=""
             if [[ "$B_VER" == "Unknown" || "$B_VER" == "" ]]; then VER_STR="${GRAY}[Н/Д]${RESET}"
             elif [[ "$B_VER" == "?" ]]; then VER_STR="${GRAY}[Legacy]${RESET}"
@@ -606,7 +1145,7 @@ select_backup_file() {
             else VER_STR="${RED}[v$B_VER]${RESET}"; fi
 
             if [[ "$show_filenames" == "true" ]]; then
-                printf " %2d. %s %s\n" "$((i+1))" "$filename" "$VER_STR"
+                printf " %2d. %s%s %s\n" "$((i+1))" "$ENC_MARK" "$filename" "$VER_STR"
             else
                 if [[ $filename =~ _([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})_([0-9]{2}) ]]; then
                     local date_part="${BASH_REMATCH[1]}"
@@ -614,7 +1153,7 @@ select_backup_file() {
                     local d_d=${date_part:8:2}; local d_m=${date_part:5:2}
                     local pretty_date="$d_d.$d_m $time_part"
                     local fsize=$(du -h "$file" | awk '{print $1}')
-                    printf " %2d. %s | %5s | %s\n" "$((i+1))" "${BOLD}$pretty_date${RESET}" "$fsize" "$VER_STR"
+                    printf " %2d. %s | %5s | %s%s\n" "$((i+1))" "${BOLD}$pretty_date${RESET}" "$fsize" "$ENC_MARK" "$VER_STR"
                 else
                     printf " %2d. %s %s\n" "$((i+1))" "$filename" "$VER_STR"
                 fi
@@ -658,8 +1197,25 @@ execute_restore() {
 
     local TMP_DIR="$BACKUP_DIR/restore_tmp_$$"
     mkdir -p "$TMP_DIR"
+    
+    local WORK_FILE="$FILE"
+    if [[ "$FILE" == *".enc" ]]; then
+        print_message "INFO" "Файл зашифрован. Требуется пароль."
+        read -s -erp "Пароль: " decrypt_pass; echo ""
+        local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
+        
+        export LAZARUS_DEC_PASS="$decrypt_pass"
+        openssl enc -d -aes-256-cbc -pbkdf2 -in "$FILE" -out "$DECRYPTED_FILE" -pass env:LAZARUS_DEC_PASS 2>/dev/null
+        local dec_res=$?
+        unset LAZARUS_DEC_PASS
+
+        if [[ $dec_res -ne 0 ]]; then print_message "ERROR" "Неверный пароль или поврежденный файл!"; rm -rf "$TMP_DIR"; return; fi
+        print_message "SUCCESS" "Пароль принят."
+        WORK_FILE="$DECRYPTED_FILE"
+    fi
+
     print_message "INFO" "Распаковка..."
-    tar -xzf "$FILE" -C "$TMP_DIR"
+    tar -xzf "$WORK_FILE" -C "$TMP_DIR"
 
     local DB_DUMP=$(find "$TMP_DIR" -name "db_*.sql.gz" | head -1)
     local DIR_ARC=$(find "$TMP_DIR" -name "dir_*.tar.gz" | head -1)
@@ -691,6 +1247,7 @@ execute_restore() {
 
     rm -rf "$TMP_DIR"
     print_message "SUCCESS" "Восстановление успешно завершено."
+    log_message "SUCCESS" "Restore completed (mode=$MODE, file=$FILE)"
     read -erp "Нажмите Enter..." dummy
 }
 
@@ -706,7 +1263,6 @@ menu_manual_backup() {
         echo ""
         read -erp "Ваш выбор (Enter - Назад): " m_choice
         [[ -z "$m_choice" ]] && return
-        
         case $m_choice in
             1) create_backup "full"; read -erp "Enter..." dummy; return ;;
             2) create_backup "db_only"; read -erp "Enter..." dummy; return ;;
@@ -718,9 +1274,10 @@ menu_manual_backup() {
 
 menu_restore() {
     while true; do
-        local n_full=$(find "$BACKUP_DIR" -maxdepth 1 -name "lazarus_full_*.tar.gz" 2>/dev/null | wc -l)
-        local n_db=$(find "$BACKUP_DIR" -maxdepth 1 -name "lazarus_db_*.tar.gz" 2>/dev/null | wc -l)
-        local n_files=$(find "$BACKUP_DIR" -maxdepth 1 -name "lazarus_files_*.tar.gz" 2>/dev/null | wc -l)
+        # СТРОГАЯ ЛОГИКА ПОДСЧЕТА
+        local n_full=$(find "$BACKUP_DIR" -type f \( -name "lazarus_full_*.tar.gz" -o -name "lazarus_full_*.tar.gz.enc" \) 2>/dev/null | wc -l)
+        local n_db=$(find "$BACKUP_DIR" -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" \) 2>/dev/null | wc -l)
+        local n_files=$(find "$BACKUP_DIR" -type f \( -name "lazarus_files_*.tar.gz" -o -name "lazarus_files_*.tar.gz.enc" \) 2>/dev/null | wc -l)
 
         local c_f="$CYAN"; [[ "$n_full" == "0" ]] && c_f="$GRAY"
         local c_d="$CYAN"; [[ "$n_db" == "0" ]] && c_d="$GRAY"
@@ -799,7 +1356,7 @@ setup_cron_task() {
 menu_automation() {
     while true; do
         clear; echo -e "${GREEN}Настройка Автоматического Бекапа${RESET}"
-        echo -e " 1. Полный бекап [${YELLOW}${SCHEDULE_FULL}${RESET}]"
+        echo -e " 1. Полный бэкап [${YELLOW}${SCHEDULE_FULL}${RESET}]"
         echo -e " 2. Только База  [${YELLOW}${SCHEDULE_DB}${RESET}]"
         echo -e " 3. Только Файлы [${YELLOW}${SCHEDULE_FILES}${RESET}]"
         echo " 0. Назад"
@@ -813,108 +1370,220 @@ menu_automation() {
 menu_settings() {
     while true; do
         clear; echo -e "${GREEN}Настройки скрипта${RESET}"
+        
         local MASKED_TOKEN="${BOT_TOKEN:0:5}.......${BOT_TOKEN: -5}"; [[ ${#BOT_TOKEN} -lt 10 ]] && MASKED_TOKEN="*******"
-        echo -e " 1. Путь к боту:      ${CYAN}${BOT_PATH}${RESET}"
-        echo -e " 2. Telegram Token:   ${CYAN}${MASKED_TOKEN}${RESET}"
-        echo -e " 3. Chat ID:          ${CYAN}${CHAT_ID}${RESET}"
-        echo -e " 4. Thread ID:        ${CYAN}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
-        echo -e " 5. Пользователь БД:  ${CYAN}${DB_USER}${RESET}"
-        echo -e " 6. Хранить бэкапы:   ${CYAN}${RETAIN_BACKUPS_DAYS} дней${RESET}"
-        echo -e " 7. Имя контейнера:   ${CYAN}${BOT_CONTAINER_NAME}${RESET}"
-        echo -e " 8. Контейнер БД:     ${CYAN}${DB_CONTAINER_NAME}${RESET}"
-        echo -e " 9. Исключить папки:  ${CYAN}${EXCLUDE_DIRS:-Нет}${RESET}"
-        echo -e " 10. Макс. размер файла: ${CYAN}${MAX_FILE_SIZE_MB} MB${RESET}"
-        echo " 0. Назад"
+        local PASS_MASK="Нет"; [[ -n "$BACKUP_PASSWORD" ]] && PASS_MASK="********"
+        
+        local MASKED_REMOTE_USER="-"
+        if [[ -n "$REMOTE_STORAGE_USER" ]]; then
+            if [[ ${#REMOTE_STORAGE_USER} -gt 4 ]]; then
+                MASKED_REMOTE_USER="${REMOTE_STORAGE_USER:0:3}...${REMOTE_STORAGE_USER: -2}"
+            else
+                MASKED_REMOTE_USER="*****"
+            fi
+        fi
+
+        local ST_TG="${RED}Выкл${RESET}"; [[ "$SEND_TO_TELEGRAM" == "true" ]] && ST_TG="${GREEN}Вкл${RESET}"
+        local ST_REM="${RED}Выкл${RESET}"; [[ "$SEND_TO_REMOTE" == "true" ]] && ST_REM="${GREEN}Вкл${RESET}"
+        
+        local STORAGE_TYPE_DISP="Выкл"
+        if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then STORAGE_TYPE_DISP="${REMOTE_STORAGE_TYPE^^}"; fi
+
+        echo -e "${CYAN}--- ОБЩИЕ ---${RESET}"
+        echo -e " 1. Путь к боту:      ${GRAY}${BOT_PATH}${RESET}"
+        echo -e " 2. Имя контейнера:   ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
+        echo -e " 3. Контейнер БД:     ${GRAY}${DB_CONTAINER_NAME}${RESET}"
+        echo -e " 4. Пользователь БД:  ${GRAY}${DB_USER}${RESET}"
+        echo -e " 5. Хранить бэкапы:   ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
+        echo -e " 6. Исключить папки:  ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
+        echo -e " 7. Макс. размер файла: ${GRAY}${MAX_FILE_SIZE_MB} MB${RESET}"
+        
+        echo -e "\n${CYAN}--- TELEGRAM ($ST_TG) ---${RESET}"
+        echo -e " 8. Token:            ${GRAY}${MASKED_TOKEN}${RESET}"
+        echo -e " 9. Chat ID:          ${GRAY}${CHAT_ID}${RESET}"
+        echo -e " 10. Thread ID:       ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
+        echo -e " 11. Отправка:        $ST_TG"
+        echo -e " 12. ⚡ Проверить связь (Telegram)"
+
+        echo -e "\n${CYAN}--- УДАЛЕННОЕ ХРАНИЛИЩЕ ($ST_REM) ---${RESET}"
+        echo -e " 13. Тип:             ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
+        echo -e " 14. URL:             ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
+        echo -e " 15. Пользователь:    ${GRAY}${MASKED_REMOTE_USER}${RESET}"
+        echo -e " 16. Пароль:          ${GRAY}********${RESET}"
+        echo -e " 17. Загрузка:        $ST_REM"
+        echo -e " 18. ⚡ Проверить связь (Облако)"
+
+        echo -e "\n${CYAN}--- БЕЗОПАСНОСТЬ ---${RESET}"
+        echo -e " 19. Пароль архива:   ${GRAY}${PASS_MASK}${RESET}"
+    echo -e "\n${CYAN}--- УДАЛЕНИЕ СТАРЫХ БЭКАПОВ ---${RESET}"
+    local DM_DISPLAY="$DELETE_MODE"
+    if [[ "$DELETE_MODE" == "time" ]]; then DM_DISPLAY="По времени"; else DM_DISPLAY="По количеству"; fi
+    echo -e " 20. Режим удаления:  ${GRAY}${DM_DISPLAY}${RESET}"
+    echo -e " 21. Срок хранения (дней): ${GRAY}${RETENTION_DAYS}${RESET}"
+        
+        echo -e "\n 0. Назад"
         echo ""
-        read -erp "Что изменить (Enter - Назад): " s
+        read -erp "Что изменить (номер): " s
         [[ -z "$s" ]] && return
         
         case $s in
             1) read -erp "Новый путь: " np; if [[ -n "$np" ]]; then if [[ -d "$np" ]]; then BOT_PATH="$np"; save_config; print_message "SUCCESS" "Сохранено"; else print_message "ERROR" "Папка не найдена!"; fi; fi ;;
-            2) read -erp "Новый Token: " nt; if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            3) read -erp "Новый Chat ID: " nid; if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            4) read -erp "Новый Thread ID: " ntid; TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
-            5) read -erp "Новый DB User: " ndb; if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            6) read -erp "Дней хранения: " nd; if [[ "$nd" =~ ^[0-9]+$ ]]; then RETAIN_BACKUPS_DAYS="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
             
-            7) 
+            2) 
                 scan_system_for_bot
                 local def_cont="${FOUND_BOT:-$BOT_CONTAINER_NAME}"
                 local prompt_msg="Имя контейнера бота"
                 [[ -n "$FOUND_BOT" ]] && prompt_msg+=" (Enter = '$FOUND_BOT')"
+                read -erp "$prompt_msg: " nc; nc="${nc:-$def_cont}"
+                if [[ -n "$nc" ]]; then BOT_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                 
-                read -erp "$prompt_msg: " nc
-                nc="${nc:-$def_cont}"
-                
-                if [[ -n "$nc" ]]; then 
-                    BOT_CONTAINER_NAME="$nc"
-                    save_config
-                    print_message "SUCCESS" "Сохранено: $nc"
-                else
-                    print_message "INFO" "Без изменений."
-                fi 
-                ;;
-                
-            8) 
+            3) 
                 scan_system_for_bot
                 local def_db="${FOUND_DB:-$DB_CONTAINER_NAME}"
                 local prompt_msg="Имя контейнера БД"
                 [[ -n "$FOUND_DB" ]] && prompt_msg+=" (Enter = '$FOUND_DB')"
-                
-                read -erp "$prompt_msg: " ndb_c
-                ndb_c="${ndb_c:-$def_db}"
-                
-                if [[ -n "$ndb_c" ]]; then 
-                    DB_CONTAINER_NAME="$ndb_c"
-                    save_config
-                    print_message "SUCCESS" "Сохранено: $ndb_c"
-                else
-                    print_message "INFO" "Без изменений."
-                fi 
-                ;;
-                
-            9) read -erp "Исключить (например: uploads/cache node_modules): " ed; 
-               if [[ -n "$ed" ]]; then 
-                   EXCLUDE_DIRS="$ed"
-                   save_config
-                   print_message "SUCCESS" "Сохранено"
-               else
-                   if [[ -n "$EXCLUDE_DIRS" ]]; then
-                        read -erp "Очистить список исключений? (y/N): " clr
-                        if [[ "$clr" =~ ^[Yy]$ ]]; then EXCLUDE_DIRS=""; save_config; print_message "SUCCESS" "Очищено"; fi
-                   fi
-               fi ;;
-            10) read -erp "Макс. размер файла в MB (целое число): " msize
-                if [[ "$msize" =~ ^[0-9]+$ ]] && [ "$msize" -gt 0 ]; then
-                    MAX_FILE_SIZE_MB="$msize"; save_config; print_message "SUCCESS" "Сохранено"
-                else print_message "ERROR" "Введите число больше 0"; fi ;;
+                read -erp "$prompt_msg: " ndb_c; ndb_c="${ndb_c:-$def_db}"
+                if [[ -n "$ndb_c" ]]; then DB_CONTAINER_NAME="$ndb_c"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+
+            4) read -erp "Новый DB User: " ndb; if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            5) read -erp "Макс. количество бэкапов: " nd; if [[ "$nd" =~ ^[0-9]+$ ]]; then MAX_BACKUPS_COUNT="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            6) read -erp "Исключить (например: uploads/cache): " ed; if [[ -n "$ed" ]]; then EXCLUDE_DIRS="$ed"; save_config; print_message "SUCCESS" "Сохранено"; else if [[ -n "$EXCLUDE_DIRS" ]]; then read -erp "Очистить? (y/N): " clr; if [[ "$clr" =~ ^[Yy]$ ]]; then EXCLUDE_DIRS=""; save_config; fi; fi; fi ;;
+            7) read -erp "Макс. размер файла в MB: " msize; if [[ "$msize" =~ ^[0-9]+$ ]] && [ "$msize" -gt 0 ]; then MAX_FILE_SIZE_MB="$msize"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            
+            8) read -erp "Новый Token: " nt; if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            9) read -erp "Новый Chat ID: " nid; if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            10) read -erp "Новый Thread ID: " ntid; TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
+            11) if [[ "$SEND_TO_TELEGRAM" == "true" ]]; then SEND_TO_TELEGRAM="false"; else SEND_TO_TELEGRAM="true"; fi; save_config; ;;
+            12) test_telegram_connection ;;
+
+            13) configure_remote_storage ;; 
+            14) configure_remote_storage ;; 
+            15) configure_remote_storage ;; 
+            16) configure_remote_storage ;; 
+            17) if [[ "$SEND_TO_REMOTE" == "true" ]]; then SEND_TO_REMOTE="false"; else SEND_TO_REMOTE="true"; fi; save_config; ;;
+            18) if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then validate_remote_connection "$REMOTE_STORAGE_TYPE" "$REMOTE_STORAGE_URL" "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS"; if [[ $? -eq 0 ]]; then print_message "SUCCESS" "Соединение OK"; else print_message "ERROR" "Ошибка соединения"; fi; read -erp "Enter..." d; else print_message "WARN" "Хранилище отключено"; sleep 1; fi ;;
+
+            19) read -s -erp "Новый пароль шифрования (Enter - сбросить): " new_pass; echo ""
+                BACKUP_PASSWORD="$new_pass"; save_config; print_message "SUCCESS" "Сохранено." ;;
+            20)
+                echo "Выберите режим удаления старых бэкапов:"; echo " 1) По времени (days)"; echo " 2) По количеству (count)"
+                read -erp "Выбор (1/2): " dm
+                if [[ "$dm" == "1" ]]; then DELETE_MODE="time"; else DELETE_MODE="count"; fi
+                save_config; print_message "SUCCESS" "Сохранено" ;;
+            21)
+                read -erp "Введите срок хранения в днях (число): " ndays
+                if [[ "$ndays" =~ ^[0-9]+$ ]] && [ "$ndays" -ge 0 ]; then RETENTION_DAYS="$ndays"; save_config; print_message "SUCCESS" "Сохранено"; else print_message "ERROR" "Неверное значение"; fi ;;
+            
             0) return ;;
-        esac; if [[ -n "$s" ]]; then sleep 1; fi
+        esac; if [[ -n "$s" ]]; then sleep 0.5; fi
     done
 }
 
 cleanup_old_backups() {
-    clear; echo -e "${RED}Очистка старых бэкапов${RESET}"; echo "Поиск файлов старше $RETAIN_BACKUPS_DAYS дней..."
-    local COUNT=$(find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS | wc -l)
-    if [[ "$COUNT" -eq 0 ]]; then print_message "INFO" "Файлов не найдено."; read -erp "Enter..." dummy; return; fi
-    find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -print
-    echo ""; print_message "WARN" "Найдено файлов: $COUNT"; read -erp "Удалить? (y/n): " c
-    if [[ "$c" == "y" ]]; then
-        find "$BACKUP_DIR" -name "lazarus_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -delete
-        find "$BACKUP_DIR" -name "lazarus_*.tar.gz.version" -mtime +$RETAIN_BACKUPS_DAYS -delete
-        print_message "SUCCESS" "Очищено."; else print_message "INFO" "Отменено."; fi
+    clear; echo -e "${RED}Очистка старых бэкапов${RESET}"
+    
+    local del_full=0; local del_db=0; local del_files=0
+
+    echo -e "Текущий режим очистки: ${YELLOW}$DELETE_MODE${RESET}"
+    if [[ "$DELETE_MODE" == "count" ]]; then
+        echo "Лимит хранения: $MAX_BACKUPS_COUNT шт."
+        echo ""
+        del_full=$(rotate_backups_by_count "lazarus_full" "Полные бэкапы" "false" | tail -n1)
+        del_db=$(rotate_backups_by_count "lazarus_db" "Базы данных" "false" | tail -n1)
+        del_files=$(rotate_backups_by_count "lazarus_files" "Архивы файлов" "false" | tail -n1)
+    else
+        # time-based
+        echo -e " Срок хранения (дней): ${YELLOW}$RETENTION_DAYS${RESET}"
+        echo ""
+        del_full=$(rotate_backups_by_age "lazarus_full" "Полные бэкапы" "$RETENTION_DAYS" "false" | tail -n1)
+        del_db=$(rotate_backups_by_age "lazarus_db" "Базы данных" "$RETENTION_DAYS" "false" | tail -n1)
+        del_files=$(rotate_backups_by_age "lazarus_files" "Архивы файлов" "$RETENTION_DAYS" "false" | tail -n1)
+    fi
+
+    echo ""
+    # normalize empty to 0
+    del_full=${del_full:-0}; del_db=${del_db:-0}; del_files=${del_files:-0}
+    local total_del=$((del_full + del_db + del_files))
+
+    if [[ "$total_del" -eq 0 ]]; then
+        print_message "SUCCESS" "Чистка не требуется. Все в пределах лимита."
+        read -erp "Enter..." dummy
+        return
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_message "WARN" "[DRY-RUN] Кандидатов на удаление: $total_del"
+    else
+        print_message "WARN" "Будет удалено старых архивов: $total_del"
+    fi
+    # support non-interactive auto-confirm
+    if [[ "$AUTO_CONFIRM" == "true" ]]; then
+        confirm="y"
+    else
+        read -erp "Удалить эти файлы? (y/N): " confirm
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # In dry-run we never delete
+        log_message "INFO" "[DRY_RUN] Cleanup preview (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, candidates=$total_del)"
+        if [[ "$REPORT_TO_TG" == "true" && "$SEND_TO_TELEGRAM" == "true" ]]; then
+            send_telegram_text "$(escape_markdown_v2 "🧹 DRY-RUN очистка: кандидатов=$total_del, mode=$DELETE_MODE")"
+        fi
+        read -erp "Enter..." dummy
+        return
+    fi
+
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo ""
+        if [[ "$DELETE_MODE" == "count" ]]; then
+            rotate_backups_by_count "lazarus_full" "Полные бэкапы" "true" >/dev/null
+            rotate_backups_by_count "lazarus_db" "Базы данных" "true" >/dev/null
+            rotate_backups_by_count "lazarus_files" "Архивы файлов" "true" >/dev/null
+        else
+            rotate_backups_by_age "lazarus_full" "Полные бэкапы" "$RETENTION_DAYS" "true" >/dev/null
+            rotate_backups_by_age "lazarus_db" "Базы данных" "$RETENTION_DAYS" "true" >/dev/null
+            rotate_backups_by_age "lazarus_files" "Архивы файлов" "$RETENTION_DAYS" "true" >/dev/null
+        fi
+        echo ""; print_message "SUCCESS" "Очистка завершена."
+        log_message "INFO" "Cleanup completed (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, deleted=$total_del)"
+        if [[ "$REPORT_TO_TG" == "true" && "$SEND_TO_TELEGRAM" == "true" ]]; then
+            send_telegram_text "$(escape_markdown_v2 "🧹 Очистка завершена: удалено=$total_del, mode=$DELETE_MODE")"
+        fi
+    else
+        echo ""; print_message "INFO" "Отменено."
+    fi
     read -erp "Enter..." dummy
 }
 
 # --- MAIN LOOP ---
+rotate_internal_log
+check_dependencies
 install_script
 load_or_create_config
 check_config_mismatch # Проверка при запуске
+# --- Global CLI flags parsing ---
+# Support calling like: lazarus --yes --dry-run cleanup
+DRY_RUN="false"
+REPORT_TO_TG="false"
+
+# Build new argv stripping known global flags
+_NEWARGS=()
+for _a in "$@"; do
+    case "$_a" in
+        --yes|-y) AUTO_CONFIRM="true" ;;
+        --dry-run|-n) DRY_RUN="true" ;;
+        --report-tg) REPORT_TO_TG="true" ;;
+        *) _NEWARGS+=("$_a") ;;
+    esac
+done
+set -- "${_NEWARGS[@]}"
 
 case "$1" in
     backup_full) create_backup "full" ;;
     backup_db)   create_backup "db_only" ;;
     backup_files) create_backup "files_only" ;;
+    cleanup|cleanup_old_backups)
+        cleanup_old_backups ;;
     restore) menu_restore ;;
     check_update) check_for_updates ;;
     *)
@@ -932,9 +1601,16 @@ case "$1" in
             echo " --- ДЕЙСТВИЯ ---"
             echo " 1. Ручной бекап (Full / DB / Files)"
             echo " 2. Настроить авто-бекап"
-            echo " 3. Восстановить из бекапа"
+            echo " 3. Восстановить из бэкапа"
             echo " 4. Настройки (Пути / Токены / Ротация)"
-            echo " 5. Удалить старые бэкапы (>${RETAIN_BACKUPS_DAYS} дней)"
+            
+            CLEANUP_LABEL=""
+            if [[ "$DELETE_MODE" == "time" ]]; then
+                CLEANUP_LABEL="(>$RETENTION_DAYS дней)"
+            else
+                CLEANUP_LABEL="(>$MAX_BACKUPS_COUNT шт.)"
+            fi
+            echo " 5. Удалить старые бэкапы $CLEANUP_LABEL"
             echo ""
             echo -e " 8. Проверить обновления"
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
