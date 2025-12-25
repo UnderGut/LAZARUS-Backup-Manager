@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.6.4-ignore-panel"
+VERSION="4.7.1-smart-suggestions"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -64,6 +64,57 @@ escape_markdown_v2() {
         -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\!/g'
 }
 
+# --- СИСТЕМА ОБНОВЛЕНИЯ ---
+
+check_for_updates() {
+    clear
+    echo -e "${CYAN}Проверка обновлений...${RESET}"
+    
+    local REMOTE_CONTENT
+    if command -v curl >/dev/null 2>&1; then
+        REMOTE_CONTENT=$(curl -sL "$REMOTE_URL")
+    elif command -v wget >/dev/null 2>&1; then
+        REMOTE_CONTENT=$(wget -qO- "$REMOTE_URL")
+    else
+        print_message "ERROR" "Нет curl или wget для проверки обновлений."
+        read -erp "Enter..." dummy; return
+    fi
+
+    local REMOTE_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
+
+    if [[ -z "$REMOTE_VERSION" ]]; then
+        print_message "ERROR" "Не удалось получить информацию о версии."
+        read -erp "Enter..." dummy; return
+    fi
+
+    echo -e "Текущая версия: ${BOLD}$VERSION${RESET}"
+    echo -e "Актуальная версия: ${BOLD}$REMOTE_VERSION${RESET}"
+    echo ""
+
+    if [[ "$VERSION" == "$REMOTE_VERSION" ]]; then
+        print_message "SUCCESS" "У вас установлена последняя версия."
+        read -erp "Enter..." dummy
+    else
+        print_message "WARN" "Доступно обновление!"
+        read -erp "Обновить скрипт сейчас? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            if echo "$REMOTE_CONTENT" | head -n 1 | grep -q "^#!/bin/bash"; then
+                echo "$REMOTE_CONTENT" > "$INSTALL_DIR/$SCRIPT_NAME"
+                chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
+                print_message "SUCCESS" "Обновление завершено! Перезапуск..."
+                sleep 1
+                exec "$INSTALL_DIR/$SCRIPT_NAME"
+            else
+                print_message "ERROR" "Ошибка загрузки файла обновления. Отмена."
+                read -erp "Enter..." dummy
+            fi
+        else
+            print_message "INFO" "Обновление отменено."
+            read -erp "Enter..." dummy
+        fi
+    fi
+}
+
 # --- СИСТЕМА УСТАНОВКИ ---
 
 install_script() {
@@ -107,7 +158,7 @@ install_script() {
                 mv "$TEMP_FILE" "$INSTALLED_SCRIPT_PATH"
                 DOWNLOAD_SUCCESS=true
             else
-                print_message "ERROR" "Ошибка загрузки! Сервер вернул неверный файл (возможно 404)."
+                print_message "ERROR" "Ошибка загрузки! Сервер вернул неверный файл."
                 rm -f "$TEMP_FILE"
                 exit 1
             fi
@@ -129,47 +180,6 @@ install_script() {
     fi
 }
 
-# --- УДАЛЕНИЕ СКРИПТА ---
-
-uninstall_script() {
-    clear
-    echo -e "${RED}${BOLD}УДАЛЕНИЕ СКРИПТА${RESET}"
-    echo "Вы собираетесь удалить LAZARUS Backup Manager."
-    echo ""
-    
-    read -erp "Напишите 'yes' для подтверждения (Enter - Отмена): " confirm
-    
-    if [[ "$confirm" != "yes" ]]; then
-        print_message "INFO" "Удаление отменено."
-        read -erp "Enter..." dummy
-        return
-    fi
-
-    echo ""
-    read -erp "Удалить все сохраненные бэкапы с диска? (y/N): " del_backups
-
-    (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME") | crontab -
-    print_message "SUCCESS" "Задачи Cron удалены."
-
-    rm -f "$SYMLINK_PATH"
-    print_message "SUCCESS" "Симлинк удален."
-
-    if [[ "$del_backups" =~ ^[Yy]$ ]]; then
-        rm -rf "$INSTALL_DIR"
-        print_message "SUCCESS" "Скрипт, конфиг и БЭКАПЫ полностью удалены."
-    else
-        rm -f "$INSTALL_DIR/$SCRIPT_NAME" "$CONFIG_FILE"
-        rmdir "$BACKUP_DIR" 2>/dev/null
-        rmdir "$INSTALL_DIR" 2>/dev/null
-        print_message "SUCCESS" "Скрипт удален."
-        if [[ -d "$BACKUP_DIR" ]]; then
-            print_message "WARN" "Ваши бэкапы остались в папке: $BACKUP_DIR"
-        fi
-    fi
-    echo ""
-    exit 0
-}
-
 # --- ЯДРО ИНТЕЛЛЕКТУАЛЬНОГО ПОИСКА ---
 
 scan_system_for_bot() {
@@ -183,14 +193,12 @@ scan_system_for_bot() {
         local c_name=$(echo "$container" | cut -d'|' -f1)
         local c_image=$(echo "$container" | cut -d'|' -f2)
         
-        # --- ФИЛЬТР: ИГНОРИРОВАНИЕ ПАНЕЛИ (PANEL) ---
-        # Панель Remnawave (Web Backend) не является ботом. Игнорируем её компоненты.
+        # Фильтр панели
         if [[ "$c_image" == *"remnawave/backend"* ]]; then continue; fi
         if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then continue; fi
         if [[ "$c_name" == "remnawave" ]]; then continue; fi
-        if [[ "$c_name" == "remnawave-db" ]]; then continue; fi # Стандартное имя БД панели
+        if [[ "$c_name" == "remnawave-db" ]]; then continue; fi 
         if [[ "$c_name" == "remnawave-redis" ]]; then continue; fi
-        # --------------------------------------------
 
         for key in "${KEYWORDS[@]}"; do
             if [[ "$c_image" == *"$key"* ]]; then
@@ -209,9 +217,7 @@ scan_system_for_bot() {
         local compose_files=$(find "${search_dirs[@]}" -maxdepth 4 -name "docker-compose.yml" -o -name "compose.yaml" 2>/dev/null)
         
         for file in $compose_files; do
-            # Тоже игнорируем файлы, где явно описана панель (по образу backend)
             if grep -q "remnawave/backend" "$file"; then continue; fi
-
             if grep -qE "image:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" || grep -qE "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file"; then
                 FOUND_PATH=$(dirname "$file")
                 FOUND_BOT=$(grep "container_name:" "$file" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
@@ -225,7 +231,6 @@ scan_system_for_bot() {
             local db_services=("db" "postgres" "database" "postgresql")
             for svc in "${db_services[@]}"; do
                 local db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2>/dev/null)
-                # Дополнительная проверка: не подцепили ли мы случайно remnawave-db
                 if [[ -n "$db_c" && "$db_c" != "remnawave-db" ]]; then
                     FOUND_DB="$db_c"
                     break
@@ -832,8 +837,43 @@ menu_settings() {
             4) read -erp "Новый Thread ID: " ntid; TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
             5) read -erp "Новый DB User: " ndb; if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
             6) read -erp "Дней хранения: " nd; if [[ "$nd" =~ ^[0-9]+$ ]]; then RETAIN_BACKUPS_DAYS="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            7) read -erp "Имя контейнера бота: " nc; if [[ -n "$nc" ]]; then BOT_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            8) read -erp "Имя контейнера БД: " nc; if [[ -n "$nc" ]]; then DB_CONTAINER_NAME="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            
+            7) 
+                scan_system_for_bot
+                local def_cont="${FOUND_BOT:-$BOT_CONTAINER_NAME}"
+                local prompt_msg="Имя контейнера бота"
+                [[ -n "$FOUND_BOT" ]] && prompt_msg+=" (Enter = '$FOUND_BOT')"
+                
+                read -erp "$prompt_msg: " nc
+                nc="${nc:-$def_cont}"
+                
+                if [[ -n "$nc" ]]; then 
+                    BOT_CONTAINER_NAME="$nc"
+                    save_config
+                    print_message "SUCCESS" "Сохранено: $nc"
+                else
+                    print_message "INFO" "Без изменений."
+                fi 
+                ;;
+                
+            8) 
+                scan_system_for_bot
+                local def_db="${FOUND_DB:-$DB_CONTAINER_NAME}"
+                local prompt_msg="Имя контейнера БД"
+                [[ -n "$FOUND_DB" ]] && prompt_msg+=" (Enter = '$FOUND_DB')"
+                
+                read -erp "$prompt_msg: " ndb_c
+                ndb_c="${ndb_c:-$def_db}"
+                
+                if [[ -n "$ndb_c" ]]; then 
+                    DB_CONTAINER_NAME="$ndb_c"
+                    save_config
+                    print_message "SUCCESS" "Сохранено: $ndb_c"
+                else
+                    print_message "INFO" "Без изменений."
+                fi 
+                ;;
+                
             9) read -erp "Исключить (например: uploads/cache node_modules): " ed; 
                if [[ -n "$ed" ]]; then 
                    EXCLUDE_DIRS="$ed"
@@ -877,6 +917,7 @@ case "$1" in
     backup_db)   create_backup "db_only" ;;
     backup_files) create_backup "files_only" ;;
     restore) menu_restore ;;
+    check_update) check_for_updates ;;
     *)
         while true; do
             BOT_VERSION=$(get_bot_version_display)
@@ -896,13 +937,14 @@ case "$1" in
             echo " 4. Настройки (Пути / Токены / Ротация)"
             echo " 5. Удалить старые бэкапы (>${RETAIN_BACKUPS_DAYS} дней)"
             echo ""
+            echo -e " 8. 🔄 Проверить обновления"
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
             echo " 0. Выход"
             echo ""
             read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
             case $opt in
                 1) menu_manual_backup ;; 2) menu_automation ;; 3) menu_restore ;; 
-                4) menu_settings ;; 5) cleanup_old_backups ;; 666) uninstall_script ;; 0) exit 0 ;;
+                4) menu_settings ;; 5) cleanup_old_backups ;; 8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
             esac
         done
         ;;
