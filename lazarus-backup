@@ -1,12 +1,13 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.6.1-clean-notify"
+VERSION="4.6.2-pipe-install-fix"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
+REMOTE_URL="https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup"
 RETAIN_BACKUPS_DAYS=7
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА ---
@@ -71,26 +72,46 @@ install_script() {
         exit 1
     fi
 
-    local CURRENT_SCRIPT_PATH=$(realpath "$0")
+    local CURRENT_SCRIPT_PATH=$(realpath "$0" 2>/dev/null)
     local INSTALLED_SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
 
-    if [[ "$CURRENT_SCRIPT_PATH" != "$INSTALLED_SCRIPT_PATH" ]]; then
-        echo -e "${CYAN}--- УСТАНОВКА LAZARUS BACKUP ---${RESET}"
-        if [[ ! -d "$INSTALL_DIR" ]]; then
-            mkdir -p "$INSTALL_DIR"
-            print_message "SUCCESS" "Создана папка: $INSTALL_DIR"
-        fi
-        cp "$CURRENT_SCRIPT_PATH" "$INSTALLED_SCRIPT_PATH"
-        chmod +x "$INSTALLED_SCRIPT_PATH"
-        
-        if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then rm -f "$SYMLINK_PATH"; fi
-        ln -s "$INSTALLED_SCRIPT_PATH" "$SYMLINK_PATH"
-        
-        print_message "SUCCESS" "Установка завершена. Запуск..."
-        echo ""
-        exec "$INSTALLED_SCRIPT_PATH"
-        exit 0
+    # Проверка: если скрипт уже запущен из папки установки - ничего не делаем
+    if [[ "$CURRENT_SCRIPT_PATH" == "$INSTALLED_SCRIPT_PATH" ]]; then
+        return
     fi
+
+    echo -e "${CYAN}--- УСТАНОВКА LAZARUS BACKUP ---${RESET}"
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        mkdir -p "$INSTALL_DIR"
+        print_message "SUCCESS" "Создана папка: $INSTALL_DIR"
+    fi
+
+    # Логика копирования или скачивания
+    if [[ -f "$0" && "$0" != "bash" ]]; then
+        # Если скрипт запущен как файл (./lazarus)
+        cp "$(realpath "$0")" "$INSTALLED_SCRIPT_PATH"
+    else
+        # Если скрипт запущен через pipe (curl | bash)
+        print_message "INFO" "Загрузка скрипта с GitHub..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL "$REMOTE_URL" -o "$INSTALLED_SCRIPT_PATH"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$INSTALLED_SCRIPT_PATH" "$REMOTE_URL"
+        else
+            print_message "ERROR" "Для установки нужен curl или wget!"
+            exit 1
+        fi
+    fi
+
+    chmod +x "$INSTALLED_SCRIPT_PATH"
+    
+    if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then rm -f "$SYMLINK_PATH"; fi
+    ln -s "$INSTALLED_SCRIPT_PATH" "$SYMLINK_PATH"
+    
+    print_message "SUCCESS" "Установка завершена. Запуск..."
+    echo ""
+    exec "$INSTALLED_SCRIPT_PATH"
+    exit 0
 }
 
 # --- УДАЛЕНИЕ СКРИПТА ---
