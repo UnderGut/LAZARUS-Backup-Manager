@@ -62,14 +62,14 @@
 ### Вариант через `wget`
 ```bash
 wget -O /usr/local/bin/lazarus \
-  https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup \
+  https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup.sh \
   && chmod +x /usr/local/bin/lazarus
 ```
 
 ### Вариант через `curl`
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup \
+  https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup.sh \
   -o /usr/local/bin/lazarus \
   && chmod +x /usr/local/bin/lazarus
 ```
