@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.7.3-hybrid-style"
+VERSION="4.8.0-remote-storage"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -22,6 +22,12 @@ DB_USER="postgres"
 IGNORE_MISMATCH="false"
 EXCLUDE_DIRS=""
 MAX_FILE_SIZE_MB="1"
+
+# Настройки удаленного хранилища
+REMOTE_STORAGE_TYPE="off" # off, ftp, webdav
+REMOTE_STORAGE_URL=""
+REMOTE_STORAGE_USER=""
+REMOTE_STORAGE_PASS=""
 
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
@@ -367,6 +373,10 @@ DB_CONTAINER_NAME="$DB_CONTAINER_NAME"
 IGNORE_MISMATCH="$IGNORE_MISMATCH"
 EXCLUDE_DIRS="$EXCLUDE_DIRS"
 MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB"
+REMOTE_STORAGE_TYPE="$REMOTE_STORAGE_TYPE"
+REMOTE_STORAGE_URL="$REMOTE_STORAGE_URL"
+REMOTE_STORAGE_USER="$REMOTE_STORAGE_USER"
+REMOTE_STORAGE_PASS="$REMOTE_STORAGE_PASS"
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -376,6 +386,7 @@ load_or_create_config() {
     if [[ -z "$RETAIN_BACKUPS_DAYS" ]]; then RETAIN_BACKUPS_DAYS=7; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
     if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
+    if [[ -z "$REMOTE_STORAGE_TYPE" ]]; then REMOTE_STORAGE_TYPE="off"; fi
     mkdir -p "$BACKUP_DIR"
 
     local updated=false
@@ -433,6 +444,81 @@ send_telegram_document() {
     fi
 }
 
+upload_to_remote() {
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local remote_status=""
+
+    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then
+        return
+    fi
+
+    print_message "INFO" "Загрузка на удаленный сервер ($REMOTE_STORAGE_TYPE)..."
+
+    local upload_url="${REMOTE_STORAGE_URL%/}/$filename"
+    local curl_cmd=(curl -s -o /dev/null -w "%{http_code}" -T "$file_path")
+
+    # Добавляем авторизацию
+    if [[ -n "$REMOTE_STORAGE_USER" ]]; then
+        curl_cmd+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
+    fi
+
+    # Специфика протокола
+    if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then
+        # Для FTP часто нужно указать --ftp-create-dirs, но оставим просто
+        curl_cmd+=("$upload_url")
+    elif [[ "$REMOTE_STORAGE_TYPE" == "webdav" ]]; then
+        curl_cmd+=("$upload_url")
+    fi
+
+    local http_code=$("${curl_cmd[@]}" 2>/dev/null)
+
+    # Проверка успеха
+    # FTP успех часто 226, HTTP (WebDAV) - 201 или 200/204
+    if [[ "$http_code" =~ ^(200|201|204|226)$ ]]; then
+        print_message "SUCCESS" "Файл успешно загружен в хранилище."
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then remote_status=$'\n☁️ FTP: OK'
+        else remote_status=$'\n☁️ WebDAV: OK'; fi
+    else
+        print_message "ERROR" "Ошибка загрузки (Код: $http_code)."
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then remote_status=$'\n☁️ FTP: Ошибка'
+        else remote_status=$'\n☁️ WebDAV: Ошибка'; fi
+    fi
+    
+    echo "$remote_status"
+}
+
+configure_remote_storage() {
+    clear
+    echo -e "${CYAN}Настройка удаленного хранилища (FTP / WebDAV)${RESET}"
+    echo "1. Тип: FTP"
+    echo "2. Тип: WebDAV"
+    echo "3. Отключить"
+    echo ""
+    read -erp "Выбор: " r_type
+    
+    case $r_type in
+        1) REMOTE_STORAGE_TYPE="ftp" ;;
+        2) REMOTE_STORAGE_TYPE="webdav" ;;
+        3) REMOTE_STORAGE_TYPE="off"; save_config; print_message "SUCCESS" "Отключено."; return ;;
+        *) return ;;
+    esac
+
+    echo ""
+    echo "Пример URL:"
+    echo " FTP:    ftp://backup.server.com/folder"
+    echo " WebDAV: https://webdav.yandex.ru"
+    echo ""
+    read -erp "URL сервера: " REMOTE_STORAGE_URL
+    read -erp "Пользователь: " REMOTE_STORAGE_USER
+    read -s -erp "Пароль: " REMOTE_STORAGE_PASS
+    echo ""
+    
+    save_config
+    print_message "SUCCESS" "Настройки сохранены."
+    sleep 1
+}
+
 # --- БЭКАП ---
 
 create_backup() {
@@ -442,6 +528,7 @@ create_backup() {
     local FILE_DIR="dir_${TIMESTAMP}.tar.gz"
     local FILE_VERSION="bot_version.txt"
     local FILE_FINAL=""
+    local BACKUP_TAG=""
     local HAS_ERROR=0
     local SKIP_INFO=""
     local SKIP_FILE="$BACKUP_DIR/skipped_files.txt"
@@ -525,6 +612,9 @@ create_backup() {
     
     local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
     print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
+
+    # --- ЗАГРУЗКА НА УДАЛЕННОЕ ХРАНИЛИЩЕ ---
+    local REMOTE_MSG=$(upload_to_remote "$BACKUP_DIR/$FILE_FINAL")
     
     # --- НОВЫЙ ФОРМАТ СООБЩЕНИЯ В TELEGRAM ---
     local DISPLAY_DATE=$(date "+%d.%m.%Y %H:%M:%S")
@@ -551,7 +641,7 @@ create_backup() {
     local CAPTION="${HASHTAG}
 📅 ${DISPLAY_DATE}
 ${TYPE_NAME}
-📏 ${SIZE}${VER_MSG}${SKIP_INFO}"
+📏 ${SIZE}${VER_MSG}${REMOTE_MSG}${SKIP_INFO}"
     
     send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
 
@@ -824,6 +914,13 @@ menu_settings() {
         echo -e " 8. Контейнер БД:     ${CYAN}${DB_CONTAINER_NAME}${RESET}"
         echo -e " 9. Исключить папки:  ${CYAN}${EXCLUDE_DIRS:-Нет}${RESET}"
         echo -e " 10. Макс. размер файла: ${CYAN}${MAX_FILE_SIZE_MB} MB${RESET}"
+        
+        local STORAGE_STATUS="Выкл"
+        if [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then 
+            STORAGE_STATUS="${REMOTE_STORAGE_TYPE^^}"
+        fi
+        echo -e " 11. Сетевое хранилище: ${CYAN}${STORAGE_STATUS}${RESET}"
+        
         echo " 0. Назад"
         echo ""
         read -erp "Что изменить (Enter - Назад): " s
@@ -888,6 +985,7 @@ menu_settings() {
                 if [[ "$msize" =~ ^[0-9]+$ ]] && [ "$msize" -gt 0 ]; then
                     MAX_FILE_SIZE_MB="$msize"; save_config; print_message "SUCCESS" "Сохранено"
                 else print_message "ERROR" "Введите число больше 0"; fi ;;
+            11) configure_remote_storage ;;
             0) return ;;
         esac; if [[ -n "$s" ]]; then sleep 1; fi
     done
