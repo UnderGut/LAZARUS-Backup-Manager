@@ -279,13 +279,33 @@ check_for_updates() {
     clear_screen
     echo -e "${CYAN}Проверка обновлений...${RESET}"
     
-    local REMOTE_CONTENT
-    if command -v curl >/dev/null 2>&1; then
-        REMOTE_CONTENT=$(curl -sL "$REMOTE_URL")
-    elif command -v wget >/dev/null 2>&1; then
-        REMOTE_CONTENT=$(wget -qO- "$REMOTE_URL")
-    else
-        print_message "ERROR" "Нет curl или wget для проверки обновлений."
+    local REMOTE_CONTENT=""
+    local DOWNLOAD_OK=false
+    local MAX_RETRIES=3
+    local TIMEOUT=15
+    
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        if command -v curl >/dev/null 2>&1; then
+            REMOTE_CONTENT=$(curl -sL --connect-timeout $TIMEOUT --max-time 30 "$REMOTE_URL" 2>/dev/null)
+        elif command -v wget >/dev/null 2>&1; then
+            REMOTE_CONTENT=$(wget -qO- --timeout=$TIMEOUT "$REMOTE_URL" 2>/dev/null)
+        else
+            print_message "ERROR" "Нет curl или wget для проверки обновлений."
+            read -erp "Enter..." dummy; return
+        fi
+        
+        # Проверяем что получили валидный скрипт
+        if [[ -n "$REMOTE_CONTENT" ]] && echo "$REMOTE_CONTENT" | head -1 | grep -q "^#!/bin/bash"; then
+            DOWNLOAD_OK=true
+            break
+        fi
+        
+        [[ $attempt -lt $MAX_RETRIES ]] && echo -e "${YELLOW}Попытка $attempt/$MAX_RETRIES не удалась, повтор...${RESET}" && sleep 2
+    done
+    
+    if [[ "$DOWNLOAD_OK" != "true" ]]; then
+        print_message "ERROR" "Не удалось подключиться к серверу обновлений."
+        echo -e "${GRAY}URL: $REMOTE_URL${RESET}"
         read -erp "Enter..." dummy; return
     fi
 
@@ -293,6 +313,7 @@ check_for_updates() {
 
     if [[ -z "$REMOTE_VERSION" ]]; then
         print_message "ERROR" "Не удалось получить информацию о версии."
+        echo -e "${GRAY}Файл получен, но VERSION= не найден${RESET}"
         read -erp "Enter..." dummy; return
     fi
 
@@ -337,15 +358,49 @@ check_for_updates() {
 
 perform_update() {
     local CONTENT="$1"
-    if echo "$CONTENT" | head -n 1 | grep -q "^#!/bin/bash"; then
-        echo "$CONTENT" > "$INSTALL_DIR/$SCRIPT_NAME"
-        chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
-        print_message "SUCCESS" "Обновление завершено! Перезапуск..."
-        sleep 1
-        exec "$INSTALL_DIR/$SCRIPT_NAME"
-    else
-        print_message "ERROR" "Ошибка загрузки файла обновления. Отмена."
+    local SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+    local BACKUP_PATH="$INSTALL_DIR/${SCRIPT_NAME}.backup"
+    
+    # Проверяем валидность содержимого
+    if ! echo "$CONTENT" | head -n 1 | grep -q "^#!/bin/bash"; then
+        print_message "ERROR" "Ошибка: загруженный файл не является bash-скриптом."
         read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    # Проверяем минимальный размер (защита от обрезанных файлов)
+    local CONTENT_SIZE=${#CONTENT}
+    if [[ $CONTENT_SIZE -lt 10000 ]]; then
+        print_message "ERROR" "Ошибка: загруженный файл слишком мал ($CONTENT_SIZE байт)."
+        print_message "ERROR" "Возможно, файл был повреждён при загрузке."
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    # Создаём резервную копию текущей версии
+    if [[ -f "$SCRIPT_PATH" ]]; then
+        cp "$SCRIPT_PATH" "$BACKUP_PATH"
+        print_message "INFO" "Создана резервная копия: ${SCRIPT_NAME}.backup"
+    fi
+    
+    # Записываем новую версию
+    if echo "$CONTENT" > "$SCRIPT_PATH"; then
+        chmod +x "$SCRIPT_PATH"
+        print_message "SUCCESS" "Обновление завершено!"
+        log_message "SUCCESS" "Script updated to new version"
+        echo ""
+        echo -e "${CYAN}Перезапуск скрипта...${RESET}"
+        sleep 1
+        exec "$SCRIPT_PATH"
+    else
+        print_message "ERROR" "Не удалось записать файл обновления!"
+        # Восстанавливаем из бэкапа
+        if [[ -f "$BACKUP_PATH" ]]; then
+            mv "$BACKUP_PATH" "$SCRIPT_PATH"
+            print_message "WARN" "Восстановлена предыдущая версия из бэкапа."
+        fi
+        read -erp "Enter..." dummy
+        return 1
     fi
 }
 
@@ -379,16 +434,24 @@ install_script() {
     else
         print_message "INFO" "Загрузка последней версии..."
         if command -v curl >/dev/null 2>&1; then
-            curl -sL "$REMOTE_URL" -o "$TEMP_FILE"
+            curl -sL --connect-timeout 15 --max-time 60 "$REMOTE_URL" -o "$TEMP_FILE"
         elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$TEMP_FILE" "$REMOTE_URL"
+            wget -qO "$TEMP_FILE" --timeout=15 "$REMOTE_URL"
         else
             print_message "ERROR" "Для установки нужен curl или wget!"
             exit 1
         fi
 
         if [[ -f "$TEMP_FILE" ]]; then
+            # Проверяем что это bash-скрипт
             if head -n 1 "$TEMP_FILE" | grep -q "^#!/bin/bash"; then
+                # Проверяем минимальный размер
+                local FILE_SIZE=$(stat -c%s "$TEMP_FILE" 2>/dev/null || stat -f%z "$TEMP_FILE" 2>/dev/null || echo "0")
+                if [[ $FILE_SIZE -lt 10000 ]]; then
+                    print_message "ERROR" "Загруженный файл слишком мал ($FILE_SIZE байт)."
+                    rm -f "$TEMP_FILE"
+                    exit 1
+                fi
                 mv "$TEMP_FILE" "$INSTALLED_SCRIPT_PATH"
                 DOWNLOAD_SUCCESS=true
             else
