@@ -1013,126 +1013,132 @@ upload_to_remote() {
 }
 
 configure_remote_storage() {
-    clear_screen
-    echo -e "${GREEN}${BOLD}Настройка удалённого хранилища${RESET}"
-    echo ""
-    
-    # Показываем текущий статус
-    if [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
-        echo -e "Текущие настройки:"
-        echo -e "  Тип: ${YELLOW}${REMOTE_STORAGE_TYPE^^}${RESET}"
-        echo -e "  URL: ${GRAY}${REMOTE_STORAGE_URL}${RESET}"
-        [[ -n "$REMOTE_STORAGE_USER" ]] && echo -e "  Пользователь: ${GRAY}${REMOTE_STORAGE_USER}${RESET}"
-        echo ""
-    fi
-    
-    echo " 1. FTP / FTPS"
-    echo " 2. WebDAV (Яндекс.Диск, Nextcloud, и др.)"
-    echo " 3. Rclone (Google Drive, S3, Dropbox, и др.)"
-    echo ""
-    echo -e " ${RED}0. Отключить${RESET}"
-    echo ""
-    read -erp "Выбор (Enter - Назад): " r_type
-    [[ -z "$r_type" ]] && return
-    
-    local new_type="off"
-    local input_url="" input_user="" input_pass=""
-    
-    case $r_type in
-        1) new_type="ftp" ;;
-        2) new_type="webdav" ;;
-        3) new_type="rclone" ;;
-        0) 
-            REMOTE_STORAGE_TYPE="off"
-            REMOTE_STORAGE_URL=""
-            REMOTE_STORAGE_USER=""
-            REMOTE_STORAGE_PASS=""
-            save_config
-            print_message "SUCCESS" "Удалённое хранилище отключено."
-            sleep 1
-            return 
-            ;;
-        *) return ;;
-    esac
-
-    echo ""
-    
-    if [[ "$new_type" == "ftp" ]]; then
-        echo -e "${CYAN}Настройка FTP/FTPS${RESET}"
-        echo ""
-        echo "Примеры URL:"
-        echo -e "  ${GRAY}ftp://backup.example.com/backups${RESET}"
-        echo -e "  ${GRAY}ftps://secure.example.com:990/folder${RESET}"
-        echo ""
-        read -erp "URL сервера: " input_url
-        [[ -z "$input_url" ]] && return
-        read -erp "Пользователь: " input_user
-        read -s -erp "Пароль: " input_pass
+    while true; do
+        clear_screen
+        echo -e "${GREEN}${BOLD}Настройка удалённого хранилища${RESET}"
         echo ""
         
-    elif [[ "$new_type" == "webdav" ]]; then
-        echo -e "${CYAN}Настройка WebDAV${RESET}"
-        echo ""
-        echo "Примеры URL:"
-        echo -e "  ${GRAY}https://webdav.yandex.ru/backups${RESET}       (Яндекс.Диск)"
-        echo -e "  ${GRAY}https://cloud.example.com/remote.php/dav/files/user/backups${RESET} (Nextcloud)"
-        echo ""
-        read -erp "URL сервера: " input_url
-        [[ -z "$input_url" ]] && return
-        read -erp "Пользователь: " input_user
-        read -s -erp "Пароль (или токен приложения): " input_pass
-        echo ""
-        
-    elif [[ "$new_type" == "rclone" ]]; then
-        echo -e "${CYAN}Настройка Rclone${RESET}"
-        echo ""
-        if ! command -v rclone >/dev/null 2>&1; then
-            print_message "ERROR" "Rclone не установлен!"
-            echo -e "Установка: ${GRAY}curl https://rclone.org/install.sh | sudo bash${RESET}"
-            read -erp "Enter..." dummy
-            return
+        # Показываем текущий статус
+        if [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
+            echo -e "Текущие настройки:"
+            echo -e "  Тип: ${YELLOW}${REMOTE_STORAGE_TYPE^^}${RESET}"
+            echo -e "  URL: ${GRAY}${REMOTE_STORAGE_URL}${RESET}"
+            [[ -n "$REMOTE_STORAGE_USER" ]] && echo -e "  Пользователь: ${GRAY}${REMOTE_STORAGE_USER}${RESET}"
+            echo ""
         fi
-        echo "Доступные remotes:"
-        rclone listremotes 2>/dev/null | sed 's/^/  /'
+        
+        echo " 1. FTP / FTPS"
+        echo " 2. WebDAV (Яндекс.Диск, Nextcloud, и др.)"
+        echo " 3. Rclone (Google Drive, S3, Dropbox, и др.)"
         echo ""
-        echo "Примеры путей:"
-        echo -e "  ${GRAY}gdrive:backups${RESET}        (Google Drive)"
-        echo -e "  ${GRAY}s3:bucket/backups${RESET}     (Amazon S3)"
-        echo -e "  ${GRAY}dropbox:backups${RESET}       (Dropbox)"
+        echo -e " ${RED}0. Отключить${RESET}"
         echo ""
-        read -erp "Rclone путь: " input_url
-        [[ -z "$input_url" ]] && return
-        input_user=""
-        input_pass=""
-    fi
+        read -erp "Выбор (Enter - Назад): " r_type
+        [[ -z "$r_type" ]] && return
+        
+        local new_type="off"
+        local input_url="" input_user="" input_pass=""
+        
+        case $r_type in
+            1) new_type="ftp" ;;
+            2) new_type="webdav" ;;
+            3) new_type="rclone" ;;
+            0) 
+                REMOTE_STORAGE_TYPE="off"
+                REMOTE_STORAGE_URL=""
+                REMOTE_STORAGE_USER=""
+                REMOTE_STORAGE_PASS=""
+                save_config
+                print_message "SUCCESS" "Удалённое хранилище отключено."
+                sleep 1
+                return 
+                ;;
+            *) continue ;;
+        esac
 
-    echo ""
-    print_message "INFO" "Проверка подключения..."
-    
-    if validate_remote_connection "$new_type" "$input_url" "$input_user" "$input_pass"; then
-        print_message "SUCCESS" "Соединение установлено!"
-        REMOTE_STORAGE_TYPE="$new_type"
-        REMOTE_STORAGE_URL="$input_url"
-        REMOTE_STORAGE_USER="$input_user"
-        REMOTE_STORAGE_PASS="$input_pass"
-        save_config
-        print_message "SUCCESS" "Настройки сохранены."
-    else
-        print_message "ERROR" "Не удалось подключиться к серверу!"
         echo ""
-        read -erp "Сохранить настройки несмотря на ошибку? (y/N): " force_save
-        if [[ "$force_save" =~ ^[Yy]$ ]]; then
+        
+        if [[ "$new_type" == "ftp" ]]; then
+            echo -e "${CYAN}Настройка FTP/FTPS${RESET}"
+            echo ""
+            echo "Примеры URL:"
+            echo -e "  ${GRAY}ftp://backup.example.com/backups${RESET}"
+            echo -e "  ${GRAY}ftps://secure.example.com:990/folder${RESET}"
+            echo ""
+            read -erp "URL сервера (Enter - назад): " input_url
+            [[ -z "$input_url" ]] && continue
+            read -erp "Пользователь: " input_user
+            read -s -erp "Пароль: " input_pass
+            echo ""
+            
+        elif [[ "$new_type" == "webdav" ]]; then
+            echo -e "${CYAN}Настройка WebDAV${RESET}"
+            echo ""
+            echo "Примеры URL:"
+            echo -e "  ${GRAY}https://webdav.yandex.ru/backups${RESET}       (Яндекс.Диск)"
+            echo -e "  ${GRAY}https://cloud.example.com/remote.php/dav/files/user/backups${RESET} (Nextcloud)"
+            echo ""
+            read -erp "URL сервера (Enter - назад): " input_url
+            [[ -z "$input_url" ]] && continue
+            read -erp "Пользователь: " input_user
+            read -s -erp "Пароль (или токен приложения): " input_pass
+            echo ""
+            
+        elif [[ "$new_type" == "rclone" ]]; then
+            echo -e "${CYAN}Настройка Rclone${RESET}"
+            echo ""
+            if ! command -v rclone >/dev/null 2>&1; then
+                print_message "ERROR" "Rclone не установлен!"
+                echo -e "Установка: ${GRAY}curl https://rclone.org/install.sh | sudo bash${RESET}"
+                read -erp "Enter..." dummy
+                continue
+            fi
+            echo "Доступные remotes:"
+            rclone listremotes 2>/dev/null | sed 's/^/  /'
+            echo ""
+            echo "Примеры путей:"
+            echo -e "  ${GRAY}gdrive:backups${RESET}        (Google Drive)"
+            echo -e "  ${GRAY}s3:bucket/backups${RESET}     (Amazon S3)"
+            echo -e "  ${GRAY}dropbox:backups${RESET}       (Dropbox)"
+            echo ""
+            read -erp "Rclone путь (Enter - назад): " input_url
+            [[ -z "$input_url" ]] && continue
+            input_user=""
+            input_pass=""
+        fi
+
+        echo ""
+        print_message "INFO" "Проверка подключения..."
+        
+        if validate_remote_connection "$new_type" "$input_url" "$input_user" "$input_pass"; then
+            print_message "SUCCESS" "Соединение установлено!"
             REMOTE_STORAGE_TYPE="$new_type"
             REMOTE_STORAGE_URL="$input_url"
             REMOTE_STORAGE_USER="$input_user"
             REMOTE_STORAGE_PASS="$input_pass"
             save_config
-            print_message "WARN" "Настройки сохранены (соединение не проверено)."
+            print_message "SUCCESS" "Настройки сохранены."
+            sleep 1.5
+            return
         else
-            print_message "INFO" "Отменено."
+            print_message "ERROR" "Не удалось подключиться к серверу!"
+            echo ""
+            read -erp "Сохранить настройки несмотря на ошибку? (y/N): " force_save
+            if [[ "$force_save" =~ ^[Yy]$ ]]; then
+                REMOTE_STORAGE_TYPE="$new_type"
+                REMOTE_STORAGE_URL="$input_url"
+                REMOTE_STORAGE_USER="$input_user"
+                REMOTE_STORAGE_PASS="$input_pass"
+                save_config
+                print_message "WARN" "Настройки сохранены (соединение не проверено)."
+                sleep 1.5
+                return
+            else
+                print_message "INFO" "Отменено. Возврат к выбору типа..."
+                sleep 1
+            fi
         fi
-    fi
-    sleep 1.5
+    done
 }
 
 # --- РОТАЦИЯ (УДАЛЕНИЕ ЛИШНИХ) ---
@@ -2077,6 +2083,16 @@ menu_settings() {
         local MASKED_TOKEN="${BOT_TOKEN:0:5}.......${BOT_TOKEN: -5}"; [[ ${#BOT_TOKEN} -lt 10 ]] && MASKED_TOKEN="*******"
         local PASS_MASK="Нет"; [[ -n "$BACKUP_PASSWORD" ]] && PASS_MASK="********"
         
+        # Маскируем Chat ID (показываем только первые 4 и последние 3 символа)
+        local MASKED_CHAT_ID="-"
+        if [[ -n "$CHAT_ID" ]]; then
+            if [[ ${#CHAT_ID} -gt 8 ]]; then
+                MASKED_CHAT_ID="${CHAT_ID:0:4}...${CHAT_ID: -3}"
+            else
+                MASKED_CHAT_ID="*****"
+            fi
+        fi
+        
         local MASKED_REMOTE_USER="-"
         if [[ -n "$REMOTE_STORAGE_USER" ]]; then
             if [[ ${#REMOTE_STORAGE_USER} -gt 4 ]]; then
@@ -2105,7 +2121,7 @@ menu_settings() {
         
         echo -e "\n${CYAN}--- TELEGRAM ---${RESET}"
         echo -e " 8.  Token:             ${GRAY}${MASKED_TOKEN}${RESET}"
-        echo -e " 9.  Chat ID:           ${GRAY}${CHAT_ID}${RESET}"
+        echo -e " 9.  Chat ID:           ${GRAY}${MASKED_CHAT_ID}${RESET}"
         echo -e " 10. Thread ID:         ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
         echo -e " 11. Уведомления:       $ST_TG_NOTIFY"
         echo -e " 12. Отправка файла:    $ST_TG_FILE"
@@ -2178,7 +2194,8 @@ menu_settings() {
             8) read -erp "Новый Token: " nt
                if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
-            9) read -erp "Новый Chat ID: " nid
+            9) echo -e "Текущий Chat ID: ${CYAN}${CHAT_ID}${RESET}"
+               read -erp "Новый Chat ID: " nid
                if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
             10) read -erp "Новый Thread ID (пусто - сбросить): " ntid
