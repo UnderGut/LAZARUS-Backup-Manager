@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.16.2"
+VERSION="4.16.3"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -1750,8 +1750,9 @@ create_backup() {
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         print_message "INFO" "Шифрование архива (это может занять время)..."
         # Pass password via env var to avoid process listing leak
+        # AES-256-CBC + PBKDF2 with 100k iterations for brute-force protection
         export LAZARUS_ENC_PASS="$BACKUP_PASSWORD"
-        openssl enc -aes-256-cbc -salt -pbkdf2 -in "$BACKUP_DIR/$FILE_FINAL" -out "$BACKUP_DIR/${FILE_FINAL}.enc" -pass env:LAZARUS_ENC_PASS
+        openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$BACKUP_DIR/$FILE_FINAL" -out "$BACKUP_DIR/${FILE_FINAL}.enc" -pass env:LAZARUS_ENC_PASS
         local enc_res=$?
         unset LAZARUS_ENC_PASS
         
@@ -1776,7 +1777,7 @@ create_backup() {
         # For encrypted files, we can't easily verify without decrypting. 
         # We assume openssl exit code 0 was enough, or we could decrypt to /dev/null
         export LAZARUS_VERIFY_PASS="$BACKUP_PASSWORD"
-        if openssl enc -d -aes-256-cbc -pbkdf2 -in "$BACKUP_DIR/$FILE_FINAL" -pass env:LAZARUS_VERIFY_PASS | gzip -t 2> "$SILENT_LOG"; then
+        if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$BACKUP_DIR/$FILE_FINAL" -pass env:LAZARUS_VERIFY_PASS | gzip -t 2> "$SILENT_LOG"; then
              VERIFY_OK="true"
         fi
         unset LAZARUS_VERIFY_PASS
@@ -1941,7 +1942,7 @@ execute_restore() {
         local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
         
         export LAZARUS_DEC_PASS="$decrypt_pass"
-        openssl enc -d -aes-256-cbc -pbkdf2 -in "$FILE" -out "$DECRYPTED_FILE" -pass env:LAZARUS_DEC_PASS 2> "$SILENT_LOG"
+        openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$FILE" -out "$DECRYPTED_FILE" -pass env:LAZARUS_DEC_PASS 2> "$SILENT_LOG"
         local dec_res=$?
         unset LAZARUS_DEC_PASS
 
