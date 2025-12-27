@@ -24,13 +24,13 @@
   <circle cx="60" cy="15" r="6" class="dot-green"/>
   
   <!-- Header Lines (Double Lines) -->
-  <line x1="80" y1="60" x2="520" y2="60" class="line-stroke"/>
-  <line x1="80" y1="63" x2="520" y2="63" class="line-stroke"/>
+  <line x1="40" y1="60" x2="560" y2="60" class="line-stroke" shape-rendering="crispEdges"/>
+  <line x1="40" y1="63" x2="560" y2="63" class="line-stroke" shape-rendering="crispEdges"/>
   
   <text x="300" y="85" text-anchor="middle" class="text green bold">LAZARUS Backup Manager v4.16.0</text>
   
-  <line x1="80" y1="97" x2="520" y2="97" class="line-stroke"/>
-  <line x1="80" y1="100" x2="520" y2="100" class="line-stroke"/>
+  <line x1="40" y1="97" x2="560" y2="97" class="line-stroke" shape-rendering="crispEdges"/>
+  <line x1="40" y1="100" x2="560" y2="100" class="line-stroke" shape-rendering="crispEdges"/>
   
   <!-- Body Content -->
   <text x="20" y="140" class="text">
