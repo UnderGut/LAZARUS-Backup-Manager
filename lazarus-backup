@@ -542,7 +542,7 @@ scan_system_for_bot() {
 # --- ФУНКЦИИ ВЕРСИИ И ПОИСКА ---
 
 get_raw_bot_version() {
-    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker container inspect -f '{{.State.Running}}' "$BOT_CONTAINER_NAME" &> "$SILENT_LOG"; then
+    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker container inspect -f '{{.State.Running}}' "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
         local full_image=$(docker inspect -f '{{.Config.Image}}' "$BOT_CONTAINER_NAME")
         local ver="${full_image##*:}"
         echo "${ver:-Unknown}"
@@ -600,7 +600,7 @@ detect_bot_installation() {
 
 check_config_mismatch() {
     if [[ -n "$BOT_CONTAINER_NAME" && "$IGNORE_MISMATCH" != "true" ]]; then
-        if ! docker inspect "$BOT_CONTAINER_NAME" &> "$SILENT_LOG"; then
+        if ! docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
             scan_system_for_bot
             if [[ -n "$FOUND_BOT" && "$FOUND_BOT" != "$BOT_CONTAINER_NAME" ]]; then
                 echo ""; print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден, но найден '$FOUND_BOT'."
@@ -628,9 +628,9 @@ ensure_bot_path() {
     local path_valid=false
     if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && ( -f "$BOT_PATH/docker-compose.yml" || -f "$BOT_PATH/compose.yaml" ) ]]; then path_valid=true; fi
     local container_valid=false
-    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker inspect "$BOT_CONTAINER_NAME" &> "$SILENT_LOG"; then container_valid=true; fi
+    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then container_valid=true; fi
     local db_valid=false
-    if [[ -n "$DB_CONTAINER_NAME" ]] && docker inspect "$DB_CONTAINER_NAME" &> "$SILENT_LOG"; then db_valid=true; fi
+    if [[ -n "$DB_CONTAINER_NAME" ]] && docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then db_valid=true; fi
 
     if [[ "$path_valid" == "false" || "$container_valid" == "false" || "$db_valid" == "false" ]]; then
         if [[ "$path_valid" == "false" ]]; then
@@ -648,7 +648,7 @@ ensure_bot_path() {
             save_config
         fi
 
-        if [[ -z "$BOT_CONTAINER_NAME" ]] || ! docker inspect "$BOT_CONTAINER_NAME" &> "$SILENT_LOG"; then
+        if [[ -z "$BOT_CONTAINER_NAME" ]] || ! docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
             echo ""; print_message "WARN" "Контейнер бота не определен."
             print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
             read -erp "Имя: " input_name
@@ -656,7 +656,7 @@ ensure_bot_path() {
             save_config
         fi
 
-        if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" &> "$SILENT_LOG"; then
+        if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
             echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
             print_message "ACTION" "Введите имя контейнера БД (или Enter для '$DEFAULT_DB_NAME')."
             read -erp "Имя БД: " input_db
