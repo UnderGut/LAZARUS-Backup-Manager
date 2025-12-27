@@ -9,7 +9,7 @@
 [![Version](https://img.shields.io/badge/version-4.16.3-blue?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
-**LAZARUS** — продвинутая система резервного копирования для **Remnawave Telegram Shop Bot** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
+**LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
 
 ---
 
