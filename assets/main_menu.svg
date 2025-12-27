@@ -11,6 +11,7 @@
     .dot-red { fill: #ff5f56; }
     .dot-yellow { fill: #ffbd2e; }
     .dot-green { fill: #27c93f; }
+    .line-stroke { stroke: #2ecc71; stroke-width: 1; }
   </style>
 
   <!-- Window Frame -->
@@ -22,13 +23,18 @@
   <circle cx="40" cy="15" r="6" class="dot-yellow"/>
   <circle cx="60" cy="15" r="6" class="dot-green"/>
   
-  <!-- Content -->
-  <text x="20" y="60" class="text">
-    <tspan class="green">═══════════════════════════════════════════════════</tspan>
-    <tspan x="20" dy="20" class="green">  LAZARUS Backup Manager v4.16.0</tspan>
-    <tspan x="20" dy="20" class="green">═══════════════════════════════════════════════════</tspan>
-    
-    <tspan x="20" dy="30">Бот: <tspan class="cyan">3.21.0</tspan> | Контейнер: <tspan class="green">Online</tspan></tspan>
+  <!-- Header Lines (Double Lines) -->
+  <line x1="80" y1="60" x2="520" y2="60" class="line-stroke"/>
+  <line x1="80" y1="63" x2="520" y2="63" class="line-stroke"/>
+  
+  <text x="300" y="85" text-anchor="middle" class="text green bold">LAZARUS Backup Manager v4.16.0</text>
+  
+  <line x1="80" y1="97" x2="520" y2="97" class="line-stroke"/>
+  <line x1="80" y1="100" x2="520" y2="100" class="line-stroke"/>
+  
+  <!-- Body Content -->
+  <text x="20" y="140" class="text">
+    <tspan>Бот: <tspan class="cyan">3.21.0</tspan> | Контейнер: <tspan class="green">Online</tspan></tspan>
     
     <tspan x="20" dy="30">Бэкапы: 14 Full | 223 DB | 5 Files | <tspan class="bold">189M</tspan> всего</tspan>
     <tspan x="20" dy="20">Последний: 27.12 10:00 (2 часа назад)</tspan>
