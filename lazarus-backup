@@ -113,11 +113,13 @@ send_telegram_notification() {
             escaped_msg=$(escape_markdown_v2 "$msg")
             local thread_param=""
             [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
-            
+            local full_text="🚨 *Lazarus Error* 🚨
+
+${escaped_msg}"
             curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
                 -d chat_id="$CHAT_ID" \
                 -d parse_mode="MarkdownV2" \
-                -d text="🚨 *Lazarus Error* 🚨%0A%0A${escaped_msg}" \
+                --data-urlencode text="$full_text" \
                 $thread_param >/dev/null 2>&1 || true
         fi
     fi
@@ -730,12 +732,36 @@ send_telegram_document() {
     if [[ "$TG_SEND_FILE" != "true" ]]; then
         print_message "INFO" "Отправка файла в TG отключена, отправляем уведомление..."
         local filename=$(basename "$file_path")
-        local notify_text="${caption}
+        # Экранируем для MarkdownV2
+        local escaped_filename=$(escape_markdown_v2 "$filename")
+        local escaped_caption=$(escape_markdown_v2 "$caption")
+        # Формируем сообщение (уже экранированное)
+        local notify_text="📦 *Бэкап создан*
 
-📁 Файл: \`${filename}\`
+${escaped_caption}
+
+📁 Файл: \`${escaped_filename}\`
 💡 _Отправка файла в Telegram отключена_"
-        send_telegram_text "$notify_text"
-        return 0
+        
+        # Отправляем напрямую (текст уже экранирован)
+        local thread_param=""
+        [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
+        
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -d chat_id="$CHAT_ID" \
+            -d parse_mode="MarkdownV2" \
+            --data-urlencode text="$notify_text" \
+            $thread_param 2>/dev/null)
+        
+        if [[ "$http_code" == "200" ]]; then
+            print_message "SUCCESS" "Уведомление отправлено в Telegram."
+            return 0
+        else
+            print_message "WARN" "Не удалось отправить уведомление (HTTP: $http_code)"
+            log_message "WARN" "Telegram notification failed, HTTP code: $http_code"
+            return 1
+        fi
     fi
     
     print_message "INFO" "Отправка в Telegram..."
@@ -752,19 +778,20 @@ send_telegram_document() {
         
         if [[ $file_size -ge 52428800 ]]; then
             print_message "ERROR" "Файл >50MB. Telegram API отклонил отправку."
+            local escaped_fname=$(escape_markdown_v2 "$(basename "$file_path")")
             local error_msg="⚠️ *Ошибка отправки бэкапа*
 
 Файл занимает больше 50 МБ\. Telegram Bot API не позволяет загружать такие файлы напрямую\.
 
 📂 *Бэкап сохранен локально:*
-\`$(basename "$file_path")\`"
+\`${escaped_fname}\`"
             
             local thread_param=""
             [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
 
             curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
                 -d chat_id="$CHAT_ID" \
-                -d text="$error_msg" \
+                --data-urlencode text="$error_msg" \
                 -d parse_mode="MarkdownV2" \
                 $thread_param >/dev/null
         else
@@ -774,14 +801,15 @@ send_telegram_document() {
 }
 
 send_telegram_text() {
-    # send simple text message to configured chat
+    # send simple text message to configured chat (expects already escaped MarkdownV2 text)
     local text="$1"
     [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
+    [[ "$SEND_TO_TELEGRAM" != "true" ]] && return 0
     local thread_param=""
     [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
     curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d chat_id="$CHAT_ID" \
-        -d text="$text" \
+        --data-urlencode text="$text" \
         -d parse_mode="MarkdownV2" $thread_param >/dev/null 2>&1
 }
 
