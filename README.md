@@ -53,29 +53,27 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 
 ---
 
-## Главное меню
+## Интерфейс
 
-```
-LAZARUS Backup Manager v4.16.0
-Бот: 3.21.0 | Контейнер: Online
+### Главное меню
+<p align="center">
+  <img src="assets/main_menu.svg?v=1" alt="LAZARUS main menu" width="600">
+</p>
 
-Бэкапы: 14 Full | 223 DB | 5 Files | 189M
-Последний: 27.12 10:00 (2 часа назад)
+### Настройки
+<p align="center">
+  <img src="assets/settings_menu.svg" alt="LAZARUS settings menu" width="600">
+</p>
 
-Авто-бэкап:
- * Full:  Ежедневно 04:00
- * DB:    Каждые 15 мин
- * Files: Выкл
+### Автоматизация (Cron)
+<p align="center">
+  <img src="assets/cron_menu.svg" alt="LAZARUS cron menu" width="600">
+</p>
 
-1. Ручной бекап
-2. Настроить авто-бекап
-3. Восстановить из бэкапа
-4. Настройки
-5. Удалить старые бэкапы
-8. Проверить обновления
-666. Удалить скрипт
-0. Выход
-```
+### Восстановление
+<p align="center">
+  <img src="assets/restore_menu.svg" alt="LAZARUS restore menu" width="600">
+</p>
 
 ---
 
