@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.15.0"
+VERSION="4.16.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -321,6 +321,8 @@ check_for_updates() {
 
     local V_LOCAL=$(echo "$VERSION" | cut -d'-' -f1)
     local V_REMOTE=$(echo "$REMOTE_VERSION" | cut -d'-' -f1)
+    local SUFFIX_LOCAL=$(echo "$VERSION" | grep -oE '\-.*$' || echo "")
+    local SUFFIX_REMOTE=$(echo "$REMOTE_VERSION" | grep -oE '\-.*$' || echo "")
 
     echo -e "Текущая версия: ${BOLD}$VERSION${RESET}"
     echo -e "Актуальная версия: ${BOLD}$REMOTE_VERSION${RESET}"
@@ -333,7 +335,11 @@ check_for_updates() {
     fi
 
     local IS_UPGRADE=false
+    # Сначала сравниваем основную версию (X.Y.Z)
     if [[ "$(printf '%s\n' "$V_LOCAL" "$V_REMOTE" | sort -V | head -n1)" == "$V_LOCAL" && "$V_LOCAL" != "$V_REMOTE" ]]; then
+        IS_UPGRADE=true
+    # Если основные версии равны, но есть разница в суффиксах — это тоже обновление
+    elif [[ "$V_LOCAL" == "$V_REMOTE" && "$SUFFIX_LOCAL" != "$SUFFIX_REMOTE" ]]; then
         IS_UPGRADE=true
     fi
 
