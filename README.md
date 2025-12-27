@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/main_menu.svg" alt="LAZARUS main menu" width="600">
+  <img src="assets/main_menu.svg?v=1" alt="LAZARUS main menu" width="600">
 </p>
 
 # LAZARUS Backup Manager
