@@ -1022,7 +1022,7 @@ configure_remote_storage() {
         if [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
             echo -e "Текущие настройки:"
             echo -e "  Тип: ${YELLOW}${REMOTE_STORAGE_TYPE^^}${RESET}"
-            echo -e "  URL: ${GRAY}${REMOTE_STORAGE_URL}${RESET}"
+            echo -e "  URL: ${CYAN}${REMOTE_STORAGE_URL}${RESET}"
             [[ -n "$REMOTE_STORAGE_USER" ]] && echo -e "  Пользователь: ${GRAY}${REMOTE_STORAGE_USER}${RESET}"
             echo ""
         fi
@@ -1037,7 +1037,8 @@ configure_remote_storage() {
         [[ -z "$r_type" ]] && return
         
         local new_type="off"
-        local input_url="" input_user="" input_pass=""
+        local input_url="" input_user="" input_pass="" input_folder=""
+        local base_url=""
         
         case $r_type in
             1) new_type="ftp" ;;
@@ -1059,33 +1060,91 @@ configure_remote_storage() {
         echo ""
         
         if [[ "$new_type" == "ftp" ]]; then
-            echo -e "${CYAN}Настройка FTP/FTPS${RESET}"
+            echo -e "${CYAN}${BOLD}Настройка FTP/FTPS${RESET}"
             echo ""
-            echo "Примеры URL:"
-            echo -e "  ${GRAY}ftp://backup.example.com/backups${RESET}"
-            echo -e "  ${GRAY}ftps://secure.example.com:990/folder${RESET}"
+            echo -e "${GRAY}Шаг 1/3: Адрес сервера${RESET}"
             echo ""
-            read -erp "URL сервера (Enter - назад): " input_url
-            [[ -z "$input_url" ]] && continue
+            echo "Примеры:"
+            echo -e "  ${GRAY}ftp://backup.example.com${RESET}"
+            echo -e "  ${GRAY}ftps://secure.example.com:990${RESET}"
+            echo ""
+            read -erp "Адрес сервера (Enter - назад): " base_url
+            [[ -z "$base_url" ]] && continue
+            
+            # Убираем trailing slash
+            base_url="${base_url%/}"
+            
+            echo ""
+            echo -e "${GRAY}Шаг 2/3: Папка на сервере${RESET}"
+            echo ""
+            echo "Примеры:"
+            echo -e "  ${GRAY}backups${RESET}           → ${CYAN}${base_url}/backups${RESET}"
+            echo -e "  ${GRAY}backup/lazarus${RESET}    → ${CYAN}${base_url}/backup/lazarus${RESET}"
+            echo -e "  ${GRAY}(пусто)${RESET}           → ${CYAN}${base_url}${RESET} (корень)"
+            echo ""
+            read -erp "Папка: " input_folder
+            
+            # Формируем итоговый URL
+            if [[ -n "$input_folder" ]]; then
+                input_folder="${input_folder#/}"  # Убираем leading slash
+                input_folder="${input_folder%/}"  # Убираем trailing slash
+                input_url="${base_url}/${input_folder}"
+            else
+                input_url="$base_url"
+            fi
+            
+            echo ""
+            echo -e "Итоговый путь: ${CYAN}${input_url}${RESET}"
+            echo ""
+            echo -e "${GRAY}Шаг 3/3: Авторизация${RESET}"
             read -erp "Пользователь: " input_user
             read -s -erp "Пароль: " input_pass
             echo ""
             
         elif [[ "$new_type" == "webdav" ]]; then
-            echo -e "${CYAN}Настройка WebDAV${RESET}"
+            echo -e "${CYAN}${BOLD}Настройка WebDAV${RESET}"
             echo ""
-            echo "Примеры URL:"
-            echo -e "  ${GRAY}https://webdav.yandex.ru/backups${RESET}       (Яндекс.Диск)"
-            echo -e "  ${GRAY}https://cloud.example.com/remote.php/dav/files/user/backups${RESET} (Nextcloud)"
+            echo -e "${GRAY}Шаг 1/3: Адрес сервера${RESET}"
             echo ""
-            read -erp "URL сервера (Enter - назад): " input_url
-            [[ -z "$input_url" ]] && continue
+            echo "Примеры базовых адресов:"
+            echo -e "  ${GRAY}https://webdav.yandex.ru${RESET}                    (Яндекс.Диск)"
+            echo -e "  ${GRAY}https://cloud.example.com/remote.php/dav/files/user${RESET} (Nextcloud)"
+            echo ""
+            read -erp "Адрес сервера (Enter - назад): " base_url
+            [[ -z "$base_url" ]] && continue
+            
+            # Убираем trailing slash
+            base_url="${base_url%/}"
+            
+            echo ""
+            echo -e "${GRAY}Шаг 2/3: Папка для бэкапов${RESET}"
+            echo ""
+            echo "Примеры:"
+            echo -e "  ${GRAY}backups${RESET}           → ${CYAN}${base_url}/backups${RESET}"
+            echo -e "  ${GRAY}Backup/Lazarus${RESET}    → ${CYAN}${base_url}/Backup/Lazarus${RESET}"
+            echo -e "  ${GRAY}(пусто)${RESET}           → ${CYAN}${base_url}${RESET} (корень)"
+            echo ""
+            read -erp "Папка: " input_folder
+            
+            # Формируем итоговый URL
+            if [[ -n "$input_folder" ]]; then
+                input_folder="${input_folder#/}"
+                input_folder="${input_folder%/}"
+                input_url="${base_url}/${input_folder}"
+            else
+                input_url="$base_url"
+            fi
+            
+            echo ""
+            echo -e "Итоговый путь: ${CYAN}${input_url}${RESET}"
+            echo ""
+            echo -e "${GRAY}Шаг 3/3: Авторизация${RESET}"
             read -erp "Пользователь: " input_user
             read -s -erp "Пароль (или токен приложения): " input_pass
             echo ""
             
         elif [[ "$new_type" == "rclone" ]]; then
-            echo -e "${CYAN}Настройка Rclone${RESET}"
+            echo -e "${CYAN}${BOLD}Настройка Rclone${RESET}"
             echo ""
             if ! command -v rclone >/dev/null 2>&1; then
                 print_message "ERROR" "Rclone не установлен!"
@@ -1093,16 +1152,46 @@ configure_remote_storage() {
                 read -erp "Enter..." dummy
                 continue
             fi
+            
+            echo -e "${GRAY}Шаг 1/2: Выбор remote${RESET}"
+            echo ""
             echo "Доступные remotes:"
-            rclone listremotes 2>/dev/null | sed 's/^/  /'
+            local remotes=$(rclone listremotes 2>/dev/null)
+            if [[ -z "$remotes" ]]; then
+                print_message "WARN" "Нет настроенных remotes!"
+                echo -e "Настройте через: ${GRAY}rclone config${RESET}"
+                read -erp "Enter..." dummy
+                continue
+            fi
+            echo "$remotes" | sed 's/^/  /'
             echo ""
-            echo "Примеры путей:"
-            echo -e "  ${GRAY}gdrive:backups${RESET}        (Google Drive)"
-            echo -e "  ${GRAY}s3:bucket/backups${RESET}     (Amazon S3)"
-            echo -e "  ${GRAY}dropbox:backups${RESET}       (Dropbox)"
+            read -erp "Имя remote (без двоеточия, Enter - назад): " base_url
+            [[ -z "$base_url" ]] && continue
+            
+            # Убираем двоеточие если пользователь его добавил
+            base_url="${base_url%:}"
+            
             echo ""
-            read -erp "Rclone путь (Enter - назад): " input_url
-            [[ -z "$input_url" ]] && continue
+            echo -e "${GRAY}Шаг 2/2: Папка в хранилище${RESET}"
+            echo ""
+            echo "Примеры:"
+            echo -e "  ${GRAY}backups${RESET}           → ${CYAN}${base_url}:backups${RESET}"
+            echo -e "  ${GRAY}Backup/Server1${RESET}    → ${CYAN}${base_url}:Backup/Server1${RESET}"
+            echo -e "  ${GRAY}(пусто)${RESET}           → ${CYAN}${base_url}:${RESET} (корень)"
+            echo ""
+            read -erp "Папка: " input_folder
+            
+            # Формируем итоговый путь для rclone
+            if [[ -n "$input_folder" ]]; then
+                input_folder="${input_folder#/}"
+                input_folder="${input_folder%/}"
+                input_url="${base_url}:${input_folder}"
+            else
+                input_url="${base_url}:"
+            fi
+            
+            echo ""
+            echo -e "Итоговый путь: ${CYAN}${input_url}${RESET}"
             input_user=""
             input_pass=""
         fi
