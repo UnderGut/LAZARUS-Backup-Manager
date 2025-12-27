@@ -1817,7 +1817,11 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     
     send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
 
-    rotate_backups_by_count "lazarus_$TYPE" "$ROTATION_KEY" "true"
+    local ROTATION_PREFIX="lazarus_$TYPE"
+    if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="lazarus_db"; fi
+    if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="lazarus_files"; fi
+
+    rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true"
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
