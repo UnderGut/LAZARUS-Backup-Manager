@@ -34,11 +34,13 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 - **Smart Scan** — автоматически находит бота в Docker
 - **3 типа бэкапов** — Full (БД + файлы), DB Only, Files Only
 - **AES-256 шифрование** — защита архивов паролем
-- **Telegram** — отправка файлов и уведомлений (раздельно)
-- **FTP / FTPS / WebDAV / Rclone** — облачные хранилища с retry
+- **Telegram** — отправка файлов и уведомлений (раздельно настраивается)
+- **FTP / FTPS / WebDAV / Rclone** — облачные хранилища с retry и пошаговой настройкой
 - **Cron автоматизация** — настройка расписания из меню
 - **Умная ротация** — по времени или количеству
 - **Восстановление** — Full / DB / Files из любого бэкапа
+- **Авто-обновление** — проверка и установка новых версий из меню
+- **Режим отладки** — флаг `--debug` для детального логирования
 
 ---
 
@@ -79,18 +81,61 @@ LAZARUS Backup Manager v4.16.0
 
 ## Настройки (config.env)
 
-| Параметр | Описание |
-|----------|----------|
-| `BOT_TOKEN` | Токен Telegram бота |
-| `CHAT_ID` | ID чата для уведомлений |
-| `SEND_TO_TELEGRAM` | Уведомления в TG (true/false) |
-| `TG_SEND_FILE` | Отправка файла в TG (true/false) |
-| `REMOTE_STORAGE_TYPE` | off / ftp / webdav / rclone |
-| `DELETE_MODE` | time (по дням) / count (по кол-ву) |
-| `RETENTION_DAYS` | Хранить N дней |
-| `BACKUP_PASSWORD` | Пароль шифрования |
+Конфигурация: `/opt/lazarus-backup/config.env` (chmod 600)
 
-Конфиг: `/opt/lazarus-backup/config.env`
+### Telegram
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `BOT_TOKEN` | Токен Telegram бота | `123456:ABC-DEF1234...` |
+| `CHAT_ID` | ID чата для уведомлений | `-1001234567890` |
+| `TG_MESSAGE_THREAD_ID` | ID топика (для групп с темами) | `12345` или пусто |
+| `SEND_TO_TELEGRAM` | Уведомления в TG | `true` / `false` |
+| `TG_SEND_FILE` | Отправлять архив в TG | `true` / `false` |
+
+### Бот и Docker
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `BOT_PATH` | Путь к docker-compose бота | `/root/remnawave` |
+| `BOT_CONTAINER_NAME` | Имя контейнера бота | `remnawave-telegram-shop-bot` |
+| `DB_CONTAINER_NAME` | Имя контейнера БД | `remnawave-telegram-shop-db` |
+| `DB_USER` | Пользователь PostgreSQL | `postgres` |
+| `IGNORE_MISMATCH` | Игнорировать несоответствие контейнера | `true` / `false` |
+
+### Ротация бэкапов
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `DELETE_MODE` | Режим удаления | `time` (по дням) / `count` (по количеству) |
+| `RETENTION_DAYS` | Хранить N дней (если mode=time) | `7` |
+| `MAX_BACKUPS_COUNT` | Макс. количество (если mode=count) | `100` |
+
+### Расписание (cron формат)
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `SCHEDULE_FULL` | Расписание полного бэкапа | `0 4 * * *` (ежедневно 04:00) |
+| `SCHEDULE_DB` | Расписание бэкапа БД | `*/15 * * * *` (каждые 15 мин) |
+| `SCHEDULE_FILES` | Расписание бэкапа файлов | пусто (отключено) |
+
+### Удалённое хранилище
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `REMOTE_STORAGE_TYPE` | Тип хранилища | `off` / `ftp` / `ftps` / `webdav` / `rclone` |
+| `REMOTE_STORAGE_URL` | URL сервера с папкой | `ftp://backup.server.com/backups/` |
+| `REMOTE_STORAGE_USER` | Логин | `backup_user` |
+| `REMOTE_STORAGE_PASS` | Пароль | `secret123` |
+| `SEND_TO_REMOTE` | Отправлять на удалённый сервер | `true` / `false` |
+
+### Шифрование и фильтрация
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `BACKUP_PASSWORD` | Пароль AES-256 шифрования | `MySecretPass123` или пусто |
+| `MAX_FILE_SIZE_MB` | Макс. размер файла в архиве (MB) | `1` (пропуск больших) |
+| `EXCLUDE_DIRS` | Исключить папки (через пробел) | `node_modules .git cache` |
 
 ---
 
