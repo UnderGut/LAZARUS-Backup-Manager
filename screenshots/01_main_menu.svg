@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="480" viewBox="0 0 600 480">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .gray { fill: #7f8c8d; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+    .line-stroke { stroke: #2ecc71; stroke-width: 1; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="600" height="480" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Header Lines (Double Lines) -->
+  <path d="M20 60 L580 60 M20 63 L580 63" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <text x="300" y="85" text-anchor="middle" class="text green bold">LAZARUS Backup Manager v4.16.3</text>
+  
+  <path d="M20 97 L580 97 M20 100 L580 100" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <!-- Body Content -->
+  <text x="20" y="140" class="text">
+    <tspan>Бот: <tspan class="cyan">3.21.0</tspan> | Контейнер: <tspan class="green">Online</tspan></tspan>
+    
+    <tspan x="20" dy="30">Бэкапы: 14 Full | 223 DB | 5 Files | <tspan class="bold">189M</tspan> всего</tspan>
+    <tspan x="20" dy="20">Последний: 27.12 10:00 (2 часа назад)</tspan>
+    
+    <tspan x="20" dy="30">Авто-бэкап (cron):</tspan>
+    <tspan x="20" dy="20"> • Full:  <tspan class="green">Ежедневно 04:00</tspan></tspan>
+    <tspan x="20" dy="20"> • DB:    <tspan class="green">Каждые 15 мин</tspan></tspan>
+    <tspan x="20" dy="20"> • Files: <tspan class="gray">Выкл</tspan></tspan>
+    
+    <tspan x="20" dy="30" class="gray"> --- ДЕЙСТВИЯ ---</tspan>
+    <tspan x="20" dy="20"> 1. Ручной бекап (Full / DB / Files)</tspan>
+    <tspan x="20" dy="20"> 2. Настроить авто-бекап</tspan>
+    <tspan x="20" dy="20"> 3. Восстановить из бэкапа</tspan>
+    <tspan x="20" dy="20"> 4. Настройки (Пути / Токены / Ротация)</tspan>
+    <tspan x="20" dy="20"> 5. Удалить старые бэкапы (>7 дней)</tspan>
+    <tspan x="20" dy="20"> 8. Проверить обновления</tspan>
+    <tspan x="20" dy="20"> 666. Удалить скрипт</tspan>
+    <tspan x="20" dy="20"> 0. Выход</tspan>
+    
+    <tspan x="20" dy="30">Ваш выбор > <tspan class="green">_</tspan></tspan>
+  </text>
+</svg>
