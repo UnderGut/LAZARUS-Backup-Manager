@@ -23,7 +23,8 @@ EXCLUDE_DIRS=""
 MAX_FILE_SIZE_MB="1"
 
 # Переключатели отправки
-SEND_TO_TELEGRAM="true"
+SEND_TO_TELEGRAM="true"      # Уведомления в Telegram
+TG_SEND_FILE="true"          # Отправка файла бэкапа в Telegram
 SEND_TO_REMOTE="true"
 
 # Настройки ротации (по количеству)
@@ -61,13 +62,14 @@ SCHEDULE_FILES="Выкл"
 IS_INTERACTIVE=true
 if [[ ! -t 0 ]]; then IS_INTERACTIVE=false; fi
 
+# Режим отладки (--debug)
+DEBUG_MODE=false
+
 # Авто-подтверждение для неинтерактивного запуска (например, cron --yes)
 AUTO_CONFIRM="false"
 
 # Лог-файл для подробных логов
 LOG_FILE="/var/log/lazarus_backup.log"
-LOCK_FILE="/var/run/lazarus.lock"
-TEMP_DIRS=()
 
 # Цвета
 if [[ -t 0 ]]; then
@@ -76,55 +78,25 @@ else
     RED=""; GREEN=""; YELLOW=""; GRAY=""; CYAN=""; MAGENTA=""; RESET=""; BOLD=""
 fi
 
-# --- SYSTEM & CLEANUP ---
-
-cleanup() {
-    local exit_code=$?
-    # Remove lock file if we own it
-    if [[ -f "$LOCK_FILE" ]]; then
-        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
-        if [[ "$lock_pid" == "$$" ]]; then
-            rm -f "$LOCK_FILE"
-        fi
-    fi
-    
-    # Remove temp dirs
-    for dir in "${TEMP_DIRS[@]}"; do
-        if [[ -d "$dir" ]]; then rm -rf "$dir"; fi
-    done
-    
-    exit "$exit_code"
-}
-
-trap cleanup EXIT INT TERM
-
-acquire_lock() {
-    # Only acquire lock for non-interactive backup commands
-    if [[ "$IS_INTERACTIVE" == "true" ]]; then return 0; fi
-
-    if [[ -f "$LOCK_FILE" ]]; then
-        local lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
-        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-            log_message "ERROR" "Concurrent execution attempt blocked (PID: $lock_pid is running)"
-            echo "Lazarus is already running (PID: $lock_pid). Exiting." >&2
-            exit 1
-        else
-            # Stale lock
-            echo "$$" > "$LOCK_FILE"
-        fi
-    else
-        # Check if we can write to lock file (might not be root)
-        if touch "$LOCK_FILE" 2>/dev/null; then
-            echo "$$" > "$LOCK_FILE"
-        else
-            # Fallback to tmp if /var/run is not writable
-            LOCK_FILE="/tmp/lazarus.lock"
-            echo "$$" > "$LOCK_FILE"
-        fi
-    fi
-}
-
 # --- ФУНКЦИИ ИНТЕРФЕЙСА ---
+
+# Очистка экрана (пропускается в debug режиме)
+clear_screen() {
+    if [[ "$DEBUG_MODE" == true ]]; then
+        echo ""
+        echo -e "${MAGENTA}═══════════════════ [DEBUG: clear skipped] ═══════════════════${RESET}"
+        echo ""
+    else
+        clear
+    fi
+}
+
+# Отладочное сообщение
+debug_log() {
+    if [[ "$DEBUG_MODE" == true ]]; then
+        echo -e "${MAGENTA}[DEBUG]${RESET} $1"
+    fi
+}
 
 escape_markdown_v2() {
     echo "$1" | sed -e 's/\\/\\\\/g' -e 's/_/\\_/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' \
@@ -224,10 +196,87 @@ check_dependencies() {
     fi
 }
 
+# --- СТАТИСТИКА БЭКАПОВ ---
+
+get_backup_stats() {
+    # Подсчёт файлов по категориям
+    local n_full=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_full_*.tar.gz" -o -name "lazarus_full_*.tar.gz.enc" \) 2>/dev/null | wc -l)
+    local n_db=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" \) 2>/dev/null | wc -l)
+    local n_files=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_files_*.tar.gz" -o -name "lazarus_files_*.tar.gz.enc" \) 2>/dev/null | wc -l)
+    
+    # Общий размер папки бэкапов
+    local total_size="0B"
+    if [[ -d "$BACKUP_DIR" ]]; then
+        total_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    fi
+    
+    # Последний бэкап (любой тип)
+    local last_backup=""
+    local last_backup_ago=""
+    local latest_file=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_*.tar.gz" -o -name "lazarus_*.tar.gz.enc" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+    
+    if [[ -n "$latest_file" && -f "$latest_file" ]]; then
+        local filename=$(basename "$latest_file")
+        # Извлекаем дату из имени файла: lazarus_type_YYYY-MM-DD_HH_MM_SS.tar.gz
+        if [[ $filename =~ _([0-9]{4})-([0-9]{2})-([0-9]{2})_([0-9]{2})_([0-9]{2}) ]]; then
+            local file_date="${BASH_REMATCH[3]}.${BASH_REMATCH[2]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}"
+            last_backup="$file_date"
+            
+            # Вычисляем "сколько времени назад"
+            local file_ts=$(stat -c %Y "$latest_file" 2>/dev/null)
+            local now_ts=$(date +%s)
+            if [[ -n "$file_ts" ]]; then
+                local diff_sec=$((now_ts - file_ts))
+                if [[ $diff_sec -lt 60 ]]; then
+                    last_backup_ago="только что"
+                elif [[ $diff_sec -lt 3600 ]]; then
+                    local mins=$((diff_sec / 60))
+                    last_backup_ago="${mins} мин назад"
+                elif [[ $diff_sec -lt 86400 ]]; then
+                    local hours=$((diff_sec / 3600))
+                    last_backup_ago="${hours} ч назад"
+                else
+                    local days=$((diff_sec / 86400))
+                    last_backup_ago="${days} дн назад"
+                fi
+            fi
+        fi
+    fi
+    
+    # Возвращаем через глобальные переменные (bash не умеет возвращать несколько значений)
+    STATS_FULL="$n_full"
+    STATS_DB="$n_db"
+    STATS_FILES="$n_files"
+    STATS_SIZE="$total_size"
+    STATS_LAST="$last_backup"
+    STATS_LAST_AGO="$last_backup_ago"
+}
+
+# Проверка свободного места на диске
+check_disk_space() {
+    local min_space_mb="${1:-1024}"  # По умолчанию 1GB
+    local backup_path="$BACKUP_DIR"
+    
+    # Получаем свободное место в MB
+    local free_space_kb=$(df -P "$backup_path" 2>/dev/null | tail -1 | awk '{print $4}')
+    local free_space_mb=$((free_space_kb / 1024))
+    
+    if [[ $free_space_mb -lt $min_space_mb ]]; then
+        local free_human=$(df -h "$backup_path" 2>/dev/null | tail -1 | awk '{print $4}')
+        return 1  # Мало места
+    fi
+    return 0  # Места достаточно
+}
+
+# Получить свободное место в человекочитаемом формате
+get_free_space() {
+    df -h "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $4}'
+}
+
 # --- СИСТЕМА ОБНОВЛЕНИЯ ---
 
 check_for_updates() {
-    clear
+    clear_screen
     echo -e "${CYAN}Проверка обновлений...${RESET}"
     
     local REMOTE_CONTENT
@@ -430,7 +479,26 @@ get_raw_bot_version() {
 
 get_bot_version_display() {
     local ver=$(get_raw_bot_version)
-    if [[ -n "$ver" ]]; then echo "$ver"; else echo "Не определена / Остановлен"; fi
+    if [[ -n "$ver" ]]; then echo "$ver"; else echo "N/A"; fi
+}
+
+# Получение статуса контейнера бота
+get_container_status() {
+    if [[ -z "$BOT_CONTAINER_NAME" ]]; then
+        echo "N/A"
+        return
+    fi
+    
+    local status
+    status=$(docker inspect -f '{{.State.Status}}' "$BOT_CONTAINER_NAME" 2>/dev/null)
+    
+    case "$status" in
+        "running") echo "Online" ;;
+        "exited"|"dead") echo "Offline" ;;
+        "paused") echo "Paused" ;;
+        "restarting") echo "Restarting" ;;
+        *) echo "N/A" ;;
+    esac
 }
 
 detect_bot_installation() {
@@ -548,6 +616,7 @@ REMOTE_STORAGE_USER="$REMOTE_STORAGE_USER"
 REMOTE_STORAGE_PASS="$REMOTE_STORAGE_PASS"
 BACKUP_PASSWORD="$BACKUP_PASSWORD"
 SEND_TO_TELEGRAM="$SEND_TO_TELEGRAM"
+TG_SEND_FILE="$TG_SEND_FILE"
 SEND_TO_REMOTE="$SEND_TO_REMOTE"
 DELETE_MODE="$DELETE_MODE"
 RETENTION_DAYS="$RETENTION_DAYS"
@@ -562,6 +631,7 @@ load_or_create_config() {
     if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
     if [[ -z "$REMOTE_STORAGE_TYPE" ]]; then REMOTE_STORAGE_TYPE="off"; fi
     if [[ -z "$SEND_TO_TELEGRAM" ]]; then SEND_TO_TELEGRAM="true"; fi
+    if [[ -z "$TG_SEND_FILE" ]]; then TG_SEND_FILE="true"; fi
     if [[ -z "$SEND_TO_REMOTE" ]]; then SEND_TO_REMOTE="true"; fi
     if [[ -z "$DELETE_MODE" ]]; then DELETE_MODE="time"; fi
     if [[ -z "$RETENTION_DAYS" ]]; then RETENTION_DAYS="7"; fi
@@ -584,13 +654,26 @@ load_or_create_config() {
 }
 
 send_telegram_document() {
-    if [[ "$SEND_TO_TELEGRAM" != "true" ]]; then
-        print_message "INFO" "Отправка в Telegram отключена в настройках."
-        return
-    fi
-
     local file_path="$1"; local caption="$2"
     [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
+    
+    # Если уведомления полностью отключены
+    if [[ "$SEND_TO_TELEGRAM" != "true" ]]; then
+        print_message "INFO" "Уведомления Telegram отключены."
+        return 0
+    fi
+    
+    # Если отправка файла отключена — отправляем только текстовое уведомление
+    if [[ "$TG_SEND_FILE" != "true" ]]; then
+        print_message "INFO" "Отправка файла в TG отключена, отправляем уведомление..."
+        local filename=$(basename "$file_path")
+        local notify_text="${caption}
+
+📁 Файл: \`${filename}\`
+💡 _Отправка файла в Telegram отключена_"
+        send_telegram_text "$notify_text"
+        return 0
+    fi
     
     print_message "INFO" "Отправка в Telegram..."
     
@@ -654,116 +737,339 @@ test_telegram_connection() {
 validate_remote_connection() {
     local type="$1"; local url="$2"; local user="$3"; local pass="$4"
     print_message "INFO" "Тестирование подключения ($type)..."
-    local base_url="${url%/}"; local curl_cmd=(curl -s -m 10)
-    [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
-
+    
+    local base_url="${url%/}"
+    
     if [[ "$type" == "ftp" ]]; then
-        if "${curl_cmd[@]}" --list-only "$base_url/" >/dev/null 2>&1; then return 0; else return 1; fi
+        # FTP: проверяем листинг директории
+        local curl_cmd=(curl -s -m 15 --ftp-pasv --list-only)
+        [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
+        
+        # Поддержка FTPS (implicit и explicit)
+        if [[ "$base_url" == ftps://* ]]; then
+            curl_cmd+=(--ssl-reqd --insecure)
+        elif [[ "$base_url" == ftp://* ]]; then
+            # Попробуем explicit TLS если доступен
+            curl_cmd+=(--ssl --insecure)
+        fi
+        
+        if "${curl_cmd[@]}" "$base_url/" >/dev/null 2>&1; then 
+            return 0
+        else 
+            # Повторная попытка без TLS для обычного FTP
+            if [[ "$base_url" == ftp://* ]]; then
+                curl_cmd=(curl -s -m 15 --ftp-pasv --list-only)
+                [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
+                if "${curl_cmd[@]}" "$base_url/" >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+            return 1
+        fi
+        
     elif [[ "$type" == "webdav" ]]; then
-        local http_code=$("${curl_cmd[@]}" -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2>/dev/null)
-        if [[ "$http_code" =~ ^(200|207|301|405)$ ]]; then return 0; else return 1; fi
+        # WebDAV: PROPFIND с Depth: 0
+        local curl_cmd=(curl -s -m 15 -L)
+        [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
+        
+        # Поддержка самоподписанных сертификатов
+        [[ "$base_url" == https://* ]] && curl_cmd+=(--insecure)
+        
+        local http_code
+        http_code=$("${curl_cmd[@]}" -o /dev/null -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2>/dev/null)
+        
+        # 207 Multi-Status — стандартный успешный ответ WebDAV
+        # 200 OK — некоторые серверы отвечают так
+        # 301/302 — редирект (curl -L обработает)
+        if [[ "$http_code" =~ ^(200|207)$ ]]; then 
+            return 0
+        else 
+            # Fallback: попробуем простой GET
+            http_code=$("${curl_cmd[@]}" -o /dev/null -w "%{http_code}" "$base_url/" 2>/dev/null)
+            if [[ "$http_code" =~ ^(200|207|401)$ ]]; then
+                # 401 означает что сервер отвечает, но нужна авторизация
+                return 0
+            fi
+            return 1
+        fi
+        
     elif [[ "$type" == "rclone" ]]; then
-        # For rclone, url is the remote name (e.g. "gdrive:")
-        if rclone listremotes | grep -q "^${url%:}\+:$"; then return 0; fi
-        if rclone lsd "$url" >/dev/null 2>&1; then return 0; else return 1; fi
+        if ! command -v rclone >/dev/null 2>&1; then
+            print_message "ERROR" "Rclone не установлен!"
+            return 1
+        fi
+        # Проверяем доступность remote
+        local remote_name="${url%%:*}"
+        if rclone listremotes 2>/dev/null | grep -q "^${remote_name}:$"; then
+            # Remote существует, проверяем доступность
+            if rclone lsd "$url" >/dev/null 2>&1; then 
+                return 0
+            fi
+        fi
+        return 1
     fi
+    
     return 1
 }
 
 upload_to_remote() {
-    if [[ "$SEND_TO_REMOTE" != "true" ]]; then return; fi
-    local file_path="$1"; local filename=$(basename "$file_path")
+    if [[ "$SEND_TO_REMOTE" != "true" ]]; then return 0; fi
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local file_size=$(stat -c%s "$file_path" 2>/dev/null || echo "0")
     REMOTE_UPLOAD_STATUS_TEXT="" 
 
-    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then return; fi
+    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then return 0; fi
+    
+    if [[ ! -f "$file_path" ]]; then
+        print_message "ERROR" "Файл для загрузки не найден: $file_path" >&2
+        log_message "ERROR" "Upload failed: file not found $file_path"
+        return 1
+    fi
 
-    print_message "INFO" "Загрузка на удаленный сервер ($REMOTE_STORAGE_TYPE)..." >&2
+    print_message "INFO" "Загрузка на $REMOTE_STORAGE_TYPE ($(numfmt --to=iec $file_size 2>/dev/null || echo "${file_size}B"))..." >&2
 
+    # === RCLONE ===
     if [[ "$REMOTE_STORAGE_TYPE" == "rclone" ]]; then
-        # Rclone upload
         if ! command -v rclone >/dev/null 2>&1; then
-             print_message "ERROR" "Rclone не установлен!"
-             return
+            print_message "ERROR" "Rclone не установлен!"
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: Не установлен'
+            return 1
         fi
         local dest="${REMOTE_STORAGE_URL%/}"
-        if rclone copy "$file_path" "$dest" --progress; then
-             print_message "SUCCESS" "Файл успешно загружен (rclone)."
-             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: OK'
-             log_message "SUCCESS" "Uploaded $file_path to rclone:$dest"
+        local rclone_opts=(--progress --retries 3 --low-level-retries 10)
+        [[ "$IS_INTERACTIVE" != "true" ]] && rclone_opts=(--quiet --retries 3 --low-level-retries 10)
+        
+        if rclone copy "$file_path" "$dest" "${rclone_opts[@]}" 2>&1; then
+            print_message "SUCCESS" "Файл загружен (rclone)." >&2
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: OK'
+            log_message "SUCCESS" "Uploaded $filename to rclone:$dest"
+            return 0
         else
-             print_message "ERROR" "Ошибка загрузки rclone."
-             log_message "ERROR" "Failed upload $file_path to rclone:$dest"
+            print_message "ERROR" "Ошибка загрузки rclone." >&2
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: Ошибка'
+            log_message "ERROR" "Failed upload $filename to rclone:$dest"
+            return 1
         fi
-        return
     fi
 
+    # === FTP / WEBDAV ===
     local upload_url="${REMOTE_STORAGE_URL%/}/$filename"
-    local curl_cmd=(curl -# -o /dev/null -w "%{http_code}" -m 300 -T "$file_path")
-    
-    [[ -n "$REMOTE_STORAGE_USER" ]] && curl_cmd+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
-    [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && curl_cmd+=("$upload_url")
-    [[ "$REMOTE_STORAGE_TYPE" == "webdav" ]] && curl_cmd+=("$upload_url")
-
+    local max_retries=3
+    local retry_delay=5
+    local attempt=1
     local http_code=""
-    if [[ "$IS_INTERACTIVE" == "true" ]]; then
-        http_code=$("${curl_cmd[@]}")
+    local upload_success=false
+    
+    # Расчёт таймаута на основе размера файла (минимум 120 сек, +60 сек на каждые 50MB)
+    local timeout=$((120 + (file_size / 50000000) * 60))
+    [[ $timeout -gt 1800 ]] && timeout=1800  # Максимум 30 минут
+    
+    while [[ $attempt -le $max_retries ]]; do
+        [[ $attempt -gt 1 ]] && print_message "INFO" "Повторная попытка $attempt/$max_retries..." >&2
+        
+        # Базовые опции curl
+        local curl_opts=(-o /dev/null -w "%{http_code}" -m "$timeout" -T "$file_path")
+        
+        # Прогресс-бар или тихий режим
+        if [[ "$IS_INTERACTIVE" == "true" ]]; then
+            curl_opts+=(-#)
+        else
+            curl_opts+=(-s)
+        fi
+        
+        # Аутентификация
+        [[ -n "$REMOTE_STORAGE_USER" ]] && curl_opts+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
+        
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then
+            # FTP специфичные опции
+            curl_opts+=(--ftp-pasv)              # Passive mode (работает за NAT)
+            curl_opts+=(--ftp-create-dirs)       # Создать директории если нужно
+            
+            # Поддержка FTPS
+            if [[ "$upload_url" == ftps://* ]]; then
+                curl_opts+=(--ssl-reqd --insecure)
+            elif [[ "$upload_url" == ftp://* ]]; then
+                curl_opts+=(--ssl --insecure)    # Попробовать TLS если доступен
+            fi
+            
+            curl_opts+=("$upload_url")
+            http_code=$(curl "${curl_opts[@]}" 2>/dev/null) || http_code="000"
+            
+            # FTP коды успеха: 226 (Transfer complete), 250 (Requested file action okay)
+            if [[ "$http_code" =~ ^(226|250|200)$ ]]; then
+                upload_success=true
+                break
+            fi
+            
+        elif [[ "$REMOTE_STORAGE_TYPE" == "webdav" ]]; then
+            # WebDAV специфичные опции
+            curl_opts+=(-L)                      # Следовать редиректам
+            curl_opts+=(--retry 2)               # Встроенный retry curl
+            curl_opts+=(--retry-delay 3)
+            
+            # Поддержка HTTPS с самоподписанными сертификатами
+            [[ "$upload_url" == https://* ]] && curl_opts+=(--insecure)
+            
+            curl_opts+=("$upload_url")
+            http_code=$(curl "${curl_opts[@]}" 2>/dev/null) || http_code="000"
+            
+            # WebDAV коды успеха: 200 OK, 201 Created, 204 No Content
+            if [[ "$http_code" =~ ^(200|201|204)$ ]]; then
+                upload_success=true
+                break
+            fi
+        fi
+        
+        # Логируем неудачную попытку
+        log_message "WARN" "Upload attempt $attempt failed: HTTP $http_code for $upload_url"
+        
+        ((attempt++))
+        [[ $attempt -le $max_retries ]] && sleep $retry_delay
+    done
+    
+    if [[ "$upload_success" == true ]]; then
+        print_message "SUCCESS" "Файл загружен в хранилище." >&2
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then 
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: OK'
+        else 
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: OK'
+        fi
+        log_message "SUCCESS" "Uploaded $filename to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code"
+        return 0
     else
-        curl_cmd[1]="-s"
-        http_code=$("${curl_cmd[@]}")
-    fi
-
-    if [[ "$http_code" =~ ^(200|201|204|226)$ ]]; then
-        print_message "SUCCESS" "Файл успешно загружен в хранилище." >&2
-        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: OK'; else REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: OK'; fi
-        log_message "SUCCESS" "Uploaded $file_path to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code"
-    else
-        print_message "ERROR" "Ошибка загрузки (Код: $http_code)." >&2
-        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: Ошибка'; else REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: Ошибка'; fi
-        log_message "ERROR" "Failed upload $file_path to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code"
+        print_message "ERROR" "Ошибка загрузки после $max_retries попыток (Код: $http_code)" >&2
+        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then 
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: Ошибка'
+        else 
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: Ошибка'
+        fi
+        log_message "ERROR" "Failed upload $filename to $REMOTE_STORAGE_TYPE after $max_retries attempts. Last HTTP=$http_code"
+        return 1
     fi
 }
 
 configure_remote_storage() {
-    clear; echo -e "${CYAN}Настройка удаленного хранилища${RESET}"
-    echo "1. Тип: FTP"
-    echo "2. Тип: WebDAV"
-    echo "3. Тип: Rclone (требуется установленный rclone)"
-    echo "4. Отключить"
-    echo ""; read -erp "Выбор: " r_type
+    clear_screen
+    echo -e "${GREEN}${BOLD}Настройка удалённого хранилища${RESET}"
+    echo ""
+    
+    # Показываем текущий статус
+    if [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
+        echo -e "Текущие настройки:"
+        echo -e "  Тип: ${YELLOW}${REMOTE_STORAGE_TYPE^^}${RESET}"
+        echo -e "  URL: ${GRAY}${REMOTE_STORAGE_URL}${RESET}"
+        [[ -n "$REMOTE_STORAGE_USER" ]] && echo -e "  Пользователь: ${GRAY}${REMOTE_STORAGE_USER}${RESET}"
+        echo ""
+    fi
+    
+    echo " 1. FTP / FTPS"
+    echo " 2. WebDAV (Яндекс.Диск, Nextcloud, и др.)"
+    echo " 3. Rclone (Google Drive, S3, Dropbox, и др.)"
+    echo ""
+    echo -e " ${RED}0. Отключить${RESET}"
+    echo ""
+    read -erp "Выбор (Enter - Назад): " r_type
+    [[ -z "$r_type" ]] && return
     
     local new_type="off"
+    local input_url="" input_user="" input_pass=""
+    
     case $r_type in
-        1) new_type="ftp" ;; 2) new_type="webdav" ;; 3) new_type="rclone" ;;
-        4) REMOTE_STORAGE_TYPE="off"; save_config; print_message "SUCCESS" "Отключено."; return ;;
+        1) new_type="ftp" ;;
+        2) new_type="webdav" ;;
+        3) new_type="rclone" ;;
+        0) 
+            REMOTE_STORAGE_TYPE="off"
+            REMOTE_STORAGE_URL=""
+            REMOTE_STORAGE_USER=""
+            REMOTE_STORAGE_PASS=""
+            save_config
+            print_message "SUCCESS" "Удалённое хранилище отключено."
+            sleep 1
+            return 
+            ;;
         *) return ;;
     esac
 
-    if [[ "$new_type" == "rclone" ]]; then
-        echo ""; echo "Введите имя remote и путь (как в rclone), например: gdrive:backups"
-        read -erp "Rclone path: " input_url
-        input_user=""; input_pass=""
-    else
-        echo ""; echo "Пример URL: ftp://backup.server.com/folder  |  https://webdav.yandex.ru"; echo ""
+    echo ""
+    
+    if [[ "$new_type" == "ftp" ]]; then
+        echo -e "${CYAN}Настройка FTP/FTPS${RESET}"
+        echo ""
+        echo "Примеры URL:"
+        echo -e "  ${GRAY}ftp://backup.example.com/backups${RESET}"
+        echo -e "  ${GRAY}ftps://secure.example.com:990/folder${RESET}"
+        echo ""
         read -erp "URL сервера: " input_url
+        [[ -z "$input_url" ]] && return
         read -erp "Пользователь: " input_user
-        read -s -erp "Пароль: " input_pass; echo ""
+        read -s -erp "Пароль: " input_pass
+        echo ""
+        
+    elif [[ "$new_type" == "webdav" ]]; then
+        echo -e "${CYAN}Настройка WebDAV${RESET}"
+        echo ""
+        echo "Примеры URL:"
+        echo -e "  ${GRAY}https://webdav.yandex.ru/backups${RESET}       (Яндекс.Диск)"
+        echo -e "  ${GRAY}https://cloud.example.com/remote.php/dav/files/user/backups${RESET} (Nextcloud)"
+        echo ""
+        read -erp "URL сервера: " input_url
+        [[ -z "$input_url" ]] && return
+        read -erp "Пользователь: " input_user
+        read -s -erp "Пароль (или токен приложения): " input_pass
+        echo ""
+        
+    elif [[ "$new_type" == "rclone" ]]; then
+        echo -e "${CYAN}Настройка Rclone${RESET}"
+        echo ""
+        if ! command -v rclone >/dev/null 2>&1; then
+            print_message "ERROR" "Rclone не установлен!"
+            echo -e "Установка: ${GRAY}curl https://rclone.org/install.sh | sudo bash${RESET}"
+            read -erp "Enter..." dummy
+            return
+        fi
+        echo "Доступные remotes:"
+        rclone listremotes 2>/dev/null | sed 's/^/  /'
+        echo ""
+        echo "Примеры путей:"
+        echo -e "  ${GRAY}gdrive:backups${RESET}        (Google Drive)"
+        echo -e "  ${GRAY}s3:bucket/backups${RESET}     (Amazon S3)"
+        echo -e "  ${GRAY}dropbox:backups${RESET}       (Dropbox)"
+        echo ""
+        read -erp "Rclone путь: " input_url
+        [[ -z "$input_url" ]] && return
+        input_user=""
+        input_pass=""
     fi
 
+    echo ""
+    print_message "INFO" "Проверка подключения..."
+    
     if validate_remote_connection "$new_type" "$input_url" "$input_user" "$input_pass"; then
         print_message "SUCCESS" "Соединение установлено!"
-        REMOTE_STORAGE_TYPE="$new_type"; REMOTE_STORAGE_URL="$input_url"; REMOTE_STORAGE_USER="$input_user"; REMOTE_STORAGE_PASS="$input_pass"
-        save_config; print_message "SUCCESS" "Настройки сохранены."
+        REMOTE_STORAGE_TYPE="$new_type"
+        REMOTE_STORAGE_URL="$input_url"
+        REMOTE_STORAGE_USER="$input_user"
+        REMOTE_STORAGE_PASS="$input_pass"
+        save_config
+        print_message "SUCCESS" "Настройки сохранены."
     else
         print_message "ERROR" "Не удалось подключиться к серверу!"
+        echo ""
         read -erp "Сохранить настройки несмотря на ошибку? (y/N): " force_save
         if [[ "$force_save" =~ ^[Yy]$ ]]; then
-            REMOTE_STORAGE_TYPE="$new_type"; REMOTE_STORAGE_URL="$input_url"; REMOTE_STORAGE_USER="$input_user"; REMOTE_STORAGE_PASS="$input_pass"
-            save_config; print_message "WARN" "Настройки сохранены (но соединение не проверено)."
+            REMOTE_STORAGE_TYPE="$new_type"
+            REMOTE_STORAGE_URL="$input_url"
+            REMOTE_STORAGE_USER="$input_user"
+            REMOTE_STORAGE_PASS="$input_pass"
+            save_config
+            print_message "WARN" "Настройки сохранены (соединение не проверено)."
         else
-            print_message "INFO" "Отмена сохранения."
+            print_message "INFO" "Отменено."
         fi
     fi
-    sleep 1
+    sleep 1.5
 }
 
 # --- РОТАЦИЯ (УДАЛЕНИЕ ЛИШНИХ) ---
@@ -914,15 +1220,254 @@ uninstall_script() {
     print_message "SUCCESS" "Uninstall finished."
 }
 
+# --- ПРОВЕРКА CRON ЗАДАЧ ---
+
+# Проверяет реальное состояние cron-задач и возвращает статус
+get_cron_status() {
+    local JOB_TYPE="$1"  # full, db, files
+    local JOB_ID="# LAZARUS-JOB-${JOB_TYPE^^}"
+    
+    local cron_line=$(crontab -l 2>/dev/null | grep "$JOB_ID")
+    
+    if [[ -z "$cron_line" ]]; then
+        echo "Выкл"
+        return
+    fi
+    
+    # Парсим cron-строку для отображения расписания
+    local minute=$(echo "$cron_line" | awk '{print $1}')
+    local hour=$(echo "$cron_line" | awk '{print $2}')
+    local day_month=$(echo "$cron_line" | awk '{print $3}')
+    local month=$(echo "$cron_line" | awk '{print $4}')
+    local day_week=$(echo "$cron_line" | awk '{print $5}')
+    
+    # Определяем тип расписания
+    if [[ "$minute" == "0" && "$hour" == "*" ]]; then
+        echo "Ежечасно"
+    elif [[ "$minute" =~ ^\*/([0-9]+)$ ]]; then
+        echo "Каждые ${BASH_REMATCH[1]} мин"
+    elif [[ "$minute" == "0" && "$hour" == "4" && "$day_week" == "1" ]]; then
+        echo "Еженедельно"
+    elif [[ "$minute" == "0" && "$hour" =~ ^[0-9]+$ && "$day_month" == "*" ]]; then
+        printf "Ежедневно %02d:00" "$hour"
+    elif [[ "$hour" =~ ^[0-9]+$ && "$minute" =~ ^[0-9]+$ ]]; then
+        printf "Ежедневно %02d:%02d" "$hour" "$minute"
+    else
+        echo "Активно"
+    fi
+}
+
+# Синхронизирует настройки скрипта с реальным состоянием cron
+sync_cron_with_config() {
+    local CRON_FULL=$(get_cron_status "full")
+    local CRON_DB=$(get_cron_status "db")
+    local CRON_FILES=$(get_cron_status "files")
+    
+    local needs_save=false
+    
+    # Обновляем переменные если они отличаются от реального cron
+    if [[ "$SCHEDULE_FULL" != "$CRON_FULL" ]]; then
+        SCHEDULE_FULL="$CRON_FULL"
+        needs_save=true
+    fi
+    if [[ "$SCHEDULE_DB" != "$CRON_DB" ]]; then
+        SCHEDULE_DB="$CRON_DB"
+        needs_save=true
+    fi
+    if [[ "$SCHEDULE_FILES" != "$CRON_FILES" ]]; then
+        SCHEDULE_FILES="$CRON_FILES"
+        needs_save=true
+    fi
+    
+    if [[ "$needs_save" == "true" ]]; then
+        save_config
+    fi
+}
+
+# Проверяет несоответствие между настройками и cron, предлагает исправить
+check_cron_mismatch() {
+    [[ "$IS_INTERACTIVE" != "true" ]] && return 0
+    
+    local CRON_FULL=$(get_cron_status "full")
+    local CRON_DB=$(get_cron_status "db")
+    local CRON_FILES=$(get_cron_status "files")
+    
+    local mismatches=()
+    
+    # Проверяем: в настройках включено, но в cron нет
+    if [[ "$SCHEDULE_FULL" != "Выкл" && "$CRON_FULL" == "Выкл" ]]; then
+        mismatches+=("Full: настройка='$SCHEDULE_FULL', cron=отсутствует")
+    fi
+    if [[ "$SCHEDULE_DB" != "Выкл" && "$CRON_DB" == "Выкл" ]]; then
+        mismatches+=("DB: настройка='$SCHEDULE_DB', cron=отсутствует")
+    fi
+    if [[ "$SCHEDULE_FILES" != "Выкл" && "$CRON_FILES" == "Выкл" ]]; then
+        mismatches+=("Files: настройка='$SCHEDULE_FILES', cron=отсутствует")
+    fi
+    
+    if [[ ${#mismatches[@]} -eq 0 ]]; then
+        return 0
+    fi
+    
+    clear_screen
+    echo -e "${YELLOW}${BOLD}⚠️ Обнаружено несоответствие настроек и cron-задач${RESET}"
+    echo ""
+    echo "В настройках скрипта указаны задачи автоматического бэкапа,"
+    echo "но соответствующие cron-задачи не найдены в системе."
+    echo ""
+    echo -e "${CYAN}Несоответствия:${RESET}"
+    for m in "${mismatches[@]}"; do
+        echo -e " • $m"
+    done
+    echo ""
+    echo "Возможно, cron-задачи были удалены вручную."
+    echo ""
+    echo " 1. Создать недостающие cron-задачи (восстановить)"
+    echo " 2. Синхронизировать настройки с cron (сбросить в 'Выкл')"
+    echo " 0. Пропустить (оставить как есть)"
+    echo ""
+    read -erp "Ваш выбор: " choice
+    
+    case $choice in
+        1)
+            # Восстанавливаем cron-задачи из настроек
+            if [[ "$SCHEDULE_FULL" != "Выкл" && "$CRON_FULL" == "Выкл" ]]; then
+                recreate_cron_from_schedule "full" "$SCHEDULE_FULL"
+            fi
+            if [[ "$SCHEDULE_DB" != "Выкл" && "$CRON_DB" == "Выкл" ]]; then
+                recreate_cron_from_schedule "db" "$SCHEDULE_DB"
+            fi
+            if [[ "$SCHEDULE_FILES" != "Выкл" && "$CRON_FILES" == "Выкл" ]]; then
+                recreate_cron_from_schedule "files" "$SCHEDULE_FILES"
+            fi
+            print_message "SUCCESS" "Cron-задачи восстановлены."
+            sleep 1
+            ;;
+        2)
+            # Синхронизируем настройки с реальным cron
+            sync_cron_with_config
+            print_message "SUCCESS" "Настройки синхронизированы с cron."
+            sleep 1
+            ;;
+        *)
+            print_message "INFO" "Пропущено."
+            sleep 0.5
+            ;;
+    esac
+}
+
+# Воссоздаёт cron-задачу из сохранённого расписания
+recreate_cron_from_schedule() {
+    local TASK_TYPE="$1"
+    local SCHEDULE="$2"
+    
+    local JOB_CMD="$SYMLINK_PATH backup_$TASK_TYPE"
+    [[ "$TASK_TYPE" == "db" ]] && JOB_CMD="$SYMLINK_PATH backup_db"
+    [[ "$TASK_TYPE" == "files" ]] && JOB_CMD="$SYMLINK_PATH backup_files"
+    [[ "$TASK_TYPE" == "full" ]] && JOB_CMD="$SYMLINK_PATH backup_full"
+    
+    local JOB_ID="# LAZARUS-JOB-${TASK_TYPE^^}"
+    local NEW_CRON_LINE=""
+    
+    # Парсим расписание и создаём cron-строку
+    case "$SCHEDULE" in
+        "Ежечасно")
+            NEW_CRON_LINE="0 * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+            ;;
+        "Еженедельно")
+            NEW_CRON_LINE="0 4 * * 1 $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+            ;;
+        Ежедневно\ *)
+            # Парсим время из "Ежедневно HH:MM" или "Ежедневно HH:00"
+            local time_part="${SCHEDULE#Ежедневно }"
+            local hour="${time_part%%:*}"
+            local minute="${time_part##*:}"
+            hour=$((10#$hour))  # Убираем ведущий ноль
+            minute=$((10#$minute))
+            NEW_CRON_LINE="$minute $hour * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+            ;;
+        Каждые\ *\ мин)
+            local interval="${SCHEDULE#Каждые }"
+            interval="${interval% мин}"
+            NEW_CRON_LINE="*/$interval * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+            ;;
+        *)
+            # Неизвестный формат — пропускаем
+            print_message "WARN" "Не удалось распознать расписание: $SCHEDULE"
+            return 1
+            ;;
+    esac
+    
+    if [[ -n "$NEW_CRON_LINE" ]]; then
+        local CURRENT_CRON=$(crontab -l 2>/dev/null | grep -v "$JOB_ID")
+        echo -e "$CURRENT_CRON\n$NEW_CRON_LINE" | crontab -
+        log_message "INFO" "Recreated cron job for $TASK_TYPE: $SCHEDULE"
+    fi
+}
+
 # --- БЭКАП ---
 
 create_backup() {
     local TYPE="$1"
     
-    acquire_lock
-
+    # Проверка свободного места (минимум 1GB)
+    local MIN_SPACE_MB=1024
+    local free_space_kb=$(df -P "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+    local free_space_mb=$((free_space_kb / 1024))
+    local free_space_human=$(df -h "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+    
+    if [[ $free_space_mb -lt $MIN_SPACE_MB ]]; then
+        print_message "ERROR" "Недостаточно места на диске! Свободно: ${free_space_human} (нужно минимум 1GB)"
+        log_message "ERROR" "Backup aborted: insufficient disk space (free=${free_space_human}, required=1GB)"
+        if [[ "$IS_INTERACTIVE" == "true" ]]; then
+            echo ""
+            echo -e "${YELLOW}Рекомендации:${RESET}"
+            echo " • Удалите старые бэкапы (меню 5)"
+            echo " • Освободите место на диске"
+            echo ""
+            read -erp "Всё равно продолжить? (y/N): " force_continue
+            if [[ ! "$force_continue" =~ ^[Yy]$ ]]; then
+                return 1
+            fi
+            print_message "WARN" "Продолжаем на свой риск..."
+        else
+            # В non-interactive режиме (cron) отправляем уведомление и прерываем
+            send_telegram_notification "Бэкап прерван: недостаточно места на диске (${free_space_human})"
+            return 1
+        fi
+    fi
+    
+    # Health-check контейнеров перед бэкапом
+    if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
+        if [[ -n "$DB_CONTAINER_NAME" ]]; then
+            local db_running=$(docker container inspect -f '{{.State.Running}}' "$DB_CONTAINER_NAME" 2>/dev/null)
+            if [[ "$db_running" != "true" ]]; then
+                print_message "ERROR" "Контейнер БД ($DB_CONTAINER_NAME) не запущен!"
+                log_message "ERROR" "Backup aborted: DB container not running ($DB_CONTAINER_NAME)"
+                if [[ "$IS_INTERACTIVE" != "true" ]]; then
+                    send_telegram_notification "Бэкап прерван: контейнер БД не запущен ($DB_CONTAINER_NAME)"
+                fi
+                return 1
+            fi
+            
+            # Проверяем health status если есть
+            local db_health=$(docker container inspect -f '{{.State.Health.Status}}' "$DB_CONTAINER_NAME" 2>/dev/null)
+            if [[ "$db_health" == "unhealthy" ]]; then
+                print_message "WARN" "Контейнер БД в состоянии 'unhealthy'!"
+                log_message "WARN" "DB container health status: unhealthy ($DB_CONTAINER_NAME)"
+                if [[ "$IS_INTERACTIVE" == "true" ]]; then
+                    read -erp "Продолжить несмотря на предупреждение? (y/N): " cont_unhealthy
+                    if [[ ! "$cont_unhealthy" =~ ^[Yy]$ ]]; then
+                        return 1
+                    fi
+                fi
+                # В cron-режиме продолжаем, но логируем предупреждение
+            fi
+        fi
+    fi
+    
     if [[ -z "$BACKUP_PASSWORD" && "$IS_INTERACTIVE" == "true" ]]; then
-        clear
+        clear_screen
         echo -e "${RED}${BOLD}⚠️ ВНИМАНИЕ: Пароль шифрования не установлен!${RESET}"
         echo "Файл бэкапа не будет зашифрован. Данные могут быть доступны третьим лицам."
         echo ""
@@ -940,18 +1485,13 @@ create_backup() {
     fi
 
     local TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
-    
-    # Create temp dir for atomic operations
-    local TMP_WORK_DIR=$(mktemp -d)
-    TEMP_DIRS+=("$TMP_WORK_DIR")
-    
     local FILE_DB="db_${TIMESTAMP}.sql.gz"
     local FILE_DIR="dir_${TIMESTAMP}.tar.gz"
     local FILE_VERSION="bot_version.txt"
     local FILE_FINAL=""
     local HAS_ERROR=0
     local SKIP_INFO=""
-    local SKIP_FILE="$TMP_WORK_DIR/skipped_files.txt"
+    local SKIP_FILE="$BACKUP_DIR/skipped_files.txt"
 
     if [[ "$TYPE" != "db_only" ]]; then if ! ensure_bot_path; then return; fi; fi
     if [[ "$TYPE" == "db_only" || "$TYPE" == "full" ]]; then
@@ -959,23 +1499,17 @@ create_backup() {
     fi
 
     local CURRENT_VER=$(get_raw_bot_version)
-    echo "${CURRENT_VER:-Unknown}" > "$TMP_WORK_DIR/$FILE_VERSION"
+    echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
 
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
         print_message "INFO" "Дамп базы данных ($DB_CONTAINER_NAME)..."
-        if ! docker container inspect -f '{{.State.Running}}' "$DB_CONTAINER_NAME" &>/dev/null; then
-             print_message "ERROR" "Контейнер DB ($DB_CONTAINER_NAME) не запущен или не найден!"
-             HAS_ERROR=1
-        else
-            # Use pipefail to catch pg_dump errors
-            if ! (set -o pipefail; docker exec "$DB_CONTAINER_NAME" pg_dumpall -c -U "$DB_USER" 2>/dev/null | gzip -9 > "$TMP_WORK_DIR/$FILE_DB"); then
-                print_message "ERROR" "Ошибка дампа БД."
-                HAS_ERROR=1
-            fi
+        if ! docker exec "$DB_CONTAINER_NAME" pg_dumpall -c -U "$DB_USER" 2>/dev/null | gzip -9 > "$BACKUP_DIR/$FILE_DB"; then
+            print_message "ERROR" "Ошибка дампа БД."
+            HAS_ERROR=1
         fi
     fi
 
-    if [[ $HAS_ERROR -eq 1 ]]; then return; fi
+    if [[ $HAS_ERROR -eq 1 ]]; then rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION"; return; fi
 
     IFS=' ' read -r -a EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
     EXCLUDE_FLAGS=()
@@ -999,17 +1533,21 @@ create_backup() {
 
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="lazarus_db_${TIMESTAMP}.tar.gz"
-        tar -czf "$TMP_WORK_DIR/$FILE_FINAL" -C "$TMP_WORK_DIR" "$FILE_VERSION" "$FILE_DB"
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB"
+        rm -f "$BACKUP_DIR/$FILE_DB"
     elif [[ "$TYPE" == "files_only" ]]; then
         FILE_FINAL="lazarus_files_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
-        tar -czf "$TMP_WORK_DIR/$FILE_FINAL" -C "$TMP_WORK_DIR" "$FILE_VERSION" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
     else 
         FILE_FINAL="lazarus_full_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
-        tar -czf "$TMP_WORK_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
-        tar -czf "$TMP_WORK_DIR/$FILE_FINAL" -C "$TMP_WORK_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
+        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
+        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
     fi
+
+    rm -f "$SKIP_FILE"
 
     local ENC_STATUS="🔓 Unencrypted"
     if [[ -z "$BACKUP_PASSWORD" && "$IS_INTERACTIVE" == "false" ]]; then ENC_STATUS="⚠️ NO PASSWORD"; fi
@@ -1018,12 +1556,12 @@ create_backup() {
         print_message "INFO" "Шифрование архива (это может занять время)..."
         # Pass password via env var to avoid process listing leak
         export LAZARUS_ENC_PASS="$BACKUP_PASSWORD"
-        openssl enc -aes-256-cbc -salt -pbkdf2 -in "$TMP_WORK_DIR/$FILE_FINAL" -out "$TMP_WORK_DIR/${FILE_FINAL}.enc" -pass env:LAZARUS_ENC_PASS
+        openssl enc -aes-256-cbc -salt -pbkdf2 -in "$BACKUP_DIR/$FILE_FINAL" -out "$BACKUP_DIR/${FILE_FINAL}.enc" -pass env:LAZARUS_ENC_PASS
         local enc_res=$?
         unset LAZARUS_ENC_PASS
         
         if [[ $enc_res -eq 0 ]]; then
-            rm "$TMP_WORK_DIR/$FILE_FINAL"
+            rm "$BACKUP_DIR/$FILE_FINAL"
             FILE_FINAL="${FILE_FINAL}.enc"
             ENC_STATUS="🔒 Encrypted"
             print_message "SUCCESS" "Архив зашифрован."
@@ -1032,10 +1570,9 @@ create_backup() {
         fi
     fi
 
-    # Move final file to BACKUP_DIR
-    mv "$TMP_WORK_DIR/$FILE_FINAL" "$BACKUP_DIR/$FILE_FINAL"
     local FINAL_VERSION_FILE="$BACKUP_DIR/$FILE_FINAL.version"
-    cp "$TMP_WORK_DIR/$FILE_VERSION" "$FINAL_VERSION_FILE"
+    cp "$BACKUP_DIR/$FILE_VERSION" "$FINAL_VERSION_FILE"
+    rm -f "$BACKUP_DIR/$FILE_VERSION"
     
     # --- VERIFY ARCHIVE ---
     print_message "INFO" "Проверка целостности архива..."
@@ -1115,7 +1652,7 @@ select_backup_file() {
         
         local CURRENT_VER=$(get_raw_bot_version)
 
-        clear; echo -e "${GREEN}Восстановление: ${BOLD}${TITLE}${RESET}"
+        clear_screen; echo -e "${GREEN}Восстановление: ${BOLD}${TITLE}${RESET}"
         echo -e "Всего файлов: ${CYAN}${total_count}${RESET}"; echo ""
 
         local loop_limit=$show_limit
@@ -1163,29 +1700,29 @@ select_backup_file() {
         echo ""
         if [[ $total_count -gt 5 ]]; then
             if [[ $loop_limit -lt $total_count ]]; then
-                 echo -e " ${MAGENTA}6. Показать все остальные ($((total_count - 5)) шт)...${RESET}"
+                 echo -e " ${MAGENTA}888. Показать все ($total_count шт)${RESET}"
             else
-                 echo -e " ${MAGENTA}6. Свернуть список (показать 5)${RESET}"
+                 echo -e " ${MAGENTA}888. Свернуть список (показать 5)${RESET}"
             fi
         fi
 
         if [[ "$show_filenames" == "false" ]]; then
-            echo -e " 7. Показать имена файлов"; 
+            echo -e " 999. Показать имена файлов"; 
         else
-            echo -e " 7. Показать дату и размер"; 
+            echo -e " 999. Показать дату и размер"; 
         fi
         echo " 0. Назад"; echo ""
-        read -erp "Номер (Enter - Назад): " choice
+        read -erp "Номер файла или команда (Enter - Назад): " choice
         
         if [[ -z "$choice" || "$choice" == "0" ]]; then return 1
-        elif [[ "$choice" == "6" ]]; then 
+        elif [[ "$choice" == "888" ]]; then 
             if [[ $loop_limit -lt $total_count ]]; then loop_limit=$total_count; else loop_limit=5; fi
             show_limit=$loop_limit
             continue
-        elif [[ "$choice" == "7" ]]; then 
+        elif [[ "$choice" == "999" ]]; then 
             if [[ "$show_filenames" == "false" ]]; then show_filenames=true; else show_filenames=false; fi
             continue
-        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -le "$total_count" ]]; then SELECTED_FILE="${sorted_backups[$((choice-1))]}"; return 0
+        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$total_count" ]]; then SELECTED_FILE="${sorted_backups[$((choice-1))]}"; return 0
         else print_message "ERROR" "Неверный выбор."; sleep 1; fi
     done
 }
@@ -1255,9 +1792,9 @@ execute_restore() {
 
 menu_manual_backup() {
     while true; do
-        clear; echo -e "${GREEN}Создание ручного бэкапа${RESET}"
+        clear_screen; echo -e "${GREEN}Создание ручного бэкапа${RESET}"
         echo " 1. Полный бэкап (БД + Файлы)"
-        echo " 2. Только База Данных"
+        echo " 2. Только БД"
         echo " 3. Только Файлы"
         echo " 0. Назад"
         echo ""
@@ -1283,9 +1820,9 @@ menu_restore() {
         local c_d="$CYAN"; [[ "$n_db" == "0" ]] && c_d="$GRAY"
         local c_fl="$CYAN"; [[ "$n_files" == "0" ]] && c_fl="$GRAY"
 
-        clear; echo -e "${GREEN}Меню восстановления${RESET}"
+        clear_screen; echo -e "${GREEN}Меню восстановления${RESET}"
         echo -e " 1. Полный бэкап      ${c_f}[${n_full} шт]${RESET}"
-        echo -e " 2. Только База       ${c_d}[${n_db} шт]${RESET}"
+        echo -e " 2. Только БД         ${c_d}[${n_db} шт]${RESET}"
         echo -e " 3. Только Файлы      ${c_fl}[${n_files} шт]${RESET}"
         echo " 0. Назад"
         echo ""
@@ -1314,13 +1851,33 @@ setup_cron_task() {
     elif [[ "$TASK_TYPE" == "files" ]]; then if ! ensure_bot_path; then return; fi; JOB_CMD="$SYMLINK_PATH backup_files"; JOB_ID="# LAZARUS-JOB-FILES"
     elif [[ "$TASK_TYPE" == "full" ]]; then if ! ensure_bot_path; then return; fi; JOB_CMD="$SYMLINK_PATH backup_full"; JOB_ID="# LAZARUS-JOB-FULL"; fi
 
-    clear; echo -e "${GREEN}Настройка периода: ${BOLD}${TASK_TYPE^^}${RESET}"
-    echo " 1. Ежечасно"
-    echo " 2. Ежедневно (04:00)"
-    echo " 3. Еженедельно"
-    echo " 4. Свое время"
-    echo " 5. Каждые N минут"
-    echo " 6. Отключить"
+    # Получаем текущий статус
+    local CURRENT_STATUS=$(get_cron_status "$TASK_TYPE")
+    local STATUS_COLOR="$GRAY"; [[ "$CURRENT_STATUS" != "Выкл" ]] && STATUS_COLOR="$YELLOW"
+    
+    # Человекочитаемое название типа
+    local TYPE_NAME=""
+    case "$TASK_TYPE" in
+        "full") TYPE_NAME="Полный бэкап" ;;
+        "db") TYPE_NAME="Только БД" ;;
+        "files") TYPE_NAME="Только Файлы" ;;
+    esac
+
+    clear_screen
+    echo -e "${GREEN}${BOLD}Настройка расписания: ${TYPE_NAME}${RESET}"
+    echo -e "Текущий статус: [${STATUS_COLOR}${CURRENT_STATUS}${RESET}]"
+    echo ""
+    echo -e " 1. Ежечасно          ${GRAY}[в :00]${RESET}"
+    echo -e " 2. Ежедневно         ${GRAY}[в 04:00]${RESET}"
+    echo -e " 3. Еженедельно       ${GRAY}[Пн в 04:00]${RESET}"
+    echo -e " 4. Своё время        ${GRAY}[ЧЧ:ММ]${RESET}"
+    echo -e " 5. Каждые N минут    ${GRAY}[1-59]${RESET}"
+    echo ""
+    if [[ "$CURRENT_STATUS" != "Выкл" ]]; then
+        echo -e " ${RED}0. Отключить${RESET}"
+    else
+        echo " 0. Назад"
+    fi
     echo ""
     read -erp "Выбор (Enter - Назад): " c
     [[ -z "$c" ]] && return
@@ -1331,15 +1888,33 @@ setup_cron_task() {
         1) NEW_CRON_LINES="0 * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Ежечасно" ;;
         2) NEW_CRON_LINES="0 4 * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Ежедневно 04:00" ;;
         3) NEW_CRON_LINES="0 4 * * 1 $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Еженедельно" ;;
-        4) echo "Время (ЧЧ:ММ) через пробел:"; read -erp "> " times_input
+        4) 
+           echo ""
+           echo "Введите время (ЧЧ:ММ), можно несколько через пробел:"
+           echo -e "${GRAY}Пример: 09:00 18:30${RESET}"
+           read -erp "> " times_input
            if [[ -z "$times_input" ]]; then print_message "ERROR" "Время не введено!"; sleep 1; return; fi
-           for t in $times_input; do if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then h=$((10#${BASH_REMATCH[1]})); m=$((10#${BASH_REMATCH[2]})); NEW_CRON_LINES+="$m $h * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"$'\n'; fi; done; DISPLAY_TIME="Свое: $times_input" ;;
-        5) read -erp "Введите интервал (минут): " interval
+           for t in $times_input; do 
+               if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then 
+                   h=$((10#${BASH_REMATCH[1]})); m=$((10#${BASH_REMATCH[2]}))
+                   NEW_CRON_LINES+="$m $h * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"$'\n'
+               fi
+           done
+           DISPLAY_TIME="Свое: $times_input" ;;
+        5) 
+           echo ""
+           echo "Введите интервал в минутах (1-59):"
+           read -erp "> " interval
            if [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] && [ "$interval" -lt 60 ]; then
                NEW_CRON_LINES="*/$interval * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
                DISPLAY_TIME="Каждые $interval мин"
            else print_message "ERROR" "Введите число от 1 до 59."; sleep 1; return; fi ;;
-        6) DISPLAY_TIME="Выкл" ;;
+        0) 
+           if [[ "$CURRENT_STATUS" != "Выкл" ]]; then
+               DISPLAY_TIME="Выкл"
+           else
+               return
+           fi ;;
         *) return ;;
     esac
 
@@ -1347,29 +1922,94 @@ setup_cron_task() {
     if [[ "$DISPLAY_TIME" != "Выкл" && -n "$NEW_CRON_LINES" ]]; then echo -e "$CURRENT_CRON\n$NEW_CRON_LINES" | crontab -
     else echo "$CURRENT_CRON" | crontab -; fi
 
-    if [[ "$TASK_TYPE" == "full" ]]; then SCHEDULE_FULL="$DISPLAY_TIME"; fi
-    if [[ "$TASK_TYPE" == "db" ]];   then SCHEDULE_DB="$DISPLAY_TIME"; fi
-    if [[ "$TASK_TYPE" == "files" ]]; then SCHEDULE_FILES="$DISPLAY_TIME"; fi
-    save_config; print_message "SUCCESS" "Расписание обновлено!"; sleep 1
+    # Синхронизируем настройки с реальным состоянием cron
+    sync_cron_with_config
+    
+    log_message "INFO" "Cron task updated: $TASK_TYPE -> $DISPLAY_TIME"
+    print_message "SUCCESS" "Расписание обновлено!"; sleep 1
 }
 
 menu_automation() {
     while true; do
-        clear; echo -e "${GREEN}Настройка Автоматического Бекапа${RESET}"
-        echo -e " 1. Полный бэкап [${YELLOW}${SCHEDULE_FULL}${RESET}]"
-        echo -e " 2. Только База  [${YELLOW}${SCHEDULE_DB}${RESET}]"
-        echo -e " 3. Только Файлы [${YELLOW}${SCHEDULE_FILES}${RESET}]"
+        # Получаем актуальные статусы из cron
+        local CRON_FULL=$(get_cron_status "full")
+        local CRON_DB=$(get_cron_status "db")
+        local CRON_FILES=$(get_cron_status "files")
+        
+        # Цветовая индикация: жёлтый если активен, серый если выключен
+        local COLOR_FULL="$GRAY"; [[ "$CRON_FULL" != "Выкл" ]] && COLOR_FULL="$YELLOW"
+        local COLOR_DB="$GRAY"; [[ "$CRON_DB" != "Выкл" ]] && COLOR_DB="$YELLOW"
+        local COLOR_FILES="$GRAY"; [[ "$CRON_FILES" != "Выкл" ]] && COLOR_FILES="$YELLOW"
+        
+        # Проверяем есть ли хоть один активный авто-бэкап
+        local HAS_ANY_CRON=false
+        [[ "$CRON_FULL" != "Выкл" || "$CRON_DB" != "Выкл" || "$CRON_FILES" != "Выкл" ]] && HAS_ANY_CRON=true
+        
+        clear_screen
+        echo -e "${GREEN}${BOLD}Настройка Автоматического Бэкапа${RESET}"
+        echo ""
+        echo -e " 1. Полный бэкап  [${COLOR_FULL}${CRON_FULL}${RESET}]"
+        echo -e " 2. Только БД     [${COLOR_DB}${CRON_DB}${RESET}]"
+        echo -e " 3. Только Файлы  [${COLOR_FILES}${CRON_FILES}${RESET}]"
+        echo ""
+        if [[ "$HAS_ANY_CRON" == true ]]; then
+            echo -e " ${RED}9. Отключить все авто-бэкапы${RESET}"
+            echo ""
+        fi
         echo " 0. Назад"
         echo ""
         read -erp "Выбор (Enter - Назад): " ac
         [[ -z "$ac" ]] && return
-        case $ac in 1) setup_cron_task "full" ;; 2) setup_cron_task "db" ;; 3) setup_cron_task "files" ;; 0) return ;; esac
+        case $ac in
+            1) setup_cron_task "full" ;;
+            2) setup_cron_task "db" ;;
+            3) setup_cron_task "files" ;;
+            9) 
+                if [[ "$HAS_ANY_CRON" == true ]]; then
+                    disable_all_cron_tasks
+                fi
+                ;;
+            0) return ;;
+        esac
     done
+}
+
+# Отключение всех cron-задач LAZARUS
+disable_all_cron_tasks() {
+    echo ""
+    print_message "WARN" "Вы уверены, что хотите отключить ВСЕ авто-бэкапы?"
+    read -erp "Подтвердить? (y/n): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # Удаляем все cron-задачи LAZARUS
+        local current_cron
+        current_cron=$(crontab -l 2>/dev/null || echo "")
+        local new_cron
+        new_cron=$(echo "$current_cron" | grep -v "# LAZARUS-JOB-")
+        
+        if [[ -z "$new_cron" ]]; then
+            crontab -r 2>/dev/null || true
+        else
+            echo "$new_cron" | crontab -
+        fi
+        
+        # Обновляем конфиг
+        SCHEDULE_FULL="Выкл"
+        SCHEDULE_DB="Выкл"
+        SCHEDULE_FILES="Выкл"
+        save_config
+        
+        print_message "SUCCESS" "Все авто-бэкапы отключены"
+        log_message "INFO" "All LAZARUS cron tasks disabled by user"
+        sleep 1.5
+    else
+        print_message "INFO" "Отменено"
+        sleep 1
+    fi
 }
 
 menu_settings() {
     while true; do
-        clear; echo -e "${GREEN}Настройки скрипта${RESET}"
+        clear_screen; echo -e "${GREEN}${BOLD}Настройки${RESET}"
         
         local MASKED_TOKEN="${BOT_TOKEN:0:5}.......${BOT_TOKEN: -5}"; [[ ${#BOT_TOKEN} -lt 10 ]] && MASKED_TOKEN="*******"
         local PASS_MASK="Нет"; [[ -n "$BACKUP_PASSWORD" ]] && PASS_MASK="********"
@@ -1383,51 +2023,57 @@ menu_settings() {
             fi
         fi
 
-        local ST_TG="${RED}Выкл${RESET}"; [[ "$SEND_TO_TELEGRAM" == "true" ]] && ST_TG="${GREEN}Вкл${RESET}"
+        # Статусы
+        local ST_TG_NOTIFY="${RED}Выкл${RESET}"; [[ "$SEND_TO_TELEGRAM" == "true" ]] && ST_TG_NOTIFY="${GREEN}Вкл${RESET}"
+        local ST_TG_FILE="${RED}Выкл${RESET}"; [[ "$TG_SEND_FILE" == "true" ]] && ST_TG_FILE="${GREEN}Вкл${RESET}"
         local ST_REM="${RED}Выкл${RESET}"; [[ "$SEND_TO_REMOTE" == "true" ]] && ST_REM="${GREEN}Вкл${RESET}"
         
         local STORAGE_TYPE_DISP="Выкл"
         if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then STORAGE_TYPE_DISP="${REMOTE_STORAGE_TYPE^^}"; fi
 
         echo -e "${CYAN}--- ОБЩИЕ ---${RESET}"
-        echo -e " 1. Путь к боту:      ${GRAY}${BOT_PATH}${RESET}"
-        echo -e " 2. Имя контейнера:   ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
-        echo -e " 3. Контейнер БД:     ${GRAY}${DB_CONTAINER_NAME}${RESET}"
-        echo -e " 4. Пользователь БД:  ${GRAY}${DB_USER}${RESET}"
-        echo -e " 5. Хранить бэкапы:   ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
-        echo -e " 6. Исключить папки:  ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
+        echo -e " 1. Путь к боту:        ${GRAY}${BOT_PATH}${RESET}"
+        echo -e " 2. Контейнер бота:     ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
+        echo -e " 3. Контейнер БД:       ${GRAY}${DB_CONTAINER_NAME}${RESET}"
+        echo -e " 4. Пользователь БД:    ${GRAY}${DB_USER}${RESET}"
+        echo -e " 5. Макс. бэкапов:      ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
+        echo -e " 6. Исключить папки:    ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
         echo -e " 7. Макс. размер файла: ${GRAY}${MAX_FILE_SIZE_MB} MB${RESET}"
         
-        echo -e "\n${CYAN}--- TELEGRAM ($ST_TG) ---${RESET}"
-        echo -e " 8. Token:            ${GRAY}${MASKED_TOKEN}${RESET}"
-        echo -e " 9. Chat ID:          ${GRAY}${CHAT_ID}${RESET}"
-        echo -e " 10. Thread ID:       ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
-        echo -e " 11. Отправка:        $ST_TG"
-        echo -e " 12. ⚡ Проверить связь (Telegram)"
+        echo -e "\n${CYAN}--- TELEGRAM ---${RESET}"
+        echo -e " 8.  Token:             ${GRAY}${MASKED_TOKEN}${RESET}"
+        echo -e " 9.  Chat ID:           ${GRAY}${CHAT_ID}${RESET}"
+        echo -e " 10. Thread ID:         ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
+        echo -e " 11. Уведомления:       $ST_TG_NOTIFY"
+        echo -e " 12. Отправка файла:    $ST_TG_FILE"
+        echo -e " 13. Проверить связь"
 
-        echo -e "\n${CYAN}--- УДАЛЕННОЕ ХРАНИЛИЩЕ ($ST_REM) ---${RESET}"
-        echo -e " 13. Тип:             ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
-        echo -e " 14. URL:             ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
-        echo -e " 15. Пользователь:    ${GRAY}${MASKED_REMOTE_USER}${RESET}"
-        echo -e " 16. Пароль:          ${GRAY}********${RESET}"
-        echo -e " 17. Загрузка:        $ST_REM"
-        echo -e " 18. ⚡ Проверить связь (Облако)"
+        echo -e "\n${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET}"
+        echo -e " 14. Тип:               ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
+        echo -e " 15. URL:               ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
+        echo -e " 16. Пользователь:      ${GRAY}${MASKED_REMOTE_USER}${RESET}"
+        echo -e " 17. Загрузка:          $ST_REM"
+        echo -e " 18. Настроить / Проверить"
 
         echo -e "\n${CYAN}--- БЕЗОПАСНОСТЬ ---${RESET}"
-        echo -e " 19. Пароль архива:   ${GRAY}${PASS_MASK}${RESET}"
-    echo -e "\n${CYAN}--- УДАЛЕНИЕ СТАРЫХ БЭКАПОВ ---${RESET}"
-    local DM_DISPLAY="$DELETE_MODE"
-    if [[ "$DELETE_MODE" == "time" ]]; then DM_DISPLAY="По времени"; else DM_DISPLAY="По количеству"; fi
-    echo -e " 20. Режим удаления:  ${GRAY}${DM_DISPLAY}${RESET}"
-    echo -e " 21. Срок хранения (дней): ${GRAY}${RETENTION_DAYS}${RESET}"
+        echo -e " 19. Пароль шифрования: ${GRAY}${PASS_MASK}${RESET}"
+        
+        echo -e "\n${CYAN}--- РОТАЦИЯ БЭКАПОВ ---${RESET}"
+        local DM_DISPLAY="По времени"; [[ "$DELETE_MODE" == "count" ]] && DM_DISPLAY="По количеству"
+        echo -e " 20. Режим удаления:    ${GRAY}${DM_DISPLAY}${RESET}"
+        echo -e " 21. Срок хранения:     ${GRAY}${RETENTION_DAYS} дней${RESET}"
         
         echo -e "\n 0. Назад"
         echo ""
-        read -erp "Что изменить (номер): " s
+        read -erp "Выбор: " s
         [[ -z "$s" ]] && return
         
         case $s in
-            1) read -erp "Новый путь: " np; if [[ -n "$np" ]]; then if [[ -d "$np" ]]; then BOT_PATH="$np"; save_config; print_message "SUCCESS" "Сохранено"; else print_message "ERROR" "Папка не найдена!"; fi; fi ;;
+            1) read -erp "Новый путь: " np
+               if [[ -n "$np" ]]; then 
+                   if [[ -d "$np" ]]; then BOT_PATH="$np"; save_config; print_message "SUCCESS" "Сохранено"
+                   else print_message "ERROR" "Папка не найдена!"; fi
+               fi ;;
             
             2) 
                 scan_system_for_bot
@@ -1445,42 +2091,121 @@ menu_settings() {
                 read -erp "$prompt_msg: " ndb_c; ndb_c="${ndb_c:-$def_db}"
                 if [[ -n "$ndb_c" ]]; then DB_CONTAINER_NAME="$ndb_c"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
 
-            4) read -erp "Новый DB User: " ndb; if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            5) read -erp "Макс. количество бэкапов: " nd; if [[ "$nd" =~ ^[0-9]+$ ]]; then MAX_BACKUPS_COUNT="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            6) read -erp "Исключить (например: uploads/cache): " ed; if [[ -n "$ed" ]]; then EXCLUDE_DIRS="$ed"; save_config; print_message "SUCCESS" "Сохранено"; else if [[ -n "$EXCLUDE_DIRS" ]]; then read -erp "Очистить? (y/N): " clr; if [[ "$clr" =~ ^[Yy]$ ]]; then EXCLUDE_DIRS=""; save_config; fi; fi; fi ;;
-            7) read -erp "Макс. размер файла в MB: " msize; if [[ "$msize" =~ ^[0-9]+$ ]] && [ "$msize" -gt 0 ]; then MAX_FILE_SIZE_MB="$msize"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+            4) read -erp "Новый DB User: " ndb
+               if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+               
+            5) read -erp "Макс. количество бэкапов: " nd
+               if [[ "$nd" =~ ^[0-9]+$ ]]; then MAX_BACKUPS_COUNT="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+               
+            6) read -erp "Исключить (например: uploads/cache): " ed
+               if [[ -n "$ed" ]]; then 
+                   EXCLUDE_DIRS="$ed"; save_config; print_message "SUCCESS" "Сохранено"
+               else 
+                   if [[ -n "$EXCLUDE_DIRS" ]]; then 
+                       read -erp "Очистить? (y/N): " clr
+                       if [[ "$clr" =~ ^[Yy]$ ]]; then EXCLUDE_DIRS=""; save_config; fi
+                   fi
+               fi ;;
+               
+            7) read -erp "Макс. размер файла в MB: " msize
+               if [[ "$msize" =~ ^[0-9]+$ ]] && [ "$msize" -gt 0 ]; then 
+                   MAX_FILE_SIZE_MB="$msize"; save_config; print_message "SUCCESS" "Сохранено"
+               fi ;;
             
-            8) read -erp "Новый Token: " nt; if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            9) read -erp "Новый Chat ID: " nid; if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-            10) read -erp "Новый Thread ID: " ntid; TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
-            11) if [[ "$SEND_TO_TELEGRAM" == "true" ]]; then SEND_TO_TELEGRAM="false"; else SEND_TO_TELEGRAM="true"; fi; save_config; ;;
-            12) test_telegram_connection ;;
+            8) read -erp "Новый Token: " nt
+               if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+               
+            9) read -erp "Новый Chat ID: " nid
+               if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
+               
+            10) read -erp "Новый Thread ID (пусто - сбросить): " ntid
+                TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
+                
+            11) # Переключение уведомлений
+                if [[ "$SEND_TO_TELEGRAM" == "true" ]]; then 
+                    SEND_TO_TELEGRAM="false"
+                    print_message "INFO" "Уведомления Telegram отключены"
+                else 
+                    SEND_TO_TELEGRAM="true"
+                    print_message "SUCCESS" "Уведомления Telegram включены"
+                fi
+                save_config ;;
+                
+            12) # Переключение отправки файла
+                if [[ "$TG_SEND_FILE" == "true" ]]; then
+                    # Проверяем есть ли альтернативное хранилище
+                    if [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]]; then
+                        echo ""
+                        print_message "WARN" "Удалённое хранилище не настроено!"
+                        print_message "WARN" "Бэкапы будут только на локальном диске."
+                        read -erp "Всё равно отключить отправку файла в TG? (y/N): " confirm
+                        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                            print_message "INFO" "Отменено"
+                            sleep 1
+                            continue
+                        fi
+                    fi
+                    TG_SEND_FILE="false"
+                    print_message "INFO" "Отправка файла в TG отключена (уведомления сохранены)"
+                else
+                    TG_SEND_FILE="true"
+                    print_message "SUCCESS" "Отправка файла в TG включена"
+                fi
+                save_config ;;
+                
+            13) test_telegram_connection ;;
 
-            13) configure_remote_storage ;; 
-            14) configure_remote_storage ;; 
-            15) configure_remote_storage ;; 
-            16) configure_remote_storage ;; 
-            17) if [[ "$SEND_TO_REMOTE" == "true" ]]; then SEND_TO_REMOTE="false"; else SEND_TO_REMOTE="true"; fi; save_config; ;;
-            18) if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then validate_remote_connection "$REMOTE_STORAGE_TYPE" "$REMOTE_STORAGE_URL" "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS"; if [[ $? -eq 0 ]]; then print_message "SUCCESS" "Соединение OK"; else print_message "ERROR" "Ошибка соединения"; fi; read -erp "Enter..." d; else print_message "WARN" "Хранилище отключено"; sleep 1; fi ;;
+            14|15|16|18) configure_remote_storage ;;
+            
+            17) # Переключение загрузки на удалённое хранилище
+                if [[ "$SEND_TO_REMOTE" == "true" ]]; then 
+                    SEND_TO_REMOTE="false"
+                    print_message "INFO" "Загрузка на удалённое хранилище отключена"
+                else 
+                    if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+                        print_message "WARN" "Сначала настройте хранилище (пункт 18)"
+                        sleep 1.5
+                        continue
+                    fi
+                    SEND_TO_REMOTE="true"
+                    print_message "SUCCESS" "Загрузка на удалённое хранилище включена"
+                fi
+                save_config ;;
 
-            19) read -s -erp "Новый пароль шифрования (Enter - сбросить): " new_pass; echo ""
-                BACKUP_PASSWORD="$new_pass"; save_config; print_message "SUCCESS" "Сохранено." ;;
-            20)
-                echo "Выберите режим удаления старых бэкапов:"; echo " 1) По времени (days)"; echo " 2) По количеству (count)"
+            19) echo ""
+                read -s -erp "Новый пароль шифрования (пусто - отключить): " new_pass
+                echo ""
+                BACKUP_PASSWORD="$new_pass"
+                save_config
+                if [[ -n "$new_pass" ]]; then
+                    print_message "SUCCESS" "Шифрование включено"
+                else
+                    print_message "INFO" "Шифрование отключено"
+                fi ;;
+                
+            20) echo ""
+                echo "Режим удаления старых бэкапов:"
+                echo " 1. По времени (старше N дней)"
+                echo " 2. По количеству (оставлять N последних)"
                 read -erp "Выбор (1/2): " dm
-                if [[ "$dm" == "1" ]]; then DELETE_MODE="time"; else DELETE_MODE="count"; fi
+                if [[ "$dm" == "1" ]]; then DELETE_MODE="time"; elif [[ "$dm" == "2" ]]; then DELETE_MODE="count"; fi
                 save_config; print_message "SUCCESS" "Сохранено" ;;
-            21)
-                read -erp "Введите срок хранения в днях (число): " ndays
-                if [[ "$ndays" =~ ^[0-9]+$ ]] && [ "$ndays" -ge 0 ]; then RETENTION_DAYS="$ndays"; save_config; print_message "SUCCESS" "Сохранено"; else print_message "ERROR" "Неверное значение"; fi ;;
+                
+            21) read -erp "Срок хранения в днях: " ndays
+                if [[ "$ndays" =~ ^[0-9]+$ ]] && [ "$ndays" -ge 1 ]; then 
+                    RETENTION_DAYS="$ndays"; save_config; print_message "SUCCESS" "Сохранено"
+                else 
+                    print_message "ERROR" "Введите число >= 1"
+                fi ;;
             
             0) return ;;
-        esac; if [[ -n "$s" ]]; then sleep 0.5; fi
+        esac
+        [[ -n "$s" ]] && sleep 0.5
     done
 }
 
 cleanup_old_backups() {
-    clear; echo -e "${RED}Очистка старых бэкапов${RESET}"
+    clear_screen; echo -e "${RED}Очистка старых бэкапов${RESET}"
     
     local del_full=0; local del_db=0; local del_files=0
 
@@ -1573,10 +2298,26 @@ for _a in "$@"; do
         --yes|-y) AUTO_CONFIRM="true" ;;
         --dry-run|-n) DRY_RUN="true" ;;
         --report-tg) REPORT_TO_TG="true" ;;
+        --debug|-d) DEBUG_MODE=true ;;
         *) _NEWARGS+=("$_a") ;;
     esac
 done
 set -- "${_NEWARGS[@]}"
+
+# Debug mode banner
+if [[ "$DEBUG_MODE" == true ]]; then
+    echo -e "${MAGENTA}${BOLD}╔═══════════════════════════════════════╗${RESET}"
+    echo -e "${MAGENTA}${BOLD}║         DEBUG MODE ENABLED            ║${RESET}"
+    echo -e "${MAGENTA}${BOLD}╚═══════════════════════════════════════╝${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Version: $VERSION"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Config: $CONFIG_FILE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Backup dir: $BACKUP_DIR"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Bot path: $BOT_PATH"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Containers: $BOT_CONTAINER_NAME / $DB_CONTAINER_NAME"
+    echo -e "${MAGENTA}[DEBUG]${RESET} TG: notify=$SEND_TO_TELEGRAM file=$TG_SEND_FILE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Remote: $REMOTE_STORAGE_TYPE ($SEND_TO_REMOTE)"
+    echo ""
+fi
 
 case "$1" in
     backup_full) create_backup "full" ;;
@@ -1587,16 +2328,59 @@ case "$1" in
     restore) menu_restore ;;
     check_update) check_for_updates ;;
     *)
+        # Проверка несоответствия cron при первом запуске интерактивного режима
+        check_cron_mismatch
+        
         while true; do
+            # Получаем актуальные статусы из cron
+            CRON_STATUS_FULL=$(get_cron_status "full")
+            CRON_STATUS_DB=$(get_cron_status "db")
+            CRON_STATUS_FILES=$(get_cron_status "files")
+            
+            # Получаем статистику бэкапов
+            get_backup_stats
+            
+            # Цветовая индикация статусов cron
+            # Full и DB — обязательные (красные если выключены оба), Files — опциональный (серый если выключен)
+            NO_CRITICAL_BACKUP=false
+            [[ "$CRON_STATUS_FULL" == "Выкл" && "$CRON_STATUS_DB" == "Выкл" ]] && NO_CRITICAL_BACKUP=true
+            
+            COLOR_FULL="$GRAY"; [[ "$CRON_STATUS_FULL" != "Выкл" ]] && COLOR_FULL="$YELLOW"
+            COLOR_DB="$GRAY"; [[ "$CRON_STATUS_DB" != "Выкл" ]] && COLOR_DB="$YELLOW"
+            COLOR_FILES="$GRAY"; [[ "$CRON_STATUS_FILES" != "Выкл" ]] && COLOR_FILES="$YELLOW"
+            
             BOT_VERSION=$(get_bot_version_display)
-            clear
-            echo -e "${GREEN}${BOLD}LAZARUS Backup Manager v${VERSION}${RESET}"
-            echo -e "Версия бота: ${CYAN}${BOT_VERSION}${RESET}"
+            CONTAINER_STATUS=$(get_container_status)
+            
+            # Цвет статуса контейнера
+            STATUS_COLOR="$GREEN"
+            [[ "$CONTAINER_STATUS" != "Online" ]] && STATUS_COLOR="$RED"
+            
+            clear_screen
+            echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+            echo -e "${GREEN}${BOLD}  LAZARUS Backup Manager v${VERSION}${RESET}"
+            echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+            echo -e "Бот: ${CYAN}${BOT_VERSION}${RESET} | Контейнер: ${STATUS_COLOR}${CONTAINER_STATUS}${RESET}"
             echo ""
-            echo -e "Статусы авто-бекапа:"
-            echo -e " • Full:  ${YELLOW}${SCHEDULE_FULL}${RESET}"
-            echo -e " • DB:    ${YELLOW}${SCHEDULE_DB}${RESET}"
-            echo -e " • Files: ${YELLOW}${SCHEDULE_FILES}${RESET}"
+            
+            # Статистика бэкапов
+            echo -e "Бэкапы: ${STATS_FULL} Full | ${STATS_DB} DB | ${STATS_FILES} Files | ${BOLD}${STATS_SIZE}${RESET} всего"
+            if [[ -n "$STATS_LAST" ]]; then
+                echo -e "Последний: ${STATS_LAST} (${STATS_LAST_AGO})"
+            fi
+            echo ""
+            
+            # Предупреждение если нет критических авто-бэкапов
+            if [[ "$NO_CRITICAL_BACKUP" == true ]]; then
+                echo -e "${RED}${BOLD}⚠️  ВНИМАНИЕ: Авто-бэкап не настроен!${RESET}"
+                echo -e "${RED}   Рекомендуется включить Full или DB бэкап${RESET}"
+                echo ""
+            fi
+            
+            echo -e "Авто-бэкап (cron):"
+            echo -e " • Full:  ${COLOR_FULL}${CRON_STATUS_FULL}${RESET}"
+            echo -e " • DB:    ${COLOR_DB}${CRON_STATUS_DB}${RESET}"
+            echo -e " • Files: ${COLOR_FILES}${CRON_STATUS_FILES}${RESET}"
             echo ""
             echo " --- ДЕЙСТВИЯ ---"
             echo " 1. Ручной бекап (Full / DB / Files)"
