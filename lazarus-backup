@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.16.3"
+VERSION="4.17.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -9,8 +9,9 @@ CONFIG_FILE="$INSTALL_DIR/config.env"
 SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
 REMOTE_URL="https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup"
 
-# --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА ---
-KEYWORDS=("remnawave" "telegram-shop" "shop-bot" "shopbot" "rwp_shop")
+# --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА БОТА (НЕ ПАНЕЛИ!) ---
+# Исключаем "remnawave" т.к. это контейнер панели управления
+KEYWORDS=("telegram-shop" "shop-bot" "shopbot" "rwp_shop")
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 BOT_PATH=""
@@ -48,9 +49,13 @@ BACKUP_PASSWORD=""
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
 DB_CONTAINER_NAME=""
-DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
+# Пути по умолчанию (новая и старая документация)
+DEFAULT_BOT_PATH_NEW="/opt/private-remnawave-telegram-shop-bot"  # Новая документация
+DEFAULT_BOT_PATH_OLD="/opt/remnawave-service"                     # Старая установка
+DEFAULT_BOT_PATH="$DEFAULT_BOT_PATH_NEW"                          # Приоритет новой
 DEFAULT_DB_NAME="remnawave-telegram-shop-db"
-DB_VOLUME_NAME="rwp_shop_db_data"
+# Volume имена (определяются автоматически)
+DB_VOLUME_NAME=""  # Будет определено автоматически
 DB_SERVICE_NAME="db" 
 
 # Статусы расписаний
@@ -494,18 +499,47 @@ scan_system_for_bot() {
     FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
     local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
     
+    # Список контейнеров панели управления (ИСКЛЮЧАЕМ из поиска)
+    local PANEL_CONTAINERS=(
+        "remnawave"              # Основной контейнер панели
+        "remnawave-db"           # БД панели
+        "remnawave-redis"        # Redis панели
+        "remnawave-nginx"        # Nginx панели
+        "remnawave-subscription-page"   # Страница подписок панели
+        "remnawave-telegram-mini-app"   # Mini App панели
+        "certwardenclient"       # Cert Warden
+    )
+    
     for container in $running_containers; do
         local c_name=$(echo "$container" | cut -d'|' -f1)
         local c_image=$(echo "$container" | cut -d'|' -f2)
         
-        if [[ "$c_image" == *"remnawave/backend"* ]]; then continue; fi
-        if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then continue; fi
-        if [[ "$c_name" == "remnawave" ]]; then continue; fi
-        if [[ "$c_name" == "remnawave-db" ]]; then continue; fi 
-        if [[ "$c_name" == "remnawave-redis" ]]; then continue; fi
+        # Проверяем что это не контейнер панели
+        local is_panel=false
+        for panel_c in "${PANEL_CONTAINERS[@]}"; do
+            if [[ "$c_name" == "$panel_c" ]]; then
+                is_panel=true
+                break
+            fi
+        done
+        
+        # Исключаем контейнеры панели по image
+        if [[ "$c_image" == *"remnawave/backend"* ]]; then is_panel=true; fi
+        if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then is_panel=true; fi
+        if [[ "$c_image" == *"remnawave-telegram-sub-mini-app"* ]]; then is_panel=true; fi
+        if [[ "$c_image" == *"certwarden-client"* ]]; then is_panel=true; fi
+        if [[ "$c_image" == "nginx"* || "$c_image" == "postgres"* || "$c_image" == "redis"* ]]; then
+            # Пропускаем только если имя контейнера содержит "remnawave" БЕЗ "shop"/"bot"
+            if [[ "$c_name" == *"remnawave"* && "$c_name" != *"shop"* && "$c_name" != *"bot"* ]]; then
+                is_panel=true
+            fi
+        fi
+        
+        if [[ "$is_panel" == true ]]; then continue; fi
 
+        # Ищем контейнер БОТА по ключевым словам
         for key in "${KEYWORDS[@]}"; do
-            if [[ "$c_image" == *"$key"* ]]; then
+            if [[ "$c_image" == *"$key"* || "$c_name" == *"$key"* ]]; then
                 FOUND_BOT="$c_name"
                 local work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name")
                 if [[ -n "$work_dir" && -d "$work_dir" ]]; then FOUND_PATH="$work_dir"; fi
@@ -514,25 +548,40 @@ scan_system_for_bot() {
         done
     done
 
+    # Если не нашли через контейнеры — ищем по файлам docker-compose
     if [[ -z "$FOUND_PATH" ]]; then
         local search_dirs=("/opt" "/home" "/root")
         local compose_files=$(find "${search_dirs[@]}" -maxdepth 4 -name "docker-compose.yml" -o -name "compose.yaml" 2> "$SILENT_LOG")
         for file in $compose_files; do
+            # Пропускаем compose файлы панели управления
             if grep -q "remnawave/backend" "$file"; then continue; fi
+            if grep -q "remnawave/subscription-page" "$file"; then continue; fi
+            
+            # Ищем по ключевым словам БОТА
             if grep -qE "image:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" || grep -qE "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file"; then
                 FOUND_PATH=$(dirname "$file")
-                FOUND_BOT=$(grep "container_name:" "$file" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                # Извлекаем имя контейнера бота из compose файла
+                FOUND_BOT=$(grep -E "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                if [[ -z "$FOUND_BOT" ]]; then
+                    # Если container_name не найден, берем первый подходящий service name
+                    FOUND_BOT=$(grep -B5 "image:.*rwp_shop" "$file" | grep -E "^\s*[a-z]" | head -1 | awk '{print $1}' | tr -d ':')
+                fi
                 break
             fi
         done
     fi
 
+    # Поиск контейнера БД
     if [[ -n "$FOUND_PATH" ]]; then
         if cd "$FOUND_PATH" 2> "$SILENT_LOG"; then
             local db_services=("db" "postgres" "database" "postgresql")
             for svc in "${db_services[@]}"; do
                 local db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
-                if [[ -n "$db_c" && "$db_c" != "remnawave-db" ]]; then FOUND_DB="$db_c"; break; fi
+                # Исключаем БД панели
+                if [[ -n "$db_c" && "$db_c" != "remnawave-db" && "$db_c" != *"remnawave_"* ]]; then 
+                    FOUND_DB="$db_c"
+                    break
+                fi
             done
             cd - > "$SILENT_LOG"
         fi
@@ -573,6 +622,45 @@ get_container_status() {
         "restarting") echo "Restarting" ;;
         *) echo "N/A" ;;
     esac
+}
+
+# Автоматическое определение DB volume
+get_db_volume_name() {
+    if [[ -z "$DB_CONTAINER_NAME" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # Извлекаем имя volume из docker inspect
+    local volume=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}' "$DB_CONTAINER_NAME" 2> "$SILENT_LOG")
+    
+    if [[ -n "$volume" ]]; then
+        echo "$volume"
+        return 0
+    fi
+    
+    # Fallback: пытаемся определить из docker-compose.yml
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        local compose_file=""
+        [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+        [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+        
+        if [[ -n "$compose_file" ]]; then
+            # Ищем volume в секции volumes БД
+            local vol=$(grep -A 10 "^\s*$DB_SERVICE_NAME:" "$compose_file" | grep -E "volumes:" -A 5 | grep -oE "[a-zA-Z0-9_-]+:/var/lib/postgresql" | cut -d':' -f1 | head -1)
+            if [[ -n "$vol" ]]; then
+                # Проверяем есть ли такой volume
+                if docker volume inspect "$vol" > /dev/null 2> "$SILENT_LOG"; then
+                    echo "$vol"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    
+    # Если всё равно не нашли — возвращаем пустую строку
+    echo ""
+    return 1
 }
 
 detect_bot_installation() {
@@ -642,8 +730,15 @@ ensure_bot_path() {
 
         if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
             echo ""; print_message "ACTION" "Укажите путь к папке бота вручную."
-            read -erp "Путь (Enter для '$DEFAULT_BOT_PATH'): " input_path
-            BOT_PATH="${input_path:-$DEFAULT_BOT_PATH}"
+            
+            # Пробуем оба варианта пути по умолчанию
+            local suggested_path="$DEFAULT_BOT_PATH_NEW"
+            if [[ ! -d "$DEFAULT_BOT_PATH_NEW" && -d "$DEFAULT_BOT_PATH_OLD" ]]; then
+                suggested_path="$DEFAULT_BOT_PATH_OLD"
+            fi
+            
+            read -erp "Путь (Enter для '$suggested_path'): " input_path
+            BOT_PATH="${input_path:-$suggested_path}"
             if [[ ! -d "$BOT_PATH" ]]; then print_message "ERROR" "Папка не найдена!"; return 1; fi
             save_config
         fi
@@ -652,15 +747,15 @@ ensure_bot_path() {
             echo ""; print_message "WARN" "Контейнер бота не определен."
             print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
             read -erp "Имя: " input_name
-            if [[ -n "$input_name" ]]; then BOT_CONTAINER_NAME="$input_name"; else BOT_CONTAINER_NAME="shopbot"; fi
+            if [[ -n "$input_name" ]]; then BOT_CONTAINER_NAME="$input_name"; else BOT_CONTAINER_NAME="rwp_shop"; fi
             save_config
         fi
 
         if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
             echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
-            print_message "ACTION" "Введите имя контейнера БД (или Enter для '$DEFAULT_DB_NAME')."
-            read -erp "Имя БД: " input_db
-            if [[ -n "$input_db" ]]; then DB_CONTAINER_NAME="$input_db"; else DB_CONTAINER_NAME="$DEFAULT_DB_NAME"; fi
+            print_message "ACTION" "Введите имя контейнера БД."
+            read -erp "Имя БД (Enter для 'rwp_shop_db'): " input_db
+            if [[ -n "$input_db" ]]; then DB_CONTAINER_NAME="$input_db"; else DB_CONTAINER_NAME="rwp_shop_db"; fi
             save_config
         fi
     fi
@@ -1965,7 +2060,16 @@ execute_restore() {
         rm -rf "$BOT_PATH"/*
         print_message "INFO" "Извлечение файлов..."
         tar -xzf "$DIR_ARC" -C "$(dirname "$BOT_PATH")"
-        docker volume rm "$DB_VOLUME_NAME" 2> "$SILENT_LOG" || true
+        
+        # Определяем имя volume автоматически
+        local volume_name=$(get_db_volume_name)
+        if [[ -n "$volume_name" ]]; then
+            print_message "INFO" "Удаление старого volume: $volume_name"
+            docker volume rm "$volume_name" 2> "$SILENT_LOG" || true
+        else
+            print_message "WARN" "Volume БД не определён, пропускаем удаление."
+        fi
+        
         print_message "INFO" "Запуск БД..."
         docker compose up -d "$DB_SERVICE_NAME"
         sleep 5
