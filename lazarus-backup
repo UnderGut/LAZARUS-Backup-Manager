@@ -10,7 +10,7 @@ SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
 REMOTE_URL="https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup"
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА ---
-KEYWORDS=("remnawave" "telegram-shop" "shop-bot" "shopbot")
+KEYWORDS=("remnawave" "telegram-shop" "shop-bot" "shopbot" "rwp_shop")
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 BOT_PATH=""
@@ -50,7 +50,7 @@ BOT_CONTAINER_NAME=""
 DB_CONTAINER_NAME=""
 DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
 DEFAULT_DB_NAME="remnawave-telegram-shop-db"
-DB_VOLUME_NAME="remnawave-telegram-shop-db-data"
+DB_VOLUME_NAME="rwp_shop_db_data"
 DB_SERVICE_NAME="db" 
 
 # Статусы расписаний
