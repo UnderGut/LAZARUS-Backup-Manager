@@ -11,7 +11,8 @@ REMOTE_URL="https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/ma
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА БОТА (НЕ ПАНЕЛИ!) ---
 # Исключаем "remnawave" т.к. это контейнер панели управления
-KEYWORDS=("telegram-shop" "shop-bot" "shopbot" "rwp_shop")
+# Порядок важен: сначала более специфичные паттерны
+KEYWORDS=("rwp_shop" "telegram-shop" "shop-bot" "shopbot")
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 BOT_PATH=""
@@ -49,10 +50,8 @@ BACKUP_PASSWORD=""
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
 DB_CONTAINER_NAME=""
-# Пути по умолчанию (новая и старая документация)
-DEFAULT_BOT_PATH_NEW="/opt/private-remnawave-telegram-shop-bot"  # Новая документация
-DEFAULT_BOT_PATH_OLD="/opt/remnawave-service"                     # Старая установка
-DEFAULT_BOT_PATH="$DEFAULT_BOT_PATH_NEW"                          # Приоритет новой
+# Путь по умолчанию (из официальной документации)
+DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
 DEFAULT_DB_NAME="remnawave-telegram-shop-db"
 # Volume имена (определяются автоматически)
 DB_VOLUME_NAME=""  # Будет определено автоматически
@@ -730,15 +729,8 @@ ensure_bot_path() {
 
         if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
             echo ""; print_message "ACTION" "Укажите путь к папке бота вручную."
-            
-            # Пробуем оба варианта пути по умолчанию
-            local suggested_path="$DEFAULT_BOT_PATH_NEW"
-            if [[ ! -d "$DEFAULT_BOT_PATH_NEW" && -d "$DEFAULT_BOT_PATH_OLD" ]]; then
-                suggested_path="$DEFAULT_BOT_PATH_OLD"
-            fi
-            
-            read -erp "Путь (Enter для '$suggested_path'): " input_path
-            BOT_PATH="${input_path:-$suggested_path}"
+            read -erp "Путь (Enter для '$DEFAULT_BOT_PATH'): " input_path
+            BOT_PATH="${input_path:-$DEFAULT_BOT_PATH}"
             if [[ ! -d "$BOT_PATH" ]]; then print_message "ERROR" "Папка не найдена!"; return 1; fi
             save_config
         fi
