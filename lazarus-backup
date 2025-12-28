@@ -559,11 +559,22 @@ scan_system_for_bot() {
             # Ищем по ключевым словам БОТА
             if grep -qE "image:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" || grep -qE "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file"; then
                 FOUND_PATH=$(dirname "$file")
-                # Извлекаем имя контейнера бота из compose файла
-                FOUND_BOT=$(grep -E "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
-                if [[ -z "$FOUND_BOT" ]]; then
-                    # Если container_name не найден, берем первый подходящий service name
-                    FOUND_BOT=$(grep -B5 "image:.*rwp_shop" "$file" | grep -E "^\s*[a-z]" | head -1 | awk '{print $1}' | tr -d ':')
+                # Сначала пытаемся найти container_name
+                FOUND_BOT=$(grep -E "container_name:" "$file" | grep -E "($(IFS="|"; echo "${KEYWORDS[*]}"))" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                
+                # Если container_name не найден, используем docker compose для получения имени контейнера
+                if [[ -z "$FOUND_BOT" && -d "$FOUND_PATH" ]]; then
+                    cd "$FOUND_PATH" 2> "$SILENT_LOG"
+                    # Ищем service который использует наш image
+                    for key in "${KEYWORDS[@]}"; do
+                        local services=$(grep -B 2 "image:.*$key" "$file" | grep "^[a-z]" | head -1 | awk '{print $1}' | tr -d ':')
+                        if [[ -n "$services" ]]; then
+                            # Получаем реальное имя контейнера через docker compose
+                            FOUND_BOT=$(docker compose ps -a --format '{{.Name}}' "$services" 2> "$SILENT_LOG" | head -1)
+                            [[ -n "$FOUND_BOT" ]] && break
+                        fi
+                    done
+                    cd - > "$SILENT_LOG"
                 fi
                 break
             fi
@@ -645,8 +656,10 @@ get_db_volume_name() {
         [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
         
         if [[ -n "$compose_file" ]]; then
-            # Ищем volume в секции volumes БД
-            local vol=$(grep -A 10 "^\s*$DB_SERVICE_NAME:" "$compose_file" | grep -E "volumes:" -A 5 | grep -oE "[a-zA-Z0-9_-]+:/var/lib/postgresql" | cut -d':' -f1 | head -1)
+            # Ищем volume в секции volumes БД (поддержка обоих путей)
+            # Новая документация: /var/lib/postgresql/data
+            # Старые установки: /var/lib/postgresql
+            local vol=$(grep -A 10 "^\s*$DB_SERVICE_NAME:" "$compose_file" | grep -E "volumes:" -A 5 | grep -oE "[a-zA-Z0-9_-]+:/var/lib/postgresql(/data)?" | cut -d':' -f1 | head -1)
             if [[ -n "$vol" ]]; then
                 # Проверяем есть ли такой volume
                 if docker volume inspect "$vol" > /dev/null 2> "$SILENT_LOG"; then
