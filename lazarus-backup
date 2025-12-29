@@ -771,7 +771,56 @@ update_bot() {
     echo ""
     
     # Проверяем что путь к боту настроен
-    if ! ensure_bot_path; then
+    local bot_path_ok=false
+    
+    # Сначала проверяем текущий BOT_PATH
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && ( -f "$BOT_PATH/docker-compose.yml" || -f "$BOT_PATH/compose.yaml" ) ]]; then
+        bot_path_ok=true
+    fi
+    
+    # Если не настроен — пробуем ensure_bot_path (поиск + ввод)
+    if [[ "$bot_path_ok" == "false" ]]; then
+        print_message "INFO" "Путь к боту не настроен. Запускаем поиск..."
+        
+        # Проверяем путь по умолчанию из документации
+        if [[ -d "$DEFAULT_BOT_PATH" && ( -f "$DEFAULT_BOT_PATH/docker-compose.yml" || -f "$DEFAULT_BOT_PATH/compose.yaml" ) ]]; then
+            print_message "SUCCESS" "Найден бот в $DEFAULT_BOT_PATH"
+            BOT_PATH="$DEFAULT_BOT_PATH"
+            save_config
+            bot_path_ok=true
+        else
+            # Запускаем автопоиск
+            if ! ensure_bot_path; then
+                echo ""
+                print_message "ERROR" "Не удалось найти установку бота!"
+                echo ""
+                echo -e "Ожидаемая структура:"
+                echo -e "  ${CYAN}/opt/private-remnawave-telegram-shop-bot/${RESET}"
+                echo -e "  ├── compose.yaml (или docker-compose.yml)"
+                echo -e "  ├── .env"
+                echo -e "  └── rwp_shop-X.Y.Z-amd64.tar"
+                echo ""
+                echo -e "Укажите путь к папке бота вручную:"
+                read -erp "Путь (Enter - $DEFAULT_BOT_PATH): " manual_path
+                manual_path="${manual_path:-$DEFAULT_BOT_PATH}"
+                
+                if [[ -d "$manual_path" ]]; then
+                    BOT_PATH="$manual_path"
+                    save_config
+                    bot_path_ok=true
+                else
+                    print_message "ERROR" "Папка не найдена: $manual_path"
+                    read -erp "Нажмите Enter..." dummy
+                    return 1
+                fi
+            else
+                bot_path_ok=true
+            fi
+        fi
+    fi
+    
+    # Финальная проверка
+    if [[ "$bot_path_ok" == "false" || -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
         print_message "ERROR" "Путь к боту не настроен!"
         read -erp "Нажмите Enter..." dummy
         return 1
