@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="450" height="250" viewBox="0 0 450 250">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .yellow { fill: #f1c40f; }
+    .gray { fill: #7f8c8d; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="450" height="250" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L440 0 C446 0 450 4 450 10 L450 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Title -->
+  <text x="225" y="60" text-anchor="middle" class="text yellow bold">Меню восстановления</text>
+  
+  <!-- Body Content -->
+  <text x="20" y="100" class="text">
+    <tspan> 1. Полный бэкап     <tspan class="cyan">[14 шт]</tspan></tspan>
+    <tspan x="20" dy="25"> 2. Только БД        <tspan class="cyan">[223 шт]</tspan></tspan>
+    <tspan x="20" dy="25"> 3. Только Файлы     <tspan class="cyan">[5 шт]</tspan></tspan>
+    
+    <tspan x="20" dy="35"> 0. Назад</tspan>
+    
+    <tspan x="20" dy="35">Выбор (Enter - Назад): <tspan class="green">_</tspan></tspan>
+  </text>
+</svg>
