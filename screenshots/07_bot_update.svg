@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="700" height="680" viewBox="0 0 700 680">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 13px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .yellow { fill: #f1c40f; }
+    .gray { fill: #7f8c8d; }
+    .red { fill: #e74c3c; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+    .line-stroke { stroke: #2ecc71; stroke-width: 1; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="700" height="680" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L690 0 C696 0 700 4 700 10 L700 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Header Lines -->
+  <path d="M20 55 L680 55 M20 58 L680 58" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <text x="350" y="78" text-anchor="middle" class="text green bold">Обновление бота</text>
+  
+  <path d="M20 90 L680 90 M20 93 L680 93" class="line-stroke" shape-rendering="crispEdges"/>
+
+  <!-- Body Content -->
+  <text x="20" y="120" class="text">
+    <tspan>Путь к боту:     <tspan class="cyan">/opt/private-remnawave-telegram-shop-bot</tspan></tspan>
+    <tspan x="20" dy="18">Текущая версия:  <tspan class="cyan">3.21.2</tspan></tspan>
+    <tspan x="20" dy="18">Статус:          <tspan class="green">Online</tspan></tspan>
+    
+    <tspan x="20" dy="28" class="cyan">[INFO]</tspan><tspan>    Поиск файлов образа...</tspan>
+    
+    <tspan x="20" dy="25" class="bold">Найденные файлы образов:</tspan>
+    <tspan x="20" dy="18" class="green"> 1. rwp_shop-3.23.5-amd64.tar</tspan>
+    <tspan x="20" dy="16">    v3.23.5 | 156M | <tspan class="green">[новый]</tspan> <tspan class="green">← ОБНОВЛЕНИЕ</tspan></tspan>
+    <tspan x="20" dy="18" class="gray"> 2. private-remnawave-telegram-shop-bot-3.21.2-amd64.tar</tspan>
+    <tspan x="20" dy="16">    v3.21.2 | 148M | <tspan class="gray">[старый]</tspan> <tspan class="yellow">(текущая)</tspan></tspan>
+    
+    <tspan x="20" dy="25" class="yellow bold">Доступно обновление: 3.21.2 → 3.23.5</tspan>
+    
+    <tspan x="20" dy="28" class="cyan bold">═══ СОЗДАНИЕ БЭКАПОВ ═══</tspan>
+    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    [1/7] Создание полного бэкапа...</tspan>
+    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Полный бэкап создан</tspan>
+    <tspan x="20" dy="18" class="cyan">[INFO]</tspan><tspan>    [2/7] Создание бэкапа БД...</tspan>
+    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Бэкап БД создан</tspan>
+    
+    <tspan x="20" dy="25" class="cyan bold">═══ ЗАГРУЗКА IMAGE ═══</tspan>
+    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    [3/7] Загрузка Docker image...</tspan>
+    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Image загружен: rwp_shop:3.23.5</tspan>
+    
+    <tspan x="20" dy="25" class="cyan bold">═══ ОБНОВЛЕНИЕ КОНФИГУРАЦИИ ═══</tspan>
+    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    [4/7] Обновление compose файла...</tspan>
+    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Image обновлён: private-remnawave-telegram-shop-bot → rwp_shop:3.23.5</tspan>
+    
+    <tspan x="20" dy="25" class="cyan bold">═══ ПЕРЕЗАПУСК КОНТЕЙНЕРОВ ═══</tspan>
+    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    [5/7] Остановка контейнеров...</tspan>
+    <tspan x="20" dy="18" class="cyan">[INFO]</tspan><tspan>    [6/7] Запуск контейнеров...</tspan>
+    <tspan x="20" dy="18" class="cyan">[INFO]</tspan><tspan>    [7/7] Проверка работоспособности...</tspan>
+    
+    <tspan x="20" dy="20">  Проверка БД... <tspan class="green">OK</tspan></tspan>
+    <tspan x="20" dy="18">  Проверка бота... <tspan class="green">OK</tspan></tspan>
+    
+    <tspan x="20" dy="25" class="bold">═══════════════════════════════════════════════════</tspan>
+    <tspan x="20" dy="20" class="green bold">✓ ОБНОВЛЕНИЕ УСПЕШНО ЗАВЕРШЕНО</tspan>
+    
+    <tspan x="20" dy="25">  Версия: <tspan class="cyan">3.21.2</tspan> → <tspan class="green">3.23.5</tspan></tspan>
+    <tspan x="20" dy="18">  Статус: <tspan class="green">Online</tspan></tspan>
+    <tspan x="20" dy="25" class="bold">═══════════════════════════════════════════════════</tspan>
+    
+    <tspan x="20" dy="25">Удалить файл образа rwp_shop-3.23.5-amd64.tar? (y/N): <tspan class="green">y</tspan></tspan>
+    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Файл удалён</tspan>
+  </text>
+</svg>
