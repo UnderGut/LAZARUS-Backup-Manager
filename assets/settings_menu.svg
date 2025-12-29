@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="580" viewBox="0 0 600 580">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .red { fill: #e74c3c; }
+    .gray { fill: #7f8c8d; }
+    .yellow { fill: #f1c40f; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="600" height="580" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Content -->
+  <text x="20" y="60" class="text">
+    <tspan class="green bold">Настройки</tspan>
+    
+    <tspan x="20" dy="30" class="cyan">--- ОБЩИЕ ---</tspan>
+    <tspan x="20" dy="20"> 1. Путь к боту:        <tspan class="gray">/opt/remnawave</tspan></tspan>
+    <tspan x="20" dy="20"> 2. Контейнер бота:     <tspan class="gray">remnawave-bot</tspan></tspan>
+    <tspan x="20" dy="20"> 3. Контейнер БД:       <tspan class="gray">remnawave-db</tspan></tspan>
+    <tspan x="20" dy="20"> 4. Пользователь БД:    <tspan class="gray">postgres</tspan></tspan>
+    <tspan x="20" dy="20"> 5. Макс. бэкапов:      <tspan class="gray">100 шт.</tspan></tspan>
+    <tspan x="20" dy="20"> 6. Исключить папки:    <tspan class="gray">node_modules .git</tspan></tspan>
+    <tspan x="20" dy="20"> 7. Макс. размер файла: <tspan class="gray">50 MB</tspan></tspan>
+    
+    <tspan x="20" dy="30" class="cyan">--- TELEGRAM ---</tspan>
+    <tspan x="20" dy="20"> 8.  Token:             <tspan class="gray">12345.......ABCDE</tspan></tspan>
+    <tspan x="20" dy="20"> 9.  Chat ID:           <tspan class="gray">-100...789</tspan></tspan>
+    <tspan x="20" dy="20"> 10. Thread ID:         <tspan class="gray">Нет</tspan></tspan>
+    <tspan x="20" dy="20"> 11. Уведомления:       <tspan class="green">Вкл</tspan></tspan>
+    <tspan x="20" dy="20"> 12. Отправка файла:    <tspan class="green">Вкл</tspan></tspan>
+    <tspan x="20" dy="20"> 13. Проверить связь</tspan>
+
+    <tspan x="20" dy="30" class="cyan">--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---</tspan>
+    <tspan x="20" dy="20"> 14. Тип:               <tspan class="gray">FTP</tspan></tspan>
+    <tspan x="20" dy="20"> 15. URL:               <tspan class="gray">ftp://backup.server.com/lazarus</tspan></tspan>
+    <tspan x="20" dy="20"> 16. Пользователь:      <tspan class="gray">use...up</tspan></tspan>
+    <tspan x="20" dy="20"> 17. Загрузка:          <tspan class="green">Вкл</tspan></tspan>
+    <tspan x="20" dy="20"> 18. Настроить / Проверить</tspan>
+
+    <tspan x="20" dy="30" class="cyan">--- БЕЗОПАСНОСТЬ ---</tspan>
+    <tspan x="20" dy="20"> 19. Пароль архива:     <tspan class="gray">********</tspan></tspan>
+    
+    <tspan x="20" dy="30"> 0. Назад</tspan>
+    
+    <tspan x="20" dy="30">Ваш выбор > <tspan class="green">_</tspan></tspan>
+  </text>
+</svg>

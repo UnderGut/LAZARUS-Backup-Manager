@@ -1,0 +1,26 @@
+# Configuration with secrets
+config.env
+
+# AI instructions (local only)
+.github/copilot-instructions.md
+
+# Development notes (local only)
+TODO.md
+
+# Backup files (local testing)
+*.tar.gz
+*.tar.gz.enc
+*.version
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
