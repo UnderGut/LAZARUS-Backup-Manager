@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.17.0"
+VERSION="4.18.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -673,6 +673,316 @@ get_db_volume_name() {
     # Если всё равно не нашли — возвращаем пустую строку
     echo ""
     return 1
+}
+
+# --- ФУНКЦИЯ ОБНОВЛЕНИЯ БОТА ---
+
+# Извлечение версии из имени файла (rwp_shop-3.23.0-amd64.tar → 3.23.0)
+extract_version_from_filename() {
+    local filename="$1"
+    # Поддержка форматов: rwp_shop-3.23.0-amd64.tar, rwp_shop-3.23.0.tar, telegram-shop-2.0.0.tar
+    echo "$filename" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+# Сравнение версий (возвращает 0 если $1 > $2)
+version_gt() {
+    local v1="$1" v2="$2"
+    # Разбиваем версии на части
+    local v1_major v1_minor v1_patch v2_major v2_minor v2_patch
+    IFS='.' read -r v1_major v1_minor v1_patch <<< "$v1"
+    IFS='.' read -r v2_major v2_minor v2_patch <<< "$v2"
+    
+    # Приводим к числам (убираем ведущие нули)
+    v1_major=$((10#${v1_major:-0})); v1_minor=$((10#${v1_minor:-0})); v1_patch=$((10#${v1_patch:-0}))
+    v2_major=$((10#${v2_major:-0})); v2_minor=$((10#${v2_minor:-0})); v2_patch=$((10#${v2_patch:-0}))
+    
+    if [[ $v1_major -gt $v2_major ]]; then return 0; fi
+    if [[ $v1_major -lt $v2_major ]]; then return 1; fi
+    if [[ $v1_minor -gt $v2_minor ]]; then return 0; fi
+    if [[ $v1_minor -lt $v2_minor ]]; then return 1; fi
+    if [[ $v1_patch -gt $v2_patch ]]; then return 0; fi
+    return 1
+}
+
+# Поиск файлов образа бота в папке
+find_bot_image_files() {
+    local search_path="$1"
+    # Ищем .tar файлы с паттернами rwp_shop или telegram-shop
+    find "$search_path" -maxdepth 1 -type f \( -name "rwp_shop*.tar" -o -name "telegram-shop*.tar" \) 2> "$SILENT_LOG" | sort -V
+}
+
+# Получение последнего (самого нового) файла образа
+get_latest_bot_image_file() {
+    local search_path="$1"
+    local files=$(find_bot_image_files "$search_path")
+    
+    if [[ -z "$files" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    local latest_file=""
+    local latest_version="0.0.0"
+    
+    while IFS= read -r file; do
+        local version=$(extract_version_from_filename "$(basename "$file")")
+        if [[ -n "$version" ]] && version_gt "$version" "$latest_version"; then
+            latest_version="$version"
+            latest_file="$file"
+        fi
+    done <<< "$files"
+    
+    echo "$latest_file"
+}
+
+# Обновление image версии в docker-compose файле
+update_compose_image_version() {
+    local compose_file="$1"
+    local new_version="$2"
+    local image_name="rwp_shop"
+    
+    if [[ ! -f "$compose_file" ]]; then
+        print_message "ERROR" "Compose файл не найден: $compose_file"
+        return 1
+    fi
+    
+    # Ищем строку с image и заменяем версию
+    # Поддержка: image: rwp_shop:3.23.0, image: "rwp_shop:3.23.0"
+    if grep -qE "image:\s*['\"]?rwp_shop:" "$compose_file"; then
+        sed -i -E "s|(image:\s*['\"]?)rwp_shop:[0-9]+\.[0-9]+\.[0-9]+|\1rwp_shop:$new_version|g" "$compose_file"
+        print_message "SUCCESS" "Image обновлён до rwp_shop:$new_version"
+        return 0
+    elif grep -qE "image:\s*['\"]?telegram-shop:" "$compose_file"; then
+        sed -i -E "s|(image:\s*['\"]?)telegram-shop:[0-9]+\.[0-9]+\.[0-9]+|\1telegram-shop:$new_version|g" "$compose_file"
+        print_message "SUCCESS" "Image обновлён до telegram-shop:$new_version"
+        return 0
+    else
+        print_message "ERROR" "Не найден image rwp_shop или telegram-shop в compose файле"
+        return 1
+    fi
+}
+
+# Главная функция обновления бота
+update_bot() {
+    clear_screen
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}${BOLD}  Обновление бота${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo ""
+    
+    # Проверяем что путь к боту настроен
+    if ! ensure_bot_path; then
+        print_message "ERROR" "Путь к боту не настроен!"
+        read -erp "Нажмите Enter..." dummy
+        return 1
+    fi
+    
+    # Получаем текущую версию бота
+    local current_version=$(get_raw_bot_version)
+    if [[ -z "$current_version" || "$current_version" == "Unknown" ]]; then
+        print_message "WARN" "Не удалось определить текущую версию бота"
+        current_version="0.0.0"
+    fi
+    
+    echo -e "Путь к боту: ${CYAN}$BOT_PATH${RESET}"
+    echo -e "Текущая версия: ${CYAN}$current_version${RESET}"
+    echo ""
+    
+    # Ищем файлы образов в папке бота
+    print_message "INFO" "Поиск файлов образа в $BOT_PATH..."
+    local image_files=$(find_bot_image_files "$BOT_PATH")
+    
+    if [[ -z "$image_files" ]]; then
+        echo ""
+        print_message "WARN" "Файлы образа не найдены."
+        echo ""
+        echo -e "Ожидаемые имена файлов:"
+        echo -e "  • ${CYAN}rwp_shop-X.Y.Z-amd64.tar${RESET}"
+        echo -e "  • ${CYAN}rwp_shop-X.Y.Z.tar${RESET}"
+        echo ""
+        echo -e "Скачайте файл из приватного канала и положите в:"
+        echo -e "  ${BOLD}$BOT_PATH/${RESET}"
+        echo ""
+        read -erp "Нажмите Enter..." dummy
+        return 1
+    fi
+    
+    # Показываем найденные файлы
+    echo ""
+    echo -e "${BOLD}Найденные файлы образов:${RESET}"
+    local i=1
+    local files_array=()
+    while IFS= read -r file; do
+        local fname=$(basename "$file")
+        local fversion=$(extract_version_from_filename "$fname")
+        local fsize=$(du -h "$file" 2>/dev/null | cut -f1)
+        files_array+=("$file")
+        
+        # Подсветка если версия новее
+        if version_gt "$fversion" "$current_version"; then
+            echo -e " ${GREEN}$i. $fname ${RESET}(v$fversion, $fsize) ${GREEN}← НОВЕЕ${RESET}"
+        else
+            echo -e " ${GRAY}$i. $fname ${RESET}(v$fversion, $fsize)"
+        fi
+        ((i++))
+    done <<< "$image_files"
+    
+    echo ""
+    echo " 0. Назад"
+    echo ""
+    
+    # Получаем последнюю версию
+    local latest_file=$(get_latest_bot_image_file "$BOT_PATH")
+    local latest_version=$(extract_version_from_filename "$(basename "$latest_file")")
+    
+    # Проверяем есть ли обновление
+    if ! version_gt "$latest_version" "$current_version"; then
+        print_message "INFO" "У вас уже установлена последняя версия ($current_version)"
+        echo ""
+        read -erp "Выберите файл для установки (или Enter - назад): " choice
+        [[ -z "$choice" || "$choice" == "0" ]] && return 0
+    else
+        echo -e "${YELLOW}Доступно обновление: $current_version → $latest_version${RESET}"
+        echo ""
+        read -erp "Выберите файл (Enter - последний v$latest_version): " choice
+        [[ -z "$choice" ]] && choice=1  # По умолчанию последний
+    fi
+    
+    # Валидация выбора
+    if [[ "$choice" == "0" ]]; then return 0; fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "${#files_array[@]}" ]]; then
+        print_message "ERROR" "Неверный выбор"
+        sleep 1
+        return 1
+    fi
+    
+    local selected_file="${files_array[$((choice-1))]}"
+    local selected_version=$(extract_version_from_filename "$(basename "$selected_file")")
+    
+    echo ""
+    echo -e "${BOLD}Выбран файл:${RESET} $(basename "$selected_file")"
+    echo -e "${BOLD}Версия:${RESET} $selected_version"
+    echo ""
+    
+    # Предупреждение
+    echo -e "${YELLOW}${BOLD}ВНИМАНИЕ:${RESET}"
+    echo -e " • Будет создан полный бэкап (БД + файлы)"
+    echo -e " • Бот будет остановлен на время обновления"
+    echo -e " • Image в docker-compose будет обновлён"
+    echo ""
+    
+    read -erp "Начать обновление? (y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        print_message "INFO" "Отменено"
+        return 0
+    fi
+    
+    echo ""
+    log_message "INFO" "Starting bot update: $current_version -> $selected_version"
+    
+    # Шаг 1: Создаём бэкап
+    print_message "INFO" "Шаг 1/5: Создание полного бэкапа..."
+    create_backup "full"
+    local backup_result=$?
+    
+    if [[ $backup_result -ne 0 ]]; then
+        print_message "ERROR" "Ошибка создания бэкапа! Обновление отменено."
+        log_message "ERROR" "Bot update aborted: backup failed"
+        read -erp "Нажмите Enter..." dummy
+        return 1
+    fi
+    
+    # Шаг 2: Загружаем Docker image
+    print_message "INFO" "Шаг 2/5: Загрузка Docker image..."
+    echo ""
+    
+    local load_output
+    load_output=$(docker load -i "$selected_file" 2>&1)
+    local load_result=$?
+    
+    if [[ $load_result -ne 0 ]]; then
+        print_message "ERROR" "Ошибка загрузки image!"
+        echo "$load_output"
+        log_message "ERROR" "Bot update failed: docker load error"
+        read -erp "Нажмите Enter..." dummy
+        return 1
+    fi
+    
+    print_message "SUCCESS" "Image загружен"
+    echo "$load_output" | grep -i "loaded"
+    
+    # Шаг 3: Определяем compose файл
+    local compose_file=""
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    
+    if [[ -z "$compose_file" ]]; then
+        print_message "ERROR" "Compose файл не найден в $BOT_PATH"
+        log_message "ERROR" "Bot update failed: compose file not found"
+        read -erp "Нажмите Enter..." dummy
+        return 1
+    fi
+    
+    # Шаг 4: Обновляем версию в compose файле
+    print_message "INFO" "Шаг 3/5: Обновление версии в compose..."
+    
+    # Создаём бэкап compose файла
+    cp "$compose_file" "${compose_file}.bak"
+    
+    if ! update_compose_image_version "$compose_file" "$selected_version"; then
+        print_message "ERROR" "Ошибка обновления compose файла!"
+        mv "${compose_file}.bak" "$compose_file"
+        log_message "ERROR" "Bot update failed: compose update error"
+        read -erp "Нажмите Enter..." dummy
+        return 1
+    fi
+    
+    rm -f "${compose_file}.bak"
+    
+    # Шаг 5: Перезапускаем бота
+    print_message "INFO" "Шаг 4/5: Остановка контейнеров..."
+    cd "$BOT_PATH"
+    docker compose down 2> "$SILENT_LOG"
+    
+    print_message "INFO" "Шаг 5/5: Запуск контейнеров..."
+    docker compose up -d 2> "$SILENT_LOG"
+    
+    # Ждём запуска
+    sleep 3
+    
+    # Проверяем результат
+    local new_version=$(get_raw_bot_version)
+    local new_status=$(get_container_status)
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    
+    if [[ "$new_status" == "Online" && "$new_version" == "$selected_version" ]]; then
+        print_message "SUCCESS" "Обновление успешно завершено!"
+        echo -e "  Версия: ${CYAN}$current_version${RESET} → ${GREEN}$new_version${RESET}"
+        echo -e "  Статус: ${GREEN}$new_status${RESET}"
+        log_message "SUCCESS" "Bot updated successfully: $current_version -> $new_version"
+        
+        # Предлагаем удалить tar файл
+        echo ""
+        read -erp "Удалить файл образа $(basename "$selected_file")? (y/N): " del_confirm
+        if [[ "$del_confirm" == "y" || "$del_confirm" == "Y" ]]; then
+            rm -f "$selected_file"
+            print_message "SUCCESS" "Файл удалён"
+        fi
+    else
+        print_message "WARN" "Обновление завершено, но требуется проверка!"
+        echo -e "  Версия: ${CYAN}$new_version${RESET}"
+        echo -e "  Статус: ${YELLOW}$new_status${RESET}"
+        echo ""
+        echo "Проверьте логи: docker compose logs -f"
+        log_message "WARN" "Bot update completed with warnings: status=$new_status, version=$new_version"
+    fi
+    
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo ""
+    read -erp "Нажмите Enter..." dummy
+    return 0
 }
 
 detect_bot_installation() {
@@ -2718,15 +3028,16 @@ case "$1" in
                 CLEANUP_LABEL="(>$MAX_BACKUPS_COUNT шт.)"
             fi
             echo " 5. Удалить старые бэкапы $CLEANUP_LABEL"
+            echo -e " 6. ${CYAN}Обновить бота${RESET}"
             echo ""
-            echo -e " 8. Проверить обновления"
+            echo -e " 8. Проверить обновления скрипта"
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
             echo " 0. Выход"
             echo ""
             read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
             case $opt in
                 1) menu_manual_backup ;; 2) menu_automation ;; 3) menu_restore ;; 
-                4) menu_settings ;; 5) cleanup_old_backups ;; 8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
+                4) menu_settings ;; 5) cleanup_old_backups ;; 6) update_bot ;; 8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
             esac
         done
         ;;
