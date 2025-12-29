@@ -867,6 +867,7 @@ update_bot() {
     # Предупреждение
     echo -e "${YELLOW}${BOLD}ВНИМАНИЕ:${RESET}"
     echo -e " • Будет создан полный бэкап (БД + файлы)"
+    echo -e " • Будет создан отдельный бэкап БД"
     echo -e " • Бот будет остановлен на время обновления"
     echo -e " • Image в docker-compose будет обновлён"
     echo ""
@@ -880,20 +881,30 @@ update_bot() {
     echo ""
     log_message "INFO" "Starting bot update: $current_version -> $selected_version"
     
-    # Шаг 1: Создаём бэкап
-    print_message "INFO" "Шаг 1/5: Создание полного бэкапа..."
+    # Шаг 1: Создаём полный бэкап
+    print_message "INFO" "Шаг 1/6: Создание полного бэкапа..."
     create_backup "full"
     local backup_result=$?
     
     if [[ $backup_result -ne 0 ]]; then
-        print_message "ERROR" "Ошибка создания бэкапа! Обновление отменено."
-        log_message "ERROR" "Bot update aborted: backup failed"
+        print_message "ERROR" "Ошибка создания полного бэкапа! Обновление отменено."
+        log_message "ERROR" "Bot update aborted: full backup failed"
         read -erp "Нажмите Enter..." dummy
         return 1
     fi
     
-    # Шаг 2: Загружаем Docker image
-    print_message "INFO" "Шаг 2/5: Загрузка Docker image..."
+    # Шаг 2: Создаём отдельный бэкап БД
+    print_message "INFO" "Шаг 2/6: Создание бэкапа БД..."
+    create_backup "db_only"
+    local db_backup_result=$?
+    
+    if [[ $db_backup_result -ne 0 ]]; then
+        print_message "WARN" "Бэкап БД не создан, но полный бэкап есть. Продолжаем..."
+        log_message "WARN" "Bot update: DB-only backup failed, but full backup exists"
+    fi
+    
+    # Шаг 3: Загружаем Docker image
+    print_message "INFO" "Шаг 3/6: Загрузка Docker image..."
     echo ""
     
     local load_output
@@ -911,7 +922,7 @@ update_bot() {
     print_message "SUCCESS" "Image загружен"
     echo "$load_output" | grep -i "loaded"
     
-    # Шаг 3: Определяем compose файл
+    # Шаг 4: Определяем compose файл
     local compose_file=""
     [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
     [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
@@ -923,8 +934,8 @@ update_bot() {
         return 1
     fi
     
-    # Шаг 4: Обновляем версию в compose файле
-    print_message "INFO" "Шаг 3/5: Обновление версии в compose..."
+    # Шаг 5: Обновляем версию в compose файле
+    print_message "INFO" "Шаг 5/6: Обновление версии в compose..."
     
     # Создаём бэкап compose файла
     cp "$compose_file" "${compose_file}.bak"
@@ -939,12 +950,10 @@ update_bot() {
     
     rm -f "${compose_file}.bak"
     
-    # Шаг 5: Перезапускаем бота
-    print_message "INFO" "Шаг 4/5: Остановка контейнеров..."
+    # Шаг 6: Перезапускаем бота
+    print_message "INFO" "Шаг 6/6: Перезапуск контейнеров..."
     cd "$BOT_PATH"
     docker compose down 2> "$SILENT_LOG"
-    
-    print_message "INFO" "Шаг 5/5: Запуск контейнеров..."
     docker compose up -d 2> "$SILENT_LOG"
     
     # Ждём запуска
