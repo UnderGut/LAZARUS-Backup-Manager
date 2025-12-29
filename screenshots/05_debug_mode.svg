@@ -27,7 +27,7 @@
   <text x="20" y="55" class="text">
     <tspan class="gray">$ lazarus --debug backup_full</tspan>
     
-    <tspan x="20" dy="25" class="magenta">[DEBUG]</tspan><tspan> LAZARUS v4.16.3 starting in DEBUG mode</tspan>
+    <tspan x="20" dy="25" class="magenta">[DEBUG]</tspan><tspan> LAZARUS v4.19.0 starting in DEBUG mode</tspan>
     <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> SILENT_LOG=/dev/stderr</tspan>
     <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> CURL_SILENT=-v</tspan>
     <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> CONFIG_FILE=/opt/lazarus-backup/config.env</tspan>
