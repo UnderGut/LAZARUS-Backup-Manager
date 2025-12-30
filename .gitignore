@@ -1,8 +1,8 @@
 # Configuration with secrets
 config.env
 
-# AI instructions (local only)
-.github/copilot-instructions.md
+# AI instructions and documentation (local only)
+.github/
 
 # Development notes (local only)
 TODO.md
