@@ -25,7 +25,7 @@
   <!-- Header Lines (Double Lines) -->
   <path d="M20 60 L580 60 M20 63 L580 63" class="line-stroke" shape-rendering="crispEdges"/>
   
-  <text x="300" y="85" text-anchor="middle" class="text green bold">LAZARUS Backup Manager v4.19.0</text>
+  <text x="300" y="85" text-anchor="middle" class="text green bold">LAZARUS Backup Manager v4.22.0</text>
   
   <path d="M20 97 L580 97 M20 100 L580 100" class="line-stroke" shape-rendering="crispEdges"/>
   

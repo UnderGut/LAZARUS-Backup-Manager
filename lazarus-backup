@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.19.0"
+VERSION="4.22.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -10,7 +10,8 @@ SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
 REMOTE_URL="https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup"
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА БОТА (НЕ ПАНЕЛИ!) ---
-# Исключаем "remnawave" т.к. это контейнер панели управления
+# Согласно документации: rwp_shop, rwp_shop_db
+# Также поддержка legacy: telegram-shop, shop-bot, shopbot
 # Порядок важен: сначала более специфичные паттерны
 KEYWORDS=("rwp_shop" "telegram-shop" "shop-bot" "shopbot")
 
@@ -52,10 +53,12 @@ BOT_CONTAINER_NAME=""
 DB_CONTAINER_NAME=""
 # Путь по умолчанию (из официальной документации)
 DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
-DEFAULT_DB_NAME="remnawave-telegram-shop-db"
+# Контейнеры согласно документации: rwp_shop, rwp_shop_db
+DEFAULT_BOT_CONTAINER="rwp_shop"
+DEFAULT_DB_CONTAINER="rwp_shop_db"
 # Volume имена (определяются автоматически)
-DB_VOLUME_NAME=""  # Будет определено автоматически
-DB_SERVICE_NAME="db" 
+DB_VOLUME_NAME=""  # Будет определено автоматически (например rwp_shop_db_data)
+DB_SERVICE_NAME="db"  # Имя сервиса в compose.yaml 
 
 # Статусы расписаний
 SCHEDULE_FULL="Выкл"
@@ -78,6 +81,21 @@ AUTO_CONFIRM="false"
 # Лог-файл для подробных логов
 LOG_FILE="/var/log/lazarus_backup.log"
 
+# Lock-файл для предотвращения параллельного запуска
+LOCK_FILE="/var/run/lazarus_backup.lock"
+LOCK_FD=200  # File descriptor для flock
+
+# Trap для очистки при завершении (освобождение блокировки)
+cleanup_on_exit() {
+    # Освобождаем блокировку если была получена
+    if [[ -n "$LOCK_FD" ]]; then
+        flock -u "$LOCK_FD" 2>/dev/null || true
+        eval "exec $LOCK_FD>&-" 2>/dev/null || true
+    fi
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+}
+trap cleanup_on_exit EXIT INT TERM
+
 # Цвета
 if [[ -t 0 ]]; then
     RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; GRAY=$'\e[90m'; CYAN=$'\e[36m'; MAGENTA=$'\e[35m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
@@ -99,9 +117,17 @@ clear_screen() {
 }
 
 # Отладочное сообщение
+# Использование: debug_log "message" или debug_log "CATEGORY" "message"
 debug_log() {
     if [[ "$DEBUG_MODE" == true ]]; then
-        echo -e "${MAGENTA}[DEBUG]${RESET} $1"
+        local ts=$(date '+%H:%M:%S.%3N')
+        if [[ $# -eq 1 ]]; then
+            echo -e "${MAGENTA}[$ts DEBUG]${RESET} $1"
+        else
+            local category="$1"
+            shift
+            echo -e "${MAGENTA}[$ts DEBUG]${RESET} ${CYAN}[$category]${RESET} $*"
+        fi
     fi
 }
 
@@ -171,6 +197,49 @@ rotate_internal_log() {
             mv "$LOG_FILE" "${LOG_FILE}.old"
             echo "Log rotated on $(date)" > "$LOG_FILE"
         fi
+    fi
+}
+
+# --- БЛОКИРОВКА ОТ ПАРАЛЛЕЛЬНОГО ЗАПУСКА ---
+
+acquire_lock() {
+    # Пытаемся получить эксклюзивную блокировку
+    # Используется для предотвращения параллельного запуска из cron
+    # Возвращает 0 если блокировка получена, 1 если занято
+    
+    # Создаём директорию для lock-файла если не существует
+    local lock_dir=$(dirname "$LOCK_FILE")
+    if [[ ! -d "$lock_dir" ]]; then
+        mkdir -p "$lock_dir" 2> "$SILENT_LOG" || true
+    fi
+    
+    # Открываем файл на дескриптор LOCK_FD
+    eval "exec $LOCK_FD>\"$LOCK_FILE\""
+    
+    # Пытаемся получить неблокирующую эксклюзивную блокировку
+    if ! flock -n "$LOCK_FD" 2> "$SILENT_LOG"; then
+        return 1  # Блокировка уже занята другим процессом
+    fi
+    
+    # Записываем PID в lock-файл для отладки
+    echo "$$" >&$LOCK_FD
+    
+    return 0
+}
+
+release_lock() {
+    # Освобождаем блокировку
+    flock -u "$LOCK_FD" 2> "$SILENT_LOG" || true
+    eval "exec $LOCK_FD>&-" 2> "$SILENT_LOG" || true
+    rm -f "$LOCK_FILE" 2> "$SILENT_LOG" || true
+}
+
+check_lock_owner() {
+    # Возвращает PID процесса, владеющего блокировкой
+    if [[ -f "$LOCK_FILE" ]]; then
+        cat "$LOCK_FILE" 2> "$SILENT_LOG" || echo "unknown"
+    else
+        echo "none"
     fi
 }
 
@@ -496,7 +565,9 @@ install_script() {
 
 scan_system_for_bot() {
     FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
+    debug_log "SCAN" "=== scan_system_for_bot ==="
     local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
+    debug_log "SCAN" "Running containers: $(echo "$running_containers" | wc -l)"
     
     # Список контейнеров панели управления (ИСКЛЮЧАЕМ из поиска)
     local PANEL_CONTAINERS=(
@@ -512,25 +583,28 @@ scan_system_for_bot() {
     for container in $running_containers; do
         local c_name=$(echo "$container" | cut -d'|' -f1)
         local c_image=$(echo "$container" | cut -d'|' -f2)
+        debug_log "SCAN" "Checking: $c_name ($c_image)"
         
         # Проверяем что это не контейнер панели
         local is_panel=false
         for panel_c in "${PANEL_CONTAINERS[@]}"; do
             if [[ "$c_name" == "$panel_c" ]]; then
                 is_panel=true
+                debug_log "SCAN" "  -> Skip (panel container: $panel_c)"
                 break
             fi
         done
         
         # Исключаем контейнеры панели по image
-        if [[ "$c_image" == *"remnawave/backend"* ]]; then is_panel=true; fi
-        if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then is_panel=true; fi
+        if [[ "$c_image" == *"remnawave/backend"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (remnawave/backend)"; fi
+        if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (subscription-page)"; fi
         if [[ "$c_image" == *"remnawave-telegram-sub-mini-app"* ]]; then is_panel=true; fi
         if [[ "$c_image" == *"certwarden-client"* ]]; then is_panel=true; fi
         if [[ "$c_image" == "nginx"* || "$c_image" == "postgres"* || "$c_image" == "redis"* ]]; then
             # Пропускаем только если имя контейнера содержит "remnawave" БЕЗ "shop"/"bot"
             if [[ "$c_name" == *"remnawave"* && "$c_name" != *"shop"* && "$c_name" != *"bot"* ]]; then
                 is_panel=true
+                debug_log "SCAN" "  -> Skip (panel infra)"
             fi
         fi
         
@@ -539,16 +613,21 @@ scan_system_for_bot() {
         # Ищем контейнер БОТА по ключевым словам
         for key in "${KEYWORDS[@]}"; do
             if [[ "$c_image" == *"$key"* || "$c_name" == *"$key"* ]]; then
+                debug_log "SCAN" "  -> MATCH! keyword=$key"
                 FOUND_BOT="$c_name"
                 local work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name")
+                debug_log "SCAN" "  -> working_dir=$work_dir"
                 if [[ -n "$work_dir" && -d "$work_dir" ]]; then FOUND_PATH="$work_dir"; fi
                 break 2
             fi
         done
     done
+    
+    debug_log "SCAN" "After container scan: FOUND_BOT=$FOUND_BOT, FOUND_PATH=$FOUND_PATH"
 
     # Если не нашли через контейнеры — ищем по файлам docker-compose
     if [[ -z "$FOUND_PATH" ]]; then
+        debug_log "SCAN" "No containers found, searching compose files..."
         local search_dirs=("/opt" "/home" "/root")
         local compose_files=$(find "${search_dirs[@]}" -maxdepth 4 -name "docker-compose.yml" -o -name "compose.yaml" 2> "$SILENT_LOG")
         for file in $compose_files; do
@@ -675,6 +754,46 @@ get_db_volume_name() {
     return 1
 }
 
+# Чтение переменных из .env файла бота
+# Использование: read_bot_env "POSTGRES_USER" → возвращает значение
+read_bot_env() {
+    local var_name="$1"
+    local env_file=""
+    
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        [[ -f "$BOT_PATH/.env" ]] && env_file="$BOT_PATH/.env"
+    fi
+    
+    if [[ -z "$env_file" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # Читаем значение переменной из .env (поддержка форматов KEY=value и KEY="value")
+    local value=$(grep -E "^${var_name}=" "$env_file" 2>/dev/null | head -1 | cut -d'=' -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    echo "$value"
+}
+
+# Получение имени пользователя БД из .env бота или fallback на глобальную настройку
+get_db_user() {
+    local env_user=$(read_bot_env "POSTGRES_USER")
+    if [[ -n "$env_user" ]]; then
+        echo "$env_user"
+    else
+        echo "$DB_USER"
+    fi
+}
+
+# Получение имени базы данных из .env бота или fallback на postgres
+get_db_name() {
+    local env_db=$(read_bot_env "POSTGRES_DB")
+    if [[ -n "$env_db" ]]; then
+        echo "$env_db"
+    else
+        echo "postgres"
+    fi
+}
+
 # --- ФУНКЦИЯ ОБНОВЛЕНИЯ БОТА ---
 
 # Извлечение версии из имени файла (rwp_shop-3.23.0-amd64.tar → 3.23.0)
@@ -708,7 +827,7 @@ version_gt() {
     return 1
 }
 
-# Поиск файлов образа бота в папке
+# Поиск файлов образа бота в конкретной папке (без рекурсии)
 # Поддерживает все форматы именования: новые и старые
 find_bot_image_files() {
     local search_path="$1"
@@ -720,7 +839,67 @@ find_bot_image_files() {
         -name "rwp_shop*.tar" -o \
         -name "private-remnawave-telegram-shop-bot*.tar" -o \
         -name "telegram-shop*.tar" \
-    \) 2> "$SILENT_LOG" | sort -V
+    \) 2> "$SILENT_LOG"
+}
+
+# Поиск файлов образа во всех стандартных путях + BOT_PATH
+# Возвращает список файлов, отсортированный по версии (новые первыми)
+find_all_bot_image_files() {
+    local search_paths=()
+    
+    # Собираем все пути для поиска
+    # 1. Путь к боту (если настроен)
+    [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]] && search_paths+=("$BOT_PATH")
+    
+    # 2. Стандартные пути
+    [[ -d "/opt" ]] && search_paths+=("/opt")
+    [[ -d "/root" ]] && search_paths+=("/root")
+    
+    # 3. Путь по умолчанию (если отличается от BOT_PATH)
+    if [[ -d "$DEFAULT_BOT_PATH" && "$DEFAULT_BOT_PATH" != "$BOT_PATH" ]]; then
+        search_paths+=("$DEFAULT_BOT_PATH")
+    fi
+    
+    local all_files=""
+    local seen_files=()
+    
+    for search_path in "${search_paths[@]}"; do
+        # Рекурсивный поиск (maxdepth 3 для разумной глубины)
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            
+            # Проверка на дубликаты (по имени файла)
+            local fname=$(basename "$file")
+            local is_dup=false
+            for seen in "${seen_files[@]}"; do
+                [[ "$seen" == "$fname" ]] && is_dup=true && break
+            done
+            
+            if [[ "$is_dup" == "false" ]]; then
+                seen_files+=("$fname")
+                all_files+="$file"$'\n'
+            fi
+        done < <(find "$search_path" -maxdepth 3 -type f \( \
+            -name "rwp_shop*.tar" -o \
+            -name "private-remnawave-telegram-shop-bot*.tar" -o \
+            -name "telegram-shop*.tar" \
+        \) 2> "$SILENT_LOG")
+    done
+    
+    # Удаляем последний перенос строки
+    all_files="${all_files%$'\n'}"
+    
+    if [[ -z "$all_files" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # Сортировка по версии (извлекаем версию, сортируем, выводим)
+    # Новые версии первыми (sort -Vr)
+    echo "$all_files" | while IFS= read -r file; do
+        local version=$(extract_version_from_filename "$(basename "$file")")
+        echo "$version|$file"
+    done | sort -t'|' -k1 -Vr | cut -d'|' -f2
 }
 
 # Получение последнего (самого нового) файла образа
@@ -950,12 +1129,17 @@ update_bot() {
     echo ""
     
     # === ЭТАП 3: ПОИСК ФАЙЛОВ ОБРАЗОВ ===
-    print_message "INFO" "Поиск файлов образа..."
-    local image_files=$(find_bot_image_files "$BOT_PATH")
+    print_message "INFO" "Поиск файлов образа в /opt/, /root/, $BOT_PATH..."
+    local image_files=$(find_all_bot_image_files)
     
     if [[ -z "$image_files" ]]; then
         echo ""
-        print_message "WARN" "Файлы образа не найдены в $BOT_PATH"
+        print_message "WARN" "Файлы образа не найдены"
+        echo ""
+        echo -e "${BOLD}Пути поиска:${RESET}"
+        echo -e "  ${CYAN}/opt/${RESET} (с подпапками)"
+        echo -e "  ${CYAN}/root/${RESET} (с подпапками)"
+        [[ -n "$BOT_PATH" ]] && echo -e "  ${CYAN}$BOT_PATH/${RESET}"
         echo ""
         echo -e "${BOLD}Поддерживаемые форматы файлов:${RESET}"
         echo -e "  ${CYAN}rwp_shop-X.Y.Z-amd64.tar${RESET}  (новый, рекомендуемый)"
@@ -968,13 +1152,19 @@ update_bot() {
         return 1
     fi
     
+    # Считаем количество найденных файлов
+    local files_count=$(echo "$image_files" | wc -l)
+    print_message "SUCCESS" "Найдено файлов: $files_count"
+    
     # === ЭТАП 4: ОТОБРАЖЕНИЕ НАЙДЕННЫХ ФАЙЛОВ ===
     echo ""
-    echo -e "${BOLD}Найденные файлы образов:${RESET}"
+    echo -e "${BOLD}Найденные файлы образов (новые первыми):${RESET}"
     local i=1
     local files_array=()
     while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
         local fname=$(basename "$file")
+        local fdir=$(dirname "$file")
         local fversion=$(extract_version_from_filename "$fname")
         local fsize=$(du -h "$file" 2>/dev/null | cut -f1)
         local fimage=$(get_image_name_from_tar "$file")
@@ -992,12 +1182,15 @@ update_bot() {
         if version_gt "$fversion" "$current_version"; then
             echo -e " ${GREEN}$i. $fname${RESET}"
             echo -e "    v$fversion | $fsize | $type_label ${GREEN}← ОБНОВЛЕНИЕ${RESET}"
+            echo -e "    ${GRAY}$fdir${RESET}"
         elif [[ "$fversion" == "$current_version" ]]; then
             echo -e " ${YELLOW}$i. $fname${RESET}"
             echo -e "    v$fversion | $fsize | $type_label ${YELLOW}(текущая)${RESET}"
+            echo -e "    ${GRAY}$fdir${RESET}"
         else
             echo -e " ${GRAY}$i. $fname${RESET}"
             echo -e "    v$fversion | $fsize | $type_label"
+            echo -e "    ${GRAY}$fdir${RESET}"
         fi
         ((i++))
     done <<< "$image_files"
@@ -1007,7 +1200,8 @@ update_bot() {
     echo ""
     
     # === ЭТАП 5: ВЫБОР ФАЙЛА ===
-    local latest_file=$(get_latest_bot_image_file "$BOT_PATH")
+    # Первый файл в списке = самая новая версия (после сортировки)
+    local latest_file="${files_array[0]}"
     local latest_version=$(extract_version_from_filename "$(basename "$latest_file")")
     
     local choice=""
@@ -1339,16 +1533,16 @@ ensure_bot_path() {
         if [[ -z "$BOT_CONTAINER_NAME" ]] || ! docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
             echo ""; print_message "WARN" "Контейнер бота не определен."
             print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
-            read -erp "Имя: " input_name
-            if [[ -n "$input_name" ]]; then BOT_CONTAINER_NAME="$input_name"; else BOT_CONTAINER_NAME="rwp_shop"; fi
+            read -erp "Имя (Enter для '$DEFAULT_BOT_CONTAINER'): " input_name
+            BOT_CONTAINER_NAME="${input_name:-$DEFAULT_BOT_CONTAINER}"
             save_config
         fi
 
         if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
             echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
             print_message "ACTION" "Введите имя контейнера БД."
-            read -erp "Имя БД (Enter для 'rwp_shop_db'): " input_db
-            if [[ -n "$input_db" ]]; then DB_CONTAINER_NAME="$input_db"; else DB_CONTAINER_NAME="rwp_shop_db"; fi
+            read -erp "Имя БД (Enter для '$DEFAULT_DB_CONTAINER'): " input_db
+            DB_CONTAINER_NAME="${input_db:-$DEFAULT_DB_CONTAINER}"
             save_config
         fi
     fi
@@ -1417,17 +1611,22 @@ load_or_create_config() {
 
 send_telegram_document() {
     local file_path="$1"; local caption="$2"
-    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
+    debug_log "TG" "=== send_telegram_document ==="
+    debug_log "TG" "File: $file_path"
+    debug_log "TG" "SEND_TO_TELEGRAM=$SEND_TO_TELEGRAM, TG_SEND_FILE=$TG_SEND_FILE"
+    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && { debug_log "TG" "Missing BOT_TOKEN or CHAT_ID"; return 1; }
     
     # Если уведомления полностью отключены
     if [[ "$SEND_TO_TELEGRAM" != "true" ]]; then
         print_message "INFO" "Уведомления Telegram отключены."
+        debug_log "TG" "Notifications disabled, skipping"
         return 0
     fi
     
     # Если отправка файла отключена — отправляем только текстовое уведомление
     if [[ "$TG_SEND_FILE" != "true" ]]; then
         print_message "INFO" "Отправка файла в TG отключена, отправляем уведомление..."
+        debug_log "TG" "File sending disabled, sending text only"
         local filename=$(basename "$file_path")
         # Экранируем для MarkdownV2
         local escaped_filename=$(escape_markdown_v2 "$filename")
@@ -1450,6 +1649,7 @@ ${escaped_caption}
             -d parse_mode="MarkdownV2" \
             --data-urlencode text="$notify_text" \
             $thread_param 2> "$SILENT_LOG")
+        debug_log "TG" "Text-only notification HTTP code: $http_code"
         
         if [[ "$http_code" == "200" ]]; then
             print_message "SUCCESS" "Уведомление отправлено в Telegram."
@@ -1462,19 +1662,26 @@ ${escaped_caption}
     fi
     
     print_message "INFO" "Отправка в Telegram..."
+    local file_size_bytes=$(stat -c%s "$file_path" 2> "$SILENT_LOG" || echo 0)
+    debug_log "TG" "File size: $file_size_bytes bytes ($(numfmt --to=iec $file_size_bytes 2>/dev/null || echo "$file_size_bytes"))"
     
     local form_params=(-F chat_id="$CHAT_ID" -F document=@"$file_path" -F parse_mode="MarkdownV2" -F caption="$(escape_markdown_v2 "$caption")")
     [[ -n "$TG_MESSAGE_THREAD_ID" ]] && form_params+=(-F message_thread_id="$TG_MESSAGE_THREAD_ID")
+    debug_log "TG" "Sending to: https://api.telegram.org/bot<TOKEN>/sendDocument"
+    debug_log "TG" "Chat ID: $CHAT_ID, Thread ID: ${TG_MESSAGE_THREAD_ID:-none}"
     
     local http_code=$(curl $CURL_SILENT -o "$SILENT_LOG" -w "%{http_code}" -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" "${form_params[@]}")
+    debug_log "TG" "HTTP response code: $http_code"
     
     if [[ "$http_code" == "200" ]]; then
         print_message "SUCCESS" "Успешно отправлено в Telegram."
     else
         local file_size=$(stat -c%s "$file_path" 2> "$SILENT_LOG" || echo 0)
+        debug_log "TG" "Send FAILED! File size: $file_size"
         
         if [[ $file_size -ge 52428800 ]]; then
             print_message "ERROR" "Файл >50MB. Telegram API отклонил отправку."
+            debug_log "TG" "File exceeds 50MB limit"
             local escaped_fname=$(escape_markdown_v2 "$(basename "$file_path")")
             local error_msg="⚠️ *Ошибка отправки бэкапа*
 
@@ -1601,17 +1808,30 @@ validate_remote_connection() {
 }
 
 upload_to_remote() {
-    if [[ "$SEND_TO_REMOTE" != "true" ]]; then return 0; fi
+    if [[ "$SEND_TO_REMOTE" != "true" ]]; then 
+        debug_log "REMOTE" "Remote upload disabled (SEND_TO_REMOTE=$SEND_TO_REMOTE)"
+        return 0
+    fi
     local file_path="$1"
     local filename=$(basename "$file_path")
     local file_size=$(stat -c%s "$file_path" 2> "$SILENT_LOG" || echo "0")
     REMOTE_UPLOAD_STATUS_TEXT="" 
+    
+    debug_log "REMOTE" "=== upload_to_remote ==="
+    debug_log "REMOTE" "File: $file_path"
+    debug_log "REMOTE" "Size: $file_size bytes"
+    debug_log "REMOTE" "Type: $REMOTE_STORAGE_TYPE"
+    debug_log "REMOTE" "URL: $REMOTE_STORAGE_URL"
 
-    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then return 0; fi
+    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then 
+        debug_log "REMOTE" "Remote storage disabled or URL empty"
+        return 0
+    fi
     
     if [[ ! -f "$file_path" ]]; then
         print_message "ERROR" "Файл для загрузки не найден: $file_path" >&2
         log_message "ERROR" "Upload failed: file not found $file_path"
+        debug_log "REMOTE" "ERROR: File not found!"
         return 1
     fi
 
@@ -1619,6 +1839,7 @@ upload_to_remote() {
 
     # === RCLONE ===
     if [[ "$REMOTE_STORAGE_TYPE" == "rclone" ]]; then
+        debug_log "REMOTE" "Using rclone..."
         if ! command -v rclone > "$SILENT_LOG" 2>&1; then
             print_message "ERROR" "Rclone не установлен!"
             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: Не установлен'
@@ -1627,9 +1848,11 @@ upload_to_remote() {
         local dest="${REMOTE_STORAGE_URL%/}"
         local rclone_opts=(--progress --retries 3 --low-level-retries 10)
         [[ "$IS_INTERACTIVE" != "true" ]] && rclone_opts=(--quiet --retries 3 --low-level-retries 10)
+        debug_log "REMOTE" "Running: rclone copy $file_path $dest ${rclone_opts[*]}"
         
         if rclone copy "$file_path" "$dest" "${rclone_opts[@]}" 2>&1; then
             print_message "SUCCESS" "Файл загружен (rclone)." >&2
+            debug_log "REMOTE" "Rclone upload SUCCESS"
             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: OK'
             log_message "SUCCESS" "Uploaded $filename to rclone:$dest"
             return 0
@@ -1995,9 +2218,7 @@ rotate_backups_by_count() {
         else
             echo -e " $LABEL: Найдено $count (Лимит $MAX_BACKUPS_COUNT) -> ${RED}Кандидаты на удаление: $diff шт.${RESET}"
             echo "$diff"
-            return 0
         fi
-        return 0
     else
         if [[ "$PERFORM_DELETE" != "true" ]]; then
             echo -e " $LABEL: Найдено $count (Лимит $MAX_BACKUPS_COUNT) -> ${GREEN}OK${RESET}"
@@ -2058,9 +2279,7 @@ rotate_backups_by_age() {
         else
             echo -e " $LABEL: Найдено $count файлов старше $DAYS дней -> ${RED}Кандидаты на удаление: $count шт.${RESET}"
             echo "$count"
-            return 0
         fi
-        return 0
     else
         if [[ "$PERFORM_DELETE" != "true" ]]; then
             echo -e " $LABEL: Нет файлов старше $DAYS дней -> ${GREEN}OK${RESET}"
@@ -2292,12 +2511,32 @@ recreate_cron_from_schedule() {
 
 create_backup() {
     local TYPE="$1"
+    debug_log "BACKUP" "=== Starting backup: type=$TYPE ==="
+    debug_log "BACKUP" "BOT_PATH=$BOT_PATH"
+    debug_log "BACKUP" "BOT_CONTAINER=$BOT_CONTAINER_NAME, DB_CONTAINER=$DB_CONTAINER_NAME"
+    debug_log "BACKUP" "IS_INTERACTIVE=$IS_INTERACTIVE"
+    
+    # Блокировка от параллельного запуска (только в non-interactive режиме)
+    local LOCK_ACQUIRED="false"
+    if [[ "$IS_INTERACTIVE" == "false" ]]; then
+        debug_log "LOCK" "Attempting to acquire lock..."
+        if ! acquire_lock; then
+            local owner_pid=$(check_lock_owner)
+            debug_log "LOCK" "Lock failed! Owner PID: $owner_pid"
+            log_message "WARN" "Backup skipped: another instance is running (PID: $owner_pid)"
+            print_message "WARN" "Другой процесс бэкапа уже запущен (PID: $owner_pid)"
+            return 1
+        fi
+        debug_log "LOCK" "Lock acquired successfully"
+        LOCK_ACQUIRED="true"
+    fi
     
     # Проверка свободного места (минимум 1GB)
     local MIN_SPACE_MB=1024
     local free_space_kb=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
     local free_space_mb=$((free_space_kb / 1024))
     local free_space_human=$(df -h "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
+    debug_log "DISK" "Free space: ${free_space_mb}MB (${free_space_human}), required: ${MIN_SPACE_MB}MB"
     
     if [[ $free_space_mb -lt $MIN_SPACE_MB ]]; then
         print_message "ERROR" "Недостаточно места на диске! Свободно: ${free_space_human} (нужно минимум 1GB)"
@@ -2316,25 +2555,30 @@ create_backup() {
         else
             # В non-interactive режиме (cron) отправляем уведомление и прерываем
             send_telegram_notification "Бэкап прерван: недостаточно места на диске (${free_space_human})"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
     fi
     
     # Health-check контейнеров перед бэкапом
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
+        debug_log "HEALTH" "Checking DB container health..."
         if [[ -n "$DB_CONTAINER_NAME" ]]; then
             local db_running=$(docker container inspect -f '{{.State.Running}}' "$DB_CONTAINER_NAME" 2> "$SILENT_LOG")
+            debug_log "HEALTH" "Container $DB_CONTAINER_NAME running=$db_running"
             if [[ "$db_running" != "true" ]]; then
                 print_message "ERROR" "Контейнер БД ($DB_CONTAINER_NAME) не запущен!"
                 log_message "ERROR" "Backup aborted: DB container not running ($DB_CONTAINER_NAME)"
                 if [[ "$IS_INTERACTIVE" != "true" ]]; then
                     send_telegram_notification "Бэкап прерван: контейнер БД не запущен ($DB_CONTAINER_NAME)"
                 fi
+                [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
                 return 1
             fi
             
             # Проверяем health status если есть
             local db_health=$(docker container inspect -f '{{.State.Health.Status}}' "$DB_CONTAINER_NAME" 2> "$SILENT_LOG")
+            debug_log "HEALTH" "Container health status: $db_health"
             if [[ "$db_health" == "unhealthy" ]]; then
                 print_message "WARN" "Контейнер БД в состоянии 'unhealthy'!"
                 log_message "WARN" "DB container health status: unhealthy ($DB_CONTAINER_NAME)"
@@ -2383,32 +2627,81 @@ create_backup() {
 
     local CURRENT_VER=$(get_raw_bot_version)
     echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
+    debug_log "BACKUP" "Bot version saved: ${CURRENT_VER:-Unknown}"
 
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
-        print_message "INFO" "Дамп базы данных ($DB_CONTAINER_NAME)..."
-        if ! docker exec "$DB_CONTAINER_NAME" pg_dumpall -c -U "$DB_USER" 2> "$SILENT_LOG" | gzip -9 > "$BACKUP_DIR/$FILE_DB"; then
+        # Получаем параметры БД из .env бота (согласно официальной документации)
+        local ACTUAL_DB_USER=$(get_db_user)
+        local ACTUAL_DB_NAME=$(get_db_name)
+        debug_log "DB" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
+        
+        # Проверяем готовность БД через pg_isready (согласно healthcheck из документации)
+        print_message "INFO" "Проверка готовности БД..."
+        debug_log "DB" "Running: docker exec $DB_CONTAINER_NAME pg_isready -U $ACTUAL_DB_USER -d $ACTUAL_DB_NAME"
+        if ! docker exec "$DB_CONTAINER_NAME" pg_isready -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" > "$SILENT_LOG" 2>&1; then
+            print_message "ERROR" "База данных не готова! (pg_isready failed)"
+            log_message "ERROR" "Backup aborted: pg_isready failed for $DB_CONTAINER_NAME"
+            if [[ "$IS_INTERACTIVE" != "true" ]]; then
+                send_telegram_notification "Бэкап прерван: БД не готова ($DB_CONTAINER_NAME)"
+            fi
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+        debug_log "DB" "pg_isready: OK"
+        
+        print_message "INFO" "Дамп базы данных ($DB_CONTAINER_NAME, user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME)..."
+        debug_log "DB" "Running: docker exec $DB_CONTAINER_NAME pg_dump -U $ACTUAL_DB_USER $ACTUAL_DB_NAME | gzip -9 > $BACKUP_DIR/$FILE_DB"
+        
+        # Используем pg_dump вместо pg_dumpall (согласно официальной документации)
+        # pg_dump быстрее и проще для одной БД
+        if ! docker exec "$DB_CONTAINER_NAME" pg_dump -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" 2> "$SILENT_LOG" | gzip -9 > "$BACKUP_DIR/$FILE_DB"; then
             print_message "ERROR" "Ошибка дампа БД."
+            debug_log "DB" "pg_dump FAILED"
             HAS_ERROR=1
+        else
+            local db_size=$(du -h "$BACKUP_DIR/$FILE_DB" 2>/dev/null | cut -f1)
+            debug_log "DB" "pg_dump SUCCESS, file size: $db_size"
         fi
     fi
 
-    if [[ $HAS_ERROR -eq 1 ]]; then rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION"; return; fi
+    if [[ $HAS_ERROR -eq 1 ]]; then 
+        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    fi
 
     IFS=' ' read -r -a EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
     EXCLUDE_FLAGS=()
     for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then EXCLUDE_FLAGS+=(--exclude="$ex"); fi; done
-    EXCLUDE_FLAGS+=(--exclude="*.log" --exclude=".git" --exclude="private-remnawave-*.tar")
+    # Исключаем согласно официальной документации:
+    # - *.log файлы
+    # - .git директория
+    # - Docker образы (*.tar файлы)
+    # - logs/ директория (access-логи из ACCESS_LOG_PATH)
+    # - backups/ директория (локальные бэкапы пользователя)
+    EXCLUDE_FLAGS+=(--exclude="*.log" --exclude=".git" --exclude="logs" --exclude="backups")
+    EXCLUDE_FLAGS+=(--exclude="private-remnawave-*.tar" --exclude="rwp_shop*.tar" --exclude="telegram-shop*.tar")
+    debug_log "TAR" "Exclude flags: ${EXCLUDE_FLAGS[*]}"
 
     if [[ "$TYPE" != "db_only" ]]; then
         : > "$SKIP_FILE"
+        local BOT_DIRNAME=$(basename "$BOT_PATH")
+        debug_log "TAR" "BOT_DIRNAME=$BOT_DIRNAME, MAX_FILE_SIZE_MB=$MAX_FILE_SIZE_MB"
         local FIND_CMD="find ."
         for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then FIND_CMD+=" -path './$ex' -prune -o"; fi; done
         FIND_CMD+=" -type f -size +${MAX_FILE_SIZE_MB}M -print"
-        cd "$BOT_PATH"; eval "$FIND_CMD" > "$SKIP_FILE"
+        debug_log "TAR" "Find command: $FIND_CMD"
+        cd "$BOT_PATH"; eval "$FIND_CMD" | while read -r f; do
+            # Преобразуем ./path/file в BOT_DIRNAME/path/file для корректной работы --exclude-from
+            echo "${BOT_DIRNAME}${f#.}"
+        done > "$SKIP_FILE"
         local SKIP_COUNT=$(wc -l < "$SKIP_FILE")
+        debug_log "TAR" "Large files to skip: $SKIP_COUNT"
         if [[ "$SKIP_COUNT" -gt 0 ]]; then
-            local SKIP_SIZE=$(du -ch --files0-from=<(tr '\n' '\0' < "$SKIP_FILE") | tail -1 | cut -f1)
+            local SKIP_SIZE=$(cd "$BOT_PATH" && eval "$FIND_CMD" | tr '\n' '\0' | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
             print_message "WARN" "Пропущено больших файлов (>${MAX_FILE_SIZE_MB}MB): $SKIP_COUNT (общий вес: $SKIP_SIZE)"
+            debug_log "TAR" "Skipped files content:"
+            if [[ "$DEBUG_MODE" == true ]]; then cat "$SKIP_FILE"; fi
             EXCLUDE_FLAGS+=(--exclude-from="$SKIP_FILE")
             SKIP_INFO=$'\n⚠️ Skip: '"$SKIP_COUNT"$' (>'"$MAX_FILE_SIZE_MB"$'MB)'
         fi
@@ -2416,15 +2709,24 @@ create_backup() {
 
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="lazarus_db_${TIMESTAMP}.tar.gz"
+        debug_log "TAR" "Creating DB archive: $FILE_FINAL"
         tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB"
         rm -f "$BACKUP_DIR/$FILE_DB"
     elif [[ "$TYPE" == "files_only" ]]; then
         FILE_FINAL="lazarus_files_${TIMESTAMP}.tar.gz"
+        local FILE_DIR="bot_files_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        debug_log "TAR" "Creating files archive: $FILE_FINAL"
+        debug_log "TAR" "Running: tar -czf $BACKUP_DIR/$FILE_DIR ${EXCLUDE_FLAGS[*]} -C $(dirname "$BOT_PATH") $(basename "$BOT_PATH")"
+        # Сначала архивируем файлы бота с исключениями
+        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
+        # Затем объединяем с версией
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR"
+        rm -f "$BACKUP_DIR/$FILE_DIR"
     else 
         FILE_FINAL="lazarus_full_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
+        debug_log "TAR" "Creating full archive: $FILE_FINAL"
         tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
         tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
@@ -2449,31 +2751,38 @@ create_backup() {
             FILE_FINAL="${FILE_FINAL}.enc"
             ENC_STATUS="🔒 Encrypted"
             print_message "SUCCESS" "Архив зашифрован."
+            debug_log "ENC" "Encryption successful: $FILE_FINAL"
         else
             print_message "ERROR" "Ошибка шифрования! Отправка незашифрованного файла."
+            debug_log "ENC" "Encryption FAILED!"
         fi
     fi
 
     local FINAL_VERSION_FILE="$BACKUP_DIR/$FILE_FINAL.version"
     cp "$BACKUP_DIR/$FILE_VERSION" "$FINAL_VERSION_FILE"
     rm -f "$BACKUP_DIR/$FILE_VERSION"
+    debug_log "BACKUP" "Version file: $FINAL_VERSION_FILE"
     
     # --- VERIFY ARCHIVE ---
     print_message "INFO" "Проверка целостности архива..."
+    debug_log "VERIFY" "Verifying archive integrity..."
     local VERIFY_OK="false"
     if [[ "$FILE_FINAL" == *".enc" ]]; then
         # For encrypted files, we can't easily verify without decrypting. 
         # We assume openssl exit code 0 was enough, or we could decrypt to /dev/null
+        debug_log "VERIFY" "Running: openssl enc -d ... | gzip -t"
         export LAZARUS_VERIFY_PASS="$BACKUP_PASSWORD"
         if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$BACKUP_DIR/$FILE_FINAL" -pass env:LAZARUS_VERIFY_PASS | gzip -t 2> "$SILENT_LOG"; then
              VERIFY_OK="true"
         fi
         unset LAZARUS_VERIFY_PASS
     else
+        debug_log "VERIFY" "Running: gzip -t $BACKUP_DIR/$FILE_FINAL"
         if gzip -t "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
              VERIFY_OK="true"
         fi
     fi
+    debug_log "VERIFY" "Result: $VERIFY_OK"
 
     if [[ "$VERIFY_OK" == "true" ]]; then
         print_message "SUCCESS" "Архив валиден."
@@ -2485,8 +2794,11 @@ create_backup() {
     local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
     print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
     log_message "SUCCESS" "Backup created: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS, verify=$VERIFY_OK)"
+    debug_log "BACKUP" "Final file: $FILE_FINAL, size: $SIZE"
 
+    debug_log "UPLOAD" "Starting remote upload..."
     upload_to_remote "$BACKUP_DIR/$FILE_FINAL"
+    debug_log "UPLOAD" "Remote upload complete"
     
     local DISPLAY_DATE=$(date "+%d.%m.%Y %H:%M:%S")
     local HASHTAG=""; local TYPE_NAME=""; local ROTATION_KEY=""
@@ -2506,11 +2818,20 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     
     send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
 
+    # Автоматическая ротация бэкапов после создания
     local ROTATION_PREFIX="lazarus_$TYPE"
     if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="lazarus_db"; fi
     if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="lazarus_files"; fi
 
-    rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true"
+    # Ротация в зависимости от настроек DELETE_MODE
+    if [[ "$DELETE_MODE" == "count" ]]; then
+        rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true"
+    else
+        rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true"
+    fi
+    
+    # Освобождаем блокировку
+    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
@@ -2617,22 +2938,28 @@ select_backup_file() {
 
 execute_restore() {
     local MODE="$1"; local FILE="$2"
+    debug_log "RESTORE" "=== execute_restore ==="
+    debug_log "RESTORE" "Mode: $MODE, File: $FILE"
     echo ""; print_message "WARN" "ВНИМАНИЕ: Текущие данные будут перезаписаны!"
     read -erp "Продолжить? (y/n): " confirm; [[ "$confirm" != "y" ]] && return
 
     local TMP_DIR="$BACKUP_DIR/restore_tmp_$$"
     mkdir -p "$TMP_DIR"
+    debug_log "RESTORE" "Temp dir: $TMP_DIR"
     
     local WORK_FILE="$FILE"
     if [[ "$FILE" == *".enc" ]]; then
         print_message "INFO" "Файл зашифрован. Требуется пароль."
+        debug_log "RESTORE" "File is encrypted, requesting password..."
         read -s -erp "Пароль: " decrypt_pass; echo ""
         local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
         
+        debug_log "RESTORE" "Decrypting to: $DECRYPTED_FILE"
         export LAZARUS_DEC_PASS="$decrypt_pass"
         openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$FILE" -out "$DECRYPTED_FILE" -pass env:LAZARUS_DEC_PASS 2> "$SILENT_LOG"
         local dec_res=$?
         unset LAZARUS_DEC_PASS
+        debug_log "RESTORE" "Decryption result: $dec_res"
 
         if [[ $dec_res -ne 0 ]]; then print_message "ERROR" "Неверный пароль или поврежденный файл!"; rm -rf "$TMP_DIR"; return; fi
         print_message "SUCCESS" "Пароль принят."
@@ -2640,46 +2967,73 @@ execute_restore() {
     fi
 
     print_message "INFO" "Распаковка..."
+    debug_log "RESTORE" "Extracting: tar -xzf $WORK_FILE -C $TMP_DIR"
     tar -xzf "$WORK_FILE" -C "$TMP_DIR"
+    debug_log "RESTORE" "Contents: $(ls -la "$TMP_DIR")"
 
     local DB_DUMP=$(find "$TMP_DIR" -name "db_*.sql.gz" | head -1)
     local DIR_ARC=$(find "$TMP_DIR" -name "dir_*.tar.gz" | head -1)
+    debug_log "RESTORE" "DB_DUMP: $DB_DUMP"
+    debug_log "RESTORE" "DIR_ARC: $DIR_ARC"
 
     if [[ "$MODE" == "full" && -n "$DIR_ARC" ]]; then
         if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi
         print_message "INFO" "Остановка контейнеров..."
+        debug_log "RESTORE" "Stopping containers in $BOT_PATH"
         cd "$BOT_PATH" && docker compose down 2> "$SILENT_LOG"
         print_message "INFO" "Очистка папки..."
+        debug_log "RESTORE" "Cleaning $BOT_PATH/*"
         rm -rf "$BOT_PATH"/*
         print_message "INFO" "Извлечение файлов..."
+        debug_log "RESTORE" "Extracting: tar -xzf $DIR_ARC -C $(dirname "$BOT_PATH")"
         tar -xzf "$DIR_ARC" -C "$(dirname "$BOT_PATH")"
         
         # Определяем имя volume автоматически
         local volume_name=$(get_db_volume_name)
+        debug_log "RESTORE" "DB Volume: $volume_name"
         if [[ -n "$volume_name" ]]; then
             print_message "INFO" "Удаление старого volume: $volume_name"
+            debug_log "RESTORE" "Running: docker volume rm $volume_name"
             docker volume rm "$volume_name" 2> "$SILENT_LOG" || true
         else
             print_message "WARN" "Volume БД не определён, пропускаем удаление."
         fi
         
         print_message "INFO" "Запуск БД..."
+        debug_log "RESTORE" "Running: docker compose up -d $DB_SERVICE_NAME"
         docker compose up -d "$DB_SERVICE_NAME"
         sleep 5
     fi
 
     if [[ -n "$DB_DUMP" ]]; then
         print_message "INFO" "Импорт базы данных..."
-        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi 
-        zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" psql -U "$DB_USER" -d postgres > "$SILENT_LOG" 2>&1
+        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi
+        
+        # Получаем параметры БД из .env бота
+        local ACTUAL_DB_USER=$(get_db_user)
+        local ACTUAL_DB_NAME=$(get_db_name)
+        debug_log "RESTORE" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
+        
+        # Согласно официальной документации: очищаем схему перед импортом
+        # https://docs.remnawave.shop/ru/private/backup/
+        print_message "INFO" "Очистка схемы БД (DROP SCHEMA public CASCADE)..."
+        debug_log "RESTORE" "Running: docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER -c 'DROP SCHEMA...'"
+        docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+        
+        print_message "INFO" "Импорт данных (user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME)..."
+        debug_log "RESTORE" "Running: zcat $DB_DUMP | docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER $ACTUAL_DB_NAME"
+        zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" > "$SILENT_LOG" 2>&1
+        debug_log "RESTORE" "DB import complete"
     fi
 
     if [[ "$MODE" == "full" ]]; then
         print_message "INFO" "Запуск всех контейнеров..."
+        debug_log "RESTORE" "Running: docker compose up -d"
         cd "$BOT_PATH" && docker compose up -d
     fi
 
     rm -rf "$TMP_DIR"
+    debug_log "RESTORE" "Temp dir cleaned up"
     print_message "SUCCESS" "Восстановление успешно завершено."
     log_message "SUCCESS" "Restore completed (mode=$MODE, file=$FILE)"
     read -erp "Нажмите Enter..." dummy
@@ -2943,32 +3297,35 @@ menu_settings() {
         echo -e " 2. Контейнер бота:     ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
         echo -e " 3. Контейнер БД:       ${GRAY}${DB_CONTAINER_NAME}${RESET}"
         echo -e " 4. Пользователь БД:    ${GRAY}${DB_USER}${RESET}"
-        echo -e " 5. Макс. бэкапов:      ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
-        echo -e " 6. Исключить папки:    ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
-        echo -e " 7. Макс. размер файла: ${GRAY}${MAX_FILE_SIZE_MB} MB${RESET}"
+        echo -e " 5. Исключить папки:    ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
+        echo -e " 6. Макс. размер файла: ${GRAY}${MAX_FILE_SIZE_MB} MB${RESET}"
         
         echo -e "\n${CYAN}--- TELEGRAM ---${RESET}"
-        echo -e " 8.  Token:             ${GRAY}${MASKED_TOKEN}${RESET}"
-        echo -e " 9.  Chat ID:           ${GRAY}${MASKED_CHAT_ID}${RESET}"
-        echo -e " 10. Thread ID:         ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
-        echo -e " 11. Уведомления:       $ST_TG_NOTIFY"
-        echo -e " 12. Отправка файла:    $ST_TG_FILE"
-        echo -e " 13. Проверить связь"
+        echo -e " 7.  Token:             ${GRAY}${MASKED_TOKEN}${RESET}"
+        echo -e " 8.  Chat ID:           ${GRAY}${MASKED_CHAT_ID}${RESET}"
+        echo -e " 9.  Thread ID:         ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
+        echo -e " 10. Уведомления:       $ST_TG_NOTIFY"
+        echo -e " 11. Отправка файла:    $ST_TG_FILE"
+        echo -e " 12. Проверить связь"
 
         echo -e "\n${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET}"
-        echo -e " 14. Тип:               ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
-        echo -e " 15. URL:               ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
-        echo -e " 16. Пользователь:      ${GRAY}${MASKED_REMOTE_USER}${RESET}"
-        echo -e " 17. Загрузка:          $ST_REM"
-        echo -e " 18. Настроить / Проверить"
+        echo -e " 13. Тип:               ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
+        echo -e " 14. URL:               ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
+        echo -e " 15. Пользователь:      ${GRAY}${MASKED_REMOTE_USER}${RESET}"
+        echo -e " 16. Загрузка:          $ST_REM"
+        echo -e " 17. Настроить / Проверить"
 
         echo -e "\n${CYAN}--- БЕЗОПАСНОСТЬ ---${RESET}"
-        echo -e " 19. Пароль шифрования: ${GRAY}${PASS_MASK}${RESET}"
+        echo -e " 18. Пароль шифрования: ${GRAY}${PASS_MASK}${RESET}"
         
         echo -e "\n${CYAN}--- РОТАЦИЯ БЭКАПОВ ---${RESET}"
         local DM_DISPLAY="По времени"; [[ "$DELETE_MODE" == "count" ]] && DM_DISPLAY="По количеству"
-        echo -e " 20. Режим удаления:    ${GRAY}${DM_DISPLAY}${RESET}"
-        echo -e " 21. Срок хранения:     ${GRAY}${RETENTION_DAYS} дней${RESET}"
+        echo -e " 19. Режим удаления:    ${GRAY}${DM_DISPLAY}${RESET}"
+        if [[ "$DELETE_MODE" == "count" ]]; then
+            echo -e " 20. Макс. бэкапов:     ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
+        else
+            echo -e " 20. Срок хранения:     ${GRAY}${RETENTION_DAYS} дней${RESET}"
+        fi
         
         echo -e "\n 0. Назад"
         echo ""
@@ -3001,10 +3358,7 @@ menu_settings() {
             4) read -erp "Новый DB User: " ndb
                if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
-            5) read -erp "Макс. количество бэкапов: " nd
-               if [[ "$nd" =~ ^[0-9]+$ ]]; then MAX_BACKUPS_COUNT="$nd"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
-               
-            6) read -erp "Исключить (например: uploads/cache): " ed
+            5) read -erp "Исключить (например: uploads/cache): " ed
                if [[ -n "$ed" ]]; then 
                    EXCLUDE_DIRS="$ed"; save_config; print_message "SUCCESS" "Сохранено"
                else 
@@ -3014,22 +3368,22 @@ menu_settings() {
                    fi
                fi ;;
                
-            7) read -erp "Макс. размер файла в MB: " msize
+            6) read -erp "Макс. размер файла в MB: " msize
                if [[ "$msize" =~ ^[0-9]+$ ]] && [ "$msize" -gt 0 ]; then 
                    MAX_FILE_SIZE_MB="$msize"; save_config; print_message "SUCCESS" "Сохранено"
                fi ;;
             
-            8) read -erp "Новый Token: " nt
+            7) read -erp "Новый Token: " nt
                if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
-            9) echo -e "Текущий Chat ID: ${CYAN}${CHAT_ID}${RESET}"
+            8) echo -e "Текущий Chat ID: ${CYAN}${CHAT_ID}${RESET}"
                read -erp "Новый Chat ID: " nid
                if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
-            10) read -erp "Новый Thread ID (пусто - сбросить): " ntid
+            9) read -erp "Новый Thread ID (пусто - сбросить): " ntid
                 TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено" ;;
                 
-            11) # Переключение уведомлений
+            10) # Переключение уведомлений
                 if [[ "$SEND_TO_TELEGRAM" == "true" ]]; then 
                     SEND_TO_TELEGRAM="false"
                     print_message "INFO" "Уведомления Telegram отключены"
@@ -3039,7 +3393,7 @@ menu_settings() {
                 fi
                 save_config ;;
                 
-            12) # Переключение отправки файла
+            11) # Переключение отправки файла
                 if [[ "$TG_SEND_FILE" == "true" ]]; then
                     # Проверяем есть ли альтернативное хранилище
                     if [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]]; then
@@ -3061,17 +3415,17 @@ menu_settings() {
                 fi
                 save_config ;;
                 
-            13) test_telegram_connection ;;
+            12) test_telegram_connection ;;
 
-            14|15|16|18) configure_remote_storage ;;
+            13|14|15|17) configure_remote_storage ;;
             
-            17) # Переключение загрузки на удалённое хранилище
+            16) # Переключение загрузки на удалённое хранилище
                 if [[ "$SEND_TO_REMOTE" == "true" ]]; then 
                     SEND_TO_REMOTE="false"
                     print_message "INFO" "Загрузка на удалённое хранилище отключена"
                 else 
                     if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
-                        print_message "WARN" "Сначала настройте хранилище (пункт 18)"
+                        print_message "WARN" "Сначала настройте хранилище (пункт 17)"
                         sleep 1.5
                         continue
                     fi
@@ -3080,7 +3434,7 @@ menu_settings() {
                 fi
                 save_config ;;
 
-            19) echo ""
+            18) echo ""
                 read -s -erp "Новый пароль шифрования (пусто - отключить): " new_pass
                 echo ""
                 BACKUP_PASSWORD="$new_pass"
@@ -3091,7 +3445,7 @@ menu_settings() {
                     print_message "INFO" "Шифрование отключено"
                 fi ;;
                 
-            20) echo ""
+            19) echo ""
                 echo "Режим удаления старых бэкапов:"
                 echo " 1. По времени (старше N дней)"
                 echo " 2. По количеству (оставлять N последних)"
@@ -3099,11 +3453,21 @@ menu_settings() {
                 if [[ "$dm" == "1" ]]; then DELETE_MODE="time"; elif [[ "$dm" == "2" ]]; then DELETE_MODE="count"; fi
                 save_config; print_message "SUCCESS" "Сохранено" ;;
                 
-            21) read -erp "Срок хранения в днях: " ndays
-                if [[ "$ndays" =~ ^[0-9]+$ ]] && [ "$ndays" -ge 1 ]; then 
-                    RETENTION_DAYS="$ndays"; save_config; print_message "SUCCESS" "Сохранено"
-                else 
-                    print_message "ERROR" "Введите число >= 1"
+            20) # Настройка параметра ротации в зависимости от режима
+                if [[ "$DELETE_MODE" == "count" ]]; then
+                    read -erp "Макс. количество бэкапов: " nd
+                    if [[ "$nd" =~ ^[0-9]+$ ]] && [ "$nd" -ge 1 ]; then 
+                        MAX_BACKUPS_COUNT="$nd"; save_config; print_message "SUCCESS" "Сохранено"
+                    else 
+                        print_message "ERROR" "Введите число >= 1"
+                    fi
+                else
+                    read -erp "Срок хранения в днях: " ndays
+                    if [[ "$ndays" =~ ^[0-9]+$ ]] && [ "$ndays" -ge 1 ]; then 
+                        RETENTION_DAYS="$ndays"; save_config; print_message "SUCCESS" "Сохранено"
+                    else 
+                        print_message "ERROR" "Введите число >= 1"
+                    fi
                 fi ;;
             
             0) return ;;
@@ -3217,16 +3581,60 @@ if [[ "$DEBUG_MODE" == true ]]; then
     SILENT_LOG="/dev/stderr"
     CURL_SILENT="-v"
     WGET_SILENT=""
-    echo -e "${MAGENTA}${BOLD}╔═══════════════════════════════════════╗${RESET}"
-    echo -e "${MAGENTA}${BOLD}║         DEBUG MODE ENABLED            ║${RESET}"
-    echo -e "${MAGENTA}${BOLD}╚═══════════════════════════════════════╝${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Version: $VERSION"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Config: $CONFIG_FILE"
+    echo -e "${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${MAGENTA}${BOLD}║                    DEBUG MODE ENABLED                          ║${RESET}"
+    echo -e "${MAGENTA}${BOLD}║  All operations will be logged in detail to console           ║${RESET}"
+    echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+    echo -e "${CYAN}=== SYSTEM INFO ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} LAZARUS Version: $VERSION"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Bash Version: $BASH_VERSION"
+    echo -e "${MAGENTA}[DEBUG]${RESET} User: $(whoami) (UID: $EUID)"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Hostname: $(hostname)"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo ""
+    echo -e "${CYAN}=== CONFIG ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Config file: $CONFIG_FILE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Install dir: $INSTALL_DIR"
     echo -e "${MAGENTA}[DEBUG]${RESET} Backup dir: $BACKUP_DIR"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Bot path: $BOT_PATH"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Containers: $BOT_CONTAINER_NAME / $DB_CONTAINER_NAME"
-    echo -e "${MAGENTA}[DEBUG]${RESET} TG: notify=$SEND_TO_TELEGRAM file=$TG_SEND_FILE"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Remote: $REMOTE_STORAGE_TYPE ($SEND_TO_REMOTE)"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Log file: $LOG_FILE"
+    echo ""
+    echo -e "${CYAN}=== BOT CONFIG ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Bot path: ${BOT_PATH:-<not set>}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Bot container: ${BOT_CONTAINER_NAME:-<not set>}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} DB container: ${DB_CONTAINER_NAME:-<not set>}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} DB user: ${DB_USER:-postgres}"
+    echo ""
+    echo -e "${CYAN}=== TELEGRAM ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Notifications: $SEND_TO_TELEGRAM"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Send file: $TG_SEND_FILE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Bot token: ${BOT_TOKEN:+<set>}${BOT_TOKEN:-<not set>}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Chat ID: ${CHAT_ID:-<not set>}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Thread ID: ${TG_MESSAGE_THREAD_ID:-<not set>}"
+    echo ""
+    echo -e "${CYAN}=== REMOTE STORAGE ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Type: $REMOTE_STORAGE_TYPE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Enabled: $SEND_TO_REMOTE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} URL: ${REMOTE_STORAGE_URL:-<not set>}"
+    echo ""
+    echo -e "${CYAN}=== ROTATION ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Delete mode: $DELETE_MODE"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Retention days: $RETENTION_DAYS"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Max backups: $MAX_BACKUPS_COUNT"
+    echo ""
+    echo -e "${CYAN}=== ENCRYPTION ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Password: ${BACKUP_PASSWORD:+<set>}${BACKUP_PASSWORD:-<not set>}"
+    echo ""
+    echo -e "${CYAN}=== EXCLUSIONS ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Exclude dirs: ${EXCLUDE_DIRS:-<none>}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Max file size: ${MAX_FILE_SIZE_MB} MB"
+    echo ""
+    echo -e "${CYAN}=== DEBUG OUTPUT SETTINGS ===${RESET}"
+    echo -e "${MAGENTA}[DEBUG]${RESET} SILENT_LOG: $SILENT_LOG"
+    echo -e "${MAGENTA}[DEBUG]${RESET} CURL_SILENT: $CURL_SILENT"
+    echo -e "${MAGENTA}[DEBUG]${RESET} IS_INTERACTIVE: $IS_INTERACTIVE"
+    echo ""
+    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════════${RESET}"
     echo ""
 fi
 
