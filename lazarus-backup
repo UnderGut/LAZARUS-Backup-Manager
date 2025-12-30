@@ -3925,6 +3925,7 @@ cleanup_old_backups() {
     clear_screen; echo -e "${RED}Очистка старых бэкапов${RESET}"
     
     local del_full=0; local del_db=0; local del_files=0
+    local size_exceeded=false
 
     echo -e "Текущий режим очистки: ${YELLOW}$DELETE_MODE${RESET}"
     if [[ "$DELETE_MODE" == "count" ]]; then
@@ -3945,13 +3946,25 @@ cleanup_old_backups() {
         del_db=$(rotate_backups_by_age "lazarus_db" "Базы данных" "$RETENTION_DAYS" "false" | tail -n1)
         del_files=$(rotate_backups_by_age "lazarus_files" "Архивы файлов" "$RETENTION_DAYS" "false" | tail -n1)
     fi
+    
+    # Проверка лимита размера (показываем статус)
+    if [[ -n "$MAX_BACKUP_SIZE_MB" && "$MAX_BACKUP_SIZE_MB" != "0" ]]; then
+        local current_size_bytes=$(du -sb "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+        local limit_bytes=$((MAX_BACKUP_SIZE_MB * 1024 * 1024))
+        if [[ $current_size_bytes -gt $limit_bytes ]]; then
+            size_exceeded=true
+            rotate_backups_by_size "false"  # Показать статус без удаления
+        else
+            rotate_backups_by_size "false"  # Показать что в пределах лимита
+        fi
+    fi
 
     echo ""
     # normalize empty to 0
     del_full=${del_full:-0}; del_db=${del_db:-0}; del_files=${del_files:-0}
     local total_del=$((del_full + del_db + del_files))
 
-    if [[ "$total_del" -eq 0 ]]; then
+    if [[ "$total_del" -eq 0 && "$size_exceeded" != "true" ]]; then
         print_message "SUCCESS" "Чистка не требуется. Все в пределах лимита."
         read -erp "Enter..." dummy
         return
@@ -3960,7 +3973,12 @@ cleanup_old_backups() {
     if [[ "$DRY_RUN" == "true" ]]; then
         print_message "WARN" "[DRY-RUN] Кандидатов на удаление: $total_del"
     else
-        print_message "WARN" "Будет удалено старых архивов: $total_del"
+        if [[ "$size_exceeded" == "true" ]]; then
+            print_message "WARN" "Превышен лимит размера! Старые файлы будут удалены."
+        fi
+        if [[ "$total_del" -gt 0 ]]; then
+            print_message "WARN" "Будет удалено старых архивов: $total_del"
+        fi
     fi
     # support non-interactive auto-confirm
     if [[ "$AUTO_CONFIRM" == "true" ]]; then
@@ -3989,6 +4007,10 @@ cleanup_old_backups() {
             rotate_backups_by_age "lazarus_full" "Полные бэкапы" "$RETENTION_DAYS" "true" > "$SILENT_LOG"
             rotate_backups_by_age "lazarus_db" "Базы данных" "$RETENTION_DAYS" "true" > "$SILENT_LOG"
             rotate_backups_by_age "lazarus_files" "Архивы файлов" "$RETENTION_DAYS" "true" > "$SILENT_LOG"
+        fi
+        # Также очистка по лимиту размера
+        if [[ "$size_exceeded" == "true" ]]; then
+            rotate_backups_by_size "true"
         fi
         echo ""; print_message "SUCCESS" "Очистка завершена."
         log_message "INFO" "Cleanup completed (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, deleted=$total_del)"
