@@ -103,6 +103,7 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 | `BOT_CONTAINER_NAME` | Имя контейнера бота | `rwp_shop` |
 | `DB_CONTAINER_NAME` | Имя контейнера БД | `rwp_shop_db` |
 | `DB_USER` | Пользователь PostgreSQL | `postgres` |
+| `IGNORE_MISMATCH` | Игнорировать несоответствие контейнера | `true` / `false` |
 
 > 💡 Скрипт автоматически читает `POSTGRES_USER` и `POSTGRES_DB` из `.env` файла бота
 
