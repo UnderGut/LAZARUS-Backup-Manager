@@ -6,7 +6,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.22.0-blue?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-4.22.1-blue?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -114,6 +114,7 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 | `DELETE_MODE` | Режим удаления | `time` (по дням) / `count` (по количеству) |
 | `RETENTION_DAYS` | Хранить N дней (если mode=time) | `7` |
 | `MAX_BACKUPS_COUNT` | Макс. количество (если mode=count) | `100` |
+| `MAX_BACKUP_SIZE_MB` | Лимит общего размера бэкапов в MB | `0` (без лимита) |
 
 ### Расписание (cron формат)
 
