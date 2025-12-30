@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.22.0"
+VERSION="4.22.1"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -37,6 +37,9 @@ MAX_BACKUPS_COUNT="100"
 DELETE_MODE="time"
 # Срок хранения в днях при режиме time (по умолчанию 7 дней)
 RETENTION_DAYS="7"
+
+# Лимит размера всех бэкапов (в MB). 0 = без лимита
+MAX_BACKUP_SIZE_MB="0"
 
 # Настройки удаленного хранилища
 REMOTE_STORAGE_TYPE="off" # off, ftp, webdav
@@ -88,6 +91,7 @@ LOCK_FD=200  # File descriptor для flock
 # Trap для очистки при завершении (освобождение блокировки)
 cleanup_on_exit() {
     # Освобождаем блокировку если была получена
+    # NOTE: debug_log может не работать здесь если вызывается после закрытия stdout
     if [[ -n "$LOCK_FD" ]]; then
         flock -u "$LOCK_FD" 2>/dev/null || true
         eval "exec $LOCK_FD>&-" 2>/dev/null || true
@@ -135,11 +139,13 @@ escape_markdown_v2() {
     echo "$1" | sed -e 's/\\/\\\\/g' -e 's/_/\\_/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' \
         -e 's/(/\\(/g' -e 's/)/\\)/g' -e 's/~/\~/g' -e 's/`/\\`/g' -e 's/>/\\>/g' \
         -e 's/#/\\#/g' -e 's/+/\\+/g' -e 's/-/\\-/g' -e 's/=/\\=/g' -e 's/|/\\|/g' \
-        -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\!/g'
+        -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\\!/g'
 }
 
 send_telegram_notification() {
     local msg="$1"
+    debug_log "TG" "=== send_telegram_notification ==="
+    debug_log "TG" "SEND_TO_TELEGRAM=$SEND_TO_TELEGRAM"
     if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
         if command -v curl > "$SILENT_LOG" 2>&1; then
             local escaped_msg
@@ -149,12 +155,18 @@ send_telegram_notification() {
             local full_text="🚨 *Lazarus Error* 🚨
 
 ${escaped_msg}"
+            debug_log "TG" "Sending error notification to chat_id=$CHAT_ID"
             curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
                 -d chat_id="$CHAT_ID" \
                 -d parse_mode="MarkdownV2" \
                 --data-urlencode text="$full_text" \
                 $thread_param > "$SILENT_LOG" 2>&1 || true
+            debug_log "TG" "Notification sent"
+        else
+            debug_log "TG" "curl not available, skipping notification"
         fi
+    else
+        debug_log "TG" "Notifications disabled or credentials missing"
     fi
 }
 
@@ -206,39 +218,54 @@ acquire_lock() {
     # Пытаемся получить эксклюзивную блокировку
     # Используется для предотвращения параллельного запуска из cron
     # Возвращает 0 если блокировка получена, 1 если занято
+    debug_log "LOCK" "=== acquire_lock ==="
+    debug_log "LOCK" "Lock file: $LOCK_FILE"
     
     # Создаём директорию для lock-файла если не существует
     local lock_dir=$(dirname "$LOCK_FILE")
     if [[ ! -d "$lock_dir" ]]; then
+        debug_log "LOCK" "Creating lock directory: $lock_dir"
         mkdir -p "$lock_dir" 2> "$SILENT_LOG" || true
     fi
     
     # Открываем файл на дескриптор LOCK_FD
+    debug_log "LOCK" "Opening lock file on FD $LOCK_FD"
     eval "exec $LOCK_FD>\"$LOCK_FILE\""
     
     # Пытаемся получить неблокирующую эксклюзивную блокировку
+    debug_log "LOCK" "Attempting flock..."
     if ! flock -n "$LOCK_FD" 2> "$SILENT_LOG"; then
+        debug_log "LOCK" "FAILED - lock already held by another process"
         return 1  # Блокировка уже занята другим процессом
     fi
     
     # Записываем PID в lock-файл для отладки
     echo "$$" >&$LOCK_FD
+    debug_log "LOCK" "Lock acquired, PID=$$ written to lock file"
     
     return 0
 }
 
 release_lock() {
     # Освобождаем блокировку
+    debug_log "LOCK" "=== release_lock ==="
+    debug_log "LOCK" "Releasing FD $LOCK_FD"
     flock -u "$LOCK_FD" 2> "$SILENT_LOG" || true
     eval "exec $LOCK_FD>&-" 2> "$SILENT_LOG" || true
     rm -f "$LOCK_FILE" 2> "$SILENT_LOG" || true
+    debug_log "LOCK" "Lock released and file removed"
 }
 
 check_lock_owner() {
     # Возвращает PID процесса, владеющего блокировкой
+    debug_log "LOCK" "Checking lock owner..."
     if [[ -f "$LOCK_FILE" ]]; then
-        cat "$LOCK_FILE" 2> "$SILENT_LOG" || echo "unknown"
+        local owner
+        owner=$(cat "$LOCK_FILE" 2> "$SILENT_LOG" || echo "unknown")
+        debug_log "LOCK" "Lock owner PID: $owner"
+        echo "$owner"
     else
+        debug_log "LOCK" "No lock file found"
         echo "none"
     fi
 }
@@ -715,41 +742,54 @@ get_container_status() {
 
 # Автоматическое определение DB volume
 get_db_volume_name() {
+    debug_log "DB" "=== get_db_volume_name ==="
+    debug_log "DB" "DB_CONTAINER_NAME=$DB_CONTAINER_NAME"
+    
     if [[ -z "$DB_CONTAINER_NAME" ]]; then
+        debug_log "DB" "ERROR: DB_CONTAINER_NAME is empty"
         echo ""
         return 1
     fi
     
     # Извлекаем имя volume из docker inspect
+    debug_log "DB" "Trying docker inspect..."
     local volume=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}' "$DB_CONTAINER_NAME" 2> "$SILENT_LOG")
     
     if [[ -n "$volume" ]]; then
+        debug_log "DB" "Volume found via docker inspect: $volume"
         echo "$volume"
         return 0
     fi
+    debug_log "DB" "No volume from docker inspect, trying compose fallback"
     
     # Fallback: пытаемся определить из docker-compose.yml
     if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
         local compose_file=""
         [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
         [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+        debug_log "DB" "Compose file: $compose_file"
         
         if [[ -n "$compose_file" ]]; then
             # Ищем volume в секции volumes БД (поддержка обоих путей)
             # Новая документация: /var/lib/postgresql/data
             # Старые установки: /var/lib/postgresql
             local vol=$(grep -A 10 "^\s*$DB_SERVICE_NAME:" "$compose_file" | grep -E "volumes:" -A 5 | grep -oE "[a-zA-Z0-9_-]+:/var/lib/postgresql(/data)?" | cut -d':' -f1 | head -1)
+            debug_log "DB" "Parsed volume name from compose: '$vol'"
             if [[ -n "$vol" ]]; then
                 # Проверяем есть ли такой volume
                 if docker volume inspect "$vol" > /dev/null 2> "$SILENT_LOG"; then
+                    debug_log "DB" "Volume exists: $vol"
                     echo "$vol"
                     return 0
+                else
+                    debug_log "DB" "Volume '$vol' does not exist in docker"
                 fi
             fi
         fi
     fi
     
     # Если всё равно не нашли — возвращаем пустую строку
+    debug_log "DB" "No volume found, returning empty"
     echo ""
     return 1
 }
@@ -765,12 +805,14 @@ read_bot_env() {
     fi
     
     if [[ -z "$env_file" ]]; then
+        debug_log "DB" "read_bot_env: no .env file found for '$var_name'"
         echo ""
         return 1
     fi
     
     # Читаем значение переменной из .env (поддержка форматов KEY=value и KEY="value")
     local value=$(grep -E "^${var_name}=" "$env_file" 2>/dev/null | head -1 | cut -d'=' -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    debug_log "DB" "read_bot_env: $var_name='$value' from $env_file"
     echo "$value"
 }
 
@@ -778,8 +820,10 @@ read_bot_env() {
 get_db_user() {
     local env_user=$(read_bot_env "POSTGRES_USER")
     if [[ -n "$env_user" ]]; then
+        debug_log "DB" "get_db_user: using env POSTGRES_USER=$env_user"
         echo "$env_user"
     else
+        debug_log "DB" "get_db_user: using global DB_USER=$DB_USER"
         echo "$DB_USER"
     fi
 }
@@ -788,8 +832,10 @@ get_db_user() {
 get_db_name() {
     local env_db=$(read_bot_env "POSTGRES_DB")
     if [[ -n "$env_db" ]]; then
+        debug_log "DB" "get_db_name: using env POSTGRES_DB=$env_db"
         echo "$env_db"
     else
+        debug_log "DB" "get_db_name: using default 'postgres'"
         echo "postgres"
     fi
 }
@@ -845,6 +891,7 @@ find_bot_image_files() {
 # Поиск файлов образа во всех стандартных путях + BOT_PATH
 # Возвращает список файлов, отсортированный по версии (новые первыми)
 find_all_bot_image_files() {
+    debug_log "SCAN" "=== find_all_bot_image_files() start ==="
     local search_paths=()
     
     # Собираем все пути для поиска
@@ -860,10 +907,13 @@ find_all_bot_image_files() {
         search_paths+=("$DEFAULT_BOT_PATH")
     fi
     
+    debug_log "SCAN" "Search paths: ${search_paths[*]}"
+    
     local all_files=""
     local seen_files=()
     
     for search_path in "${search_paths[@]}"; do
+        debug_log "SCAN" "Searching in: $search_path (maxdepth=3)"
         # Рекурсивный поиск (maxdepth 3 для разумной глубины)
         while IFS= read -r file; do
             [[ -z "$file" ]] && continue
@@ -876,8 +926,11 @@ find_all_bot_image_files() {
             done
             
             if [[ "$is_dup" == "false" ]]; then
+                debug_log "SCAN" "  Found: $file"
                 seen_files+=("$fname")
                 all_files+="$file"$'\n'
+            else
+                debug_log "SCAN" "  Duplicate skipped: $fname"
             fi
         done < <(find "$search_path" -maxdepth 3 -type f \( \
             -name "rwp_shop*.tar" -o \
@@ -890,9 +943,12 @@ find_all_bot_image_files() {
     all_files="${all_files%$'\n'}"
     
     if [[ -z "$all_files" ]]; then
+        debug_log "SCAN" "No image files found"
         echo ""
         return 1
     fi
+    
+    debug_log "SCAN" "Total unique files found: $(echo "$all_files" | wc -l)"
     
     # Сортировка по версии (извлекаем версию, сортируем, выводим)
     # Новые версии первыми (sort -Vr)
@@ -951,13 +1007,20 @@ update_compose_image_version() {
     local new_version="$2"
     local new_image_name="$3"  # Опционально: имя нового image
     
+    debug_log "COMPOSE" "=== update_compose_image_version() ==="
+    debug_log "COMPOSE" "  compose_file=$compose_file"
+    debug_log "COMPOSE" "  new_version=$new_version"
+    debug_log "COMPOSE" "  new_image_name=$new_image_name"
+    
     if [[ ! -f "$compose_file" ]]; then
+        debug_log "COMPOSE" "Compose file not found: $compose_file"
         print_message "ERROR" "Compose файл не найден: $compose_file"
         return 1
     fi
     
     # Если новое имя image не указано, используем rwp_shop (официальное)
     [[ -z "$new_image_name" ]] && new_image_name="rwp_shop"
+    debug_log "COMPOSE" "Target image name: $new_image_name"
     
     # Список всех возможных имён image бота
     local image_patterns=(
@@ -969,21 +1032,26 @@ update_compose_image_version() {
     
     local found=false
     for pattern in "${image_patterns[@]}"; do
+        debug_log "COMPOSE" "Checking for pattern: $pattern"
         if grep -qE "image:\s*['\"]?${pattern}:" "$compose_file"; then
+            debug_log "COMPOSE" "Pattern matched: $pattern"
             # Заменяем на новое имя и версию
             sed -i -E "s|(image:\s*['\"]?)${pattern}:[0-9]+\.[0-9]+\.[0-9]+|\1${new_image_name}:${new_version}|g" "$compose_file"
             found=true
+            debug_log "COMPOSE" "Sed replacement done: ${pattern} -> ${new_image_name}:${new_version}"
             print_message "SUCCESS" "Image обновлён: ${pattern} → ${new_image_name}:${new_version}"
             break
         fi
     done
     
     if [[ "$found" == "false" ]]; then
+        debug_log "COMPOSE" "No matching image pattern found in compose file"
         print_message "ERROR" "Не найден image бота в compose файле"
         print_message "INFO" "Искали паттерны: ${image_patterns[*]}"
         return 1
     fi
     
+    debug_log "COMPOSE" "update_compose_image_version() completed successfully"
     return 0
 }
 
@@ -993,15 +1061,20 @@ check_db_health() {
     local max_attempts="${2:-30}"
     local attempt=1
     
+    debug_log "HEALTH" "check_db_health($db_container, max=$max_attempts)"
+    
     while [[ $attempt -le $max_attempts ]]; do
         local health=$(docker inspect -f '{{.State.Health.Status}}' "$db_container" 2> "$SILENT_LOG")
+        debug_log "HEALTH" "  attempt $attempt: health=$health"
         
         if [[ "$health" == "healthy" ]]; then
+            debug_log "HEALTH" "DB healthy via docker healthcheck"
             return 0
         fi
         
         # Альтернативная проверка через pg_isready
         if docker exec "$db_container" pg_isready -U "$DB_USER" > "$SILENT_LOG" 2>&1; then
+            debug_log "HEALTH" "DB healthy via pg_isready"
             return 0
         fi
         
@@ -1010,6 +1083,7 @@ check_db_health() {
         ((attempt++))
     done
     
+    debug_log "HEALTH" "DB health check failed after $max_attempts attempts"
     echo ""
     return 1
 }
@@ -1020,15 +1094,20 @@ check_bot_health() {
     local max_attempts="${2:-20}"
     local attempt=1
     
+    debug_log "HEALTH" "check_bot_health($bot_container, max=$max_attempts)"
+    
     while [[ $attempt -le $max_attempts ]]; do
         local status=$(docker inspect -f '{{.State.Status}}' "$bot_container" 2> "$SILENT_LOG")
         local running=$(docker inspect -f '{{.State.Running}}' "$bot_container" 2> "$SILENT_LOG")
+        debug_log "HEALTH" "  attempt $attempt: status=$status, running=$running"
         
         if [[ "$status" == "running" && "$running" == "true" ]]; then
             # Проверяем что контейнер не рестартует
             sleep 2
             local status2=$(docker inspect -f '{{.State.Status}}' "$bot_container" 2> "$SILENT_LOG")
+            debug_log "HEALTH" "  stability check: status2=$status2"
             if [[ "$status2" == "running" ]]; then
+                debug_log "HEALTH" "Bot healthy and stable"
                 return 0
             fi
         fi
@@ -1038,6 +1117,7 @@ check_bot_health() {
         ((attempt++))
     done
     
+    debug_log "HEALTH" "Bot health check failed after $max_attempts attempts"
     echo ""
     return 1
 }
@@ -1050,6 +1130,7 @@ get_latest_db_backup() {
 
 # Главная функция обновления бота
 update_bot() {
+    debug_log "UPDATE" "=== Starting update_bot() ==="
     clear_screen
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
     echo -e "${GREEN}${BOLD}  Обновление бота${RESET}"
@@ -1057,26 +1138,32 @@ update_bot() {
     echo ""
     
     # === ЭТАП 1: ОПРЕДЕЛЕНИЕ ПУТИ К БОТУ ===
+    debug_log "UPDATE" "[STAGE 1] Checking bot path..."
     local bot_path_ok=false
     
     # Сначала проверяем текущий BOT_PATH
     if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && ( -f "$BOT_PATH/docker-compose.yml" || -f "$BOT_PATH/compose.yaml" ) ]]; then
         bot_path_ok=true
+        debug_log "UPDATE" "Bot path OK: $BOT_PATH"
     fi
     
     # Если не настроен — пробуем найти
     if [[ "$bot_path_ok" == "false" ]]; then
+        debug_log "UPDATE" "Bot path not configured, starting search..."
         print_message "INFO" "Путь к боту не настроен. Запускаем поиск..."
         
         # Проверяем путь по умолчанию из документации
         if [[ -d "$DEFAULT_BOT_PATH" && ( -f "$DEFAULT_BOT_PATH/docker-compose.yml" || -f "$DEFAULT_BOT_PATH/compose.yaml" ) ]]; then
+            debug_log "UPDATE" "Found bot at default path: $DEFAULT_BOT_PATH"
             print_message "SUCCESS" "Найден бот в $DEFAULT_BOT_PATH"
             BOT_PATH="$DEFAULT_BOT_PATH"
             save_config
             bot_path_ok=true
         else
+            debug_log "UPDATE" "Default path not found, running ensure_bot_path()..."
             # Запускаем автопоиск
             if ! ensure_bot_path; then
+                debug_log "UPDATE" "ensure_bot_path() failed, prompting manual input"
                 echo ""
                 print_message "ERROR" "Не удалось найти установку бота!"
                 echo ""
@@ -1093,35 +1180,43 @@ update_bot() {
                 manual_path="${manual_path:-$DEFAULT_BOT_PATH}"
                 
                 if [[ -d "$manual_path" ]]; then
+                    debug_log "UPDATE" "Manual path accepted: $manual_path"
                     BOT_PATH="$manual_path"
                     save_config
                     bot_path_ok=true
                 else
+                    debug_log "UPDATE" "Manual path not found: $manual_path"
                     print_message "ERROR" "Папка не найдена: $manual_path"
                     read -erp "Нажмите Enter..." dummy
                     return 1
                 fi
             else
+                debug_log "UPDATE" "ensure_bot_path() success, BOT_PATH=$BOT_PATH"
                 bot_path_ok=true
             fi
         fi
     fi
     
     # Финальная проверка пути
+    debug_log "UPDATE" "Final path check: bot_path_ok=$bot_path_ok, BOT_PATH=$BOT_PATH"
     if [[ "$bot_path_ok" == "false" || -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+        debug_log "UPDATE" "Path validation failed, aborting"
         print_message "ERROR" "Путь к боту не настроен!"
         read -erp "Нажмите Enter..." dummy
         return 1
     fi
     
     # === ЭТАП 2: ИНФОРМАЦИЯ О ТЕКУЩЕЙ УСТАНОВКЕ ===
+    debug_log "UPDATE" "[STAGE 2] Getting current installation info..."
     local current_version=$(get_raw_bot_version)
+    debug_log "UPDATE" "Current version raw: $current_version"
     if [[ -z "$current_version" || "$current_version" == "Unknown" ]]; then
         print_message "WARN" "Не удалось определить текущую версию бота"
         current_version="0.0.0"
     fi
     
     local container_status=$(get_container_status)
+    debug_log "UPDATE" "Container status: $container_status"
     
     echo -e "Путь к боту:     ${CYAN}$BOT_PATH${RESET}"
     echo -e "Текущая версия:  ${CYAN}$current_version${RESET}"
@@ -1129,10 +1224,13 @@ update_bot() {
     echo ""
     
     # === ЭТАП 3: ПОИСК ФАЙЛОВ ОБРАЗОВ ===
+    debug_log "UPDATE" "[STAGE 3] Searching for image files..."
     print_message "INFO" "Поиск файлов образа в /opt/, /root/, $BOT_PATH..."
     local image_files=$(find_all_bot_image_files)
+    debug_log "UPDATE" "Image files found: $(echo "$image_files" | wc -l) files"
     
     if [[ -z "$image_files" ]]; then
+        debug_log "UPDATE" "No image files found, aborting"
         echo ""
         print_message "WARN" "Файлы образа не найдены"
         echo ""
@@ -1154,9 +1252,11 @@ update_bot() {
     
     # Считаем количество найденных файлов
     local files_count=$(echo "$image_files" | wc -l)
+    debug_log "UPDATE" "Files count: $files_count"
     print_message "SUCCESS" "Найдено файлов: $files_count"
     
     # === ЭТАП 4: ОТОБРАЖЕНИЕ НАЙДЕННЫХ ФАЙЛОВ ===
+    debug_log "UPDATE" "[STAGE 4] Displaying found files..."
     echo ""
     echo -e "${BOLD}Найденные файлы образов (новые первыми):${RESET}"
     local i=1
@@ -1169,6 +1269,7 @@ update_bot() {
         local fsize=$(du -h "$file" 2>/dev/null | cut -f1)
         local fimage=$(get_image_name_from_tar "$file")
         files_array+=("$file")
+        debug_log "UPDATE" "  [$i] $fname (v$fversion, size=$fsize, image=$fimage)"
         
         # Определяем тип файла
         local type_label=""
@@ -1200,26 +1301,33 @@ update_bot() {
     echo ""
     
     # === ЭТАП 5: ВЫБОР ФАЙЛА ===
+    debug_log "UPDATE" "[STAGE 5] File selection..."
     # Первый файл в списке = самая новая версия (после сортировки)
     local latest_file="${files_array[0]}"
     local latest_version=$(extract_version_from_filename "$(basename "$latest_file")")
+    debug_log "UPDATE" "Latest file: $(basename "$latest_file"), version: $latest_version"
     
     local choice=""
     if ! version_gt "$latest_version" "$current_version"; then
+        debug_log "UPDATE" "Current version is latest ($current_version >= $latest_version)"
         print_message "INFO" "Установлена последняя версия ($current_version)"
         echo ""
         read -erp "Выберите файл для переустановки (или Enter - назад): " choice
         [[ -z "$choice" || "$choice" == "0" ]] && return 0
     else
+        debug_log "UPDATE" "Update available: $current_version -> $latest_version"
         echo -e "${YELLOW}${BOLD}Доступно обновление: $current_version → $latest_version${RESET}"
         echo ""
         read -erp "Выберите файл (Enter - последний v$latest_version): " choice
         [[ -z "$choice" ]] && choice=1
     fi
     
+    debug_log "UPDATE" "User choice: $choice"
+    
     # Валидация выбора
     if [[ "$choice" == "0" ]]; then return 0; fi
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "${#files_array[@]}" ]]; then
+        debug_log "UPDATE" "Invalid choice: $choice (valid: 1-${#files_array[@]})"
         print_message "ERROR" "Неверный выбор"
         sleep 1
         return 1
@@ -1228,8 +1336,10 @@ update_bot() {
     local selected_file="${files_array[$((choice-1))]}"
     local selected_version=$(extract_version_from_filename "$(basename "$selected_file")")
     local selected_image_name=$(get_image_name_from_tar "$selected_file")
+    debug_log "UPDATE" "Selected: file=$selected_file, version=$selected_version, image=$selected_image_name"
     
     # === ЭТАП 6: ПОДТВЕРЖДЕНИЕ ===
+    debug_log "UPDATE" "[STAGE 6] User confirmation..."
     echo ""
     echo -e "${BOLD}════════════════════════════════════════${RESET}"
     echo -e "${BOLD}Выбран файл:${RESET} $(basename "$selected_file")"
@@ -1250,11 +1360,13 @@ update_bot() {
     
     read -erp "Начать обновление? (y/N): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        debug_log "UPDATE" "User cancelled update"
         print_message "INFO" "Отменено"
         return 0
     fi
     
     # === ЭТАП 7: СОЗДАНИЕ БЭКАПОВ ===
+    debug_log "UPDATE" "[STAGE 7] Creating pre-update backups..."
     echo ""
     echo -e "${CYAN}${BOLD}═══ СОЗДАНИЕ БЭКАПОВ ═══${RESET}"
     log_message "INFO" "Starting bot update: $current_version -> $selected_version"
@@ -1262,11 +1374,14 @@ update_bot() {
     # Запоминаем время начала для поиска созданных бэкапов
     local update_start_time=$(date +%s)
     
+    debug_log "UPDATE" "Creating full backup..."
     print_message "INFO" "[1/7] Создание полного бэкапа..."
     create_backup "full"
     local backup_result=$?
+    debug_log "UPDATE" "Full backup result: $backup_result"
     
     if [[ $backup_result -ne 0 ]]; then
+        debug_log "UPDATE" "Full backup FAILED, aborting update"
         print_message "ERROR" "Ошибка создания бэкапа! Обновление отменено."
         log_message "ERROR" "Bot update aborted: full backup failed"
         read -erp "Нажмите Enter..." dummy
@@ -1274,9 +1389,11 @@ update_bot() {
     fi
     print_message "SUCCESS" "Полный бэкап создан"
     
+    debug_log "UPDATE" "Creating DB backup..."
     print_message "INFO" "[2/7] Создание бэкапа БД..."
     create_backup "db_only"
     local db_backup_result=$?
+    debug_log "UPDATE" "DB backup result: $db_backup_result"
     
     if [[ $db_backup_result -ne 0 ]]; then
         print_message "WARN" "Бэкап БД не создан (полный бэкап есть)"
@@ -1286,17 +1403,23 @@ update_bot() {
     
     # Получаем путь к последнему бэкапу БД для возможного rollback
     local rollback_backup=$(get_latest_db_backup)
+    debug_log "UPDATE" "Rollback backup: $rollback_backup"
     
     # === ЭТАП 8: ЗАГРУЗКА DOCKER IMAGE ===
+    debug_log "UPDATE" "[STAGE 8] Loading Docker image..."
     echo ""
     echo -e "${CYAN}${BOLD}═══ ЗАГРУЗКА IMAGE ═══${RESET}"
     print_message "INFO" "[3/7] Загрузка Docker image..."
+    debug_log "DOCKER" "Running: docker load -i $selected_file"
     
     local load_output
     load_output=$(docker load -i "$selected_file" 2>&1)
     local load_result=$?
+    debug_log "DOCKER" "docker load result: $load_result"
+    debug_log "DOCKER" "docker load output: $load_output"
     
     if [[ $load_result -ne 0 ]]; then
+        debug_log "DOCKER" "docker load FAILED"
         print_message "ERROR" "Ошибка загрузки image!"
         echo "$load_output"
         log_message "ERROR" "Bot update failed: docker load error"
@@ -1308,30 +1431,39 @@ update_bot() {
     
     # Извлекаем реальное имя загруженного image
     local loaded_image=$(echo "$load_output" | grep -oE "Loaded image: [^ ]+" | cut -d' ' -f3)
+    debug_log "DOCKER" "Loaded image from output: $loaded_image"
     if [[ -n "$loaded_image" ]]; then
         print_message "SUCCESS" "Image загружен: $loaded_image"
         # Извлекаем имя image без версии
         selected_image_name="${loaded_image%%:*}"
+        debug_log "DOCKER" "Image name extracted: $selected_image_name"
     else
         print_message "SUCCESS" "Image загружен"
         echo "$load_output" | grep -i "loaded" | head -1
     fi
     
     # Проверяем что image появился
+    debug_log "DOCKER" "Verifying image in docker images..."
     if ! docker images | grep -q "$selected_image_name.*$selected_version"; then
+        debug_log "DOCKER" "Image not found in list, showing available:"
         print_message "WARN" "Image загружен, но не найден в списке"
         docker images | grep -E "(rwp_shop|telegram-shop|private-remnawave)" | head -5
+    else
+        debug_log "DOCKER" "Image verified in docker images list"
     fi
     
     # === ЭТАП 9: ОБНОВЛЕНИЕ COMPOSE ФАЙЛА ===
+    debug_log "UPDATE" "[STAGE 9] Updating compose file..."
     echo ""
     echo -e "${CYAN}${BOLD}═══ ОБНОВЛЕНИЕ КОНФИГУРАЦИИ ═══${RESET}"
     
     local compose_file=""
     [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
     [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    debug_log "COMPOSE" "Compose file: $compose_file"
     
     if [[ -z "$compose_file" ]]; then
+        debug_log "COMPOSE" "No compose file found in $BOT_PATH"
         print_message "ERROR" "Compose файл не найден!"
         log_message "ERROR" "Bot update failed: compose file not found"
         read -erp "Нажмите Enter..." dummy
@@ -1341,9 +1473,12 @@ update_bot() {
     print_message "INFO" "[4/7] Обновление compose файла..."
     
     # Создаём бэкап compose файла
+    debug_log "COMPOSE" "Creating backup: ${compose_file}.pre-update.bak"
     cp "$compose_file" "${compose_file}.pre-update.bak"
     
+    debug_log "COMPOSE" "Calling update_compose_image_version($compose_file, $selected_version, $selected_image_name)"
     if ! update_compose_image_version "$compose_file" "$selected_version" "$selected_image_name"; then
+        debug_log "COMPOSE" "update_compose_image_version FAILED, restoring backup"
         print_message "ERROR" "Ошибка обновления compose!"
         mv "${compose_file}.pre-update.bak" "$compose_file"
         log_message "ERROR" "Bot update failed: compose update error"
@@ -1354,28 +1489,40 @@ update_bot() {
     fi
     
     # === ЭТАП 10: ОСТАНОВКА КОНТЕЙНЕРОВ ===
+    debug_log "UPDATE" "[STAGE 10] Stopping containers..."
     echo ""
     echo -e "${CYAN}${BOLD}═══ ПЕРЕЗАПУСК КОНТЕЙНЕРОВ ═══${RESET}"
     print_message "INFO" "[5/7] Остановка контейнеров..."
     
     cd "$BOT_PATH"
+    debug_log "CONTAINER" "Running: docker compose down in $BOT_PATH"
     docker compose down 2> "$SILENT_LOG"
+    local down_result=$?
+    debug_log "CONTAINER" "docker compose down result: $down_result"
     sleep 2
     
     # === ЭТАП 11: ЗАПУСК КОНТЕЙНЕРОВ ===
+    debug_log "UPDATE" "[STAGE 11] Starting containers..."
     print_message "INFO" "[6/7] Запуск контейнеров..."
+    debug_log "CONTAINER" "Running: docker compose up -d"
     docker compose up -d 2> "$SILENT_LOG"
+    local up_result=$?
+    debug_log "CONTAINER" "docker compose up result: $up_result"
     
     # === ЭТАП 12: ПРОВЕРКА ЗДОРОВЬЯ ===
+    debug_log "UPDATE" "[STAGE 12] Health checks..."
     print_message "INFO" "[7/7] Проверка работоспособности..."
     echo ""
     
     # Ждём БД
     if [[ -n "$DB_CONTAINER_NAME" ]]; then
+        debug_log "HEALTH" "Checking DB health for: $DB_CONTAINER_NAME"
         echo -n "  Проверка БД..."
         if check_db_health "$DB_CONTAINER_NAME" 30; then
+            debug_log "HEALTH" "DB health check: OK"
             echo -e " ${GREEN}OK${RESET}"
         else
+            debug_log "HEALTH" "DB health check: WARN (may still be initializing)"
             echo -e " ${YELLOW}WARN${RESET}"
             print_message "WARN" "БД не отвечает, но может ещё инициализироваться"
         fi
@@ -1383,10 +1530,13 @@ update_bot() {
     
     # Ждём бота
     if [[ -n "$BOT_CONTAINER_NAME" ]]; then
+        debug_log "HEALTH" "Checking bot health for: $BOT_CONTAINER_NAME"
         echo -n "  Проверка бота..."
         if check_bot_health "$BOT_CONTAINER_NAME" 20; then
+            debug_log "HEALTH" "Bot health check: OK"
             echo -e " ${GREEN}OK${RESET}"
         else
+            debug_log "HEALTH" "Bot health check: FAIL"
             echo -e " ${RED}FAIL${RESET}"
         fi
     fi
@@ -1394,14 +1544,17 @@ update_bot() {
     sleep 2
     
     # === ЭТАП 13: ФИНАЛЬНАЯ ПРОВЕРКА ===
+    debug_log "UPDATE" "[STAGE 13] Final verification..."
     local new_version=$(get_raw_bot_version)
     local new_status=$(get_container_status)
+    debug_log "UPDATE" "New version: $new_version, status: $new_status"
     
     echo ""
     echo -e "${BOLD}═══════════════════════════════════════════════════${RESET}"
     
     if [[ "$new_status" == "Online" ]]; then
         if [[ "$new_version" == "$selected_version" ]]; then
+            debug_log "UPDATE" "=== Update SUCCESS: $current_version -> $new_version ==="
             echo -e "${GREEN}${BOLD}✓ ОБНОВЛЕНИЕ УСПЕШНО ЗАВЕРШЕНО${RESET}"
             echo ""
             echo -e "  Версия: ${CYAN}$current_version${RESET} → ${GREEN}$new_version${RESET}"
@@ -1409,15 +1562,18 @@ update_bot() {
             log_message "SUCCESS" "Bot updated successfully: $current_version -> $new_version"
             
             # Удаляем бэкап compose файла
+            debug_log "UPDATE" "Removing compose backup file"
             rm -f "${compose_file}.pre-update.bak"
             
             echo ""
             read -erp "Удалить файл образа $(basename "$selected_file")? (y/N): " del_confirm
             if [[ "$del_confirm" == "y" || "$del_confirm" == "Y" ]]; then
+                debug_log "UPDATE" "Deleting image file: $selected_file"
                 rm -f "$selected_file"
                 print_message "SUCCESS" "Файл удалён"
             fi
         else
+            debug_log "UPDATE" "=== Update WARN: version mismatch (expected=$selected_version, got=$new_version) ==="
             echo -e "${YELLOW}${BOLD}⚠ ОБНОВЛЕНИЕ ЗАВЕРШЕНО С ПРЕДУПРЕЖДЕНИЕМ${RESET}"
             echo ""
             echo -e "  Ожидалась версия: ${CYAN}$selected_version${RESET}"
@@ -1428,6 +1584,7 @@ update_bot() {
             log_message "WARN" "Bot update: version mismatch (expected=$selected_version, got=$new_version)"
         fi
     else
+        debug_log "UPDATE" "=== Update FAILED: container not running (status=$new_status) ==="
         echo -e "${RED}${BOLD}✗ ОБНОВЛЕНИЕ ЗАВЕРШЕНО С ОШИБКОЙ${RESET}"
         echo ""
         echo -e "  Статус: ${RED}$new_status${RESET}"
@@ -1458,9 +1615,11 @@ update_bot() {
 }
 
 detect_bot_installation() {
+    debug_log "SCAN" "=== detect_bot_installation ==="
     print_message "INFO" "Запуск интеллектуального поиска..."
     scan_system_for_bot 
     if [[ -n "$FOUND_PATH" ]]; then
+        debug_log "SCAN" "Found installation: PATH=$FOUND_PATH, BOT=$FOUND_BOT, DB=$FOUND_DB"
         echo ""; print_message "SUCCESS" "Обнаружена установка!"
         echo -e "   Путь:      ${BOLD}$FOUND_PATH${RESET}"
         [[ -n "$FOUND_BOT" ]] && echo -e "   Бот:       ${BOLD}$FOUND_BOT${RESET}"
@@ -1468,11 +1627,16 @@ detect_bot_installation() {
         echo ""
         read -erp "Использовать эти настройки? (Y/n): " confirm
         if [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]]; then
+            debug_log "SCAN" "User confirmed, applying settings"
             BOT_PATH="$FOUND_PATH"
             if [[ -n "$FOUND_BOT" ]]; then BOT_CONTAINER_NAME="$FOUND_BOT"; fi
             if [[ -n "$FOUND_DB" ]]; then DB_CONTAINER_NAME="$FOUND_DB"; fi
             save_config; print_message "SUCCESS" "Настройки сохранены."; return 0
+        else
+            debug_log "SCAN" "User declined auto-detected settings"
         fi
+    else
+        debug_log "SCAN" "No installation found by auto-detection"
     fi
     print_message "WARN" "Авто-поиск не дал результата. Введите данные вручную в Настройках."
     return 1
@@ -1481,76 +1645,109 @@ detect_bot_installation() {
 # --- ПРОВЕРКА НЕСООТВЕТСТВИЙ ---
 
 check_config_mismatch() {
+    debug_log "CONFIG" "=== check_config_mismatch ==="
+    debug_log "CONFIG" "BOT_CONTAINER_NAME=$BOT_CONTAINER_NAME, IGNORE_MISMATCH=$IGNORE_MISMATCH"
     if [[ -n "$BOT_CONTAINER_NAME" && "$IGNORE_MISMATCH" != "true" ]]; then
+        debug_log "CONFIG" "Checking if container exists..."
         if ! docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+            debug_log "CONFIG" "Container '$BOT_CONTAINER_NAME' NOT found, scanning for alternatives"
             scan_system_for_bot
             if [[ -n "$FOUND_BOT" && "$FOUND_BOT" != "$BOT_CONTAINER_NAME" ]]; then
+                debug_log "CONFIG" "Found alternative: $FOUND_BOT (was: $BOT_CONTAINER_NAME)"
                 echo ""; print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден, но найден '$FOUND_BOT'."
                 echo -e " ${GREEN}Предлагаю обновить настройки.${RESET}"
                 read -erp "Обновить? (Y/n): " upd
                 if [[ -z "$upd" || "$upd" =~ ^[Yy]$ ]]; then
+                    debug_log "CONFIG" "User confirmed update to new container"
                     BOT_CONTAINER_NAME="$FOUND_BOT"
                     [[ -n "$FOUND_DB" ]] && DB_CONTAINER_NAME="$FOUND_DB"
                     [[ -n "$FOUND_PATH" ]] && BOT_PATH="$FOUND_PATH"
                     save_config; print_message "SUCCESS" "Обновлено."; sleep 1
                 else
+                    debug_log "CONFIG" "User declined, setting IGNORE_MISMATCH=true"
                     IGNORE_MISMATCH="true"; save_config
                 fi
             fi
+        else
+            debug_log "CONFIG" "Container '$BOT_CONTAINER_NAME' exists"
         fi
     fi
 }
 
 ensure_bot_path() {
+    debug_log "CONFIG" "=== ensure_bot_path ==="
+    debug_log "CONFIG" "Current: BOT_PATH=$BOT_PATH, BOT=$BOT_CONTAINER_NAME, DB=$DB_CONTAINER_NAME"
+    
     if [[ -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then
+        debug_log "CONFIG" "Container names empty, starting detection"
         echo ""; print_message "WARN" "Настройки контейнеров пусты."
         detect_bot_installation; load_or_create_config 
     fi
 
     local path_valid=false
     if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && ( -f "$BOT_PATH/docker-compose.yml" || -f "$BOT_PATH/compose.yaml" ) ]]; then path_valid=true; fi
+    debug_log "CONFIG" "path_valid=$path_valid (BOT_PATH=$BOT_PATH)"
+    
     local container_valid=false
     if [[ -n "$BOT_CONTAINER_NAME" ]] && docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then container_valid=true; fi
+    debug_log "CONFIG" "container_valid=$container_valid (BOT_CONTAINER=$BOT_CONTAINER_NAME)"
+    
     local db_valid=false
     if [[ -n "$DB_CONTAINER_NAME" ]] && docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then db_valid=true; fi
+    debug_log "CONFIG" "db_valid=$db_valid (DB_CONTAINER=$DB_CONTAINER_NAME)"
 
     if [[ "$path_valid" == "false" || "$container_valid" == "false" || "$db_valid" == "false" ]]; then
+        debug_log "CONFIG" "Some validations failed, attempting auto-detection"
         if [[ "$path_valid" == "false" ]]; then
             detect_bot_installation; load_or_create_config
             if [[ -n "$BOT_PATH" ]]; then path_valid=true; fi
             if [[ -n "$BOT_CONTAINER_NAME" ]]; then container_valid=true; fi
             if [[ -n "$DB_CONTAINER_NAME" ]]; then db_valid=true; fi
+            debug_log "CONFIG" "After detection: path=$path_valid, container=$container_valid, db=$db_valid"
         fi
 
         if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+            debug_log "CONFIG" "BOT_PATH still invalid, prompting user"
             echo ""; print_message "ACTION" "Укажите путь к папке бота вручную."
             read -erp "Путь (Enter для '$DEFAULT_BOT_PATH'): " input_path
             BOT_PATH="${input_path:-$DEFAULT_BOT_PATH}"
-            if [[ ! -d "$BOT_PATH" ]]; then print_message "ERROR" "Папка не найдена!"; return 1; fi
+            debug_log "CONFIG" "User entered BOT_PATH=$BOT_PATH"
+            if [[ ! -d "$BOT_PATH" ]]; then 
+                debug_log "CONFIG" "ERROR: Path does not exist"
+                print_message "ERROR" "Папка не найдена!"; return 1
+            fi
             save_config
         fi
 
         if [[ -z "$BOT_CONTAINER_NAME" ]] || ! docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+            debug_log "CONFIG" "BOT_CONTAINER_NAME invalid, prompting user"
             echo ""; print_message "WARN" "Контейнер бота не определен."
             print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
             read -erp "Имя (Enter для '$DEFAULT_BOT_CONTAINER'): " input_name
             BOT_CONTAINER_NAME="${input_name:-$DEFAULT_BOT_CONTAINER}"
+            debug_log "CONFIG" "User entered BOT_CONTAINER_NAME=$BOT_CONTAINER_NAME"
             save_config
         fi
 
         if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+            debug_log "CONFIG" "DB_CONTAINER_NAME invalid, prompting user"
             echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
             print_message "ACTION" "Введите имя контейнера БД."
             read -erp "Имя БД (Enter для '$DEFAULT_DB_CONTAINER'): " input_db
             DB_CONTAINER_NAME="${input_db:-$DEFAULT_DB_CONTAINER}"
+            debug_log "CONFIG" "User entered DB_CONTAINER_NAME=$DB_CONTAINER_NAME"
             save_config
         fi
     fi
+    debug_log "CONFIG" "=== ensure_bot_path completed ==="
     return 0
 }
 
 save_config() {
+    debug_log "CONFIG" "=== save_config ==="
+    debug_log "CONFIG" "Creating config dir: $INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
+    debug_log "CONFIG" "Writing config to: $CONFIG_FILE"
     cat > "$CONFIG_FILE" <<EOF
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
@@ -1576,12 +1773,27 @@ TG_SEND_FILE="$TG_SEND_FILE"
 SEND_TO_REMOTE="$SEND_TO_REMOTE"
 DELETE_MODE="$DELETE_MODE"
 RETENTION_DAYS="$RETENTION_DAYS"
+MAX_BACKUP_SIZE_MB="$MAX_BACKUP_SIZE_MB"
 EOF
     chmod 600 "$CONFIG_FILE"
+    debug_log "CONFIG" "Config saved, chmod 600 applied"
+    debug_log "CONFIG" "BOT_PATH=$BOT_PATH"
+    debug_log "CONFIG" "BOT_CONTAINER=$BOT_CONTAINER_NAME, DB_CONTAINER=$DB_CONTAINER_NAME"
+    debug_log "CONFIG" "REMOTE_STORAGE_TYPE=$REMOTE_STORAGE_TYPE"
+    debug_log "CONFIG" "DELETE_MODE=$DELETE_MODE, MAX_BACKUPS=$MAX_BACKUPS_COUNT, RETENTION=$RETENTION_DAYS days"
+    debug_log "CONFIG" "MAX_BACKUP_SIZE_MB=$MAX_BACKUP_SIZE_MB"
 }
 
 load_or_create_config() {
-    if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; fi
+    debug_log "CONFIG" "=== load_or_create_config ==="
+    debug_log "CONFIG" "Config file: $CONFIG_FILE"
+    if [[ -f "$CONFIG_FILE" ]]; then 
+        debug_log "CONFIG" "Config exists, sourcing..."
+        source "$CONFIG_FILE"
+        debug_log "CONFIG" "Config loaded successfully"
+    else
+        debug_log "CONFIG" "Config file not found, using defaults"
+    fi
     if [[ -z "$MAX_BACKUPS_COUNT" ]]; then MAX_BACKUPS_COUNT=100; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
     if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
@@ -1591,22 +1803,32 @@ load_or_create_config() {
     if [[ -z "$SEND_TO_REMOTE" ]]; then SEND_TO_REMOTE="true"; fi
     if [[ -z "$DELETE_MODE" ]]; then DELETE_MODE="time"; fi
     if [[ -z "$RETENTION_DAYS" ]]; then RETENTION_DAYS="7"; fi
+    if [[ -z "$MAX_BACKUP_SIZE_MB" ]]; then MAX_BACKUP_SIZE_MB="0"; fi
+    debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
+    debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
 
     local updated=false
     if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+        debug_log "CONFIG" "Telegram settings missing, prompting user"
         echo ""; print_message "WARN" "Настройки Telegram не найдены."
         [[ -z "$BOT_TOKEN" ]] && read -erp " Введите Bot Token: " BOT_TOKEN
         [[ -z "$CHAT_ID" ]] && read -erp " Введите Chat ID: " CHAT_ID
         [[ -z "$TG_MESSAGE_THREAD_ID" ]] && read -erp " Введите ID топика (или Enter): " TG_MESSAGE_THREAD_ID
         updated=true
+        debug_log "CONFIG" "Telegram settings received from user"
     fi
     
     if [[ -z "$BOT_PATH" || -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then 
+        debug_log "CONFIG" "Bot installation not configured, starting detection"
         detect_bot_installation
     fi
     
-    if $updated; then save_config; fi
+    if $updated; then 
+        debug_log "CONFIG" "Config updated, saving..."
+        save_config
+    fi
+    debug_log "CONFIG" "=== load_or_create_config completed ==="
 }
 
 send_telegram_document() {
@@ -1731,38 +1953,52 @@ test_telegram_connection() {
 
 validate_remote_connection() {
     local type="$1"; local url="$2"; local user="$3"; local pass="$4"
+    
+    debug_log "REMOTE" "=== validate_remote_connection($type) ==="
+    debug_log "REMOTE" "URL: $url"
+    debug_log "REMOTE" "User: ${user:-<empty>}"
+    
     print_message "INFO" "Тестирование подключения ($type)..."
     
     local base_url="${url%/}"
     
     if [[ "$type" == "ftp" ]]; then
+        debug_log "REMOTE" "Testing FTP connection..."
         # FTP: проверяем листинг директории
         local curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only)
         [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
         
         # Поддержка FTPS (implicit и explicit)
         if [[ "$base_url" == ftps://* ]]; then
+            debug_log "REMOTE" "Using FTPS (implicit TLS)"
             curl_cmd+=(--ssl-reqd --insecure)
         elif [[ "$base_url" == ftp://* ]]; then
+            debug_log "REMOTE" "Using FTP with optional TLS"
             # Попробуем explicit TLS если доступен
             curl_cmd+=(--ssl --insecure)
         fi
         
+        debug_log "REMOTE" "Running: ${curl_cmd[*]} $base_url/"
         if "${curl_cmd[@]}" "$base_url/" > "$SILENT_LOG" 2>&1; then 
+            debug_log "REMOTE" "FTP connection SUCCESS"
             return 0
         else 
+            debug_log "REMOTE" "FTP with TLS failed, trying without TLS..."
             # Повторная попытка без TLS для обычного FTP
             if [[ "$base_url" == ftp://* ]]; then
                 curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only)
                 [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
                 if "${curl_cmd[@]}" "$base_url/" > "$SILENT_LOG" 2>&1; then
+                    debug_log "REMOTE" "FTP without TLS SUCCESS"
                     return 0
                 fi
             fi
+            debug_log "REMOTE" "FTP connection FAILED"
             return 1
         fi
         
     elif [[ "$type" == "webdav" ]]; then
+        debug_log "REMOTE" "Testing WebDAV connection..."
         # WebDAV: PROPFIND с Depth: 0
         local curl_cmd=(curl $CURL_SILENT -m 15 -L)
         [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
@@ -1771,39 +2007,55 @@ validate_remote_connection() {
         [[ "$base_url" == https://* ]] && curl_cmd+=(--insecure)
         
         local http_code
+        debug_log "REMOTE" "Sending PROPFIND request..."
         http_code=$("${curl_cmd[@]}" -o "$SILENT_LOG" -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2> "$SILENT_LOG")
+        debug_log "REMOTE" "PROPFIND HTTP code: $http_code"
         
         # 207 Multi-Status — стандартный успешный ответ WebDAV
         # 200 OK — некоторые серверы отвечают так
         # 301/302 — редирект (curl -L обработает)
         if [[ "$http_code" =~ ^(200|207)$ ]]; then 
+            debug_log "REMOTE" "WebDAV connection SUCCESS"
             return 0
         else 
+            debug_log "REMOTE" "PROPFIND failed, trying GET fallback..."
             # Fallback: попробуем простой GET
             http_code=$("${curl_cmd[@]}" -o "$SILENT_LOG" -w "%{http_code}" "$base_url/" 2> "$SILENT_LOG")
+            debug_log "REMOTE" "GET HTTP code: $http_code"
             if [[ "$http_code" =~ ^(200|207|401)$ ]]; then
                 # 401 означает что сервер отвечает, но нужна авторизация
+                debug_log "REMOTE" "WebDAV connection SUCCESS (via GET)"
                 return 0
             fi
+            debug_log "REMOTE" "WebDAV connection FAILED"
             return 1
         fi
         
     elif [[ "$type" == "rclone" ]]; then
+        debug_log "REMOTE" "Testing rclone connection..."
         if ! command -v rclone > "$SILENT_LOG" 2>&1; then
+            debug_log "REMOTE" "rclone not installed!"
             print_message "ERROR" "Rclone не установлен!"
             return 1
         fi
         # Проверяем доступность remote
         local remote_name="${url%%:*}"
+        debug_log "REMOTE" "Remote name: $remote_name"
         if rclone listremotes 2> "$SILENT_LOG" | grep -q "^${remote_name}:$"; then
+            debug_log "REMOTE" "Remote exists, testing lsd..."
             # Remote существует, проверяем доступность
             if rclone lsd "$url" > "$SILENT_LOG" 2>&1; then 
+                debug_log "REMOTE" "Rclone connection SUCCESS"
                 return 0
             fi
+        else
+            debug_log "REMOTE" "Remote '$remote_name' not found in rclone config"
         fi
+        debug_log "REMOTE" "Rclone connection FAILED"
         return 1
     fi
     
+    debug_log "REMOTE" "Unknown storage type: $type"
     return 1
 }
 
@@ -1875,8 +2127,11 @@ upload_to_remote() {
     # Расчёт таймаута на основе размера файла (минимум 120 сек, +60 сек на каждые 50MB)
     local timeout=$((120 + (file_size / 50000000) * 60))
     [[ $timeout -gt 1800 ]] && timeout=1800  # Максимум 30 минут
+    debug_log "UPLOAD" "Upload URL: $upload_url"
+    debug_log "UPLOAD" "Timeout: ${timeout}s, Max retries: $max_retries"
     
     while [[ $attempt -le $max_retries ]]; do
+        debug_log "UPLOAD" "Attempt $attempt/$max_retries"
         [[ $attempt -gt 1 ]] && print_message "INFO" "Повторная попытка $attempt/$max_retries..." >&2
         
         # Базовые опции curl
@@ -1896,20 +2151,26 @@ upload_to_remote() {
             # FTP специфичные опции
             curl_opts+=(--ftp-pasv)              # Passive mode (работает за NAT)
             curl_opts+=(--ftp-create-dirs)       # Создать директории если нужно
+            debug_log "UPLOAD" "FTP mode: passive, create-dirs"
             
             # Поддержка FTPS
             if [[ "$upload_url" == ftps://* ]]; then
                 curl_opts+=(--ssl-reqd --insecure)
+                debug_log "UPLOAD" "FTPS: SSL required"
             elif [[ "$upload_url" == ftp://* ]]; then
                 curl_opts+=(--ssl --insecure)    # Попробовать TLS если доступен
+                debug_log "UPLOAD" "FTP: Try TLS if available"
             fi
             
             curl_opts+=("$upload_url")
+            debug_log "UPLOAD" "Executing FTP upload..."
             http_code=$(curl "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
+            debug_log "UPLOAD" "FTP response code: $http_code"
             
             # FTP коды успеха: 226 (Transfer complete), 250 (Requested file action okay)
             if [[ "$http_code" =~ ^(226|250|200)$ ]]; then
                 upload_success=true
+                debug_log "UPLOAD" "FTP upload SUCCESS"
                 break
             fi
             
@@ -1918,21 +2179,29 @@ upload_to_remote() {
             curl_opts+=(-L)                      # Следовать редиректам
             curl_opts+=(--retry 2)               # Встроенный retry curl
             curl_opts+=(--retry-delay 3)
+            debug_log "UPLOAD" "WebDAV mode: follow redirects, retry 2"
             
             # Поддержка HTTPS с самоподписанными сертификатами
-            [[ "$upload_url" == https://* ]] && curl_opts+=(--insecure)
+            if [[ "$upload_url" == https://* ]]; then
+                curl_opts+=(--insecure)
+                debug_log "UPLOAD" "WebDAV: HTTPS with insecure"
+            fi
             
             curl_opts+=("$upload_url")
+            debug_log "UPLOAD" "Executing WebDAV upload..."
             http_code=$(curl "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
+            debug_log "UPLOAD" "WebDAV response code: $http_code"
             
             # WebDAV коды успеха: 200 OK, 201 Created, 204 No Content
             if [[ "$http_code" =~ ^(200|201|204)$ ]]; then
                 upload_success=true
+                debug_log "UPLOAD" "WebDAV upload SUCCESS"
                 break
             fi
         fi
         
         # Логируем неудачную попытку
+        debug_log "UPLOAD" "Attempt $attempt FAILED with HTTP $http_code"
         log_message "WARN" "Upload attempt $attempt failed: HTTP $http_code for $upload_url"
         
         ((attempt++))
@@ -2185,6 +2454,9 @@ rotate_backups_by_count() {
     local LABEL="$2"
     local PERFORM_DELETE="$3" 
     
+    debug_log "ROTATION" "=== rotate_backups_by_count($PREFIX, $LABEL, delete=$PERFORM_DELETE) ==="
+    debug_log "ROTATION" "MAX_BACKUPS_COUNT=$MAX_BACKUPS_COUNT"
+    
     # СТРОГИЙ ПОИСК (Только архивы), сортировка по времени (старые в начале)
     # Используем ls -1tr для сортировки по времени и while read для безопасности имен с пробелами
     local files=()
@@ -2194,10 +2466,12 @@ rotate_backups_by_count() {
     
     local count=${#files[@]}
     local diff=$((count - MAX_BACKUPS_COUNT))
+    debug_log "ROTATION" "Found $count files, limit=$MAX_BACKUPS_COUNT, to_delete=$diff"
     
     if [[ $diff -gt 0 ]]; then
         if [[ "$PERFORM_DELETE" == "true" ]]; then
             if [[ "$DRY_RUN" == "true" ]]; then
+                debug_log "ROTATION" "[DRY-RUN] Would delete $diff files"
                 echo -e "${YELLOW}[DRY-RUN] Категория '$LABEL': было бы удалено $diff старых файлов (лимит $MAX_BACKUPS_COUNT).${RESET}"
                 log_message "INFO" "[DRY_RUN] Would delete $diff files (count-based rotation, prefix=$PREFIX, limit=$MAX_BACKUPS_COUNT)"
                 echo "$diff"
@@ -2207,12 +2481,14 @@ rotate_backups_by_count() {
             for (( i=0; i<diff; i++ )); do
                 local file_to_del="${files[$i]}"
                 if [[ -f "$file_to_del" ]]; then
+                    debug_log "ROTATION" "Deleting: $file_to_del"
                     rm -f "$file_to_del"
                     rm -f "$file_to_del.version"
                     echo "  🗑 Удален: $(basename "$file_to_del")"
                     log_message "INFO" "Deleted $file_to_del (count-based rotation, prefix=$PREFIX)"
                 fi
             done
+            debug_log "ROTATION" "Deleted $diff files"
             echo "$diff"
             return 0
         else
@@ -2220,6 +2496,7 @@ rotate_backups_by_count() {
             echo "$diff"
         fi
     else
+        debug_log "ROTATION" "No files to delete (count=$count <= limit=$MAX_BACKUPS_COUNT)"
         if [[ "$PERFORM_DELETE" != "true" ]]; then
             echo -e " $LABEL: Найдено $count (Лимит $MAX_BACKUPS_COUNT) -> ${GREEN}OK${RESET}"
         fi
@@ -2234,6 +2511,8 @@ rotate_backups_by_age() {
     local DAYS="$3"
     local PERFORM_DELETE="$4"
 
+    debug_log "ROTATION" "=== rotate_backups_by_age($PREFIX, $LABEL, days=$DAYS, delete=$PERFORM_DELETE) ==="
+
     # Ищем только архивы (включая .enc)
     local pattern1="$BACKUP_DIR/${PREFIX}_*.tar.gz"
     local pattern2="$BACKUP_DIR/${PREFIX}_*.tar.gz.enc"
@@ -2247,19 +2526,23 @@ rotate_backups_by_age() {
     local find_args=("$BACKUP_DIR" -maxdepth 1 \( -name "${PREFIX}_*.tar.gz" -o -name "${PREFIX}_*.tar.gz.enc" \) -type f)
     if [[ "$DAYS" -le 0 ]]; then
         # Если 0 или меньше - не удаляем ничего (защита от полной очистки)
+        debug_log "ROTATION" "Days <= 0, skipping rotation"
         return 0
     else
         local nd=$((DAYS - 1))
         find_args+=( -mtime +"$nd" )
+        debug_log "ROTATION" "Find mtime: +$nd (files older than $DAYS days)"
     fi
     find_args+=( -print0 )
     while IFS= read -r -d $'\0' f; do files+=("$f"); done < <(find "${find_args[@]}" 2> "$SILENT_LOG")
 
     local count=${#files[@]}
+    debug_log "ROTATION" "Found $count files older than $DAYS days"
 
     if [[ $count -gt 0 ]]; then
         if [[ "$PERFORM_DELETE" == "true" ]]; then
             if [[ "$DRY_RUN" == "true" ]]; then
+                debug_log "ROTATION" "[DRY-RUN] Would delete $count files"
                 echo -e "${YELLOW}[DRY-RUN] Категория '$LABEL': было бы удалено $count файлов старше $DAYS дней.${RESET}"
                 log_message "INFO" "[DRY_RUN] Would delete $count files (age-based rotation, prefix=$PREFIX, days=$DAYS)"
                 echo "$count"
@@ -2268,12 +2551,14 @@ rotate_backups_by_age() {
             echo -e "${YELLOW}Очистка категории '$LABEL' (удаление $count файлов старше $DAYS дней):${RESET}"
             for f in "${files[@]}"; do
                 if [[ -f "$f" ]]; then
+                    debug_log "ROTATION" "Deleting: $f"
                     rm -f "$f"
                     rm -f "$f.version"
                     echo "  🗑 Удален: $(basename "$f")"
                     log_message "INFO" "Deleted $f (age-based rotation, prefix=$PREFIX, days=$DAYS)"
                 fi
             done
+            debug_log "ROTATION" "Deleted $count files"
             echo "$count"
             return 0
         else
@@ -2281,11 +2566,145 @@ rotate_backups_by_age() {
             echo "$count"
         fi
     else
+        debug_log "ROTATION" "No files to delete"
         if [[ "$PERFORM_DELETE" != "true" ]]; then
             echo -e " $LABEL: Нет файлов старше $DAYS дней -> ${GREEN}OK${RESET}"
         fi
         echo "0"
         return 0
+    fi
+}
+
+# Ротация по размеру - удаляет старые бэкапы пока общий размер не станет <= лимита
+# Использование: rotate_backups_by_size "true" для удаления, без аргумента - только проверка
+rotate_backups_by_size() {
+    local PERFORM_DELETE="$1"
+    
+    debug_log "SIZE" "=== rotate_backups_by_size(delete=$PERFORM_DELETE) ==="
+    
+    # Если лимит 0 или не задан - ничего не делаем
+    if [[ -z "$MAX_BACKUP_SIZE_MB" || "$MAX_BACKUP_SIZE_MB" == "0" ]]; then
+        debug_log "SIZE" "Size limit disabled (MAX_BACKUP_SIZE_MB=$MAX_BACKUP_SIZE_MB)"
+        return 0
+    fi
+    
+    local limit_mb="$MAX_BACKUP_SIZE_MB"
+    local limit_bytes=$((limit_mb * 1024 * 1024))
+    debug_log "SIZE" "Limit: $limit_mb MB ($limit_bytes bytes)"
+    
+    # Получаем текущий размер папки бэкапов в байтах
+    local current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+    local current_size_mb=$((current_size_bytes / 1024 / 1024))
+    debug_log "SIZE" "Current size: $current_size_mb MB ($current_size_bytes bytes)"
+    
+    # Форматирование для отображения
+    local limit_display=""
+    local current_display=""
+    if [[ $limit_mb -ge 1024 ]]; then
+        limit_display="$(echo "scale=1; $limit_mb / 1024" | bc) GB"
+    else
+        limit_display="$limit_mb MB"
+    fi
+    if [[ $current_size_mb -ge 1024 ]]; then
+        current_display="$(echo "scale=1; $current_size_mb / 1024" | bc) GB"
+    else
+        current_display="$current_size_mb MB"
+    fi
+    
+    debug_log "SIZE" "Current: $current_size_bytes bytes ($current_display), Limit: $limit_bytes bytes ($limit_display)"
+    
+    # Если размер в пределах лимита - всё ок
+    if [[ $current_size_bytes -le $limit_bytes ]]; then
+        if [[ "$PERFORM_DELETE" != "true" ]]; then
+            echo -e " Размер бэкапов: ${GREEN}$current_display${RESET} / $limit_display -> ${GREEN}OK${RESET}"
+        fi
+        return 0
+    fi
+    
+    # Нужно удалить файлы
+    local excess_mb=$((current_size_mb - limit_mb))
+    local excess_display=""
+    if [[ $excess_mb -ge 1024 ]]; then
+        excess_display="$(echo "scale=1; $excess_mb / 1024" | bc) GB"
+    else
+        excess_display="$excess_mb MB"
+    fi
+    debug_log "SIZE" "Excess: $excess_mb MB ($excess_display)"
+    
+    if [[ "$PERFORM_DELETE" != "true" ]]; then
+        echo -e " Размер бэкапов: ${RED}$current_display${RESET} / $limit_display -> ${RED}Превышение: $excess_display${RESET}"
+        return 0
+    fi
+    
+    # Режим удаления
+    if [[ "$DRY_RUN" == "true" ]]; then
+        debug_log "SIZE" "[DRY-RUN] Would delete files to free $excess_display"
+        echo -e "${YELLOW}[DRY-RUN] Превышение лимита на $excess_display. Старые файлы были бы удалены.${RESET}"
+        log_message "INFO" "[DRY_RUN] Size rotation: current=$current_display, limit=$limit_display, excess=$excess_display"
+        return 0
+    fi
+    
+    debug_log "SIZE" "Starting deletion loop..."
+    echo -e "${YELLOW}Очистка по лимиту размера (текущий: $current_display, лимит: $limit_display):${RESET}"
+    
+    # Получаем список всех бэкапов отсортированный по времени (старые первыми)
+    local files=()
+    while IFS= read -r -d $'\0' f; do 
+        files+=("$f")
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_*.tar.gz" -o -name "lazarus_*.tar.gz.enc" \) -printf '%T@ %p\0' 2> "$SILENT_LOG" | sort -zn | cut -z -d' ' -f2-)
+    
+    debug_log "SIZE" "Found ${#files[@]} backup files to process"
+    
+    local deleted_count=0
+    local deleted_size=0
+    
+    for file in "${files[@]}"; do
+        # Пересчитываем текущий размер
+        current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+        debug_log "SIZE" "Current: $current_size_bytes bytes, limit: $limit_bytes bytes"
+        
+        if [[ $current_size_bytes -le $limit_bytes ]]; then
+            debug_log "SIZE" "Size now within limit, stopping"
+            break
+        fi
+        
+        if [[ -f "$file" ]]; then
+            local file_size=$(stat -c%s "$file" 2> "$SILENT_LOG" || echo 0)
+            debug_log "SIZE" "Deleting: $file (size=$file_size bytes)"
+            rm -f "$file"
+            rm -f "$file.version"
+            echo "  🗑 Удален: $(basename "$file")"
+            log_message "INFO" "Deleted $file (size-based rotation)"
+            ((deleted_count++))
+            ((deleted_size += file_size))
+        fi
+    done
+    
+    local deleted_display=""
+    local deleted_mb=$((deleted_size / 1024 / 1024))
+    if [[ $deleted_mb -ge 1024 ]]; then
+        deleted_display="$(echo "scale=1; $deleted_mb / 1024" | bc) GB"
+    else
+        deleted_display="$deleted_mb MB"
+    fi
+    
+    if [[ $deleted_count -gt 0 ]]; then
+        print_message "SUCCESS" "Удалено $deleted_count файлов ($deleted_display)"
+        log_message "SUCCESS" "Size-based rotation: deleted $deleted_count files ($deleted_display)"
+    fi
+    
+    return 0
+}
+
+# Вспомогательная функция для форматирования размера
+format_size_mb() {
+    local size_mb="$1"
+    if [[ -z "$size_mb" || "$size_mb" == "0" ]]; then
+        echo "Без лимита"
+    elif [[ $size_mb -ge 1024 ]]; then
+        echo "$(echo "scale=1; $size_mb / 1024" | bc) GB"
+    else
+        echo "$size_mb MB"
     fi
 }
 
@@ -2818,20 +3237,25 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     
     send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
 
-    # Автоматическая ротация бэкапов после создания
+    # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
     local ROTATION_PREFIX="lazarus_$TYPE"
     if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="lazarus_db"; fi
     if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="lazarus_files"; fi
 
     # Ротация в зависимости от настроек DELETE_MODE
     if [[ "$DELETE_MODE" == "count" ]]; then
-        rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true"
+        rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true" > /dev/null
     else
-        rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true"
+        rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true" > /dev/null
     fi
+    
+    # Ротация по размеру (если настроен лимит)
+    rotate_backups_by_size "true" > /dev/null
     
     # Освобождаем блокировку
     [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+    
+    return 0
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
@@ -3326,6 +3750,7 @@ menu_settings() {
         else
             echo -e " 20. Срок хранения:     ${GRAY}${RETENTION_DAYS} дней${RESET}"
         fi
+        echo -e " 21. Лимит размера:     ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
         
         echo -e "\n 0. Назад"
         echo ""
@@ -3469,6 +3894,26 @@ menu_settings() {
                         print_message "ERROR" "Введите число >= 1"
                     fi
                 fi ;;
+                
+            21) # Лимит размера бэкапов
+                echo ""
+                echo "Лимит размера папки с бэкапами (в MB)"
+                echo "Введите 0 для отключения лимита"
+                echo ""
+                local current_mb="$MAX_BACKUP_SIZE_MB"
+                echo -e "Текущий лимит: ${CYAN}$(format_size_mb "$current_mb")${RESET}"
+                read -erp "Новый лимит (MB): " new_limit
+                if [[ "$new_limit" =~ ^[0-9]+$ ]]; then 
+                    MAX_BACKUP_SIZE_MB="$new_limit"
+                    save_config
+                    if [[ "$new_limit" == "0" ]]; then
+                        print_message "INFO" "Лимит размера отключён"
+                    else
+                        print_message "SUCCESS" "Установлен лимит: $(format_size_mb "$new_limit")"
+                    fi
+                else 
+                    print_message "ERROR" "Введите целое число (0 для отключения)"
+                fi ;;
             
             0) return ;;
         esac
@@ -3484,14 +3929,18 @@ cleanup_old_backups() {
     echo -e "Текущий режим очистки: ${YELLOW}$DELETE_MODE${RESET}"
     if [[ "$DELETE_MODE" == "count" ]]; then
         echo "Лимит хранения: $MAX_BACKUPS_COUNT шт."
-        echo ""
+    else
+        echo -e "Срок хранения: ${YELLOW}$RETENTION_DAYS дней${RESET}"
+    fi
+    echo -e "Лимит размера: ${YELLOW}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
+    echo ""
+    
+    if [[ "$DELETE_MODE" == "count" ]]; then
         del_full=$(rotate_backups_by_count "lazarus_full" "Полные бэкапы" "false" | tail -n1)
         del_db=$(rotate_backups_by_count "lazarus_db" "Базы данных" "false" | tail -n1)
         del_files=$(rotate_backups_by_count "lazarus_files" "Архивы файлов" "false" | tail -n1)
     else
         # time-based
-        echo -e " Срок хранения (дней): ${YELLOW}$RETENTION_DAYS${RESET}"
-        echo ""
         del_full=$(rotate_backups_by_age "lazarus_full" "Полные бэкапы" "$RETENTION_DAYS" "false" | tail -n1)
         del_db=$(rotate_backups_by_age "lazarus_db" "Базы данных" "$RETENTION_DAYS" "false" | tail -n1)
         del_files=$(rotate_backups_by_age "lazarus_files" "Архивы файлов" "$RETENTION_DAYS" "false" | tail -n1)
@@ -3608,14 +4057,44 @@ if [[ "$DEBUG_MODE" == true ]]; then
     echo -e "${CYAN}=== TELEGRAM ===${RESET}"
     echo -e "${MAGENTA}[DEBUG]${RESET} Notifications: $SEND_TO_TELEGRAM"
     echo -e "${MAGENTA}[DEBUG]${RESET} Send file: $TG_SEND_FILE"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Bot token: ${BOT_TOKEN:+<set>}${BOT_TOKEN:-<not set>}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Chat ID: ${CHAT_ID:-<not set>}"
+    # Маскируем токен: показываем только первые 4 и последние 4 символа
+    _masked_token="<not set>"
+    if [[ -n "$BOT_TOKEN" ]]; then
+        if [[ ${#BOT_TOKEN} -gt 10 ]]; then
+            _masked_token="${BOT_TOKEN:0:4}****${BOT_TOKEN: -4}"
+        else
+            _masked_token="<set>"
+        fi
+    fi
+    echo -e "${MAGENTA}[DEBUG]${RESET} Bot token: $_masked_token"
+    # Маскируем Chat ID: показываем только первые 4 и последние 3 символа
+    _masked_chat="<not set>"
+    if [[ -n "$CHAT_ID" ]]; then
+        if [[ ${#CHAT_ID} -gt 8 ]]; then
+            _masked_chat="${CHAT_ID:0:4}***${CHAT_ID: -3}"
+        else
+            _masked_chat="<set>"
+        fi
+    fi
+    echo -e "${MAGENTA}[DEBUG]${RESET} Chat ID: $_masked_chat"
     echo -e "${MAGENTA}[DEBUG]${RESET} Thread ID: ${TG_MESSAGE_THREAD_ID:-<not set>}"
     echo ""
     echo -e "${CYAN}=== REMOTE STORAGE ===${RESET}"
     echo -e "${MAGENTA}[DEBUG]${RESET} Type: $REMOTE_STORAGE_TYPE"
     echo -e "${MAGENTA}[DEBUG]${RESET} Enabled: $SEND_TO_REMOTE"
-    echo -e "${MAGENTA}[DEBUG]${RESET} URL: ${REMOTE_STORAGE_URL:-<not set>}"
+    # Маскируем URL: показываем только протокол и домен
+    _masked_url="<not set>"
+    if [[ -n "$REMOTE_STORAGE_URL" ]]; then
+        # Извлекаем протокол и хост, скрываем путь и креды
+        _url_proto=$(echo "$REMOTE_STORAGE_URL" | grep -oP '^[a-z]+://' || echo "")
+        _url_host=$(echo "$REMOTE_STORAGE_URL" | sed -E 's|^[a-z]+://([^@]*@)?([^/]+).*|\2|')
+        if [[ -n "$_url_host" ]]; then
+            _masked_url="${_url_proto}${_url_host}/***"
+        else
+            _masked_url="<set>"
+        fi
+    fi
+    echo -e "${MAGENTA}[DEBUG]${RESET} URL: $_masked_url"
     echo ""
     echo -e "${CYAN}=== ROTATION ===${RESET}"
     echo -e "${MAGENTA}[DEBUG]${RESET} Delete mode: $DELETE_MODE"
@@ -3623,7 +4102,10 @@ if [[ "$DEBUG_MODE" == true ]]; then
     echo -e "${MAGENTA}[DEBUG]${RESET} Max backups: $MAX_BACKUPS_COUNT"
     echo ""
     echo -e "${CYAN}=== ENCRYPTION ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Password: ${BACKUP_PASSWORD:+<set>}${BACKUP_PASSWORD:-<not set>}"
+    # Показываем только что пароль установлен, без частичного раскрытия
+    _masked_pass="<not set>"
+    [[ -n "$BACKUP_PASSWORD" ]] && _masked_pass="<set> (${#BACKUP_PASSWORD} chars)"
+    echo -e "${MAGENTA}[DEBUG]${RESET} Password: $_masked_pass"
     echo ""
     echo -e "${CYAN}=== EXCLUSIONS ===${RESET}"
     echo -e "${MAGENTA}[DEBUG]${RESET} Exclude dirs: ${EXCLUDE_DIRS:-<none>}"
