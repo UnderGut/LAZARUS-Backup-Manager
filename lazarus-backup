@@ -4037,8 +4037,10 @@ migrate_check_compatibility() {
     return 0
 }
 
-# --- Переменная для хранения выбора обработки баланса ---
-BALANCE_HANDLING_MODE=""  # ignore, export_csv, convert_days, convert_partner
+# --- Переменные для хранения настроек обработки баланса ---
+BALANCE_HANDLING_MODE=""      # ignore, export_csv, convert_days, convert_partner
+BALANCE_CONVERSION_PRICE=""   # Стоимость месяца в рублях (для convert_days)
+BALANCE_CONVERSION_DAYS=""    # Количество дней в месяце (для convert_days)
 
 # --- Функция: Анализ и обработка балансов пользователей ---
 migrate_handle_balances() {
@@ -4120,7 +4122,7 @@ migrate_handle_balances() {
     echo "     → Вы сможете вернуть деньги или продлить подписки вручную"
     echo ""
     echo -e "  ${GREEN}2.${RESET} Конвертировать в дни подписки"
-    echo "     → Баланс будет пересчитан в дни по курсу: 100₽ = 30 дней"
+    echo "     → Баланс будет пересчитан в дни по вашему тарифу"
     echo "     → Дни добавятся к expire_at пользователя"
     echo ""
     echo -e "  ${GREEN}3.${RESET} Конвертировать в партнёрский баланс"
@@ -4140,11 +4142,48 @@ migrate_handle_balances() {
                 break
                 ;;
             2)
-                read -erp "Введите курс (₽ за 30 дней) [100]: " rate
-                rate="${rate:-100}"
-                BALANCE_CONVERSION_RATE="$rate"
+                echo ""
+                echo -e "${CYAN}=== НАСТРОЙКА КОНВЕРТАЦИИ БАЛАНСА В ДНИ ===${RESET}"
+                echo ""
+                echo "Укажите параметры вашего тарифа:"
+                echo ""
+                
+                # Стоимость месяца
+                read -erp "Стоимость 1 месяца подписки в рублях [100]: " month_price
+                month_price="${month_price:-100}"
+                
+                # Валидация числа
+                if ! [[ "$month_price" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ $(echo "$month_price <= 0" | bc) -eq 1 ]]; then
+                    print_message "ERROR" "Некорректная стоимость. Используется 100₽"
+                    month_price="100"
+                fi
+                
+                # Количество дней в месяце
+                read -erp "Количество дней в 1 месяце подписки [30]: " days_per_month
+                days_per_month="${days_per_month:-30}"
+                
+                # Валидация числа
+                if ! [[ "$days_per_month" =~ ^[0-9]+$ ]] || [[ "$days_per_month" -le 0 ]]; then
+                    print_message "ERROR" "Некорректное количество дней. Используется 30"
+                    days_per_month="30"
+                fi
+                
+                BALANCE_CONVERSION_PRICE="$month_price"
+                BALANCE_CONVERSION_DAYS="$days_per_month"
                 BALANCE_HANDLING_MODE="convert_days"
-                print_message "INFO" "Курс конвертации: $rate ₽ = 30 дней"
+                
+                echo ""
+                echo -e "${CYAN}Формула расчёта:${RESET}"
+                echo "  extra_days = (balance_rubles / $month_price) × $days_per_month"
+                echo ""
+                
+                # Пример расчёта
+                local example_balance="150"
+                local example_days=$(echo "scale=0; ($example_balance / $month_price) * $days_per_month" | bc 2>/dev/null || echo "?")
+                echo -e "  ${YELLOW}Пример:${RESET} баланс 150₽ → $example_days дней"
+                echo ""
+                
+                print_message "SUCCESS" "Курс: $month_price ₽ = $days_per_month дней"
                 break
                 ;;
             3)
@@ -4220,16 +4259,17 @@ migrate_apply_balance_handling() {
             
             # Создаём файл с доп. днями для каждого пользователя
             local days_file="$import_dir/balance_to_days.csv"
-            echo "telegram_id,extra_days,balance_rubles" > "$days_file"
+            echo "telegram_id,extra_days,balance_rubles,month_price,days_per_month" > "$days_file"
             
-            local rate="${BALANCE_CONVERSION_RATE:-100}"
+            local month_price="${BALANCE_CONVERSION_PRICE:-100}"
+            local days_per_month="${BALANCE_CONVERSION_DAYS:-30}"
             
             tail -n +2 "$balances_file" | while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
                 [[ -z "$tg_id" ]] && continue
-                # Расчёт дней: (balance_rub / rate) * 30
-                local extra_days=$(echo "scale=0; ($balance_rub / $rate) * 30" | bc 2>/dev/null || echo "0")
+                # Расчёт дней: (balance_rub / month_price) * days_per_month
+                local extra_days=$(echo "scale=0; ($balance_rub / $month_price) * $days_per_month" | bc 2>/dev/null || echo "0")
                 [[ "$extra_days" -lt 1 ]] && extra_days=0
-                echo "$tg_id,$extra_days,$balance_rub" >> "$days_file"
+                echo "$tg_id,$extra_days,$balance_rub,$month_price,$days_per_month" >> "$days_file"
             done
             
             print_message "SUCCESS" "Файл конвертации создан: $days_file"
@@ -4238,10 +4278,12 @@ migrate_apply_balance_handling() {
             {
                 echo "═══════════════════════════════════════════════════════════"
                 echo "  КОНВЕРТАЦИЯ БАЛАНСОВ В ДНИ ПОДПИСКИ"
-                echo "  Курс: $rate ₽ = 30 дней"
+                echo "  Тариф: $month_price ₽ = $days_per_month дней"
+                echo "  Формула: extra_days = (balance / $month_price) × $days_per_month"
                 echo "═══════════════════════════════════════════════════════════"
                 echo ""
-                cat "$days_file"
+                echo "telegram_id,extra_days,balance_rubles"
+                tail -n +2 "$days_file" | cut -d',' -f1-3
             } > "$balance_report"
             ;;
             
