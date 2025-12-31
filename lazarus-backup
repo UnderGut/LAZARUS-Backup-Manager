@@ -4382,19 +4382,20 @@ COPY (
 "
     
     local users_file="$export_dir/users.csv"
+    local referrals_file="$export_dir/referrals.csv"
     local transactions_file="$export_dir/transactions.csv"
     local promocodes_file="$export_dir/promocodes.csv"
     local promo_uses_file="$export_dir/promocode_uses.csv"
     
-    # Экспорт users
+    # Экспорт users (без referrer_id - он идёт в отдельный файл)
     if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
         docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
-            COPY (SELECT telegram_id, tg_username, tg_first_name, language, created_at, balance, referral_balance, referrer_id FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
+            COPY (SELECT telegram_id, username, first_name, language, created_at, balance_kopeks, 0 as referral_balance FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
         " > "$users_file" 2>/dev/null
     else
         export PGPASSWORD="$MIGRATION_SOURCE_PASS"
         psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
-            COPY (SELECT telegram_id, tg_username, tg_first_name, language, created_at, balance, referral_balance, referrer_id FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
+            COPY (SELECT telegram_id, username, first_name, language, created_at, balance_kopeks, 0 as referral_balance FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
         " > "$users_file" 2>/dev/null
         unset PGPASSWORD
     fi
@@ -4407,6 +4408,42 @@ COPY (
     local user_count=$(wc -l < "$users_file")
     user_count=$((user_count - 1))  # Минус заголовок
     print_message "SUCCESS" "Экспортировано пользователей: $user_count"
+    
+    # Экспорт реферальных связей (referee_telegram_id, referrer_telegram_id, created_at)
+    # JOIN для преобразования referred_by_id (internal id) → telegram_id
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (
+                SELECT 
+                    u.telegram_id as referee_telegram_id,
+                    r.telegram_id as referrer_telegram_id,
+                    u.created_at
+                FROM users u
+                INNER JOIN users r ON u.referred_by_id = r.id
+                WHERE u.referred_by_id IS NOT NULL
+                ORDER BY u.created_at
+            ) TO STDOUT WITH CSV HEADER;
+        " > "$referrals_file" 2>/dev/null
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (
+                SELECT 
+                    u.telegram_id as referee_telegram_id,
+                    r.telegram_id as referrer_telegram_id,
+                    u.created_at
+                FROM users u
+                INNER JOIN users r ON u.referred_by_id = r.id
+                WHERE u.referred_by_id IS NOT NULL
+                ORDER BY u.created_at
+            ) TO STDOUT WITH CSV HEADER;
+        " > "$referrals_file" 2>/dev/null
+        unset PGPASSWORD
+    fi
+    
+    local referral_count=0
+    [[ -s "$referrals_file" ]] && referral_count=$(($(wc -l < "$referrals_file") - 1))
+    print_message "SUCCESS" "Экспортировано реферальных связей: $referral_count"
     
     # Экспорт transactions
     if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
@@ -4442,7 +4479,7 @@ COPY (
     [[ -s "$promocodes_file" ]] && promo_count=$(($(wc -l < "$promocodes_file") - 1))
     print_message "SUCCESS" "Экспортировано промокодов: $promo_count"
     
-    debug_log "MIGRATE" "Export complete: users=$user_count, tx=$tx_count, promo=$promo_count"
+    debug_log "MIGRATE" "Export complete: users=$user_count, referrals=$referral_count, tx=$tx_count, promo=$promo_count"
     return 0
 }
 
@@ -4459,12 +4496,12 @@ migrate_transform_data() {
     if [[ -f "$export_dir/users.csv" ]]; then
         print_message "INFO" "Конвертация users → customer..."
         
-        # Пропускаем заголовок, конвертируем данные
-        tail -n +2 "$export_dir/users.csv" | while IFS=',' read -r telegram_id tg_username tg_first_name language created_at balance referral_balance referrer_id; do
+        # Формат CSV: telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance
+        tail -n +2 "$export_dir/users.csv" | while IFS=',' read -r telegram_id username first_name language created_at balance_kopeks referral_balance; do
             # Конвертация balance из копеек в рубли
             local balance_rub=0
-            if [[ -n "$balance" && "$balance" != "0" ]]; then
-                balance_rub=$(echo "scale=2; $balance / 100" | bc 2>/dev/null || echo "0")
+            if [[ -n "$balance_kopeks" && "$balance_kopeks" != "0" ]]; then
+                balance_rub=$(echo "scale=2; $balance_kopeks / 100" | bc 2>/dev/null || echo "0")
             fi
             
             local referral_rub=0
@@ -4479,7 +4516,7 @@ migrate_transform_data() {
             # Генерация UUID
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$telegram_id")
             
-            echo "$uuid,$telegram_id,$tg_username,$tg_first_name,,$lang,$balance_rub,$referral_rub,0,$created_at,$created_at"
+            echo "$uuid,$telegram_id,$username,$first_name,,$lang,$balance_rub,$referral_rub,0,$created_at,$created_at"
         done > "$import_dir/customer.csv"
         
         # Добавляем заголовок
@@ -4628,6 +4665,58 @@ migrate_import_data() {
         print_message "SUCCESS" "promo импортирован"
     fi
     
+    # Импорт реферальных связей
+    # ВАЖНО: В RWP-Shop referral.referrer_id и referee_id ссылаются на customer(telegram_id)!
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    if [[ -f "$export_dir/referrals.csv" ]]; then
+        local ref_count=$(($(wc -l < "$export_dir/referrals.csv") - 1))
+        if [[ $ref_count -gt 0 ]]; then
+            print_message "INFO" "Импорт реферальных связей ($ref_count)..."
+            
+            # Создаём CSV для импорта в таблицу referral
+            # Формат: referrer_id (telegram_id), referee_id (telegram_id), used_at, bonus_granted
+            local referral_import="$MIGRATION_WORK_DIR/import/referral.csv"
+            
+            {
+                echo "referrer_id,referee_id,used_at,bonus_granted"
+                tail -n +2 "$export_dir/referrals.csv" | while IFS=',' read -r referee_tg referrer_tg created_at; do
+                    # Формат: referrer_telegram_id, referee_telegram_id, created_at, true (бонус уже выдан)
+                    echo "$referrer_tg,$referee_tg,$created_at,true"
+                done
+            } > "$referral_import"
+            
+            # Копируем CSV в контейнер
+            docker cp "$referral_import" "${MIGRATION_TARGET_CONTAINER}:/tmp/referral.csv"
+            
+            # Импорт через COPY с обработкой конфликтов
+            docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+                CREATE TEMP TABLE tmp_referral (
+                    referrer_id bigint,
+                    referee_id bigint,
+                    used_at timestamptz,
+                    bonus_granted boolean
+                );
+                COPY tmp_referral FROM '/tmp/referral.csv' WITH CSV HEADER;
+                INSERT INTO referral (referrer_id, referee_id, used_at, bonus_granted)
+                SELECT referrer_id, referee_id, used_at, bonus_granted FROM tmp_referral
+                ON CONFLICT DO NOTHING;
+                DROP TABLE tmp_referral;
+            " 2>&1
+            
+            local result=$?
+            docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/referral.csv
+            
+            if [[ $result -eq 0 ]]; then
+                local imported_count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -t -c "SELECT COUNT(*) FROM referral;" 2>/dev/null | tr -d ' ')
+                print_message "SUCCESS" "Реферальные связи импортированы (в БД: $imported_count)"
+            else
+                print_message "WARN" "Частичный импорт реферальных связей"
+            fi
+        else
+            print_message "INFO" "Нет реферальных связей для импорта"
+        fi
+    fi
+    
     debug_log "MIGRATE" "Import complete"
     return 0
 }
@@ -4666,6 +4755,11 @@ migrate_generate_report() {
         if [[ -f "$export_dir/users.csv" ]]; then
             local users_count=$(($(wc -l < "$export_dir/users.csv") - 1))
             echo "Users exported: $users_count"
+        fi
+        
+        if [[ -f "$export_dir/referrals.csv" ]]; then
+            local ref_count=$(($(wc -l < "$export_dir/referrals.csv") - 1))
+            echo "Referral links exported: $ref_count"
         fi
         
         if [[ -f "$export_dir/transactions.csv" ]]; then
