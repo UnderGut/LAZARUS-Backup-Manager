@@ -4037,6 +4037,283 @@ migrate_check_compatibility() {
     return 0
 }
 
+# --- Переменная для хранения выбора обработки баланса ---
+BALANCE_HANDLING_MODE=""  # ignore, export_csv, convert_days, convert_partner
+
+# --- Функция: Анализ и обработка балансов пользователей ---
+migrate_handle_balances() {
+    debug_log "MIGRATE" "Analyzing user balances"
+    print_message "INFO" "Анализ балансов пользователей..."
+    
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    local balances_file="$export_dir/user_balances.csv"
+    
+    # Получаем пользователей с ненулевым балансом
+    local balance_query="
+        SELECT telegram_id, username, first_name, balance_kopeks, 
+               ROUND(balance_kopeks::numeric / 100, 2) as balance_rubles
+        FROM users 
+        WHERE balance_kopeks > 0 
+        ORDER BY balance_kopeks DESC;
+    "
+    
+    local balance_data=""
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        balance_data=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -F',' -c "$balance_query" 2>/dev/null)
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        balance_data=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -F',' -c "$balance_query" 2>/dev/null)
+        unset PGPASSWORD
+    fi
+    
+    if [[ -z "$balance_data" ]]; then
+        print_message "SUCCESS" "Пользователей с балансом > 0 не найдено"
+        BALANCE_HANDLING_MODE="none"
+        return 0
+    fi
+    
+    # Подсчёт статистики
+    local users_with_balance=0
+    local total_balance_kopeks=0
+    
+    while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
+        [[ -z "$tg_id" ]] && continue
+        ((users_with_balance++))
+        total_balance_kopeks=$((total_balance_kopeks + balance_kop))
+    done <<< "$balance_data"
+    
+    local total_balance_rubles=$(echo "scale=2; $total_balance_kopeks / 100" | bc 2>/dev/null || echo "0")
+    
+    # Сохраняем данные в файл
+    echo "telegram_id,username,first_name,balance_kopeks,balance_rubles" > "$balances_file"
+    echo "$balance_data" >> "$balances_file"
+    
+    # Показываем предупреждение
+    echo ""
+    echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${RED}${BOLD}  ⚠️  ОБНАРУЖЕНЫ ПОЛЬЗОВАТЕЛИ С НЕНУЛЕВЫМ БАЛАНСОМ!          ${RESET}"
+    echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}Пользователей с балансом > 0:${RESET} ${WHITE}${BOLD}$users_with_balance${RESET}"
+    echo -e "  ${YELLOW}Общая сумма балансов:${RESET}        ${WHITE}${BOLD}$total_balance_rubles ₽${RESET}"
+    echo ""
+    
+    # Показываем топ-5 пользователей
+    echo -e "${CYAN}  Топ-5 пользователей по балансу:${RESET}"
+    local count=0
+    while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
+        [[ -z "$tg_id" ]] && continue
+        ((count++))
+        [[ $count -gt 5 ]] && break
+        local display_name="${username:-${fname:-ID:$tg_id}}"
+        printf "    %d. %-20s %10s ₽\n" "$count" "$display_name" "$balance_rub"
+    done <<< "$balance_data"
+    echo ""
+    
+    echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}  В Remnawave Shop НЕТ внутреннего баланса пользователя!${RESET}"
+    echo -e "${YELLOW}  Выберите как обработать эти данные:${RESET}"
+    echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo -e "  ${GREEN}1.${RESET} Экспорт в CSV (рекомендуется)"
+    echo "     → Сохранить список в файл для ручной обработки"
+    echo "     → Вы сможете вернуть деньги или продлить подписки вручную"
+    echo ""
+    echo -e "  ${GREEN}2.${RESET} Конвертировать в дни подписки"
+    echo "     → Баланс будет пересчитан в дни по курсу: 100₽ = 30 дней"
+    echo "     → Дни добавятся к expire_at пользователя"
+    echo ""
+    echo -e "  ${GREEN}3.${RESET} Конвертировать в партнёрский баланс"
+    echo "     → Если пользователь партнёр — добавить в available_balance"
+    echo "     → Остальные — экспорт в CSV"
+    echo ""
+    echo -e "  ${RED}4.${RESET} Игнорировать (ПОТЕРЯ ДАННЫХ!)"
+    echo "     → Балансы будут потеряны безвозвратно"
+    echo ""
+    
+    while true; do
+        read -erp "Выберите вариант [1-4]: " choice
+        case "$choice" in
+            1)
+                BALANCE_HANDLING_MODE="export_csv"
+                print_message "INFO" "Балансы будут сохранены в: $balances_file"
+                break
+                ;;
+            2)
+                read -erp "Введите курс (₽ за 30 дней) [100]: " rate
+                rate="${rate:-100}"
+                BALANCE_CONVERSION_RATE="$rate"
+                BALANCE_HANDLING_MODE="convert_days"
+                print_message "INFO" "Курс конвертации: $rate ₽ = 30 дней"
+                break
+                ;;
+            3)
+                BALANCE_HANDLING_MODE="convert_partner"
+                print_message "INFO" "Балансы партнёров → partner.available_balance"
+                break
+                ;;
+            4)
+                echo ""
+                echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ! ВЫ ПОТЕРЯЕТЕ $total_balance_rubles ₽!${RESET}"
+                echo ""
+                read -erp "Введите 'LOSE DATA' для подтверждения: " confirm
+                if [[ "$confirm" == "LOSE DATA" ]]; then
+                    BALANCE_HANDLING_MODE="ignore"
+                    print_message "WARN" "Балансы будут проигнорированы (потеря данных)"
+                    # Всё равно сохраняем в файл для истории
+                    print_message "INFO" "Резервная копия балансов: $balances_file"
+                    break
+                else
+                    print_message "INFO" "Отмена. Выберите другой вариант."
+                fi
+                ;;
+            *)
+                print_message "ERROR" "Неверный выбор"
+                ;;
+        esac
+    done
+    
+    return 0
+}
+
+# --- Функция: Применение обработки балансов ---
+migrate_apply_balance_handling() {
+    debug_log "MIGRATE" "Applying balance handling: $BALANCE_HANDLING_MODE"
+    
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    local import_dir="$MIGRATION_WORK_DIR/import"
+    local balances_file="$export_dir/user_balances.csv"
+    local balance_report="$MIGRATION_WORK_DIR/balance_report.txt"
+    
+    case "$BALANCE_HANDLING_MODE" in
+        "none")
+            debug_log "MIGRATE" "No balances to process"
+            return 0
+            ;;
+        "export_csv")
+            # Уже сохранено в migrate_handle_balances
+            print_message "SUCCESS" "Балансы экспортированы в: $balances_file"
+            
+            # Создаём отчёт
+            {
+                echo "═══════════════════════════════════════════════════════════"
+                echo "  ОТЧЁТ О БАЛАНСАХ ПОЛЬЗОВАТЕЛЕЙ"
+                echo "  Дата миграции: $(date '+%Y-%m-%d %H:%M:%S')"
+                echo "═══════════════════════════════════════════════════════════"
+                echo ""
+                echo "Файл с балансами: $balances_file"
+                echo ""
+                echo "РЕКОМЕНДАЦИИ:"
+                echo "1. Свяжитесь с пользователями и предложите возврат средств"
+                echo "2. Или продлите им подписку на эквивалентный срок"
+                echo "3. Используйте админ-панель Remnawave для ручных операций"
+                echo ""
+                echo "СПИСОК ПОЛЬЗОВАТЕЛЕЙ:"
+                cat "$balances_file"
+            } > "$balance_report"
+            
+            print_message "INFO" "Отчёт создан: $balance_report"
+            ;;
+            
+        "convert_days")
+            print_message "INFO" "Конвертация балансов в дни подписки..."
+            
+            # Создаём файл с доп. днями для каждого пользователя
+            local days_file="$import_dir/balance_to_days.csv"
+            echo "telegram_id,extra_days,balance_rubles" > "$days_file"
+            
+            local rate="${BALANCE_CONVERSION_RATE:-100}"
+            
+            tail -n +2 "$balances_file" | while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
+                [[ -z "$tg_id" ]] && continue
+                # Расчёт дней: (balance_rub / rate) * 30
+                local extra_days=$(echo "scale=0; ($balance_rub / $rate) * 30" | bc 2>/dev/null || echo "0")
+                [[ "$extra_days" -lt 1 ]] && extra_days=0
+                echo "$tg_id,$extra_days,$balance_rub" >> "$days_file"
+            done
+            
+            print_message "SUCCESS" "Файл конвертации создан: $days_file"
+            
+            # Отчёт
+            {
+                echo "═══════════════════════════════════════════════════════════"
+                echo "  КОНВЕРТАЦИЯ БАЛАНСОВ В ДНИ ПОДПИСКИ"
+                echo "  Курс: $rate ₽ = 30 дней"
+                echo "═══════════════════════════════════════════════════════════"
+                echo ""
+                cat "$days_file"
+            } > "$balance_report"
+            ;;
+            
+        "convert_partner")
+            print_message "INFO" "Конвертация балансов в партнёрские..."
+            
+            # Файлы для партнёров и не-партнёров
+            local partner_file="$import_dir/balance_to_partner.csv"
+            local non_partner_file="$export_dir/non_partner_balances.csv"
+            
+            echo "telegram_id,balance_rubles" > "$partner_file"
+            echo "telegram_id,username,first_name,balance_rubles" > "$non_partner_file"
+            
+            # Получаем список партнёров (users с referral_commission_percent > 0)
+            local partners_query="SELECT telegram_id FROM users WHERE referral_commission_percent > 0;"
+            local partners_list=""
+            
+            if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+                partners_list=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -c "$partners_query" 2>/dev/null)
+            else
+                export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+                partners_list=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -c "$partners_query" 2>/dev/null)
+                unset PGPASSWORD
+            fi
+            
+            tail -n +2 "$balances_file" | while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
+                [[ -z "$tg_id" ]] && continue
+                if echo "$partners_list" | grep -q "^${tg_id}$"; then
+                    echo "$tg_id,$balance_rub" >> "$partner_file"
+                else
+                    echo "$tg_id,$username,$fname,$balance_rub" >> "$non_partner_file"
+                fi
+            done
+            
+            local partner_count=$(($(wc -l < "$partner_file") - 1))
+            local non_partner_count=$(($(wc -l < "$non_partner_file") - 1))
+            
+            print_message "SUCCESS" "Партнёров с балансом: $partner_count → partner.available_balance"
+            [[ $non_partner_count -gt 0 ]] && print_message "WARN" "Не-партнёров с балансом: $non_partner_count → экспорт в CSV"
+            
+            # Отчёт
+            {
+                echo "═══════════════════════════════════════════════════════════"
+                echo "  КОНВЕРТАЦИЯ БАЛАНСОВ В ПАРТНЁРСКИЕ"
+                echo "═══════════════════════════════════════════════════════════"
+                echo ""
+                echo "ПАРТНЁРЫ (баланс → partner.available_balance):"
+                cat "$partner_file"
+                echo ""
+                echo "НЕ-ПАРТНЁРЫ (требуют ручной обработки):"
+                cat "$non_partner_file"
+            } > "$balance_report"
+            ;;
+            
+        "ignore")
+            print_message "WARN" "Балансы проигнорированы!"
+            
+            {
+                echo "═══════════════════════════════════════════════════════════"
+                echo "  ⚠️  БАЛАНСЫ БЫЛИ ПРОИГНОРИРОВАНЫ (ПОТЕРЯ ДАННЫХ)"
+                echo "  Дата: $(date '+%Y-%m-%d %H:%M:%S')"
+                echo "═══════════════════════════════════════════════════════════"
+                echo ""
+                echo "РЕЗЕРВНАЯ КОПИЯ ПОТЕРЯННЫХ БАЛАНСОВ:"
+                cat "$balances_file"
+            } > "$balance_report"
+            ;;
+    esac
+    
+    return 0
+}
+
 # --- Функция: Экспорт данных из источника ---
 migrate_export_data() {
     debug_log "MIGRATE" "Starting data export"
@@ -4499,6 +4776,7 @@ menu_migration() {
         echo " 6. Только экспорт данных"
         echo " 7. Только трансформация"
         echo " 8. Только импорт"
+        echo -e " 9. ${YELLOW}Анализ балансов пользователей${RESET}"
         echo ""
         echo " 0. Назад в главное меню"
         echo ""
@@ -4551,39 +4829,55 @@ menu_migration() {
                     echo ""
                     
                     # Этап 1: Проверка совместимости
-                    print_message "INFO" "[1/5] Проверка совместимости..."
+                    print_message "INFO" "[1/7] Проверка совместимости..."
                     if ! migrate_check_compatibility; then
                         print_message "ERROR" "Источник не совместим!"
                         read -erp "Enter..." dummy
                         continue
                     fi
                     
-                    # Этап 2: Экспорт
-                    print_message "INFO" "[2/5] Экспорт данных..."
+                    # Этап 2: Анализ балансов
+                    print_message "INFO" "[2/7] Анализ балансов пользователей..."
+                    if ! migrate_handle_balances; then
+                        print_message "ERROR" "Ошибка анализа балансов!"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    
+                    # Этап 3: Экспорт
+                    print_message "INFO" "[3/7] Экспорт данных..."
                     if ! migrate_export_data; then
                         print_message "ERROR" "Ошибка экспорта!"
                         read -erp "Enter..." dummy
                         continue
                     fi
                     
-                    # Этап 3: Трансформация
-                    print_message "INFO" "[3/5] Трансформация данных..."
+                    # Этап 4: Трансформация
+                    print_message "INFO" "[4/7] Трансформация данных..."
                     if ! migrate_transform_data; then
                         print_message "ERROR" "Ошибка трансформации!"
                         read -erp "Enter..." dummy
                         continue
                     fi
                     
-                    # Этап 4: Импорт
-                    print_message "INFO" "[4/5] Импорт в Remnawave..."
+                    # Этап 5: Применение обработки балансов
+                    print_message "INFO" "[5/7] Обработка балансов..."
+                    if ! migrate_apply_balance_handling; then
+                        print_message "ERROR" "Ошибка обработки балансов!"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    
+                    # Этап 6: Импорт
+                    print_message "INFO" "[6/7] Импорт в Remnawave..."
                     if ! migrate_import_data; then
                         print_message "ERROR" "Ошибка импорта!"
                         read -erp "Enter..." dummy
                         continue
                     fi
                     
-                    # Этап 5: Отчёт
-                    print_message "INFO" "[5/5] Генерация отчёта..."
+                    # Этап 7: Отчёт
+                    print_message "INFO" "[7/7] Генерация отчёта..."
                     migrate_generate_report
                     
                     echo ""
@@ -4606,6 +4900,16 @@ menu_migration() {
                 ;;
             8)
                 migrate_import_data
+                read -erp "Enter..." dummy
+                ;;
+            9)
+                mkdir -p "$MIGRATION_WORK_DIR"
+                if [[ -z "$MIGRATION_SOURCE_CONTAINER" && -z "$MIGRATION_SOURCE_HOST" ]]; then
+                    print_message "ERROR" "Сначала настройте источник (пункт 1)"
+                else
+                    migrate_handle_balances
+                    [[ -n "$BALANCE_HANDLING_MODE" && "$BALANCE_HANDLING_MODE" != "none" ]] && migrate_apply_balance_handling
+                fi
                 read -erp "Enter..." dummy
                 ;;
             0) return ;;
