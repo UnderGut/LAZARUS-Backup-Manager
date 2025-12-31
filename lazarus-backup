@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.23.0"
+VERSION="4.24.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -4689,6 +4689,732 @@ migrate_generate_report() {
     cat "$report_file"
 }
 
+# =============================================================================
+# МИГРАЦИЯ НАСТРОЕК (Settings Migration)
+# =============================================================================
+
+# Пути к .env файлам
+MIGRATION_SOURCE_ENV_FILE=""     # Путь к .env Bedolaga
+MIGRATION_TARGET_ENV_FILE=""     # Путь к .env RWP-Shop
+MIGRATION_TARGET_BOT_PATH=""     # Путь к папке RWP-Shop бота
+
+# Маппинг настроек: Bedolaga .env → RWP-Shop .env (критические переменные)
+declare -A SETTINGS_ENV_TO_ENV=(
+    # Telegram
+    ["BOT_TOKEN"]="TELEGRAM_TOKEN"
+    ["ADMIN_ID"]="ADMIN_TELEGRAM_ID"
+    # Database  
+    ["DATABASE_URL"]="DATABASE_URL"
+    ["POSTGRES_USER"]="POSTGRES_USER"
+    ["POSTGRES_PASSWORD"]="POSTGRES_PASSWORD"
+    ["POSTGRES_DB"]="POSTGRES_DB"
+    # Remnawave API
+    ["REMNAWAVE_BASE_URL"]="REMNAWAVE_URL"
+    ["REMNAWAVE_API_KEY"]="REMNAWAVE_TOKEN"
+)
+
+# Маппинг настроек: Bedolaga .env → RWP-Shop settings DB
+declare -A SETTINGS_ENV_TO_DB=(
+    # === YooKassa ===
+    ["YOOKASSA_ENABLED"]="yookasa_enabled"
+    ["YOOKASSA_SHOP_ID"]="yookasa_shop_id"
+    ["YOOKASSA_SECRET_KEY"]="yookasa_secret_key"
+    ["YOOKASSA_RETURN_URL"]="payment_return_url"
+    ["YOOKASSA_PAYMENT_MODE"]="yookassa_payment_mode"
+    ["YOOKASSA_PAYMENT_METHODS"]="yookassa_payment_methods"
+    
+    # === CryptoBot → CryptoPay ===
+    ["CRYPTOBOT_ENABLED"]="crypto_pay_enabled"
+    ["CRYPTOBOT_TOKEN"]="crypto_pay_token"
+    
+    # === Telegram Stars ===
+    ["TELEGRAM_STARS_ENABLED"]="telegram_stars_enabled"
+    ["STARS_EXCHANGE_RATE"]="stars_exchange_rate"
+    ["STARS_REQUIRE_PAID_PURCHASE"]="require_paid_purchase_for_stars"
+    
+    # === Tribute ===
+    ["TRIBUTE_ENABLED"]="tribute_enabled"
+    ["TRIBUTE_API_KEY"]="tribute_api_key"
+    ["TRIBUTE_PAYMENT_URL"]="tribute_payment_url"
+    ["TRIBUTE_WEBHOOK_URL"]="tribute_webhook_url"
+    
+    # === Platega ===
+    ["PLATEGA_ENABLED"]="platega_cards_enabled"
+    ["PLATEGA_MERCHANT_ID"]="platega_merchant_id"
+    ["PLATEGA_SECRET_KEY"]="platega_secret"
+    
+    # === Trial ===
+    ["TRIAL_ENABLED"]="trial_enabled"
+    ["TRIAL_DAYS"]="trial_days"
+    ["TRIAL_TRAFFIC_LIMIT_GB"]="trial_traffic_limit"
+    ["TRIAL_DEVICE_LIMIT"]="trial_device_limit"
+    ["TRIAL_SERVER_TAG"]="trial_remnawave_tag"
+    
+    # === Referral ===
+    ["REFERRAL_ENABLED"]="referral_enabled"
+    ["REFERRAL_BONUS_DAYS"]="referral_bonus_days"
+    ["REFERRAL_REFEREE_BONUS_DAYS"]="referral_referee_bonus_days"
+    ["REFERRAL_COMMISSION_PERCENT"]="referral_recurring_percent"
+    ["REFERRAL_TIERS_ENABLED"]="referral_tiers_enabled"
+    ["REFERRAL_TIER_1_THRESHOLD"]="referral_tier1_threshold"
+    ["REFERRAL_TIER_1_BONUS"]="referral_tier1_bonus"
+    ["REFERRAL_TIER_2_THRESHOLD"]="referral_tier2_threshold"
+    ["REFERRAL_TIER_2_BONUS"]="referral_tier2_bonus"
+    ["REFERRAL_TIER_3_THRESHOLD"]="referral_tier3_threshold"
+    ["REFERRAL_TIER_3_BONUS"]="referral_tier3_bonus"
+    ["REFERRAL_RECURRING_ENABLED"]="referral_recurring_enabled"
+    ["REFERRAL_RECURRING_PERCENT"]="referral_recurring_percent"
+    
+    # === UI/Branding ===
+    ["BRAND_PRIMARY_COLOR"]="brand_primary_color"
+    ["BRAND_TEXT_COLOR"]="brand_text_color"
+    ["BRAND_SUCCESS_COLOR"]="brand_success_color"
+    ["BRAND_WARNING_COLOR"]="brand_warning_color"
+    ["BRAND_ERROR_COLOR"]="brand_error_color"
+    ["EFFECT_SNOWFALL"]="effect_snowfall"
+    ["EFFECT_SNOWFALL_VARIANT"]="effect_snowfall_variant"
+    ["EFFECT_HALLOWEEN"]="effect_halloween"
+    ["EFFECT_SAKURA"]="effect_sakura"
+    
+    # === Menu/Buttons ===
+    ["MENU_BUTTONS_LAYOUT"]="menu_buttons_layout"
+    ["MENU_BUTTON_CONNECT_ENABLED"]="menu_button_connect_enabled"
+    ["MENU_BUTTON_REFERRAL_ENABLED"]="menu_button_referral_enabled"
+    ["MENU_BUTTON_PARTNER_ENABLED"]="menu_button_partner_enabled"
+    
+    # === URLs ===
+    ["SERVER_STATUS_URL"]="server_status_url"
+    ["SERVER_STATUS_ENABLED"]="server_status_enabled"
+    ["SUPPORT_URL"]="support_url"
+    ["FEEDBACK_URL"]="feedback_url"
+    ["CHANNEL_URL"]="channel_url"
+    ["TOS_URL"]="tos_url"
+    
+    # === MiniApp ===
+    ["MINIAPP_ENABLED"]="mini_app_enabled"
+    ["MINIAPP_URL"]="mini_app_url"
+    ["WEBAPP_MODE"]="web_app_mode"
+    
+    # === Recurring/Autopay ===
+    ["AUTOPAY_ENABLED"]="recurring_payments_enabled"
+    ["AUTOPAY_REMINDER_DAYS"]="recurring_notify_days_before"
+)
+
+# --- Функция: Чтение .env файла в ассоциативный массив ---
+read_env_file() {
+    local env_file="$1"
+    local -n result_map=$2
+    
+    if [[ ! -f "$env_file" ]]; then
+        debug_log "MIGRATE" "ENV file not found: $env_file"
+        return 1
+    fi
+    
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Пропускаем комментарии и пустые строки
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        
+        # Извлекаем KEY=VALUE
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            
+            # Убираем кавычки если есть
+            value="${value#\"}"
+            value="${value%\"}"
+            value="${value#\'}"
+            value="${value%\'}"
+            
+            result_map["$key"]="$value"
+        fi
+    done < "$env_file"
+    
+    debug_log "MIGRATE" "Read ${#result_map[@]} variables from $env_file"
+    return 0
+}
+
+# --- Функция: Запись переменной в .env файл ---
+write_env_variable() {
+    local env_file="$1"
+    local key="$2"
+    local value="$3"
+    
+    # Экранируем спецсимволы для sed
+    local escaped_value="${value//\\/\\\\}"
+    escaped_value="${escaped_value//&/\\&}"
+    
+    if grep -q "^${key}=" "$env_file" 2>/dev/null; then
+        # Обновляем существующую переменную
+        sed -i "s|^${key}=.*|${key}=\"${escaped_value}\"|" "$env_file"
+    else
+        # Добавляем новую переменную
+        echo "${key}=\"${value}\"" >> "$env_file"
+    fi
+}
+
+# --- Функция: Настройка путей для миграции настроек ---
+migrate_settings_configure_paths() {
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ПУТЕЙ ДЛЯ МИГРАЦИИ НАСТРОЕК ═══${RESET}"
+    echo ""
+    
+    # === Источник (Bedolaga .env) ===
+    echo -e "${YELLOW}=== ИСТОЧНИК (Bedolaga) ===${RESET}"
+    
+    # Пробуем найти автоматически
+    local found_bedolaga=""
+    for path in "/opt/bedolaga-bot" "/opt/shop-bot" "/opt/telegram-shop-bot" "/root/bedolaga-bot"; do
+        if [[ -f "$path/.env" ]]; then
+            found_bedolaga="$path/.env"
+            break
+        fi
+    done
+    
+    if [[ -n "$found_bedolaga" ]]; then
+        echo -e "Найден файл: ${GREEN}$found_bedolaga${RESET}"
+        read -erp "Использовать его? (Y/n): " use_found
+        if [[ ! "$use_found" =~ ^[Nn]$ ]]; then
+            MIGRATION_SOURCE_ENV_FILE="$found_bedolaga"
+        fi
+    fi
+    
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        read -erp "Путь к .env файлу Bedolaga: " MIGRATION_SOURCE_ENV_FILE
+    fi
+    
+    if [[ ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Файл не найден: $MIGRATION_SOURCE_ENV_FILE"
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    echo ""
+    
+    # === Приёмник (RWP-Shop) ===
+    echo -e "${YELLOW}=== ПРИЁМНИК (RWP-Shop) ===${RESET}"
+    
+    # Пробуем найти автоматически
+    local found_rwp=""
+    for path in "/opt/private-remnawave-telegram-shop-bot" "/opt/rwp-shop" "/opt/telegram-shop"; do
+        if [[ -f "$path/.env" ]]; then
+            found_rwp="$path"
+            break
+        fi
+    done
+    
+    if [[ -n "$found_rwp" ]]; then
+        echo -e "Найдена папка: ${GREEN}$found_rwp${RESET}"
+        read -erp "Использовать её? (Y/n): " use_found
+        if [[ ! "$use_found" =~ ^[Nn]$ ]]; then
+            MIGRATION_TARGET_BOT_PATH="$found_rwp"
+            MIGRATION_TARGET_ENV_FILE="$found_rwp/.env"
+        fi
+    fi
+    
+    if [[ -z "$MIGRATION_TARGET_BOT_PATH" ]]; then
+        read -erp "Путь к папке RWP-Shop бота: " MIGRATION_TARGET_BOT_PATH
+        MIGRATION_TARGET_ENV_FILE="$MIGRATION_TARGET_BOT_PATH/.env"
+    fi
+    
+    if [[ ! -f "$MIGRATION_TARGET_ENV_FILE" ]]; then
+        print_message "WARN" "Файл .env не найден в $MIGRATION_TARGET_BOT_PATH"
+        read -erp "Создать новый .env файл? (y/N): " create_new
+        if [[ "$create_new" =~ ^[Yy]$ ]]; then
+            touch "$MIGRATION_TARGET_ENV_FILE"
+            chmod 600 "$MIGRATION_TARGET_ENV_FILE"
+            print_message "SUCCESS" "Создан: $MIGRATION_TARGET_ENV_FILE"
+        else
+            return 1
+        fi
+    fi
+    
+    print_message "SUCCESS" "Пути настроены"
+    echo ""
+    echo -e "Источник: ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+    echo -e "Приёмник .env: ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
+    echo -e "Приёмник БД: ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
+    
+    read -erp "Enter..." dummy
+    return 0
+}
+
+# --- Функция: Анализ настроек для миграции ---
+migrate_settings_analyze() {
+    debug_log "MIGRATE" "Analyzing settings for migration"
+    
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к источнику не настроен"
+        return 1
+    fi
+    
+    # Читаем исходный .env
+    declare -A source_settings
+    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    
+    local total_source=${#source_settings[@]}
+    local can_migrate_env=0
+    local can_migrate_db=0
+    local no_mapping=0
+    
+    # Подсчёт переменных с маппингом
+    for key in "${!source_settings[@]}"; do
+        if [[ -n "${SETTINGS_ENV_TO_ENV[$key]}" ]]; then
+            ((can_migrate_env++))
+        elif [[ -n "${SETTINGS_ENV_TO_DB[$key]}" ]]; then
+            ((can_migrate_db++))
+        else
+            ((no_mapping++))
+        fi
+    done
+    
+    echo ""
+    echo -e "${CYAN}${BOLD}═══ АНАЛИЗ НАСТРОЕК ═══${RESET}"
+    echo ""
+    echo -e "Источник: ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────┐"
+    printf "│ %-43s %10s │\n" "Найдено настроек в Bedolaga:" "$total_source"
+    printf "│ %-43s %10s │\n" "Можно перенести в .env:" "$can_migrate_env"
+    printf "│ %-43s %10s │\n" "Можно перенести в settings DB:" "$can_migrate_db"
+    printf "│ %-43s %10s │\n" "Без аналога (не переносятся):" "$no_mapping"
+    echo "└─────────────────────────────────────────────────────────┘"
+    echo ""
+    
+    return 0
+}
+
+# --- Функция: Просмотр маппинга .env → .env ---
+migrate_settings_show_env_mapping() {
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к источнику не настроен"
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    declare -A source_settings
+    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ МАППИНГ .env → .env (критические настройки) ═══${RESET}"
+    echo ""
+    printf "%-30s │ %-30s │ %s\n" "Bedolaga" "RWP-Shop" "Значение"
+    echo "───────────────────────────────┼────────────────────────────────┼────────────────────────"
+    
+    for bedolaga_key in "${!SETTINGS_ENV_TO_ENV[@]}"; do
+        local rwp_key="${SETTINGS_ENV_TO_ENV[$bedolaga_key]}"
+        local value="${source_settings[$bedolaga_key]:-<не задано>}"
+        
+        # Маскируем чувствительные данные
+        if [[ "$bedolaga_key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
+            if [[ -n "${source_settings[$bedolaga_key]}" ]]; then
+                local masked="${value:0:6}***${value: -3}"
+                value="$masked"
+            fi
+        fi
+        
+        # Ограничиваем длину значения
+        [[ ${#value} -gt 25 ]] && value="${value:0:22}..."
+        
+        printf "%-30s │ %-30s │ %s\n" "$bedolaga_key" "$rwp_key" "$value"
+    done
+    
+    echo ""
+    read -erp "Enter..." dummy
+}
+
+# --- Функция: Просмотр маппинга .env → settings DB ---
+migrate_settings_show_db_mapping() {
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к источнику не настроен"
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    declare -A source_settings
+    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ МАППИНГ .env → settings DB ═══${RESET}"
+    echo ""
+    
+    # Группируем по категориям
+    local categories=("Payment" "Trial" "Referral" "UI" "URLs" "Other")
+    
+    printf "%-35s │ %-35s │ %s\n" "Bedolaga .env" "RWP-Shop settings.key" "Значение"
+    echo "────────────────────────────────────┼─────────────────────────────────────┼────────────────────────"
+    
+    local count=0
+    for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
+        local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
+        local value="${source_settings[$bedolaga_key]:-<не задано>}"
+        
+        # Маскируем чувствительные данные
+        if [[ "$bedolaga_key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
+            if [[ -n "${source_settings[$bedolaga_key]}" ]]; then
+                local masked="${value:0:6}***${value: -3}"
+                value="$masked"
+            fi
+        fi
+        
+        # Ограничиваем длину
+        [[ ${#value} -gt 20 ]] && value="${value:0:17}..."
+        
+        printf "%-35s │ %-35s │ %s\n" "$bedolaga_key" "$db_key" "$value"
+        
+        ((count++))
+        # Пагинация каждые 20 строк
+        if [[ $((count % 20)) -eq 0 ]]; then
+            echo ""
+            read -erp "-- Нажмите Enter для продолжения --" dummy
+            echo ""
+        fi
+    done
+    
+    echo ""
+    echo "Всего переменных для миграции в БД: ${#SETTINGS_ENV_TO_DB[@]}"
+    echo ""
+    read -erp "Enter..." dummy
+}
+
+# --- Функция: Просмотр настроек без аналога ---
+migrate_settings_show_no_mapping() {
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к источнику не настроен"
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    declare -A source_settings
+    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    
+    clear_screen
+    echo -e "${YELLOW}${BOLD}═══ НАСТРОЙКИ БЕЗ АНАЛОГА В RWP-SHOP ═══${RESET}"
+    echo ""
+    echo "Эти настройки НЕ будут перенесены (нет аналога в RWP-Shop):"
+    echo ""
+    
+    local count=0
+    for key in "${!source_settings[@]}"; do
+        # Проверяем есть ли маппинг
+        if [[ -z "${SETTINGS_ENV_TO_ENV[$key]}" && -z "${SETTINGS_ENV_TO_DB[$key]}" ]]; then
+            local value="${source_settings[$key]}"
+            
+            # Маскируем чувствительные данные
+            if [[ "$key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
+                [[ -n "$value" ]] && value="${value:0:6}***"
+            fi
+            
+            [[ ${#value} -gt 40 ]] && value="${value:0:37}..."
+            
+            printf "  %-35s = %s\n" "$key" "$value"
+            ((count++))
+            
+            # Пагинация
+            if [[ $((count % 25)) -eq 0 ]]; then
+                echo ""
+                read -erp "-- Нажмите Enter для продолжения --" dummy
+                echo ""
+            fi
+        fi
+    done | sort
+    
+    echo ""
+    echo "Всего настроек без аналога: $count"
+    echo ""
+    read -erp "Enter..." dummy
+}
+
+# --- Функция: Выполнение миграции настроек ---
+migrate_settings_execute() {
+    debug_log "MIGRATE" "Starting settings migration"
+    
+    # Проверки
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к источнику не настроен"
+        return 1
+    fi
+    
+    if [[ -z "$MIGRATION_TARGET_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к приёмнику .env не настроен"
+        return 1
+    fi
+    
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        print_message "ERROR" "Контейнер БД RWP-Shop не настроен"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
+    echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ! МИГРАЦИЯ НАСТРОЕК!               ${RESET}"
+    echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo "Будут изменены:"
+    echo " • Файл .env: $MIGRATION_TARGET_ENV_FILE"
+    echo " • База данных: $MIGRATION_TARGET_CONTAINER / $MIGRATION_TARGET_DB"
+    echo ""
+    echo -e "${YELLOW}Рекомендуется сделать бэкап перед продолжением!${RESET}"
+    echo ""
+    read -erp "Введите 'SETTINGS' для подтверждения: " confirm
+    
+    if [[ "$confirm" != "SETTINGS" ]]; then
+        print_message "INFO" "Миграция отменена"
+        return 0
+    fi
+    
+    # Читаем исходный .env
+    declare -A source_settings
+    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    
+    local work_dir="$MIGRATION_WORK_DIR"
+    [[ -z "$work_dir" ]] && work_dir="${BACKUP_DIR}/migration_settings_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$work_dir"
+    
+    # Бэкап целевого .env
+    if [[ -f "$MIGRATION_TARGET_ENV_FILE" ]]; then
+        cp "$MIGRATION_TARGET_ENV_FILE" "$work_dir/target_env_backup.env"
+        print_message "INFO" "Бэкап .env: $work_dir/target_env_backup.env"
+    fi
+    
+    local env_migrated=0
+    local db_migrated=0
+    local errors=0
+    
+    # === ЭТАП 1: Миграция .env → .env ===
+    print_message "INFO" "[1/2] Миграция критических настроек в .env..."
+    
+    for bedolaga_key in "${!SETTINGS_ENV_TO_ENV[@]}"; do
+        local rwp_key="${SETTINGS_ENV_TO_ENV[$bedolaga_key]}"
+        local value="${source_settings[$bedolaga_key]}"
+        
+        if [[ -n "$value" ]]; then
+            write_env_variable "$MIGRATION_TARGET_ENV_FILE" "$rwp_key" "$value"
+            debug_log "MIGRATE" "ENV: $bedolaga_key → $rwp_key"
+            ((env_migrated++))
+        fi
+    done
+    
+    print_message "SUCCESS" "Перенесено в .env: $env_migrated переменных"
+    
+    # === ЭТАП 2: Миграция .env → settings DB ===
+    print_message "INFO" "[2/2] Миграция настроек в таблицу settings..."
+    
+    local sql_file="$work_dir/settings_import.sql"
+    echo "-- Settings migration: Bedolaga → RWP-Shop" > "$sql_file"
+    echo "-- Generated: $(date '+%Y-%m-%d %H:%M:%S')" >> "$sql_file"
+    echo "" >> "$sql_file"
+    
+    for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
+        local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
+        local value="${source_settings[$bedolaga_key]}"
+        
+        if [[ -n "$value" ]]; then
+            # Экранируем одинарные кавычки для SQL
+            local escaped_value="${value//\'/\'\'}"
+            
+            # Конвертируем булевы значения
+            if [[ "$value" =~ ^(true|false|True|False|TRUE|FALSE|1|0)$ ]]; then
+                case "${value,,}" in
+                    true|1) escaped_value="true" ;;
+                    false|0) escaped_value="false" ;;
+                esac
+            fi
+            
+            echo "INSERT INTO settings (key, value, created_at, updated_at) VALUES ('$db_key', '$escaped_value', NOW(), NOW())" >> "$sql_file"
+            echo "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" >> "$sql_file"
+            
+            debug_log "MIGRATE" "DB: $bedolaga_key → $db_key = $value"
+            ((db_migrated++))
+        fi
+    done
+    
+    # Выполняем SQL
+    docker cp "$sql_file" "${MIGRATION_TARGET_CONTAINER}:/tmp/settings_import.sql"
+    
+    local sql_result
+    sql_result=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -f /tmp/settings_import.sql 2>&1)
+    local sql_exit=$?
+    
+    docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/settings_import.sql
+    
+    if [[ $sql_exit -ne 0 ]]; then
+        print_message "ERROR" "Ошибка SQL: $sql_result"
+        ((errors++))
+    else
+        print_message "SUCCESS" "Перенесено в settings DB: $db_migrated настроек"
+    fi
+    
+    # === ОТЧЁТ ===
+    local report_file="$work_dir/settings_migration_report.txt"
+    {
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           ОТЧЁТ МИГРАЦИИ НАСТРОЕК                              ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Дата: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+        echo "Источник: $MIGRATION_SOURCE_ENV_FILE"
+        echo "Приёмник .env: $MIGRATION_TARGET_ENV_FILE"
+        echo "Приёмник БД: $MIGRATION_TARGET_CONTAINER / $MIGRATION_TARGET_DB"
+        echo ""
+        echo "=== РЕЗУЛЬТАТЫ ==="
+        echo "Перенесено в .env: $env_migrated"
+        echo "Перенесено в settings DB: $db_migrated"
+        echo "Ошибок: $errors"
+        echo ""
+        echo "=== ВАЖНО ==="
+        echo "1. Перезапустите бота для применения настроек из .env"
+        echo "2. Проверьте админ-панель RWP-Shop для проверки настроек из БД"
+        echo "3. Некоторые настройки могут потребовать ручной корректировки"
+        echo ""
+        echo "=== НАСТРОЙКИ БЕЗ МИГРАЦИИ ==="
+        echo "Следующие настройки Bedolaga не имеют аналогов в RWP-Shop:"
+        echo ""
+        for key in "${!source_settings[@]}"; do
+            if [[ -z "${SETTINGS_ENV_TO_ENV[$key]}" && -z "${SETTINGS_ENV_TO_DB[$key]}" ]]; then
+                echo "  - $key"
+            fi
+        done | sort
+    } > "$report_file"
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}${BOLD}  ✅ МИГРАЦИЯ НАСТРОЕК ЗАВЕРШЕНА!                  ${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo "Результаты:"
+    echo " • .env: $env_migrated переменных"
+    echo " • settings DB: $db_migrated настроек"
+    echo " • Ошибок: $errors"
+    echo ""
+    echo "Отчёт: $report_file"
+    echo ""
+    
+    if [[ $errors -eq 0 ]]; then
+        print_message "WARN" "Перезапустите бота для применения изменений!"
+        echo ""
+        read -erp "Перезапустить бота сейчас? (y/N): " restart_bot
+        if [[ "$restart_bot" =~ ^[Yy]$ ]]; then
+            if [[ -n "$MIGRATION_TARGET_BOT_PATH" && -f "$MIGRATION_TARGET_BOT_PATH/compose.yaml" ]]; then
+                print_message "INFO" "Перезапуск бота..."
+                (cd "$MIGRATION_TARGET_BOT_PATH" && docker compose restart bot)
+                print_message "SUCCESS" "Бот перезапущен"
+            else
+                print_message "WARN" "Путь к compose.yaml не найден. Перезапустите бота вручную."
+            fi
+        fi
+    fi
+    
+    log_message "SUCCESS" "Settings migration completed: env=$env_migrated, db=$db_migrated, errors=$errors"
+    
+    read -erp "Enter..." dummy
+    return 0
+}
+
+# --- Функция: Экспорт настроек в CSV ---
+migrate_settings_export_csv() {
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Путь к источнику не настроен"
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    declare -A source_settings
+    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    
+    local work_dir="${BACKUP_DIR}/settings_export_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$work_dir"
+    
+    local csv_file="$work_dir/bedolaga_settings.csv"
+    
+    echo "key,value,maps_to_env,maps_to_db,migration_status" > "$csv_file"
+    
+    for key in "${!source_settings[@]}"; do
+        local value="${source_settings[$key]}"
+        local env_target="${SETTINGS_ENV_TO_ENV[$key]:-}"
+        local db_target="${SETTINGS_ENV_TO_DB[$key]:-}"
+        local status="no_mapping"
+        
+        [[ -n "$env_target" ]] && status="env"
+        [[ -n "$db_target" ]] && status="db"
+        
+        # Экранируем для CSV
+        value="${value//\"/\"\"}"
+        
+        echo "\"$key\",\"$value\",\"$env_target\",\"$db_target\",\"$status\"" >> "$csv_file"
+    done
+    
+    print_message "SUCCESS" "Настройки экспортированы: $csv_file"
+    echo ""
+    echo "Статистика:"
+    echo " • Всего настроек: ${#source_settings[@]}"
+    echo " • Маппинг на .env: $(grep -c ',env$' "$csv_file")"
+    echo " • Маппинг на DB: $(grep -c ',db$' "$csv_file")"
+    echo " • Без маппинга: $(grep -c ',no_mapping$' "$csv_file")"
+    
+    read -erp "Enter..." dummy
+}
+
+# --- Меню миграции настроек ---
+menu_migrate_settings() {
+    while true; do
+        clear_screen
+        echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
+        echo -e "${CYAN}${BOLD}            🔧 МИГРАЦИЯ НАСТРОЕК BEDOLAGA → RWP-SHOP          ${RESET}"
+        echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
+        echo ""
+        
+        # Статус путей
+        echo -e "${YELLOW}=== ТЕКУЩИЕ ПУТИ ===${RESET}"
+        if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+            echo -e "Источник .env: ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+        else
+            echo -e "Источник .env: ${RED}Не настроен${RESET}"
+        fi
+        
+        if [[ -n "$MIGRATION_TARGET_ENV_FILE" ]]; then
+            echo -e "Приёмник .env: ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
+        else
+            echo -e "Приёмник .env: ${RED}Не настроен${RESET}"
+        fi
+        
+        if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+            echo -e "Приёмник БД: ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
+        else
+            echo -e "Приёмник БД: ${RED}Не настроен${RESET}"
+        fi
+        echo ""
+        
+        # Показываем статистику если пути настроены
+        if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+            migrate_settings_analyze 2>/dev/null
+        fi
+        
+        echo ""
+        echo " [1] Настроить пути (.env файлы)"
+        echo " [2] Просмотреть маппинг .env → .env"
+        echo " [3] Просмотреть маппинг .env → settings DB"
+        echo " [4] Просмотреть настройки без аналога"
+        echo -e " ${GREEN}[5] ▶ ВЫПОЛНИТЬ МИГРАЦИЮ НАСТРОЕК${RESET}"
+        echo " [6] Экспортировать настройки в CSV"
+        echo ""
+        echo " [0] ← Назад"
+        echo ""
+        read -erp "Выбор: " opt
+        
+        case "$opt" in
+            1) migrate_settings_configure_paths ;;
+            2) migrate_settings_show_env_mapping ;;
+            3) migrate_settings_show_db_mapping ;;
+            4) migrate_settings_show_no_mapping ;;
+            5) migrate_settings_execute ;;
+            6) migrate_settings_export_csv ;;
+            0) return ;;
+        esac
+    done
+}
+
 # --- Функция: Настройка источника ---
 migrate_configure_source() {
     clear_screen
@@ -4779,7 +5505,7 @@ menu_migration() {
     while true; do
         clear_screen
         echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
-        echo -e "${MAGENTA}${BOLD}  🔄 МИГРАЦИЯ: Bedolaga → RWP-Shop (Private)   ${RESET}"
+        echo -e "${MAGENTA}${BOLD}  МИГРАЦИЯ: Bedolaga → RWP-Shop (Private)   ${RESET}"
         echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
         echo ""
         echo -e "${YELLOW}ВНИМАНИЕ: Эта функция переносит данные между ботами!${RESET}"
@@ -4811,14 +5537,17 @@ menu_migration() {
         echo " 3. Проверить подключения"
         echo " 4. Анализ структуры источника"
         echo ""
-        echo " --- МИГРАЦИЯ ---"
-        echo -e " ${GREEN}5. 🚀 ЗАПУСТИТЬ ПОЛНУЮ МИГРАЦИЮ${RESET}"
+        echo " --- МИГРАЦИЯ ДАННЫХ ---"
+        echo -e " ${GREEN}5. 🚀 ЗАПУСТИТЬ ПОЛНУЮ МИГРАЦИЮ ДАННЫХ${RESET}"
         echo ""
         echo " --- РУЧНЫЕ ЭТАПЫ ---"
         echo " 6. Только экспорт данных"
         echo " 7. Только трансформация"
         echo " 8. Только импорт"
         echo -e " 9. ${YELLOW}Анализ балансов пользователей${RESET}"
+        echo ""
+        echo " --- НАСТРОЙКИ ---"
+        echo -e " ${CYAN}10. 🔧 МИГРАЦИЯ НАСТРОЕК (.env → .env + DB)${RESET}"
         echo ""
         echo " 0. Назад в главное меню"
         echo ""
@@ -4954,6 +5683,7 @@ menu_migration() {
                 fi
                 read -erp "Enter..." dummy
                 ;;
+            10) menu_migrate_settings ;;
             0) return ;;
         esac
     done
@@ -5257,7 +5987,7 @@ case "$1" in
             fi
             echo " 5. Удалить старые бэкапы $CLEANUP_LABEL"
             echo -e " 6. ${CYAN}Обновить бота${RESET}"
-            echo -e " 7. ${MAGENTA}🔄 Миграция между ботами${RESET}"
+            echo -e " 7. ${MAGENTA}Миграция между ботами${RESET}"
             echo ""
             echo -e " 8. Проверить обновления скрипта"
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
