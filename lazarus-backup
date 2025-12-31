@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.24.1"
+VERSION="4.24.2"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -4698,6 +4698,202 @@ MIGRATION_SOURCE_ENV_FILE=""     # Путь к .env Bedolaga
 MIGRATION_TARGET_ENV_FILE=""     # Путь к .env RWP-Shop
 MIGRATION_TARGET_BOT_PATH=""     # Путь к папке RWP-Shop бота
 
+# === ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ИЗ .env.example BEDOLAGA ===
+declare -A BEDOLAGA_DEFAULTS=(
+    # Telegram
+    ["BOT_TOKEN"]=""
+    ["ADMIN_ID"]=""
+    # Database
+    ["POSTGRES_HOST"]="db"
+    ["POSTGRES_PORT"]="5432"
+    ["POSTGRES_USER"]="postgres"
+    ["POSTGRES_PASSWORD"]="postgres"
+    ["POSTGRES_DB"]="shop_bot"
+    # Redis
+    ["REDIS_HOST"]="redis"
+    ["REDIS_PORT"]="6379"
+    # Remnawave
+    ["REMNAWAVE_BASE_URL"]=""
+    ["REMNAWAVE_API_KEY"]=""
+    # Payment - YooKassa
+    ["YOOKASSA_ENABLED"]="false"
+    ["YOOKASSA_SHOP_ID"]=""
+    ["YOOKASSA_SECRET_KEY"]=""
+    ["YOOKASSA_RETURN_URL"]=""
+    ["YOOKASSA_PAYMENT_MODE"]="redirect"
+    ["YOOKASSA_PAYMENT_METHODS"]="bank_card,sbp,sberbank"
+    # Payment - CryptoBot
+    ["CRYPTOBOT_ENABLED"]="false"
+    ["CRYPTOBOT_TOKEN"]=""
+    # Payment - Telegram Stars
+    ["TELEGRAM_STARS_ENABLED"]="false"
+    ["STARS_EXCHANGE_RATE"]="2"
+    ["STARS_REQUIRE_PAID_PURCHASE"]="false"
+    # Payment - Tribute
+    ["TRIBUTE_ENABLED"]="false"
+    ["TRIBUTE_API_KEY"]=""
+    ["TRIBUTE_PAYMENT_URL"]=""
+    ["TRIBUTE_WEBHOOK_URL"]=""
+    # Payment - Platega
+    ["PLATEGA_ENABLED"]="false"
+    ["PLATEGA_MERCHANT_ID"]=""
+    ["PLATEGA_SECRET_KEY"]=""
+    # Trial
+    ["TRIAL_ENABLED"]="false"
+    ["TRIAL_DAYS"]="1"
+    ["TRIAL_TRAFFIC_LIMIT_GB"]="0"
+    ["TRIAL_DEVICE_LIMIT"]="1"
+    ["TRIAL_SERVER_TAG"]=""
+    # Referral
+    ["REFERRAL_ENABLED"]="false"
+    ["REFERRAL_BONUS_DAYS"]="7"
+    ["REFERRAL_REFEREE_BONUS_DAYS"]="3"
+    ["REFERRAL_COMMISSION_PERCENT"]="10"
+    ["REFERRAL_TIERS_ENABLED"]="false"
+    ["REFERRAL_TIER_1_THRESHOLD"]="5"
+    ["REFERRAL_TIER_1_BONUS"]="10"
+    ["REFERRAL_TIER_2_THRESHOLD"]="15"
+    ["REFERRAL_TIER_2_BONUS"]="15"
+    ["REFERRAL_TIER_3_THRESHOLD"]="30"
+    ["REFERRAL_TIER_3_BONUS"]="20"
+    ["REFERRAL_RECURRING_ENABLED"]="false"
+    ["REFERRAL_RECURRING_PERCENT"]="5"
+    # Branding
+    ["BRAND_PRIMARY_COLOR"]="#007AFF"
+    ["BRAND_TEXT_COLOR"]="#FFFFFF"
+    ["BRAND_SUCCESS_COLOR"]="#34C759"
+    ["BRAND_WARNING_COLOR"]="#FF9500"
+    ["BRAND_ERROR_COLOR"]="#FF3B30"
+    # Effects
+    ["EFFECT_SNOWFALL"]="false"
+    ["EFFECT_SNOWFALL_VARIANT"]="standard"
+    ["EFFECT_HALLOWEEN"]="false"
+    ["EFFECT_SAKURA"]="false"
+    # Menu
+    ["MENU_BUTTONS_LAYOUT"]="2x2"
+    ["MENU_BUTTON_CONNECT_ENABLED"]="true"
+    ["MENU_BUTTON_REFERRAL_ENABLED"]="true"
+    ["MENU_BUTTON_PARTNER_ENABLED"]="true"
+    # URLs
+    ["SERVER_STATUS_URL"]=""
+    ["SERVER_STATUS_ENABLED"]="false"
+    ["SUPPORT_URL"]=""
+    ["FEEDBACK_URL"]=""
+    ["CHANNEL_URL"]=""
+    ["TOS_URL"]=""
+    # MiniApp
+    ["MINIAPP_ENABLED"]="false"
+    ["MINIAPP_URL"]=""
+    ["WEBAPP_MODE"]="fullscreen"
+    # Autopay
+    ["AUTOPAY_ENABLED"]="false"
+    ["AUTOPAY_REMINDER_DAYS"]="3"
+)
+
+# === ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ИЗ ДОКУМЕНТАЦИИ RWP-SHOP ===
+declare -A RWP_SHOP_DEFAULTS=(
+    # === .env файл ===
+    ["TELEGRAM_TOKEN"]=""
+    ["ADMIN_TELEGRAM_ID"]=""
+    ["DATABASE_URL"]="postgres://postgres:postgres@db:5432/postgres?sslmode=disable"
+    ["POSTGRES_USER"]="postgres"
+    ["POSTGRES_PASSWORD"]="postgres"
+    ["POSTGRES_DB"]="postgres"
+    ["REMNAWAVE_URL"]=""
+    ["REMNAWAVE_TOKEN"]=""
+    ["REMNAWAVE_MODE"]="private"
+    ["BOT_ADMIN_URL"]=""
+    ["WEBHOOK_SECRET"]=""
+    
+    # === settings DB (ключ = имя в таблице settings) ===
+    # Payment - YooKassa
+    ["yookasa_enabled"]="false"
+    ["yookasa_shop_id"]=""
+    ["yookasa_secret_key"]=""
+    ["yookassa_payment_mode"]="redirect"
+    ["yookassa_payment_methods"]="bank_card,sbp"
+    ["payment_return_url"]=""
+    # Payment - CryptoPay
+    ["crypto_pay_enabled"]="false"
+    ["crypto_pay_token"]=""
+    # Payment - Telegram Stars
+    ["telegram_stars_enabled"]="false"
+    ["stars_exchange_rate"]="2"
+    ["require_paid_purchase_for_stars"]="false"
+    # Payment - Tribute
+    ["tribute_enabled"]="false"
+    ["tribute_api_key"]=""
+    ["tribute_payment_url"]=""
+    ["tribute_webhook_url"]=""
+    # Payment - Platega
+    ["platega_cards_enabled"]="false"
+    ["platega_sbp_enabled"]="false"
+    ["platega_crypto_enabled"]="false"
+    ["platega_merchant_id"]=""
+    ["platega_secret"]=""
+    # Payment - SeverPay
+    ["severpay_cards_enabled"]="false"
+    ["severpay_sbp_enabled"]="false"
+    ["severpay_secret"]=""
+    # Payment - Stripe
+    ["stripe_enabled"]="false"
+    ["stripe_secret_key"]=""
+    ["stripe_webhook_secret"]=""
+    # Payment - Wata
+    ["wata_enabled"]="false"
+    ["wata_merchant_id"]=""
+    ["wata_api_key"]=""
+    # Trial
+    ["trial_enabled"]="false"
+    ["trial_days"]="1"
+    ["trial_traffic_limit"]="0"
+    ["trial_device_limit"]="1"
+    ["trial_remnawave_tag"]=""
+    # Referral
+    ["referral_enabled"]="false"
+    ["referral_bonus_days"]="7"
+    ["referral_referee_bonus_days"]="3"
+    ["referral_recurring_enabled"]="false"
+    ["referral_recurring_percent"]="5"
+    ["referral_tiers_enabled"]="false"
+    ["referral_tier1_threshold"]="5"
+    ["referral_tier1_bonus"]="10"
+    ["referral_tier2_threshold"]="15"
+    ["referral_tier2_bonus"]="15"
+    ["referral_tier3_threshold"]="30"
+    ["referral_tier3_bonus"]="20"
+    # Branding
+    ["brand_primary_color"]="#007AFF"
+    ["brand_text_color"]="#FFFFFF"
+    ["brand_success_color"]="#34C759"
+    ["brand_warning_color"]="#FF9500"
+    ["brand_error_color"]="#FF3B30"
+    # Effects
+    ["effect_snowfall"]="false"
+    ["effect_snowfall_variant"]="standard"
+    ["effect_halloween"]="false"
+    ["effect_sakura"]="false"
+    # Menu
+    ["menu_buttons_layout"]="2x2"
+    ["menu_button_connect_enabled"]="true"
+    ["menu_button_referral_enabled"]="true"
+    ["menu_button_partner_enabled"]="true"
+    # URLs
+    ["server_status_url"]=""
+    ["server_status_enabled"]="false"
+    ["support_url"]=""
+    ["feedback_url"]=""
+    ["channel_url"]=""
+    ["tos_url"]=""
+    # MiniApp
+    ["mini_app_enabled"]="false"
+    ["mini_app_url"]=""
+    ["web_app_mode"]="fullscreen"
+    # Recurring
+    ["recurring_payments_enabled"]="false"
+    ["recurring_notify_days_before"]="3"
+)
+
 # Маппинг настроек: Bedolaga .env → RWP-Shop .env (критические переменные)
 declare -A SETTINGS_ENV_TO_ENV=(
     # Telegram
@@ -4832,6 +5028,27 @@ read_env_file() {
     
     debug_log "MIGRATE" "Read ${#result_map[@]} variables from $env_file"
     return 0
+}
+
+# --- Функция: Получить значение с дефолтом из Bedolaga ---
+# Использование: get_bedolaga_value source_settings "KEY"
+get_bedolaga_value() {
+    local -n _source_map=$1
+    local key="$2"
+    local value="${_source_map[$key]:-}"
+    
+    # Если значение пустое — берём дефолт
+    if [[ -z "$value" ]]; then
+        value="${BEDOLAGA_DEFAULTS[$key]:-}"
+    fi
+    
+    echo "$value"
+}
+
+# --- Функция: Получить дефолт RWP-Shop ---
+get_rwp_default() {
+    local key="$1"
+    echo "${RWP_SHOP_DEFAULTS[$key]:-}"
 }
 
 # --- Функция: Запись переменной в .env файл ---
@@ -5476,6 +5693,7 @@ migrate_settings_execute() {
     
     local env_migrated=0
     local db_migrated=0
+    local defaults_used=0
     local errors=0
     
     # === ЭТАП 1: Миграция .env → .env ===
@@ -5483,19 +5701,39 @@ migrate_settings_execute() {
     
     for bedolaga_key in "${!SETTINGS_ENV_TO_ENV[@]}"; do
         local rwp_key="${SETTINGS_ENV_TO_ENV[$bedolaga_key]}"
-        local value="${source_settings[$bedolaga_key]}"
+        local value="${source_settings[$bedolaga_key]:-}"
+        local is_default=false
+        
+        # Если значение пустое — пробуем взять дефолт из Bedolaga
+        if [[ -z "$value" ]]; then
+            value="${BEDOLAGA_DEFAULTS[$bedolaga_key]:-}"
+            [[ -n "$value" ]] && is_default=true
+        fi
+        
+        # Если всё ещё пусто — пробуем дефолт RWP-Shop
+        if [[ -z "$value" ]]; then
+            value="${RWP_SHOP_DEFAULTS[$rwp_key]:-}"
+            [[ -n "$value" ]] && is_default=true
+        fi
         
         if [[ -n "$value" ]]; then
             write_env_variable "$MIGRATION_TARGET_ENV_FILE" "$rwp_key" "$value"
-            debug_log "MIGRATE" "ENV: $bedolaga_key → $rwp_key"
+            if $is_default; then
+                debug_log "MIGRATE" "ENV: $bedolaga_key → $rwp_key (DEFAULT: $value)"
+                ((defaults_used++))
+            else
+                debug_log "MIGRATE" "ENV: $bedolaga_key → $rwp_key = $value"
+            fi
             ((env_migrated++))
         fi
     done
     
     print_message "SUCCESS" "Перенесено в .env: $env_migrated переменных"
+    [[ $defaults_used -gt 0 ]] && echo -e "   ${GRAY}(из них дефолтных: $defaults_used)${RESET}"
     
     # === ЭТАП 2: Миграция .env → settings DB ===
     print_message "INFO" "[2/2] Миграция настроек в таблицу settings..."
+    defaults_used=0
     
     local sql_file="$work_dir/settings_import.sql"
     echo "-- Settings migration: Bedolaga → RWP-Shop" > "$sql_file"
@@ -5504,7 +5742,20 @@ migrate_settings_execute() {
     
     for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
         local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
-        local value="${source_settings[$bedolaga_key]}"
+        local value="${source_settings[$bedolaga_key]:-}"
+        local is_default=false
+        
+        # Если значение пустое — пробуем взять дефолт из Bedolaga
+        if [[ -z "$value" ]]; then
+            value="${BEDOLAGA_DEFAULTS[$bedolaga_key]:-}"
+            [[ -n "$value" ]] && is_default=true
+        fi
+        
+        # Если всё ещё пусто — пробуем дефолт RWP-Shop (по имени ключа в БД)
+        if [[ -z "$value" ]]; then
+            value="${RWP_SHOP_DEFAULTS[$db_key]:-}"
+            [[ -n "$value" ]] && is_default=true
+        fi
         
         if [[ -n "$value" ]]; then
             # Экранируем одинарные кавычки для SQL
@@ -5521,7 +5772,12 @@ migrate_settings_execute() {
             echo "INSERT INTO settings (key, value, created_at, updated_at) VALUES ('$db_key', '$escaped_value', NOW(), NOW())" >> "$sql_file"
             echo "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" >> "$sql_file"
             
-            debug_log "MIGRATE" "DB: $bedolaga_key → $db_key = $value"
+            if $is_default; then
+                debug_log "MIGRATE" "DB: $bedolaga_key → $db_key (DEFAULT: $value)"
+                ((defaults_used++))
+            else
+                debug_log "MIGRATE" "DB: $bedolaga_key → $db_key = $value"
+            fi
             ((db_migrated++))
         fi
     done
@@ -5540,6 +5796,7 @@ migrate_settings_execute() {
         ((errors++))
     else
         print_message "SUCCESS" "Перенесено в settings DB: $db_migrated настроек"
+        [[ $defaults_used -gt 0 ]] && echo -e "   ${GRAY}(из них дефолтных: $defaults_used)${RESET}"
     fi
     
     # === ОТЧЁТ ===
