@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.24.2"
+VERSION="4.24.3"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -4693,10 +4693,14 @@ migrate_generate_report() {
 # МИГРАЦИЯ НАСТРОЕК (Settings Migration)
 # =============================================================================
 
-# Пути к .env файлам
-MIGRATION_SOURCE_ENV_FILE=""     # Путь к .env Bedolaga
-MIGRATION_TARGET_ENV_FILE=""     # Путь к .env RWP-Shop
-MIGRATION_TARGET_BOT_PATH=""     # Путь к папке RWP-Shop бота
+# Пути к файлам миграции
+MIGRATION_SOURCE_ENV_FILE=""          # Путь к .env Bedolaga (опционально)
+MIGRATION_SOURCE_BACKUP_FILE=""       # Путь к архиву бэкапа Bedolaga (приоритет!)
+MIGRATION_TARGET_ENV_FILE=""          # Путь к .env RWP-Shop
+MIGRATION_TARGET_BOT_PATH=""          # Путь к папке RWP-Shop бота
+
+# Временная директория для распаковки архива
+MIGRATION_EXTRACTED_DIR=""
 
 # === ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ИЗ .env.example BEDOLAGA ===
 declare -A BEDOLAGA_DEFAULTS=(
@@ -4894,6 +4898,40 @@ declare -A RWP_SHOP_DEFAULTS=(
     ["recurring_notify_days_before"]="3"
 )
 
+# === МАППИНГ: Bedolaga system_settings (из backup) → RWP-Shop settings DB ===
+# Ключи из таблицы system_settings в database.json бэкапа Bedolaga
+declare -A BEDOLAGA_BACKUP_TO_RWP=(
+    # Trial settings
+    ["TRIAL_DURATION_DAYS"]="trial_days"
+    ["TRIAL_PAYMENT_ENABLED"]="trial_enabled"
+    ["TRIAL_ADD_REMAINING_DAYS_TO_PAID"]=""  # Нет в RWP-Shop
+    ["TRIAL_TRAFFIC_LIMIT"]="trial_traffic_limit"
+    ["TRIAL_DEVICE_LIMIT"]="trial_device_limit"
+    
+    # Pricing (в копейках в Bedolaga, нужна конвертация!)
+    ["PRICE_PER_DEVICE"]=""  # Нет прямого аналога в RWP-Shop (цены в тарифах)
+    ["TRAFFIC_PACKAGES_CONFIG"]=""  # Формат отличается
+    
+    # Referral
+    ["REFERRAL_BONUS_DAYS"]="referral_bonus_days"
+    ["REFERRAL_REFEREE_BONUS_DAYS"]="referral_referee_bonus_days"
+    ["REFERRAL_COMMISSION_PERCENT"]="referral_recurring_percent"
+    
+    # Autopay/Recurring
+    ["AUTOPAY_ENABLED"]="recurring_payments_enabled"
+    ["AUTOPAY_REMINDER_DAYS"]="recurring_notify_days_before"
+    
+    # Backup settings (не переносятся)
+    ["BACKUP_INCLUDE_LOGS"]=""
+    ["BACKUP_SEND_CHAT_ID"]=""
+    ["BACKUP_SEND_ENABLED"]=""
+    ["BACKUP_ARCHIVE_PASSWORD"]=""
+    
+    # External admin (не переносятся — разная архитектура)
+    ["EXTERNAL_ADMIN_TOKEN"]=""
+    ["EXTERNAL_ADMIN_TOKEN_BOT_ID"]=""
+)
+
 # Маппинг настроек: Bedolaga .env → RWP-Shop .env (критические переменные)
 declare -A SETTINGS_ENV_TO_ENV=(
     # Telegram
@@ -5068,6 +5106,188 @@ write_env_variable() {
         # Добавляем новую переменную
         echo "${key}=\"${value}\"" >> "$env_file"
     fi
+}
+
+# --- Функция: Поиск архива бэкапа Bedolaga ---
+find_bedolaga_backup() {
+    debug_log "MIGRATE" "=== find_bedolaga_backup() ==="
+    local found_backup=""
+    
+    # Паттерн имени файла бэкапа Bedolaga
+    local backup_pattern="backup_*.tar.gz"
+    
+    # Список мест для поиска
+    local search_paths=(
+        # Рядом с RWP-Shop
+        "${MIGRATION_TARGET_BOT_PATH}/backups"
+        "${MIGRATION_TARGET_BOT_PATH}/../bedolaga-backups"
+        "${MIGRATION_TARGET_BOT_PATH}/../bedolaga-backup"
+        # Стандартные пути Bedolaga
+        "/opt/bedolaga-bot/data/backups"
+        "/opt/shop-bot/data/backups"
+        "/opt/shopbot/data/backups"
+        "/root/bedolaga-bot/data/backups"
+        # Общие папки
+        "/opt/backups"
+        "/root/backups"
+    )
+    
+    # Если настроен BOT_PATH из LAZARUS
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        search_paths=("${BOT_PATH}/backups" "${BOT_PATH}/../bedolaga-backups" "${search_paths[@]}")
+    fi
+    
+    for path in "${search_paths[@]}"; do
+        [[ ! -d "$path" ]] && continue
+        debug_log "MIGRATE" "Searching in: $path"
+        
+        # Ищем последний (самый новый) бэкап
+        local latest=$(find "$path" -maxdepth 1 -name "$backup_pattern" -type f 2>/dev/null | sort -r | head -1)
+        
+        if [[ -n "$latest" && -f "$latest" ]]; then
+            # Проверяем что это действительно бэкап Bedolaga (содержит database.json)
+            if tar -tzf "$latest" 2>/dev/null | grep -q "^database.json$"; then
+                found_backup="$latest"
+                debug_log "MIGRATE" "Found Bedolaga backup: $found_backup"
+                echo "$found_backup"
+                return 0
+            fi
+        fi
+    done
+    
+    debug_log "MIGRATE" "No Bedolaga backup found"
+    return 1
+}
+
+# --- Функция: Извлечение архива Bedolaga во временную папку ---
+extract_bedolaga_backup() {
+    local backup_file="$1"
+    
+    if [[ ! -f "$backup_file" ]]; then
+        print_message "ERROR" "Файл бэкапа не найден: $backup_file"
+        return 1
+    fi
+    
+    # Создаём временную директорию
+    MIGRATION_EXTRACTED_DIR=$(mktemp -d "/tmp/lazarus_bedolaga_XXXXXX")
+    TEMP_DIRS+=("$MIGRATION_EXTRACTED_DIR")
+    
+    debug_log "MIGRATE" "Extracting backup to: $MIGRATION_EXTRACTED_DIR"
+    
+    if ! tar -xzf "$backup_file" -C "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
+        print_message "ERROR" "Не удалось распаковать архив"
+        return 1
+    fi
+    
+    # Проверяем наличие ключевых файлов
+    if [[ ! -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+        print_message "ERROR" "Архив не содержит database.json — это не бэкап Bedolaga"
+        return 1
+    fi
+    
+    debug_log "MIGRATE" "Backup extracted successfully"
+    return 0
+}
+
+# --- Функция: Чтение system_settings из database.json Bedolaga ---
+# Возвращает значение по ключу или пустую строку
+read_bedolaga_setting() {
+    local key="$1"
+    local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+    
+    if [[ ! -f "$db_json" ]]; then
+        return 1
+    fi
+    
+    # Используем grep + sed для парсинга JSON (без зависимости от jq)
+    # Ищем в массиве system_settings объект с нужным key
+    local value=$(grep -A1 "\"key\": \"$key\"" "$db_json" 2>/dev/null | grep '"value"' | head -1 | sed 's/.*"value": *"\([^"]*\)".*/\1/')
+    
+    echo "$value"
+}
+
+# --- Функция: Получить все system_settings из бэкапа Bedolaga ---
+read_all_bedolaga_settings() {
+    local -n result_map=$1
+    local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+    
+    if [[ ! -f "$db_json" ]]; then
+        return 1
+    fi
+    
+    # Парсим system_settings без jq
+    # Формат: {"id": N, "key": "KEY", "value": "VALUE", ...}
+    local in_settings=false
+    local current_key=""
+    local current_value=""
+    
+    while IFS= read -r line; do
+        # Начало секции system_settings
+        if [[ "$line" =~ \"system_settings\" ]]; then
+            in_settings=true
+            continue
+        fi
+        
+        # Конец массива (другая таблица)
+        if $in_settings && [[ "$line" =~ ^[[:space:]]*\],?$ ]]; then
+            # Сохраняем последнюю пару
+            if [[ -n "$current_key" && -n "$current_value" ]]; then
+                result_map["$current_key"]="$current_value"
+            fi
+            break
+        fi
+        
+        if $in_settings; then
+            # Извлекаем key
+            if [[ "$line" =~ \"key\":\ *\"([^\"]+)\" ]]; then
+                # Сохраняем предыдущую пару если есть
+                if [[ -n "$current_key" && -n "$current_value" ]]; then
+                    result_map["$current_key"]="$current_value"
+                fi
+                current_key="${BASH_REMATCH[1]}"
+                current_value=""
+            fi
+            # Извлекаем value
+            if [[ "$line" =~ \"value\":\ *\"([^\"]+)\" ]]; then
+                current_value="${BASH_REMATCH[1]}"
+            fi
+            # Альтернатива: value может быть на той же строке что и key
+            if [[ "$line" =~ \"value\":\ *\"([^\"]+)\".*\"key\":\ *\"([^\"]+)\" ]]; then
+                current_value="${BASH_REMATCH[1]}"
+                current_key="${BASH_REMATCH[2]}"
+            fi
+        fi
+    done < "$db_json"
+    
+    debug_log "MIGRATE" "Read ${#result_map[@]} settings from Bedolaga backup"
+    return 0
+}
+
+# --- Функция: Получить информацию о бэкапе Bedolaga ---
+get_bedolaga_backup_info() {
+    local backup_file="$1"
+    
+    if [[ ! -f "$backup_file" ]]; then
+        return 1
+    fi
+    
+    # Извлекаем metadata.json во временный файл
+    local metadata=$(tar -xzf "$backup_file" -O metadata.json 2>/dev/null)
+    
+    if [[ -z "$metadata" ]]; then
+        echo "Метаданные недоступны"
+        return 1
+    fi
+    
+    # Парсим без jq
+    local timestamp=$(echo "$metadata" | grep -o '"timestamp": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+    local tables=$(echo "$metadata" | grep -o '"tables_count": *[0-9]*' | head -1 | sed 's/.*: *//')
+    local records=$(echo "$metadata" | grep -o '"total_records": *[0-9]*' | head -1 | sed 's/.*: *//')
+    local backup_type=$(echo "$metadata" | grep -o '"backup_type": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+    
+    echo "Дата: ${timestamp:-неизвестно}"
+    echo "Тип: ${backup_type:-неизвестно}"
+    echo "Таблиц: ${tables:-?}, записей: ${records:-?}"
 }
 
 # --- Функция: Интеллектуальный поиск .env файла Bedolaga ---
@@ -5318,44 +5538,7 @@ migrate_settings_configure_paths() {
     print_message "INFO" "Запуск автопоиска..."
     echo ""
     
-    # === Автопоиск источника (Bedolaga .env) ===
-    echo -e "${YELLOW}=== ИСТОЧНИК (Bedolaga) ===${RESET}"
-    
-    local found_bedolaga=$(find_bedolaga_env)
-    
-    if [[ -n "$found_bedolaga" && -f "$found_bedolaga" ]]; then
-        echo -e "✅ Найден файл: ${GREEN}$found_bedolaga${RESET}"
-        
-        # Показываем краткую информацию о файле
-        local vars_count=$(grep -c "^[A-Z].*=" "$found_bedolaga" 2>/dev/null || echo "0")
-        echo -e "   Переменных: ${CYAN}$vars_count${RESET}"
-        
-        read -erp "Использовать его? (Y/n): " use_found
-        if [[ ! "$use_found" =~ ^[Nn]$ ]]; then
-            MIGRATION_SOURCE_ENV_FILE="$found_bedolaga"
-        fi
-    else
-        echo -e "${YELLOW}⚠️  Автопоиск не нашёл .env файл Bedolaga${RESET}"
-    fi
-    
-    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        echo ""
-        echo "Стандартные пути:"
-        echo "  • /opt/bedolaga-bot/.env"
-        echo "  • /opt/shop-bot/.env"
-        echo ""
-        read -erp "Введите путь к .env файлу Bedolaga: " MIGRATION_SOURCE_ENV_FILE
-    fi
-    
-    if [[ ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "ERROR" "Файл не найден: $MIGRATION_SOURCE_ENV_FILE"
-        read -erp "Enter..." dummy
-        return 1
-    fi
-    
-    echo ""
-    
-    # === Автопоиск приёмника (RWP-Shop) ===
+    # === СНАЧАЛА ИЩЕМ ПРИЁМНИК (RWP-Shop) - он нужен для поиска бэкапа ===
     echo -e "${YELLOW}=== ПРИЁМНИК (RWP-Shop) ===${RESET}"
     
     local found_rwp=$(find_rwp_shop_env)
@@ -5363,7 +5546,6 @@ migrate_settings_configure_paths() {
     if [[ -n "$found_rwp" && -d "$found_rwp" ]]; then
         echo -e "✅ Найдена папка: ${GREEN}$found_rwp${RESET}"
         
-        # Показываем информацию
         if [[ -f "$found_rwp/.env" ]]; then
             local vars_count=$(grep -c "^[A-Z].*=" "$found_rwp/.env" 2>/dev/null || echo "0")
             echo -e "   .env файл: ${GREEN}есть${RESET} ($vars_count переменных)"
@@ -5396,6 +5578,79 @@ migrate_settings_configure_paths() {
         return 1
     fi
     
+    echo ""
+    
+    # === ИСТОЧНИК: Архив бэкапа Bedolaga (приоритет!) ===
+    echo -e "${YELLOW}=== ИСТОЧНИК (Архив бэкапа Bedolaga) ===${RESET}"
+    echo -e "${GRAY}Архив содержит настройки из админ-панели Bedolaga${RESET}"
+    echo ""
+    
+    local found_backup=$(find_bedolaga_backup)
+    
+    if [[ -n "$found_backup" && -f "$found_backup" ]]; then
+        echo -e "✅ Найден архив: ${GREEN}$found_backup${RESET}"
+        
+        # Показываем информацию о бэкапе
+        local backup_info=$(get_bedolaga_backup_info "$found_backup")
+        echo -e "   ${GRAY}$backup_info${RESET}" | head -3
+        
+        read -erp "Использовать его? (Y/n): " use_backup
+        if [[ ! "$use_backup" =~ ^[Nn]$ ]]; then
+            MIGRATION_SOURCE_BACKUP_FILE="$found_backup"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Архив бэкапа не найден автоматически${RESET}"
+    fi
+    
+    if [[ -z "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        echo ""
+        echo "Где искать архив backup_*.tar.gz:"
+        echo "  • В папке бота Bedolaga: /opt/bedolaga-bot/data/backups/"
+        echo "  • В папке рядом с RWP-Shop"
+        echo "  • Скопировать из Telegram (если бот отправлял бэкапы)"
+        echo ""
+        read -erp "Введите путь к архиву бэкапа (или Enter для пропуска): " manual_backup
+        
+        if [[ -n "$manual_backup" && -f "$manual_backup" ]]; then
+            MIGRATION_SOURCE_BACKUP_FILE="$manual_backup"
+        fi
+    fi
+    
+    # === ОПЦИОНАЛЬНО: .env файл Bedolaga (для критических настроек) ===
+    echo ""
+    echo -e "${YELLOW}=== ОПЦИОНАЛЬНО: .env файл Bedolaga ===${RESET}"
+    echo -e "${GRAY}Содержит токены и пароли (BOT_TOKEN, DB credentials)${RESET}"
+    echo ""
+    
+    local found_env=$(find_bedolaga_env)
+    
+    if [[ -n "$found_env" && -f "$found_env" ]]; then
+        echo -e "✅ Найден .env: ${GREEN}$found_env${RESET}"
+        
+        read -erp "Использовать его? (Y/n): " use_env
+        if [[ ! "$use_env" =~ ^[Nn]$ ]]; then
+            MIGRATION_SOURCE_ENV_FILE="$found_env"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  .env файл Bedolaga не найден${RESET}"
+        echo "Критические настройки (токены) нужно будет ввести вручную"
+    fi
+    
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        read -erp "Путь к .env Bedolaga (или Enter для пропуска): " manual_env
+        if [[ -n "$manual_env" && -f "$manual_env" ]]; then
+            MIGRATION_SOURCE_ENV_FILE="$manual_env"
+        fi
+    fi
+    
+    # Проверяем что хотя бы один источник указан
+    if [[ -z "$MIGRATION_SOURCE_BACKUP_FILE" && -z "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Не указан ни архив бэкапа, ни .env файл Bedolaga"
+        read -erp "Enter..." dummy
+        return 1
+    fi
+    
+    # === Настройка .env приёмника ===
     if [[ ! -f "$MIGRATION_TARGET_ENV_FILE" ]]; then
         print_message "WARN" "Файл .env не найден в $MIGRATION_TARGET_BOT_PATH"
         read -erp "Создать новый .env файл? (y/N): " create_new
@@ -5408,12 +5663,11 @@ migrate_settings_configure_paths() {
         fi
     fi
     
-    # === Автопоиск контейнера БД RWP-Shop (если не настроен) ===
+    # === Автопоиск контейнера БД RWP-Shop ===
     if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
         echo ""
         echo -e "${YELLOW}=== КОНТЕЙНЕР БД RWP-Shop ===${RESET}"
         
-        # Пробуем найти автоматически
         local detected_db=""
         for pattern in "rwp_shop_db" "telegram-shop-db" "telegram-shop_db"; do
             detected_db=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE "^${pattern}$" | head -1)
@@ -5429,18 +5683,28 @@ migrate_settings_configure_paths() {
                 MIGRATION_TARGET_USER="${MIGRATION_TARGET_USER:-postgres}"
             fi
         else
-            echo -e "${YELLOW}⚠️  Контейнер БД не найден автоматически${RESET}"
-            echo "Укажите вручную или настройте через пункт 2 главного меню миграции"
+            echo -e "${YELLOW}⚠️  Контейнер БД не найден${RESET}"
         fi
     fi
     
+    # === ИТОГОВАЯ КОНФИГУРАЦИЯ ===
     echo ""
     print_message "SUCCESS" "Настройка путей завершена"
     echo ""
     echo -e "┌─────────────────────────────────────────────────────────────┐"
     echo -e "│ ${BOLD}ИТОГОВАЯ КОНФИГУРАЦИЯ${RESET}                                       │"
     echo -e "├─────────────────────────────────────────────────────────────┤"
-    echo -e "│ Источник .env:   ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+    if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        echo -e "│ Архив Bedolaga:  ${GREEN}$(basename "$MIGRATION_SOURCE_BACKUP_FILE")${RESET}"
+    else
+        echo -e "│ Архив Bedolaga:  ${YELLOW}Не указан${RESET}"
+    fi
+    if [[ -n "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        echo -e "│ .env Bedolaga:   ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+    else
+        echo -e "│ .env Bedolaga:   ${YELLOW}Не указан${RESET}"
+    fi
+    echo -e "├─────────────────────────────────────────────────────────────┤"
     echo -e "│ Приёмник .env:   ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
     if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
         echo -e "│ Контейнер БД:    ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
@@ -5643,9 +5907,9 @@ migrate_settings_show_no_mapping() {
 migrate_settings_execute() {
     debug_log "MIGRATE" "Starting settings migration"
     
-    # Проверки
-    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "ERROR" "Путь к источнику не настроен"
+    # Проверки источника
+    if [[ -z "$MIGRATION_SOURCE_BACKUP_FILE" && -z "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        print_message "ERROR" "Не указан ни архив бэкапа, ни .env файл Bedolaga"
         return 1
     fi
     
@@ -5655,8 +5919,7 @@ migrate_settings_execute() {
     fi
     
     if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
-        print_message "ERROR" "Контейнер БД RWP-Shop не настроен"
-        return 1
+        print_message "WARN" "Контейнер БД RWP-Shop не настроен — настройки в БД не будут перенесены"
     fi
     
     echo ""
@@ -5664,11 +5927,15 @@ migrate_settings_execute() {
     echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ! МИГРАЦИЯ НАСТРОЕК!               ${RESET}"
     echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
     echo ""
+    echo "Источники:"
+    [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" ]] && echo " • Архив: $(basename "$MIGRATION_SOURCE_BACKUP_FILE")"
+    [[ -n "$MIGRATION_SOURCE_ENV_FILE" ]] && echo " • .env:  $MIGRATION_SOURCE_ENV_FILE"
+    echo ""
     echo "Будут изменены:"
     echo " • Файл .env: $MIGRATION_TARGET_ENV_FILE"
-    echo " • База данных: $MIGRATION_TARGET_CONTAINER / $MIGRATION_TARGET_DB"
+    [[ -n "$MIGRATION_TARGET_CONTAINER" ]] && echo " • База данных: $MIGRATION_TARGET_CONTAINER / $MIGRATION_TARGET_DB"
     echo ""
-    echo -e "${YELLOW}Рекомендуется сделать бэкап перед продолжением!${RESET}"
+    echo -e "${YELLOW}Рекомендуется сделать бэкап RWP-Shop перед продолжением!${RESET}"
     echo ""
     read -erp "Введите 'SETTINGS' для подтверждения: " confirm
     
@@ -5676,10 +5943,6 @@ migrate_settings_execute() {
         print_message "INFO" "Миграция отменена"
         return 0
     fi
-    
-    # Читаем исходный .env
-    declare -A source_settings
-    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
     
     local work_dir="$MIGRATION_WORK_DIR"
     [[ -z "$work_dir" ]] && work_dir="${BACKUP_DIR}/migration_settings_$(date +%Y%m%d_%H%M%S)"
@@ -5693,24 +5956,46 @@ migrate_settings_execute() {
     
     local env_migrated=0
     local db_migrated=0
+    local backup_settings_migrated=0
     local defaults_used=0
     local errors=0
     
-    # === ЭТАП 1: Миграция .env → .env ===
-    print_message "INFO" "[1/2] Миграция критических настроек в .env..."
+    # === ЭТАП 1: Распаковка архива Bedolaga (если указан) ===
+    declare -A backup_settings
+    if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        print_message "INFO" "[1/3] Распаковка архива Bedolaga..."
+        
+        if extract_bedolaga_backup "$MIGRATION_SOURCE_BACKUP_FILE"; then
+            # Читаем system_settings из бэкапа
+            read_all_bedolaga_settings backup_settings
+            print_message "SUCCESS" "Прочитано настроек из бэкапа: ${#backup_settings[@]}"
+        else
+            print_message "WARN" "Не удалось распаковать архив, продолжаем без него"
+        fi
+    fi
+    
+    # Читаем .env Bedolaga (если указан)
+    declare -A env_settings
+    if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        read_env_file "$MIGRATION_SOURCE_ENV_FILE" env_settings
+    fi
+    
+    # === ЭТАП 2: Миграция критических настроек в .env ===
+    print_message "INFO" "[2/3] Миграция критических настроек в .env..."
     
     for bedolaga_key in "${!SETTINGS_ENV_TO_ENV[@]}"; do
         local rwp_key="${SETTINGS_ENV_TO_ENV[$bedolaga_key]}"
-        local value="${source_settings[$bedolaga_key]:-}"
+        local value=""
         local is_default=false
         
-        # Если значение пустое — пробуем взять дефолт из Bedolaga
+        # Приоритет: 1) .env Bedolaga → 2) Дефолт Bedolaga → 3) Дефолт RWP-Shop
+        value="${env_settings[$bedolaga_key]:-}"
+        
         if [[ -z "$value" ]]; then
             value="${BEDOLAGA_DEFAULTS[$bedolaga_key]:-}"
             [[ -n "$value" ]] && is_default=true
         fi
         
-        # Если всё ещё пусто — пробуем дефолт RWP-Shop
         if [[ -z "$value" ]]; then
             value="${RWP_SHOP_DEFAULTS[$rwp_key]:-}"
             [[ -n "$value" ]] && is_default=true
@@ -5731,72 +6016,127 @@ migrate_settings_execute() {
     print_message "SUCCESS" "Перенесено в .env: $env_migrated переменных"
     [[ $defaults_used -gt 0 ]] && echo -e "   ${GRAY}(из них дефолтных: $defaults_used)${RESET}"
     
-    # === ЭТАП 2: Миграция .env → settings DB ===
-    print_message "INFO" "[2/2] Миграция настроек в таблицу settings..."
-    defaults_used=0
-    
-    local sql_file="$work_dir/settings_import.sql"
-    echo "-- Settings migration: Bedolaga → RWP-Shop" > "$sql_file"
-    echo "-- Generated: $(date '+%Y-%m-%d %H:%M:%S')" >> "$sql_file"
-    echo "" >> "$sql_file"
-    
-    for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
-        local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
-        local value="${source_settings[$bedolaga_key]:-}"
-        local is_default=false
+    # === ЭТАП 3: Миграция настроек в БД RWP-Shop ===
+    if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+        print_message "INFO" "[3/3] Миграция настроек в таблицу settings..."
+        defaults_used=0
         
-        # Если значение пустое — пробуем взять дефолт из Bedolaga
-        if [[ -z "$value" ]]; then
-            value="${BEDOLAGA_DEFAULTS[$bedolaga_key]:-}"
-            [[ -n "$value" ]] && is_default=true
+        local sql_file="$work_dir/settings_import.sql"
+        echo "-- Settings migration: Bedolaga → RWP-Shop" > "$sql_file"
+        echo "-- Generated: $(date '+%Y-%m-%d %H:%M:%S')" >> "$sql_file"
+        echo "-- Sources: backup=${MIGRATION_SOURCE_BACKUP_FILE:-none}, env=${MIGRATION_SOURCE_ENV_FILE:-none}" >> "$sql_file"
+        echo "" >> "$sql_file"
+        
+        # 3a) Сначала переносим из архива бэкапа (system_settings → settings)
+        if [[ ${#backup_settings[@]} -gt 0 ]]; then
+            echo "-- From Bedolaga backup (system_settings):" >> "$sql_file"
+            
+            for backup_key in "${!backup_settings[@]}"; do
+                local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$backup_key]:-}"
+                
+                # Пропускаем настройки без маппинга
+                [[ -z "$rwp_key" ]] && continue
+                
+                local value="${backup_settings[$backup_key]}"
+                
+                # Экранируем одинарные кавычки для SQL
+                local escaped_value="${value//\'/\'\'}"
+                
+                # Конвертируем булевы значения
+                if [[ "$value" =~ ^(true|false|True|False|TRUE|FALSE|1|0)$ ]]; then
+                    case "${value,,}" in
+                        true|1) escaped_value="true" ;;
+                        false|0) escaped_value="false" ;;
+                    esac
+                fi
+                
+                echo "INSERT INTO settings (key, value, created_at, updated_at) VALUES ('$rwp_key', '$escaped_value', NOW(), NOW())" >> "$sql_file"
+                echo "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" >> "$sql_file"
+                
+                debug_log "MIGRATE" "BACKUP→DB: $backup_key → $rwp_key = $value"
+                ((backup_settings_migrated++))
+            done
         fi
         
-        # Если всё ещё пусто — пробуем дефолт RWP-Shop (по имени ключа в БД)
-        if [[ -z "$value" ]]; then
-            value="${RWP_SHOP_DEFAULTS[$db_key]:-}"
-            [[ -n "$value" ]] && is_default=true
+        # 3b) Затем переносим из .env (SETTINGS_ENV_TO_DB)
+        if [[ ${#env_settings[@]} -gt 0 || ${#BEDOLAGA_DEFAULTS[@]} -gt 0 ]]; then
+            echo "" >> "$sql_file"
+            echo "-- From Bedolaga .env (SETTINGS_ENV_TO_DB):" >> "$sql_file"
+            
+            for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
+                local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
+                local value=""
+                local is_default=false
+                
+                # Приоритет: 1) Уже есть в backup_settings → пропускаем
+                # Проверяем, не было ли это уже перенесено из бэкапа
+                local already_from_backup=false
+                for bk in "${!BEDOLAGA_BACKUP_TO_RWP[@]}"; do
+                    if [[ "${BEDOLAGA_BACKUP_TO_RWP[$bk]}" == "$db_key" && -n "${backup_settings[$bk]:-}" ]]; then
+                        already_from_backup=true
+                        break
+                    fi
+                done
+                
+                $already_from_backup && continue
+                
+                # 2) .env Bedolaga → 3) Дефолт Bedolaga → 4) Дефолт RWP-Shop
+                value="${env_settings[$bedolaga_key]:-}"
+                
+                if [[ -z "$value" ]]; then
+                    value="${BEDOLAGA_DEFAULTS[$bedolaga_key]:-}"
+                    [[ -n "$value" ]] && is_default=true
+                fi
+                
+                if [[ -z "$value" ]]; then
+                    value="${RWP_SHOP_DEFAULTS[$db_key]:-}"
+                    [[ -n "$value" ]] && is_default=true
+                fi
+                
+                if [[ -n "$value" ]]; then
+                    local escaped_value="${value//\'/\'\'}"
+                    
+                    if [[ "$value" =~ ^(true|false|True|False|TRUE|FALSE|1|0)$ ]]; then
+                        case "${value,,}" in
+                            true|1) escaped_value="true" ;;
+                            false|0) escaped_value="false" ;;
+                        esac
+                    fi
+                    
+                    echo "INSERT INTO settings (key, value, created_at, updated_at) VALUES ('$db_key', '$escaped_value', NOW(), NOW())" >> "$sql_file"
+                    echo "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" >> "$sql_file"
+                    
+                    if $is_default; then
+                        debug_log "MIGRATE" "ENV→DB: $bedolaga_key → $db_key (DEFAULT: $value)"
+                        ((defaults_used++))
+                    else
+                        debug_log "MIGRATE" "ENV→DB: $bedolaga_key → $db_key = $value"
+                    fi
+                    ((db_migrated++))
+                fi
+            done
         fi
         
-        if [[ -n "$value" ]]; then
-            # Экранируем одинарные кавычки для SQL
-            local escaped_value="${value//\'/\'\'}"
-            
-            # Конвертируем булевы значения
-            if [[ "$value" =~ ^(true|false|True|False|TRUE|FALSE|1|0)$ ]]; then
-                case "${value,,}" in
-                    true|1) escaped_value="true" ;;
-                    false|0) escaped_value="false" ;;
-                esac
-            fi
-            
-            echo "INSERT INTO settings (key, value, created_at, updated_at) VALUES ('$db_key', '$escaped_value', NOW(), NOW())" >> "$sql_file"
-            echo "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();" >> "$sql_file"
-            
-            if $is_default; then
-                debug_log "MIGRATE" "DB: $bedolaga_key → $db_key (DEFAULT: $value)"
-                ((defaults_used++))
-            else
-                debug_log "MIGRATE" "DB: $bedolaga_key → $db_key = $value"
-            fi
-            ((db_migrated++))
+        # Выполняем SQL
+        docker cp "$sql_file" "${MIGRATION_TARGET_CONTAINER}:/tmp/settings_import.sql"
+        
+        local sql_result
+        sql_result=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -f /tmp/settings_import.sql 2>&1)
+        local sql_exit=$?
+        
+        docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/settings_import.sql
+        
+        if [[ $sql_exit -ne 0 ]]; then
+            print_message "ERROR" "Ошибка SQL: $sql_result"
+            ((errors++))
+        else
+            local total_db=$((backup_settings_migrated + db_migrated))
+            print_message "SUCCESS" "Перенесено в settings DB: $total_db настроек"
+            [[ $backup_settings_migrated -gt 0 ]] && echo -e "   ${GRAY}(из архива: $backup_settings_migrated)${RESET}"
+            [[ $defaults_used -gt 0 ]] && echo -e "   ${GRAY}(из них дефолтных: $defaults_used)${RESET}"
         fi
-    done
-    
-    # Выполняем SQL
-    docker cp "$sql_file" "${MIGRATION_TARGET_CONTAINER}:/tmp/settings_import.sql"
-    
-    local sql_result
-    sql_result=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -f /tmp/settings_import.sql 2>&1)
-    local sql_exit=$?
-    
-    docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/settings_import.sql
-    
-    if [[ $sql_exit -ne 0 ]]; then
-        print_message "ERROR" "Ошибка SQL: $sql_result"
-        ((errors++))
     else
-        print_message "SUCCESS" "Перенесено в settings DB: $db_migrated настроек"
-        [[ $defaults_used -gt 0 ]] && echo -e "   ${GRAY}(из них дефолтных: $defaults_used)${RESET}"
+        print_message "WARN" "Пропущен импорт в БД — контейнер не настроен"
     fi
     
     # === ОТЧЁТ ===
@@ -5808,13 +6148,18 @@ migrate_settings_execute() {
         echo ""
         echo "Дата: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
-        echo "Источник: $MIGRATION_SOURCE_ENV_FILE"
-        echo "Приёмник .env: $MIGRATION_TARGET_ENV_FILE"
-        echo "Приёмник БД: $MIGRATION_TARGET_CONTAINER / $MIGRATION_TARGET_DB"
+        echo "=== ИСТОЧНИКИ ==="
+        echo "Архив бэкапа: ${MIGRATION_SOURCE_BACKUP_FILE:-не указан}"
+        echo ".env файл:    ${MIGRATION_SOURCE_ENV_FILE:-не указан}"
+        echo ""
+        echo "=== ПРИЁМНИКИ ==="
+        echo ".env:         $MIGRATION_TARGET_ENV_FILE"
+        echo "БД:           ${MIGRATION_TARGET_CONTAINER:-не настроен} / ${MIGRATION_TARGET_DB:-}"
         echo ""
         echo "=== РЕЗУЛЬТАТЫ ==="
         echo "Перенесено в .env: $env_migrated"
-        echo "Перенесено в settings DB: $db_migrated"
+        echo "Из архива бэкапа в БД: $backup_settings_migrated"
+        echo "Из .env в БД: $db_migrated"
         echo "Ошибок: $errors"
         echo ""
         echo "=== ВАЖНО ==="
@@ -5823,14 +6168,13 @@ migrate_settings_execute() {
         echo "3. Некоторые настройки могут потребовать ручной корректировки"
         echo ""
         echo "=== НАСТРОЙКИ БЕЗ МИГРАЦИИ ==="
-        echo "Следующие настройки Bedolaga не имеют аналогов в RWP-Shop:"
-        echo ""
-        for key in "${!source_settings[@]}"; do
-            if [[ -z "${SETTINGS_ENV_TO_ENV[$key]}" && -z "${SETTINGS_ENV_TO_DB[$key]}" ]]; then
-                echo "  - $key"
-            fi
-        done | sort
+        echo "Некоторые настройки Bedolaga не имеют прямых аналогов в RWP-Shop:"
+        echo "  - Цены и пакеты трафика (разная архитектура тарифов)"
+        echo "  - Настройки бэкапа (у RWP-Shop нет встроенного бэкапа)"
+        echo "  - Внешний админ токен (архитектура отличается)"
     } > "$report_file"
+    
+    local total_db=$((backup_settings_migrated + db_migrated))
     
     echo ""
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
@@ -5839,7 +6183,8 @@ migrate_settings_execute() {
     echo ""
     echo "Результаты:"
     echo " • .env: $env_migrated переменных"
-    echo " • settings DB: $db_migrated настроек"
+    [[ $backup_settings_migrated -gt 0 ]] && echo " • Из архива в БД: $backup_settings_migrated настроек"
+    [[ $db_migrated -gt 0 ]] && echo " • Из .env в БД: $db_migrated настроек"
     echo " • Ошибок: $errors"
     echo ""
     echo "Отчёт: $report_file"
