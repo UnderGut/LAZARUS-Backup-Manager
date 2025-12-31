@@ -4,14 +4,8 @@ config.env
 # AI instructions and documentation (local only)
 .github/
 
-# Migrator (development - do not push until ready)
+# Migrator development (will be merged into lazarus-backup later)
 lazarus-migrator/
-migrator/
-*.migrator.env
-migration.env
-migration-*.log
-*.dump
-*.sql.backup
 
 # Development notes (local only)
 TODO.md
