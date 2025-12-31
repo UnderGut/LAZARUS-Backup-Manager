@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.22.1"
+VERSION="4.23.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -3921,6 +3921,698 @@ menu_settings() {
     done
 }
 
+# =============================================================================
+# МИГРАЦИЯ МЕЖДУ БОТАМИ (Bedolaga → Private Remnawave Shop)
+# =============================================================================
+
+# Конфигурация миграции
+MIGRATION_SOURCE_HOST=""
+MIGRATION_SOURCE_PORT="5432"
+MIGRATION_SOURCE_DB=""
+MIGRATION_SOURCE_USER=""
+MIGRATION_SOURCE_PASS=""
+MIGRATION_TARGET_CONTAINER=""
+MIGRATION_TARGET_DB=""
+MIGRATION_TARGET_USER=""
+MIGRATION_WORK_DIR=""
+
+# Маппинг payment_method (Bedolaga) → invoice_type (Remnawave Shop)
+# 
+# Bedolaga поддерживает: telegram_stars, tribute, yookassa, cryptobot, 
+#                        heleket, mulenpay, pal24, wata, platega, cloudpayments, manual
+#
+# Remnawave Shop поддерживает: yookassa, crypto, telegram, severpay_cards, 
+#                               severpay_sbp, wata, platega, stripe
+#
+# ⚠️ Методы без аналога в Remnawave: tribute, heleket, mulenpay, pal24, cloudpayments
+#    Они будут замаппены на "unknown" и потребуют ручной обработки
+declare -A PAYMENT_METHOD_MAP=(
+    # Прямые совпадения (публичная + приватная версия)
+    ["yookassa"]="yookassa"
+    ["tribute"]="tribute"
+    ["wata"]="wata"
+    
+    # Требуют преобразования
+    ["telegram_stars"]="telegram"
+    ["cryptobot"]="crypto"
+    
+    # Platega в Bedolaga → platega_cards в Remnawave (приватная версия)
+    # Доступные варианты: platega_cards, platega_sbp, platega_crypto, platega_acquiring, platega_worldwide
+    ["platega"]="platega_cards"
+    
+    # Нет аналога в Remnawave Shop - помечаем как unknown
+    ["manual"]="unknown"
+    ["heleket"]="unknown"
+    ["mulenpay"]="unknown"
+    ["pal24"]="unknown"
+    ["cloudpayments"]="unknown"
+)
+
+# --- Функция: Анализ структуры источника ---
+migrate_analyze_source() {
+    debug_log "MIGRATE" "Starting source analysis"
+    print_message "INFO" "Анализ базы данных источника..."
+    
+    local source_info=""
+    
+    # Проверка подключения через Docker (если контейнер) или напрямую
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        debug_log "MIGRATE" "Using Docker container: $MIGRATION_SOURCE_CONTAINER"
+        source_info=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
+            SELECT 'tables:' || count(*) FROM information_schema.tables WHERE table_schema='public';
+        " 2>&1)
+    else
+        debug_log "MIGRATE" "Using direct connection: $MIGRATION_SOURCE_HOST:$MIGRATION_SOURCE_PORT"
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        source_info=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
+            SELECT 'tables:' || count(*) FROM information_schema.tables WHERE table_schema='public';
+        " 2>&1)
+        unset PGPASSWORD
+    fi
+    
+    if [[ $? -ne 0 ]]; then
+        print_message "ERROR" "Не удалось подключиться к БД источника"
+        debug_log "MIGRATE" "Connection failed: $source_info"
+        return 1
+    fi
+    
+    echo "$source_info"
+    debug_log "MIGRATE" "Source info: $source_info"
+}
+
+# --- Функция: Проверка совместимости ---
+migrate_check_compatibility() {
+    debug_log "MIGRATE" "Checking source compatibility"
+    print_message "INFO" "Проверка совместимости источника..."
+    
+    local required_tables=("users" "transactions" "promocodes")
+    local missing_tables=()
+    
+    for table in "${required_tables[@]}"; do
+        local exists=""
+        if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+            exists=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
+                SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1;
+            " 2>/dev/null | tr -d ' ')
+        else
+            export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+            exists=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
+                SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1;
+            " 2>/dev/null | tr -d ' ')
+            unset PGPASSWORD
+        fi
+        
+        if [[ "$exists" != "1" ]]; then
+            missing_tables+=("$table")
+        fi
+    done
+    
+    if [[ ${#missing_tables[@]} -gt 0 ]]; then
+        print_message "ERROR" "Отсутствуют обязательные таблицы: ${missing_tables[*]}"
+        debug_log "MIGRATE" "Missing tables: ${missing_tables[*]}"
+        return 1
+    fi
+    
+    print_message "SUCCESS" "Источник совместим (Bedolaga format)"
+    return 0
+}
+
+# --- Функция: Экспорт данных из источника ---
+migrate_export_data() {
+    debug_log "MIGRATE" "Starting data export"
+    print_message "INFO" "Экспорт данных из Bedolaga..."
+    
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    mkdir -p "$export_dir"
+    
+    local export_sql="
+-- Export users
+COPY (
+    SELECT 
+        telegram_id,
+        tg_username,
+        tg_first_name,
+        language,
+        created_at,
+        balance,
+        referral_balance,
+        referrer_id
+    FROM users
+    ORDER BY telegram_id
+) TO STDOUT WITH CSV HEADER;
+"
+    
+    local users_file="$export_dir/users.csv"
+    local transactions_file="$export_dir/transactions.csv"
+    local promocodes_file="$export_dir/promocodes.csv"
+    local promo_uses_file="$export_dir/promocode_uses.csv"
+    
+    # Экспорт users
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (SELECT telegram_id, tg_username, tg_first_name, language, created_at, balance, referral_balance, referrer_id FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
+        " > "$users_file" 2>/dev/null
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (SELECT telegram_id, tg_username, tg_first_name, language, created_at, balance, referral_balance, referrer_id FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
+        " > "$users_file" 2>/dev/null
+        unset PGPASSWORD
+    fi
+    
+    if [[ ! -s "$users_file" ]]; then
+        print_message "ERROR" "Не удалось экспортировать пользователей"
+        return 1
+    fi
+    
+    local user_count=$(wc -l < "$users_file")
+    user_count=$((user_count - 1))  # Минус заголовок
+    print_message "SUCCESS" "Экспортировано пользователей: $user_count"
+    
+    # Экспорт transactions
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (SELECT id, user_id, amount, payment_method, status, created_at, subscription_days FROM transactions WHERE status='completed' ORDER BY id) TO STDOUT WITH CSV HEADER;
+        " > "$transactions_file" 2>/dev/null
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (SELECT id, user_id, amount, payment_method, status, created_at, subscription_days FROM transactions WHERE status='completed' ORDER BY id) TO STDOUT WITH CSV HEADER;
+        " > "$transactions_file" 2>/dev/null
+        unset PGPASSWORD
+    fi
+    
+    local tx_count=0
+    [[ -s "$transactions_file" ]] && tx_count=$(($(wc -l < "$transactions_file") - 1))
+    print_message "SUCCESS" "Экспортировано транзакций: $tx_count"
+    
+    # Экспорт promocodes
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (SELECT code, bonus_days, max_uses, current_uses, is_active, created_at FROM promocodes ORDER BY code) TO STDOUT WITH CSV HEADER;
+        " > "$promocodes_file" 2>/dev/null
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (SELECT code, bonus_days, max_uses, current_uses, is_active, created_at FROM promocodes ORDER BY code) TO STDOUT WITH CSV HEADER;
+        " > "$promocodes_file" 2>/dev/null
+        unset PGPASSWORD
+    fi
+    
+    local promo_count=0
+    [[ -s "$promocodes_file" ]] && promo_count=$(($(wc -l < "$promocodes_file") - 1))
+    print_message "SUCCESS" "Экспортировано промокодов: $promo_count"
+    
+    debug_log "MIGRATE" "Export complete: users=$user_count, tx=$tx_count, promo=$promo_count"
+    return 0
+}
+
+# --- Функция: Трансформация данных ---
+migrate_transform_data() {
+    debug_log "MIGRATE" "Starting data transformation"
+    print_message "INFO" "Трансформация данных для Remnawave..."
+    
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    local import_dir="$MIGRATION_WORK_DIR/import"
+    mkdir -p "$import_dir"
+    
+    # Трансформация users → customer
+    if [[ -f "$export_dir/users.csv" ]]; then
+        print_message "INFO" "Конвертация users → customer..."
+        
+        # Пропускаем заголовок, конвертируем данные
+        tail -n +2 "$export_dir/users.csv" | while IFS=',' read -r telegram_id tg_username tg_first_name language created_at balance referral_balance referrer_id; do
+            # Конвертация balance из копеек в рубли
+            local balance_rub=0
+            if [[ -n "$balance" && "$balance" != "0" ]]; then
+                balance_rub=$(echo "scale=2; $balance / 100" | bc 2>/dev/null || echo "0")
+            fi
+            
+            local referral_rub=0
+            if [[ -n "$referral_balance" && "$referral_balance" != "0" ]]; then
+                referral_rub=$(echo "scale=2; $referral_balance / 100" | bc 2>/dev/null || echo "0")
+            fi
+            
+            # Язык: ru/en (Bedolaga) → ru/en (Remnawave)
+            local lang="${language:-ru}"
+            [[ "$lang" != "ru" && "$lang" != "en" ]] && lang="ru"
+            
+            # Генерация UUID
+            local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$telegram_id")
+            
+            echo "$uuid,$telegram_id,$tg_username,$tg_first_name,,$lang,$balance_rub,$referral_rub,0,$created_at,$created_at"
+        done > "$import_dir/customer.csv"
+        
+        # Добавляем заголовок
+        sed -i '1i id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,created_at,updated_at' "$import_dir/customer.csv" 2>/dev/null || \
+        { echo "id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,created_at,updated_at"; cat "$import_dir/customer.csv"; } > "$import_dir/customer.csv.tmp" && mv "$import_dir/customer.csv.tmp" "$import_dir/customer.csv"
+        
+        print_message "SUCCESS" "customer.csv создан"
+    fi
+    
+    # Трансформация transactions → purchase
+    if [[ -f "$export_dir/transactions.csv" ]]; then
+        print_message "INFO" "Конвертация transactions → purchase..."
+        
+        tail -n +2 "$export_dir/transactions.csv" | while IFS=',' read -r id user_id amount payment_method status created_at subscription_days; do
+            # Конвертация amount из копеек в рубли
+            local amount_rub=0
+            if [[ -n "$amount" && "$amount" != "0" ]]; then
+                amount_rub=$(echo "scale=2; $amount / 100" | bc 2>/dev/null || echo "0")
+            fi
+            
+            # Маппинг payment_method → invoice_type
+            local invoice_type="${PAYMENT_METHOD_MAP[$payment_method]:-admin}"
+            
+            # UUID
+            local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$id")
+            
+            echo "$uuid,$user_id,$amount_rub,$invoice_type,completed,$subscription_days,$created_at,$created_at"
+        done > "$import_dir/purchase.csv"
+        
+        sed -i '1i id,customer_telegram_id,amount,invoice_type,status,subscription_days,created_at,updated_at' "$import_dir/purchase.csv" 2>/dev/null || \
+        { echo "id,customer_telegram_id,amount,invoice_type,status,subscription_days,created_at,updated_at"; cat "$import_dir/purchase.csv"; } > "$import_dir/purchase.csv.tmp" && mv "$import_dir/purchase.csv.tmp" "$import_dir/purchase.csv"
+        
+        print_message "SUCCESS" "purchase.csv создан"
+    fi
+    
+    # Трансформация promocodes → promo
+    if [[ -f "$export_dir/promocodes.csv" ]]; then
+        print_message "INFO" "Конвертация promocodes → promo..."
+        
+        tail -n +2 "$export_dir/promocodes.csv" | while IFS=',' read -r code bonus_days max_uses current_uses is_active created_at; do
+            local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$code")
+            
+            # promo_type: subscription (даёт дни)
+            local promo_type="subscription"
+            [[ "$bonus_days" == "0" || -z "$bonus_days" ]] && promo_type="balance"
+            
+            # active: is_active (bool)
+            local active="true"
+            [[ "$is_active" == "false" || "$is_active" == "0" || "$is_active" == "f" ]] && active="false"
+            
+            echo "$uuid,$code,$promo_type,$bonus_days,0,$max_uses,${current_uses:-0},$active,$created_at,$created_at"
+        done > "$import_dir/promo.csv"
+        
+        sed -i '1i id,code,promo_type,subscription_days,balance_bonus,max_uses,uses,active,created_at,updated_at' "$import_dir/promo.csv" 2>/dev/null || \
+        { echo "id,code,promo_type,subscription_days,balance_bonus,max_uses,uses,active,created_at,updated_at"; cat "$import_dir/promo.csv"; } > "$import_dir/promo.csv.tmp" && mv "$import_dir/promo.csv.tmp" "$import_dir/promo.csv"
+        
+        print_message "SUCCESS" "promo.csv создан"
+    fi
+    
+    debug_log "MIGRATE" "Transformation complete"
+    return 0
+}
+
+# --- Функция: Импорт данных в Remnawave ---
+migrate_import_data() {
+    debug_log "MIGRATE" "Starting data import to Remnawave"
+    print_message "INFO" "Импорт данных в Remnawave Shop..."
+    
+    local import_dir="$MIGRATION_WORK_DIR/import"
+    
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        print_message "ERROR" "Контейнер БД Remnawave не указан"
+        return 1
+    fi
+    
+    # Проверка что контейнер запущен
+    if ! docker ps --format '{{.Names}}' | grep -q "^${MIGRATION_TARGET_CONTAINER}$"; then
+        print_message "ERROR" "Контейнер $MIGRATION_TARGET_CONTAINER не запущен"
+        return 1
+    fi
+    
+    # Импорт customer
+    if [[ -f "$import_dir/customer.csv" ]]; then
+        print_message "INFO" "Импорт customer..."
+        
+        # Копируем файл в контейнер
+        docker cp "$import_dir/customer.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/customer.csv"
+        
+        # Импорт через COPY
+        docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+            CREATE TEMP TABLE tmp_customer (LIKE customer INCLUDING ALL);
+            COPY tmp_customer FROM '/tmp/customer.csv' WITH CSV HEADER;
+            INSERT INTO customer SELECT * FROM tmp_customer
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                balance = customer.balance + EXCLUDED.balance,
+                referral_balance = customer.referral_balance + EXCLUDED.referral_balance,
+                updated_at = NOW();
+            DROP TABLE tmp_customer;
+        " 2>&1
+        
+        local result=$?
+        docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/customer.csv
+        
+        if [[ $result -ne 0 ]]; then
+            print_message "WARN" "Частичный импорт customer (возможны дубликаты)"
+        else
+            print_message "SUCCESS" "customer импортирован"
+        fi
+    fi
+    
+    # Импорт purchase
+    if [[ -f "$import_dir/purchase.csv" ]]; then
+        print_message "INFO" "Импорт purchase..."
+        
+        docker cp "$import_dir/purchase.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/purchase.csv"
+        
+        docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+            COPY purchase(id, customer_telegram_id, amount, invoice_type, status, subscription_days, created_at, updated_at)
+            FROM '/tmp/purchase.csv' WITH CSV HEADER;
+        " 2>&1
+        
+        docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/purchase.csv
+        print_message "SUCCESS" "purchase импортирован"
+    fi
+    
+    # Импорт promo
+    if [[ -f "$import_dir/promo.csv" ]]; then
+        print_message "INFO" "Импорт promo..."
+        
+        docker cp "$import_dir/promo.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/promo.csv"
+        
+        docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+            CREATE TEMP TABLE tmp_promo (LIKE promo INCLUDING ALL);
+            COPY tmp_promo FROM '/tmp/promo.csv' WITH CSV HEADER;
+            INSERT INTO promo SELECT * FROM tmp_promo
+            ON CONFLICT (code) DO UPDATE SET
+                uses = promo.uses + EXCLUDED.uses,
+                active = EXCLUDED.active,
+                updated_at = NOW();
+            DROP TABLE tmp_promo;
+        " 2>&1
+        
+        docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/promo.csv
+        print_message "SUCCESS" "promo импортирован"
+    fi
+    
+    debug_log "MIGRATE" "Import complete"
+    return 0
+}
+
+# --- Функция: Генерация отчёта миграции ---
+migrate_generate_report() {
+    print_message "INFO" "Генерация отчёта миграции..."
+    
+    local report_file="$MIGRATION_WORK_DIR/migration_report_$(date +%Y%m%d_%H%M%S).txt"
+    
+    {
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           LAZARUS Migration Report                             ║"
+        echo "║           Bedolaga → Private Remnawave Shop                    ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+        echo "=== SOURCE (Bedolaga) ==="
+        if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+            echo "Container: $MIGRATION_SOURCE_CONTAINER"
+        else
+            echo "Host: $MIGRATION_SOURCE_HOST:$MIGRATION_SOURCE_PORT"
+        fi
+        echo "Database: $MIGRATION_SOURCE_DB"
+        echo ""
+        echo "=== TARGET (Remnawave Shop) ==="
+        echo "Container: $MIGRATION_TARGET_CONTAINER"
+        echo "Database: $MIGRATION_TARGET_DB"
+        echo ""
+        echo "=== MIGRATION STATS ==="
+        
+        local export_dir="$MIGRATION_WORK_DIR/export"
+        local import_dir="$MIGRATION_WORK_DIR/import"
+        
+        if [[ -f "$export_dir/users.csv" ]]; then
+            local users_count=$(($(wc -l < "$export_dir/users.csv") - 1))
+            echo "Users exported: $users_count"
+        fi
+        
+        if [[ -f "$export_dir/transactions.csv" ]]; then
+            local tx_count=$(($(wc -l < "$export_dir/transactions.csv") - 1))
+            echo "Transactions exported: $tx_count"
+        fi
+        
+        if [[ -f "$export_dir/promocodes.csv" ]]; then
+            local promo_count=$(($(wc -l < "$export_dir/promocodes.csv") - 1))
+            echo "Promocodes exported: $promo_count"
+        fi
+        
+        echo ""
+        echo "=== FILES CREATED ==="
+        ls -la "$import_dir"/*.csv 2>/dev/null || echo "No import files"
+        echo ""
+        echo "Migration completed at: $(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$report_file"
+    
+    print_message "SUCCESS" "Отчёт сохранён: $report_file"
+    cat "$report_file"
+}
+
+# --- Функция: Настройка источника ---
+migrate_configure_source() {
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ИСТОЧНИКА (Bedolaga) ═══${RESET}"
+    echo ""
+    echo "Выберите способ подключения к БД Bedolaga:"
+    echo " 1. Docker контейнер (на этом сервере)"
+    echo " 2. Внешний PostgreSQL сервер"
+    echo " 0. Назад"
+    echo ""
+    read -erp "Выбор: " source_type
+    
+    case "$source_type" in
+        1)
+            echo ""
+            echo "Доступные PostgreSQL контейнеры:"
+            docker ps --format '{{.Names}}' | grep -iE 'postgres|db|bedolaga' | while read -r name; do
+                echo "  - $name"
+            done
+            echo ""
+            read -erp "Имя контейнера БД Bedolaga: " MIGRATION_SOURCE_CONTAINER
+            read -erp "Имя базы данных [shop_bot]: " MIGRATION_SOURCE_DB
+            MIGRATION_SOURCE_DB="${MIGRATION_SOURCE_DB:-shop_bot}"
+            read -erp "Пользователь БД [postgres]: " MIGRATION_SOURCE_USER
+            MIGRATION_SOURCE_USER="${MIGRATION_SOURCE_USER:-postgres}"
+            MIGRATION_SOURCE_HOST=""
+            MIGRATION_SOURCE_PASS=""
+            ;;
+        2)
+            echo ""
+            read -erp "Хост PostgreSQL: " MIGRATION_SOURCE_HOST
+            read -erp "Порт [5432]: " MIGRATION_SOURCE_PORT
+            MIGRATION_SOURCE_PORT="${MIGRATION_SOURCE_PORT:-5432}"
+            read -erp "Имя базы данных: " MIGRATION_SOURCE_DB
+            read -erp "Пользователь: " MIGRATION_SOURCE_USER
+            read -serp "Пароль: " MIGRATION_SOURCE_PASS
+            echo ""
+            MIGRATION_SOURCE_CONTAINER=""
+            ;;
+        0) return ;;
+    esac
+    
+    print_message "SUCCESS" "Источник настроен"
+}
+
+# --- Функция: Настройка приёмника ---
+migrate_configure_target() {
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ПРИЁМНИКА (Remnawave Shop) ═══${RESET}"
+    echo ""
+    
+    # Автоопределение контейнера БД Remnawave
+    local detected_container=""
+    for pattern in "rwp_shop_db" "telegram-shop-db" "remnawave.*db"; do
+        detected_container=$(docker ps --format '{{.Names}}' | grep -iE "^$pattern$" | head -1)
+        [[ -n "$detected_container" ]] && break
+    done
+    
+    if [[ -n "$detected_container" ]]; then
+        echo -e "Обнаружен контейнер: ${GREEN}$detected_container${RESET}"
+        read -erp "Использовать его? (Y/n): " use_detected
+        if [[ ! "$use_detected" =~ ^[Nn]$ ]]; then
+            MIGRATION_TARGET_CONTAINER="$detected_container"
+        fi
+    fi
+    
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        echo "Доступные контейнеры:"
+        docker ps --format '{{.Names}}' | while read -r name; do
+            echo "  - $name"
+        done
+        echo ""
+        read -erp "Имя контейнера БД Remnawave: " MIGRATION_TARGET_CONTAINER
+    fi
+    
+    read -erp "Имя базы данных [postgres]: " MIGRATION_TARGET_DB
+    MIGRATION_TARGET_DB="${MIGRATION_TARGET_DB:-postgres}"
+    read -erp "Пользователь БД [postgres]: " MIGRATION_TARGET_USER
+    MIGRATION_TARGET_USER="${MIGRATION_TARGET_USER:-postgres}"
+    
+    print_message "SUCCESS" "Приёмник настроен"
+}
+
+# --- Главное меню миграции ---
+menu_migration() {
+    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+    
+    while true; do
+        clear_screen
+        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
+        echo -e "${MAGENTA}${BOLD}  🔄 МИГРАЦИЯ: Bedolaga → Private Remnawave Shop   ${RESET}"
+        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
+        echo ""
+        echo -e "${YELLOW}ВНИМАНИЕ: Эта функция переносит данные между ботами!${RESET}"
+        echo -e "${YELLOW}Перед миграцией ОБЯЗАТЕЛЬНО сделайте бэкап обеих БД!${RESET}"
+        echo ""
+        
+        # Статус настроек
+        echo -e "${CYAN}=== ТЕКУЩИЕ НАСТРОЙКИ ===${RESET}"
+        if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+            echo -e "Источник: ${GREEN}Docker: $MIGRATION_SOURCE_CONTAINER${RESET} (DB: $MIGRATION_SOURCE_DB)"
+        elif [[ -n "$MIGRATION_SOURCE_HOST" ]]; then
+            echo -e "Источник: ${GREEN}$MIGRATION_SOURCE_HOST:$MIGRATION_SOURCE_PORT${RESET} (DB: $MIGRATION_SOURCE_DB)"
+        else
+            echo -e "Источник: ${RED}Не настроен${RESET}"
+        fi
+        
+        if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+            echo -e "Приёмник: ${GREEN}Docker: $MIGRATION_TARGET_CONTAINER${RESET} (DB: $MIGRATION_TARGET_DB)"
+        else
+            echo -e "Приёмник: ${RED}Не настроен${RESET}"
+        fi
+        echo ""
+        
+        echo " --- НАСТРОЙКА ---"
+        echo " 1. Настроить источник (Bedolaga)"
+        echo " 2. Настроить приёмник (Remnawave Shop)"
+        echo ""
+        echo " --- ДЕЙСТВИЯ ---"
+        echo " 3. Проверить подключения"
+        echo " 4. Анализ структуры источника"
+        echo ""
+        echo " --- МИГРАЦИЯ ---"
+        echo -e " ${GREEN}5. 🚀 ЗАПУСТИТЬ ПОЛНУЮ МИГРАЦИЮ${RESET}"
+        echo ""
+        echo " --- РУЧНЫЕ ЭТАПЫ ---"
+        echo " 6. Только экспорт данных"
+        echo " 7. Только трансформация"
+        echo " 8. Только импорт"
+        echo ""
+        echo " 0. Назад в главное меню"
+        echo ""
+        read -erp "Выбор: " opt
+        
+        case "$opt" in
+            1) migrate_configure_source ;;
+            2) migrate_configure_target ;;
+            3)
+                echo ""
+                if [[ -n "$MIGRATION_SOURCE_CONTAINER" || -n "$MIGRATION_SOURCE_HOST" ]]; then
+                    migrate_analyze_source && print_message "SUCCESS" "Источник доступен"
+                else
+                    print_message "ERROR" "Источник не настроен"
+                fi
+                
+                if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+                    if docker ps --format '{{.Names}}' | grep -q "^${MIGRATION_TARGET_CONTAINER}$"; then
+                        print_message "SUCCESS" "Приёмник доступен"
+                    else
+                        print_message "ERROR" "Контейнер приёмника не запущен"
+                    fi
+                else
+                    print_message "ERROR" "Приёмник не настроен"
+                fi
+                read -erp "Enter..." dummy
+                ;;
+            4)
+                migrate_check_compatibility
+                read -erp "Enter..." dummy
+                ;;
+            5)
+                # Полная миграция
+                echo ""
+                echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
+                echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ! ПОЛНАЯ МИГРАЦИЯ ДАННЫХ!           ${RESET}"
+                echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
+                echo ""
+                echo "Будут перенесены:"
+                echo " • Пользователи (users → customer)"
+                echo " • Транзакции (transactions → purchase)"
+                echo " • Промокоды (promocodes → promo)"
+                echo ""
+                echo -e "${YELLOW}Убедитесь что сделали бэкап обеих баз данных!${RESET}"
+                echo ""
+                read -erp "Введите 'MIGRATE' для подтверждения: " confirm
+                
+                if [[ "$confirm" == "MIGRATE" ]]; then
+                    mkdir -p "$MIGRATION_WORK_DIR"
+                    echo ""
+                    
+                    # Этап 1: Проверка совместимости
+                    print_message "INFO" "[1/5] Проверка совместимости..."
+                    if ! migrate_check_compatibility; then
+                        print_message "ERROR" "Источник не совместим!"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    
+                    # Этап 2: Экспорт
+                    print_message "INFO" "[2/5] Экспорт данных..."
+                    if ! migrate_export_data; then
+                        print_message "ERROR" "Ошибка экспорта!"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    
+                    # Этап 3: Трансформация
+                    print_message "INFO" "[3/5] Трансформация данных..."
+                    if ! migrate_transform_data; then
+                        print_message "ERROR" "Ошибка трансформации!"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    
+                    # Этап 4: Импорт
+                    print_message "INFO" "[4/5] Импорт в Remnawave..."
+                    if ! migrate_import_data; then
+                        print_message "ERROR" "Ошибка импорта!"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    
+                    # Этап 5: Отчёт
+                    print_message "INFO" "[5/5] Генерация отчёта..."
+                    migrate_generate_report
+                    
+                    echo ""
+                    print_message "SUCCESS" "✅ МИГРАЦИЯ ЗАВЕРШЕНА УСПЕШНО!"
+                    echo ""
+                    log_message "SUCCESS" "Migration completed: Bedolaga → Remnawave Shop"
+                else
+                    print_message "INFO" "Миграция отменена"
+                fi
+                read -erp "Enter..." dummy
+                ;;
+            6)
+                mkdir -p "$MIGRATION_WORK_DIR"
+                migrate_export_data
+                read -erp "Enter..." dummy
+                ;;
+            7)
+                migrate_transform_data
+                read -erp "Enter..." dummy
+                ;;
+            8)
+                migrate_import_data
+                read -erp "Enter..." dummy
+                ;;
+            0) return ;;
+        esac
+    done
+}
+
 cleanup_old_backups() {
     clear_screen; echo -e "${RED}Очистка старых бэкапов${RESET}"
     
@@ -4219,6 +4911,7 @@ case "$1" in
             fi
             echo " 5. Удалить старые бэкапы $CLEANUP_LABEL"
             echo -e " 6. ${CYAN}Обновить бота${RESET}"
+            echo -e " 7. ${MAGENTA}🔄 Миграция между ботами${RESET}"
             echo ""
             echo -e " 8. Проверить обновления скрипта"
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
@@ -4227,7 +4920,8 @@ case "$1" in
             read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
             case $opt in
                 1) menu_manual_backup ;; 2) menu_automation ;; 3) menu_restore ;; 
-                4) menu_settings ;; 5) cleanup_old_backups ;; 6) update_bot ;; 8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
+                4) menu_settings ;; 5) cleanup_old_backups ;; 6) update_bot ;; 
+                7) menu_migration ;; 8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
             esac
         done
         ;;
