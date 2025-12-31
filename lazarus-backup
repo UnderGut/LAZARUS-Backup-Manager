@@ -4717,7 +4717,50 @@ COPY (
     [[ -s "$activity_file" ]] && activity_count=$(($(wc -l < "$activity_file") - 1))
     print_message "SUCCESS" "Экспортировано записей активности: $activity_count"
     
-    debug_log "MIGRATE" "Export complete: users=$user_count, referrals=$referral_count, tx=$tx_count, promo=$promo_count, promo_uses=$promo_uses_count, subs=$subs_count, tickets=$tickets_count, messages=$messages_count, broadcast=$broadcast_count"
+    # Экспорт истории реферальных бонусов (referral_earnings → referral_bonus_history)
+    # Только записи с бонусами в днях (reason содержит 'registration')
+    local ref_bonus_file="$export_dir/referral_bonus.csv"
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (
+                SELECT 
+                    re.id,
+                    referrer.telegram_id as referrer_telegram_id,
+                    referee.telegram_id as referee_telegram_id,
+                    re.reason,
+                    re.amount_kopeks,
+                    re.created_at
+                FROM referral_earnings re
+                INNER JOIN users referrer ON re.user_id = referrer.id
+                INNER JOIN users referee ON re.referral_id = referee.id
+                ORDER BY re.id
+            ) TO STDOUT WITH CSV HEADER;
+        " > "$ref_bonus_file" 2>/dev/null
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (
+                SELECT 
+                    re.id,
+                    referrer.telegram_id as referrer_telegram_id,
+                    referee.telegram_id as referee_telegram_id,
+                    re.reason,
+                    re.amount_kopeks,
+                    re.created_at
+                FROM referral_earnings re
+                INNER JOIN users referrer ON re.user_id = referrer.id
+                INNER JOIN users referee ON re.referral_id = referee.id
+                ORDER BY re.id
+            ) TO STDOUT WITH CSV HEADER;
+        " > "$ref_bonus_file" 2>/dev/null
+        unset PGPASSWORD
+    fi
+    
+    local ref_bonus_count=0
+    [[ -s "$ref_bonus_file" ]] && ref_bonus_count=$(($(wc -l < "$ref_bonus_file") - 1))
+    print_message "SUCCESS" "Экспортировано записей реферальных бонусов: $ref_bonus_count"
+    
+    debug_log "MIGRATE" "Export complete: users=$user_count, referrals=$referral_count, tx=$tx_count, promo=$promo_count, promo_uses=$promo_uses_count, subs=$subs_count, tickets=$tickets_count, messages=$messages_count, broadcast=$broadcast_count, ref_bonus=$ref_bonus_count"
     return 0
 }
 
@@ -4849,6 +4892,13 @@ migrate_transform_data() {
         print_message "INFO" "Подготовка user_activity..."
         cp "$export_dir/user_activity.csv" "$import_dir/user_activity.csv"
         print_message "SUCCESS" "user_activity.csv скопирован"
+    fi
+    
+    # Копирование referral_bonus для referral_bonus_history
+    if [[ -f "$export_dir/referral_bonus.csv" ]]; then
+        print_message "INFO" "Подготовка referral_bonus..."
+        cp "$export_dir/referral_bonus.csv" "$import_dir/referral_bonus.csv"
+        print_message "SUCCESS" "referral_bonus.csv скопирован"
     fi
     
     debug_log "MIGRATE" "Transformation complete"
@@ -5307,6 +5357,64 @@ EOF
         fi
     fi
     
+    # === 11. Импорт истории реферальных бонусов (referral_earnings → referral_bonus_history) ===
+    local ref_bonus_file="$import_dir/referral_bonus.csv"
+    if [[ -f "$ref_bonus_file" ]]; then
+        local ref_bonus_count=$(($(wc -l < "$ref_bonus_file") - 1))
+        if [[ $ref_bonus_count -gt 0 ]]; then
+            print_message "ACTION" "Импорт истории реферальных бонусов..."
+            debug_log "MIGRATE" "Importing referral bonus history: $ref_bonus_count records"
+            
+            docker cp "$ref_bonus_file" "$MIGRATION_TARGET_CONTAINER:/tmp/referral_bonus.csv"
+            
+            # Импортируем только бонусы за регистрацию (в днях)
+            # Бонусы в рублях (amount_kopeks > 0) пропускаем - разные единицы измерения
+            docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                CREATE TEMP TABLE tmp_ref_bonus (
+                    old_id BIGINT,
+                    referrer_telegram_id BIGINT,
+                    referee_telegram_id BIGINT,
+                    reason TEXT,
+                    amount_kopeks BIGINT,
+                    created_at TIMESTAMP
+                );
+                
+                \\copy tmp_ref_bonus FROM '/tmp/referral_bonus.csv' WITH CSV HEADER;
+                
+                -- Вставляем только бонусы за регистрацию (reason содержит 'registration')
+                -- Для них bonus_days берём из настройки (по умолчанию 7)
+                INSERT INTO referral_bonus_history (referral_id, bonus_days, is_first_bonus, granted_at)
+                SELECT 
+                    r.id as referral_id,
+                    7 as bonus_days,  -- Значение по умолчанию, можно настроить
+                    CASE 
+                        WHEN tmp.reason LIKE '%registration%' THEN true
+                        ELSE false
+                    END as is_first_bonus,
+                    tmp.created_at as granted_at
+                FROM tmp_ref_bonus tmp
+                INNER JOIN referral r ON r.referrer_id = tmp.referrer_telegram_id 
+                                     AND r.referee_id = tmp.referee_telegram_id
+                WHERE tmp.reason LIKE '%registration%'
+                ON CONFLICT DO NOTHING;
+                
+                DROP TABLE tmp_ref_bonus;
+EOF
+            
+            local result=$?
+            docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/referral_bonus.csv
+            
+            if [[ $result -eq 0 ]]; then
+                local imported_bonus=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -t -c "SELECT COUNT(*) FROM referral_bonus_history;" 2>/dev/null | tr -d ' ')
+                print_message "SUCCESS" "История реферальных бонусов импортирована (в БД: $imported_bonus)"
+            else
+                print_message "WARN" "Частичный импорт реферальных бонусов"
+            fi
+        else
+            print_message "INFO" "Нет данных реферальных бонусов для импорта"
+        fi
+    fi
+    
     debug_log "MIGRATE" "Import complete"
     return 0
 }
@@ -5390,6 +5498,11 @@ migrate_generate_report() {
         if [[ -f "$export_dir/user_activity.csv" ]]; then
             local act_count=$(($(wc -l < "$export_dir/user_activity.csv") - 1))
             echo "User activity records exported: $act_count"
+        fi
+        
+        if [[ -f "$export_dir/referral_bonus.csv" ]]; then
+            local ref_bonus_count=$(($(wc -l < "$export_dir/referral_bonus.csv") - 1))
+            echo "Referral bonus history exported: $ref_bonus_count"
         fi
         
         echo ""
