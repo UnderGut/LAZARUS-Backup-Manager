@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.24.4"
+VERSION="4.24.5"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -4479,7 +4479,44 @@ COPY (
     [[ -s "$promocodes_file" ]] && promo_count=$(($(wc -l < "$promocodes_file") - 1))
     print_message "SUCCESS" "Экспортировано промокодов: $promo_count"
     
-    debug_log "MIGRATE" "Export complete: users=$user_count, referrals=$referral_count, tx=$tx_count, promo=$promo_count"
+    # Экспорт promocode_uses (история использования промокодов)
+    # JOIN для преобразования user_id и promocode_id во внешние идентификаторы
+    local promo_uses_file="$export_dir/promocode_uses.csv"
+    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (
+                SELECT 
+                    u.telegram_id as customer_telegram_id,
+                    p.code as promo_code,
+                    pu.used_at
+                FROM promocode_uses pu
+                INNER JOIN users u ON pu.user_id = u.id
+                INNER JOIN promocodes p ON pu.promocode_id = p.id
+                ORDER BY pu.used_at
+            ) TO STDOUT WITH CSV HEADER;
+        " > "$promo_uses_file" 2>/dev/null
+    else
+        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+        psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
+            COPY (
+                SELECT 
+                    u.telegram_id as customer_telegram_id,
+                    p.code as promo_code,
+                    pu.used_at
+                FROM promocode_uses pu
+                INNER JOIN users u ON pu.user_id = u.id
+                INNER JOIN promocodes p ON pu.promocode_id = p.id
+                ORDER BY pu.used_at
+            ) TO STDOUT WITH CSV HEADER;
+        " > "$promo_uses_file" 2>/dev/null
+        unset PGPASSWORD
+    fi
+    
+    local promo_uses_count=0
+    [[ -s "$promo_uses_file" ]] && promo_uses_count=$(($(wc -l < "$promo_uses_file") - 1))
+    print_message "SUCCESS" "Экспортировано использований промокодов: $promo_uses_count"
+    
+    debug_log "MIGRATE" "Export complete: users=$user_count, referrals=$referral_count, tx=$tx_count, promo=$promo_count, promo_uses=$promo_uses_count"
     return 0
 }
 
@@ -4714,6 +4751,54 @@ migrate_import_data() {
             fi
         else
             print_message "INFO" "Нет реферальных связей для импорта"
+        fi
+    fi
+    
+    # Импорт promo_usage (история использования промокодов)
+    # ВАЖНО: promo_usage.customer_id и promo_id ссылаются на внутренние ID!
+    if [[ -f "$export_dir/promocode_uses.csv" ]]; then
+        local uses_count=$(($(wc -l < "$export_dir/promocode_uses.csv") - 1))
+        if [[ $uses_count -gt 0 ]]; then
+            print_message "INFO" "Импорт истории использования промокодов ($uses_count)..."
+            
+            # Копируем CSV в контейнер
+            docker cp "$export_dir/promocode_uses.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/promo_uses.csv"
+            
+            # Импорт через COPY с JOIN для поиска внутренних ID
+            # Формат CSV: customer_telegram_id, promo_code, used_at
+            docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+                CREATE TEMP TABLE tmp_promo_uses (
+                    customer_telegram_id bigint,
+                    promo_code text,
+                    used_at timestamptz
+                );
+                COPY tmp_promo_uses FROM '/tmp/promo_uses.csv' WITH CSV HEADER;
+                
+                -- Вставка с поиском внутренних ID через JOIN
+                INSERT INTO promo_usage (promo_id, customer_id, used_at)
+                SELECT 
+                    pr.id as promo_id,
+                    c.id as customer_id,
+                    tmp.used_at
+                FROM tmp_promo_uses tmp
+                INNER JOIN customer c ON c.telegram_id = tmp.customer_telegram_id
+                INNER JOIN promo pr ON pr.code = tmp.promo_code
+                ON CONFLICT DO NOTHING;
+                
+                DROP TABLE tmp_promo_uses;
+            " 2>&1
+            
+            local result=$?
+            docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/promo_uses.csv
+            
+            if [[ $result -eq 0 ]]; then
+                local imported_count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -t -c "SELECT COUNT(*) FROM promo_usage;" 2>/dev/null | tr -d ' ')
+                print_message "SUCCESS" "История использования промокодов импортирована (в БД: $imported_count)"
+            else
+                print_message "WARN" "Частичный импорт истории промокодов (возможно отсутствуют customer или promo)"
+            fi
+        else
+            print_message "INFO" "Нет истории использования промокодов для импорта"
         fi
     fi
     
