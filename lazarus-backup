@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.26.0"
+VERSION="4.26.1"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -4388,14 +4388,15 @@ COPY (
     local promo_uses_file="$export_dir/promocode_uses.csv"
     
     # Экспорт users (без referrer_id - он идёт в отдельный файл)
+    # Добавлено поле status для миграции is_blocked
     if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
         docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
-            COPY (SELECT telegram_id, username, first_name, language, created_at, balance_kopeks, 0 as referral_balance FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
+            COPY (SELECT telegram_id, username, first_name, language, created_at, balance_kopeks, 0 as referral_balance, COALESCE(status, 'active') as status FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
         " > "$users_file" 2>/dev/null
     else
         export PGPASSWORD="$MIGRATION_SOURCE_PASS"
         psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -c "
-            COPY (SELECT telegram_id, username, first_name, language, created_at, balance_kopeks, 0 as referral_balance FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
+            COPY (SELECT telegram_id, username, first_name, language, created_at, balance_kopeks, 0 as referral_balance, COALESCE(status, 'active') as status FROM users ORDER BY telegram_id) TO STDOUT WITH CSV HEADER;
         " > "$users_file" 2>/dev/null
         unset PGPASSWORD
     fi
@@ -4777,8 +4778,8 @@ migrate_transform_data() {
     if [[ -f "$export_dir/users.csv" ]]; then
         print_message "INFO" "Конвертация users → customer..."
         
-        # Формат CSV: telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance
-        tail -n +2 "$export_dir/users.csv" | while IFS=',' read -r telegram_id username first_name language created_at balance_kopeks referral_balance; do
+        # Формат CSV: telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status
+        tail -n +2 "$export_dir/users.csv" | while IFS=',' read -r telegram_id username first_name language created_at balance_kopeks referral_balance status; do
             # Конвертация balance из копеек в рубли
             local balance_rub=0
             if [[ -n "$balance_kopeks" && "$balance_kopeks" != "0" ]]; then
@@ -4794,15 +4795,19 @@ migrate_transform_data() {
             local lang="${language:-ru}"
             [[ "$lang" != "ru" && "$lang" != "en" ]] && lang="ru"
             
+            # Конвертация status → is_blocked (status='blocked' → true)
+            local is_blocked="false"
+            [[ "$status" == "blocked" ]] && is_blocked="true"
+            
             # Генерация UUID
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$telegram_id")
             
-            echo "$uuid,$telegram_id,$username,$first_name,,$lang,$balance_rub,$referral_rub,0,$created_at,$created_at"
+            echo "$uuid,$telegram_id,$username,$first_name,,$lang,$balance_rub,$referral_rub,0,$is_blocked,$created_at,$created_at"
         done > "$import_dir/customer.csv"
         
         # Добавляем заголовок
-        sed -i '1i id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,created_at,updated_at' "$import_dir/customer.csv" 2>/dev/null || \
-        { echo "id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,created_at,updated_at"; cat "$import_dir/customer.csv"; } > "$import_dir/customer.csv.tmp" && mv "$import_dir/customer.csv.tmp" "$import_dir/customer.csv"
+        sed -i '1i id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at' "$import_dir/customer.csv" 2>/dev/null || \
+        { echo "id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at"; cat "$import_dir/customer.csv"; } > "$import_dir/customer.csv.tmp" && mv "$import_dir/customer.csv.tmp" "$import_dir/customer.csv"
         
         print_message "SUCCESS" "customer.csv создан"
     fi
@@ -4930,16 +4935,31 @@ migrate_import_data() {
         # Копируем файл в контейнер
         docker cp "$import_dir/customer.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/customer.csv"
         
-        # Импорт через COPY
+        # Импорт через COPY с явным указанием колонок
+        # CSV: id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at
         docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
-            CREATE TEMP TABLE tmp_customer (LIKE customer INCLUDING ALL);
-            COPY tmp_customer FROM '/tmp/customer.csv' WITH CSV HEADER;
-            INSERT INTO customer SELECT * FROM tmp_customer
+            CREATE TEMP TABLE tmp_customer (
+                id UUID,
+                telegram_id BIGINT,
+                tg_username TEXT,
+                tg_first_name TEXT,
+                tg_last_name TEXT,
+                language VARCHAR(10),
+                balance NUMERIC,
+                referral_balance NUMERIC,
+                lead_score INTEGER,
+                is_blocked BOOLEAN,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            );
+            \\copy tmp_customer FROM '/tmp/customer.csv' WITH CSV HEADER;
+            INSERT INTO customer (telegram_id, tg_username, tg_first_name, tg_last_name, language, is_blocked, created_at)
+            SELECT telegram_id, tg_username, tg_first_name, tg_last_name, language, COALESCE(is_blocked, false), created_at
+            FROM tmp_customer
             ON CONFLICT (telegram_id) DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                balance = customer.balance + EXCLUDED.balance,
-                referral_balance = customer.referral_balance + EXCLUDED.referral_balance,
+                tg_username = EXCLUDED.tg_username,
+                tg_first_name = EXCLUDED.tg_first_name,
+                is_blocked = EXCLUDED.is_blocked,
                 updated_at = NOW();
             DROP TABLE tmp_customer;
         " 2>&1
@@ -4950,7 +4970,8 @@ migrate_import_data() {
         if [[ $result -ne 0 ]]; then
             print_message "WARN" "Частичный импорт customer (возможны дубликаты)"
         else
-            print_message "SUCCESS" "customer импортирован"
+            local blocked_count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -t -c "SELECT COUNT(*) FROM customer WHERE is_blocked = true;" 2>/dev/null | tr -d ' ')
+            print_message "SUCCESS" "customer импортирован (заблокированных: ${blocked_count:-0})"
         fi
     fi
     
