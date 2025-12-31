@@ -3922,7 +3922,7 @@ menu_settings() {
 }
 
 # =============================================================================
-# МИГРАЦИЯ МЕЖДУ БОТАМИ (Bedolaga → Private Remnawave Shop)
+# МИГРАЦИЯ МЕЖДУ БОТАМИ (Bedolaga → RWP-Shop (Private))
 # =============================================================================
 
 # Конфигурация миграции
@@ -3936,12 +3936,12 @@ MIGRATION_TARGET_DB=""
 MIGRATION_TARGET_USER=""
 MIGRATION_WORK_DIR=""
 
-# Маппинг payment_method (Bedolaga) → invoice_type (Remnawave Shop)
+# Маппинг payment_method (Bedolaga) → invoice_type (RWP-Shop)
 # 
 # Bedolaga поддерживает: telegram_stars, tribute, yookassa, cryptobot, 
 #                        heleket, mulenpay, pal24, wata, platega, cloudpayments, manual
 #
-# Remnawave Shop поддерживает: yookassa, crypto, telegram, severpay_cards, 
+# RWP-Shop поддерживает: yookassa, crypto, telegram, severpay_cards, 
 #                               severpay_sbp, wata, platega, stripe
 #
 # ⚠️ Методы без аналога в Remnawave: tribute, heleket, mulenpay, pal24, cloudpayments
@@ -3960,7 +3960,7 @@ declare -A PAYMENT_METHOD_MAP=(
     # Доступные варианты: platega_cards, platega_sbp, platega_crypto, platega_acquiring, platega_worldwide
     ["platega"]="platega_cards"
     
-    # Нет аналога в Remnawave Shop - помечаем как unknown
+    # Нет аналога в RWP-Shop - помечаем как unknown
     ["manual"]="unknown"
     ["heleket"]="unknown"
     ["mulenpay"]="unknown"
@@ -4111,7 +4111,7 @@ migrate_handle_balances() {
     echo ""
     
     echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${YELLOW}  В Remnawave Shop НЕТ внутреннего баланса пользователя!${RESET}"
+    echo -e "${YELLOW}  В RWP-Shop НЕТ внутреннего баланса пользователя!${RESET}"
     echo -e "${YELLOW}  Выберите как обработать эти данные:${RESET}"
     echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
     echo ""
@@ -4504,7 +4504,7 @@ migrate_transform_data() {
 # --- Функция: Импорт данных в Remnawave ---
 migrate_import_data() {
     debug_log "MIGRATE" "Starting data import to Remnawave"
-    print_message "INFO" "Импорт данных в Remnawave Shop..."
+    print_message "INFO" "Импорт данных в RWP-Shop..."
     
     local import_dir="$MIGRATION_WORK_DIR/import"
     
@@ -4599,7 +4599,7 @@ migrate_generate_report() {
     {
         echo "╔════════════════════════════════════════════════════════════════╗"
         echo "║           LAZARUS Migration Report                             ║"
-        echo "║           Bedolaga → Private Remnawave Shop                    ║"
+        echo "║           Bedolaga → RWP-Shop (Private)                    ║"
         echo "╚════════════════════════════════════════════════════════════════╝"
         echo ""
         echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -4612,7 +4612,7 @@ migrate_generate_report() {
         fi
         echo "Database: $MIGRATION_SOURCE_DB"
         echo ""
-        echo "=== TARGET (Remnawave Shop) ==="
+        echo "=== TARGET (RWP-Shop) ==="
         echo "Container: $MIGRATION_TARGET_CONTAINER"
         echo "Database: $MIGRATION_TARGET_DB"
         echo ""
@@ -4695,7 +4695,7 @@ migrate_configure_source() {
 # --- Функция: Настройка приёмника ---
 migrate_configure_target() {
     clear_screen
-    echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ПРИЁМНИКА (Remnawave Shop) ═══${RESET}"
+    echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ПРИЁМНИКА (RWP-Shop) ═══${RESET}"
     echo ""
     
     # Автоопределение контейнера БД Remnawave
@@ -4737,7 +4737,7 @@ menu_migration() {
     while true; do
         clear_screen
         echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
-        echo -e "${MAGENTA}${BOLD}  🔄 МИГРАЦИЯ: Bedolaga → Private Remnawave Shop   ${RESET}"
+        echo -e "${MAGENTA}${BOLD}  🔄 МИГРАЦИЯ: Bedolaga → RWP-Shop (Private)   ${RESET}"
         echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
         echo ""
         echo -e "${YELLOW}ВНИМАНИЕ: Эта функция переносит данные между ботами!${RESET}"
@@ -4763,7 +4763,7 @@ menu_migration() {
         
         echo " --- НАСТРОЙКА ---"
         echo " 1. Настроить источник (Bedolaga)"
-        echo " 2. Настроить приёмник (Remnawave Shop)"
+        echo " 2. Настроить приёмник (RWP-Shop)"
         echo ""
         echo " --- ДЕЙСТВИЯ ---"
         echo " 3. Проверить подключения"
@@ -4869,7 +4869,7 @@ menu_migration() {
                     fi
                     
                     # Этап 6: Импорт
-                    print_message "INFO" "[6/7] Импорт в Remnawave..."
+                    print_message "INFO" "[6/7] Импорт в RWP-Shop..."
                     if ! migrate_import_data; then
                         print_message "ERROR" "Ошибка импорта!"
                         read -erp "Enter..." dummy
@@ -4883,7 +4883,7 @@ menu_migration() {
                     echo ""
                     print_message "SUCCESS" "✅ МИГРАЦИЯ ЗАВЕРШЕНА УСПЕШНО!"
                     echo ""
-                    log_message "SUCCESS" "Migration completed: Bedolaga → Remnawave Shop"
+                    log_message "SUCCESS" "Migration completed: Bedolaga → RWP-Shop"
                 else
                     print_message "INFO" "Миграция отменена"
                 fi
