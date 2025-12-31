@@ -4935,9 +4935,8 @@ migrate_import_data() {
         # Копируем файл в контейнер
         docker cp "$import_dir/customer.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/customer.csv"
         
-        # Импорт через COPY с явным указанием колонок
-        # CSV: id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at
-        docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+        # Импорт через серверную команду COPY (читает файл внутри контейнера)
+        docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
             CREATE TEMP TABLE tmp_customer (
                 id UUID,
                 telegram_id BIGINT,
@@ -4952,7 +4951,7 @@ migrate_import_data() {
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             );
-            \\copy tmp_customer FROM '/tmp/customer.csv' WITH CSV HEADER;
+            COPY tmp_customer FROM '/tmp/customer.csv' WITH CSV HEADER;
             INSERT INTO customer (telegram_id, tg_username, tg_first_name, tg_last_name, language, is_blocked, created_at)
             SELECT telegram_id, tg_username, tg_first_name, tg_last_name, language, COALESCE(is_blocked, false), created_at
             FROM tmp_customer
@@ -4962,7 +4961,7 @@ migrate_import_data() {
                 is_blocked = EXCLUDED.is_blocked,
                 updated_at = NOW();
             DROP TABLE tmp_customer;
-        " 2>&1
+EOF
         
         local result=$?
         docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/customer.csv
@@ -5139,7 +5138,7 @@ migrate_import_data() {
                     status TEXT
                 );
                 
-                \\copy tmp_subscriptions FROM '/tmp/subscriptions.csv' WITH CSV HEADER;
+                COPY tmp_subscriptions FROM '/tmp/subscriptions.csv' WITH CSV HEADER;
                 
                 -- Обновляем существующих customer данными подписки
                 UPDATE customer SET
@@ -5189,7 +5188,7 @@ EOF
                     closed_at TIMESTAMP
                 );
                 
-                \\copy tmp_tickets FROM '/tmp/tickets.csv' WITH CSV HEADER;
+                COPY tmp_tickets FROM '/tmp/tickets.csv' WITH CSV HEADER;
                 
                 -- Вставляем тикеты с поиском customer_id по telegram_id
                 INSERT INTO support_ticket (customer_id, subject, status, created_at, updated_at, closed_at)
@@ -5244,7 +5243,7 @@ EOF
                     created_at TIMESTAMP
                 );
                 
-                \\copy tmp_messages FROM '/tmp/ticket_messages.csv' WITH CSV HEADER;
+                COPY tmp_messages FROM '/tmp/ticket_messages.csv' WITH CSV HEADER;
                 
                 -- Вставляем сообщения (ticket_id должен существовать)
                 INSERT INTO support_message (ticket_id, sender_type, sender_id, message, created_at)
@@ -5298,7 +5297,7 @@ EOF
                     failed_count INTEGER
                 );
                 
-                \\copy tmp_broadcast FROM '/tmp/broadcast.csv' WITH CSV HEADER;
+                COPY tmp_broadcast FROM '/tmp/broadcast.csv' WITH CSV HEADER;
                 
                 -- Вставляем рассылки
                 INSERT INTO broadcast (content, type, language, created_at, status, total_count, sent_count, failed_count, blocked_count)
@@ -5353,7 +5352,7 @@ EOF
                     last_activity TIMESTAMP
                 );
                 
-                \\copy tmp_activity FROM '/tmp/user_activity.csv' WITH CSV HEADER;
+                COPY tmp_activity FROM '/tmp/user_activity.csv' WITH CSV HEADER;
                 
                 -- Обновляем last_activity_at
                 UPDATE customer SET
@@ -5400,7 +5399,7 @@ EOF
                     created_at TIMESTAMP
                 );
                 
-                \\copy tmp_ref_bonus FROM '/tmp/referral_bonus.csv' WITH CSV HEADER;
+                COPY tmp_ref_bonus FROM '/tmp/referral_bonus.csv' WITH CSV HEADER;
                 
                 -- Вставляем только бонусы за регистрацию (reason содержит 'registration')
                 -- Для них bonus_days берём из настройки (по умолчанию 7)
