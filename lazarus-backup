@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.24.0"
+VERSION="4.24.1"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -4853,34 +4853,281 @@ write_env_variable() {
     fi
 }
 
+# --- Функция: Интеллектуальный поиск .env файла Bedolaga ---
+find_bedolaga_env() {
+    debug_log "MIGRATE" "=== find_bedolaga_env() ==="
+    local found_env=""
+    
+    # Метод 1: Поиск по запущенным Docker контейнерам
+    # Bedolaga обычно имеет контейнеры: bedolaga-bot, bedolaga-db или shop-bot, shop-bot-db
+    debug_log "MIGRATE" "Method 1: Searching by running Docker containers..."
+    
+    local bedolaga_keywords=("bedolaga" "shop-bot" "shopbot")
+    local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+    
+    for container in $running_containers; do
+        local name="${container%%|*}"
+        local image="${container##*|}"
+        
+        # Пропускаем контейнеры RWP-Shop и панели
+        [[ "$name" =~ rwp_shop|telegram-shop|remnawave ]] && continue
+        [[ "$image" =~ rwp_shop|remnawave ]] && continue
+        
+        # Ищем контейнеры Bedolaga
+        for keyword in "${bedolaga_keywords[@]}"; do
+            if [[ "${name,,}" =~ $keyword || "${image,,}" =~ $keyword ]]; then
+                debug_log "MIGRATE" "Found Bedolaga container: $name"
+                
+                # Получаем working_dir из docker inspect
+                local working_dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$name" 2>/dev/null)
+                
+                if [[ -n "$working_dir" && -f "$working_dir/.env" ]]; then
+                    found_env="$working_dir/.env"
+                    debug_log "MIGRATE" "Found .env via container label: $found_env"
+                    echo "$found_env"
+                    return 0
+                fi
+            fi
+        done
+    done
+    
+    # Метод 2: Поиск docker-compose файлов с ключевыми словами Bedolaga
+    debug_log "MIGRATE" "Method 2: Searching by docker-compose files..."
+    
+    local search_paths=("/opt" "/root" "/home")
+    for base_path in "${search_paths[@]}"; do
+        [[ ! -d "$base_path" ]] && continue
+        
+        while IFS= read -r compose_file; do
+            [[ -z "$compose_file" ]] && continue
+            local dir=$(dirname "$compose_file")
+            
+            # Пропускаем директории RWP-Shop
+            [[ "$dir" =~ private-remnawave|rwp-shop|telegram-shop ]] && continue
+            
+            # Проверяем содержимое compose файла на ключевые слова Bedolaga
+            if grep -qiE "bedolaga|shop.?bot" "$compose_file" 2>/dev/null; then
+                if [[ -f "$dir/.env" ]]; then
+                    # Дополнительная проверка: в .env должны быть характерные переменные Bedolaga
+                    if grep -qE "^(BOT_TOKEN|TELEGRAM_BOT_TOKEN)=" "$dir/.env" 2>/dev/null; then
+                        found_env="$dir/.env"
+                        debug_log "MIGRATE" "Found .env via compose content: $found_env"
+                        echo "$found_env"
+                        return 0
+                    fi
+                fi
+            fi
+        done < <(find "$base_path" -maxdepth 3 -type f \( -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "compose.yaml" \) 2>/dev/null)
+    done
+    
+    # Метод 3: Поиск по стандартным путям установки Bedolaga
+    debug_log "MIGRATE" "Method 3: Searching by standard paths..."
+    
+    local standard_paths=(
+        "/opt/bedolaga-bot"
+        "/opt/bedolaga"
+        "/opt/shop-bot"
+        "/opt/shopbot"
+        "/opt/telegram-shop-bot"
+        "/root/bedolaga-bot"
+        "/root/shop-bot"
+        "/home/*/bedolaga-bot"
+        "/home/*/shop-bot"
+    )
+    
+    for path_pattern in "${standard_paths[@]}"; do
+        # Раскрываем glob-паттерны
+        for path in $path_pattern; do
+            if [[ -d "$path" && -f "$path/.env" ]]; then
+                # Проверяем что это НЕ RWP-Shop
+                if ! grep -q "REMNAWAVE_MODE=" "$path/.env" 2>/dev/null; then
+                    # Проверяем характерные переменные Bedolaga
+                    if grep -qE "^(BOT_TOKEN|TELEGRAM_BOT_TOKEN|ADMIN_IDS)=" "$path/.env" 2>/dev/null; then
+                        found_env="$path/.env"
+                        debug_log "MIGRATE" "Found .env via standard path: $found_env"
+                        echo "$found_env"
+                        return 0
+                    fi
+                fi
+            fi
+        done
+    done
+    
+    # Метод 4: Глобальный поиск .env файлов с характерными переменными
+    debug_log "MIGRATE" "Method 4: Global search for .env files..."
+    
+    while IFS= read -r env_file; do
+        [[ -z "$env_file" ]] && continue
+        local dir=$(dirname "$env_file")
+        
+        # Пропускаем известные директории RWP-Shop
+        [[ "$dir" =~ private-remnawave|rwp-shop|rwp_shop|lazarus ]] && continue
+        
+        # Проверяем характерные переменные Bedolaga (ADMIN_IDS есть только в Bedolaga)
+        if grep -qE "^ADMIN_IDS=" "$env_file" 2>/dev/null; then
+            found_env="$env_file"
+            debug_log "MIGRATE" "Found .env via global search (ADMIN_IDS): $found_env"
+            echo "$found_env"
+            return 0
+        fi
+        
+        # Альтернативная проверка: наличие REDIS_HOST (Bedolaga использует Redis, RWP-Shop — нет)
+        if grep -qE "^REDIS_HOST=" "$env_file" 2>/dev/null && grep -qE "^BOT_TOKEN=" "$env_file" 2>/dev/null; then
+            found_env="$env_file"
+            debug_log "MIGRATE" "Found .env via global search (REDIS): $found_env"
+            echo "$found_env"
+            return 0
+        fi
+    done < <(find /opt /root /home -maxdepth 4 -name ".env" -type f 2>/dev/null)
+    
+    debug_log "MIGRATE" "No Bedolaga .env found"
+    return 1
+}
+
+# --- Функция: Интеллектуальный поиск .env файла RWP-Shop ---
+find_rwp_shop_env() {
+    debug_log "MIGRATE" "=== find_rwp_shop_env() ==="
+    local found_path=""
+    
+    # Метод 1: Использовать уже настроенный BOT_PATH из LAZARUS
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && -f "$BOT_PATH/.env" ]]; then
+        # Проверяем что это RWP-Shop (есть REMNAWAVE_MODE или REMNAWAVE_URL)
+        if grep -qE "^(REMNAWAVE_MODE|REMNAWAVE_URL)=" "$BOT_PATH/.env" 2>/dev/null; then
+            debug_log "MIGRATE" "Using configured BOT_PATH: $BOT_PATH"
+            echo "$BOT_PATH"
+            return 0
+        fi
+    fi
+    
+    # Метод 2: Поиск по запущенным Docker контейнерам RWP-Shop
+    debug_log "MIGRATE" "Method 2: Searching by running Docker containers..."
+    
+    local rwp_keywords=("rwp_shop" "telegram-shop" "remnawave-telegram-shop")
+    local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+    
+    for container in $running_containers; do
+        local name="${container%%|*}"
+        local image="${container##*|}"
+        
+        # Пропускаем панель управления и БД контейнеры
+        [[ "$name" =~ remnawave-backend|remnawave-subscription|_db$ ]] && continue
+        [[ "$image" =~ remnawave/backend|postgres ]] && continue
+        
+        # Ищем контейнеры RWP-Shop
+        for keyword in "${rwp_keywords[@]}"; do
+            if [[ "${name,,}" =~ $keyword || "${image,,}" =~ $keyword ]]; then
+                debug_log "MIGRATE" "Found RWP-Shop container: $name"
+                
+                # Получаем working_dir из docker inspect
+                local working_dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$name" 2>/dev/null)
+                
+                if [[ -n "$working_dir" && -d "$working_dir" ]]; then
+                    found_path="$working_dir"
+                    debug_log "MIGRATE" "Found path via container label: $found_path"
+                    echo "$found_path"
+                    return 0
+                fi
+            fi
+        done
+    done
+    
+    # Метод 3: Стандартные пути RWP-Shop
+    debug_log "MIGRATE" "Method 3: Searching by standard paths..."
+    
+    local standard_paths=(
+        "/opt/private-remnawave-telegram-shop-bot"
+        "/opt/rwp-shop"
+        "/opt/rwp_shop"
+        "/opt/telegram-shop"
+        "/opt/remnawave-telegram-shop-bot"
+        "/root/private-remnawave-telegram-shop-bot"
+        "/root/rwp-shop"
+    )
+    
+    for path in "${standard_paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            # Проверяем наличие compose файла
+            if [[ -f "$path/compose.yaml" || -f "$path/docker-compose.yml" ]]; then
+                # Проверяем .env на характерные переменные RWP-Shop
+                if [[ -f "$path/.env" ]]; then
+                    if grep -qE "^(REMNAWAVE_MODE|REMNAWAVE_URL|REMNAWAVE_TOKEN)=" "$path/.env" 2>/dev/null; then
+                        found_path="$path"
+                        debug_log "MIGRATE" "Found path via standard path: $found_path"
+                        echo "$found_path"
+                        return 0
+                    fi
+                else
+                    # Есть папка, но нет .env — это тоже подходит (создадим)
+                    found_path="$path"
+                    debug_log "MIGRATE" "Found path (no .env yet): $found_path"
+                    echo "$found_path"
+                    return 0
+                fi
+            fi
+        fi
+    done
+    
+    # Метод 4: Поиск по docker-compose файлам с образами RWP-Shop
+    debug_log "MIGRATE" "Method 4: Searching by compose files..."
+    
+    local search_paths=("/opt" "/root")
+    for base_path in "${search_paths[@]}"; do
+        [[ ! -d "$base_path" ]] && continue
+        
+        while IFS= read -r compose_file; do
+            [[ -z "$compose_file" ]] && continue
+            local dir=$(dirname "$compose_file")
+            
+            # Проверяем содержимое на образы RWP-Shop
+            if grep -qE "image:.*rwp_shop|image:.*telegram-shop" "$compose_file" 2>/dev/null; then
+                found_path="$dir"
+                debug_log "MIGRATE" "Found path via compose image: $found_path"
+                echo "$found_path"
+                return 0
+            fi
+        done < <(find "$base_path" -maxdepth 3 -type f \( -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "compose.yaml" \) 2>/dev/null)
+    done
+    
+    debug_log "MIGRATE" "No RWP-Shop path found"
+    return 1
+}
+
 # --- Функция: Настройка путей для миграции настроек ---
 migrate_settings_configure_paths() {
     clear_screen
     echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ПУТЕЙ ДЛЯ МИГРАЦИИ НАСТРОЕК ═══${RESET}"
     echo ""
     
-    # === Источник (Bedolaga .env) ===
+    print_message "INFO" "Запуск автопоиска..."
+    echo ""
+    
+    # === Автопоиск источника (Bedolaga .env) ===
     echo -e "${YELLOW}=== ИСТОЧНИК (Bedolaga) ===${RESET}"
     
-    # Пробуем найти автоматически
-    local found_bedolaga=""
-    for path in "/opt/bedolaga-bot" "/opt/shop-bot" "/opt/telegram-shop-bot" "/root/bedolaga-bot"; do
-        if [[ -f "$path/.env" ]]; then
-            found_bedolaga="$path/.env"
-            break
-        fi
-    done
+    local found_bedolaga=$(find_bedolaga_env)
     
-    if [[ -n "$found_bedolaga" ]]; then
-        echo -e "Найден файл: ${GREEN}$found_bedolaga${RESET}"
+    if [[ -n "$found_bedolaga" && -f "$found_bedolaga" ]]; then
+        echo -e "✅ Найден файл: ${GREEN}$found_bedolaga${RESET}"
+        
+        # Показываем краткую информацию о файле
+        local vars_count=$(grep -c "^[A-Z].*=" "$found_bedolaga" 2>/dev/null || echo "0")
+        echo -e "   Переменных: ${CYAN}$vars_count${RESET}"
+        
         read -erp "Использовать его? (Y/n): " use_found
         if [[ ! "$use_found" =~ ^[Nn]$ ]]; then
             MIGRATION_SOURCE_ENV_FILE="$found_bedolaga"
         fi
+    else
+        echo -e "${YELLOW}⚠️  Автопоиск не нашёл .env файл Bedolaga${RESET}"
     fi
     
     if [[ -z "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        read -erp "Путь к .env файлу Bedolaga: " MIGRATION_SOURCE_ENV_FILE
+        echo ""
+        echo "Стандартные пути:"
+        echo "  • /opt/bedolaga-bot/.env"
+        echo "  • /opt/shop-bot/.env"
+        echo ""
+        read -erp "Введите путь к .env файлу Bedolaga: " MIGRATION_SOURCE_ENV_FILE
     fi
     
     if [[ ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
@@ -4891,30 +5138,45 @@ migrate_settings_configure_paths() {
     
     echo ""
     
-    # === Приёмник (RWP-Shop) ===
+    # === Автопоиск приёмника (RWP-Shop) ===
     echo -e "${YELLOW}=== ПРИЁМНИК (RWP-Shop) ===${RESET}"
     
-    # Пробуем найти автоматически
-    local found_rwp=""
-    for path in "/opt/private-remnawave-telegram-shop-bot" "/opt/rwp-shop" "/opt/telegram-shop"; do
-        if [[ -f "$path/.env" ]]; then
-            found_rwp="$path"
-            break
-        fi
-    done
+    local found_rwp=$(find_rwp_shop_env)
     
-    if [[ -n "$found_rwp" ]]; then
-        echo -e "Найдена папка: ${GREEN}$found_rwp${RESET}"
+    if [[ -n "$found_rwp" && -d "$found_rwp" ]]; then
+        echo -e "✅ Найдена папка: ${GREEN}$found_rwp${RESET}"
+        
+        # Показываем информацию
+        if [[ -f "$found_rwp/.env" ]]; then
+            local vars_count=$(grep -c "^[A-Z].*=" "$found_rwp/.env" 2>/dev/null || echo "0")
+            echo -e "   .env файл: ${GREEN}есть${RESET} ($vars_count переменных)"
+        else
+            echo -e "   .env файл: ${YELLOW}отсутствует${RESET} (будет создан)"
+        fi
+        
         read -erp "Использовать её? (Y/n): " use_found
         if [[ ! "$use_found" =~ ^[Nn]$ ]]; then
             MIGRATION_TARGET_BOT_PATH="$found_rwp"
             MIGRATION_TARGET_ENV_FILE="$found_rwp/.env"
         fi
+    else
+        echo -e "${YELLOW}⚠️  Автопоиск не нашёл папку RWP-Shop${RESET}"
     fi
     
     if [[ -z "$MIGRATION_TARGET_BOT_PATH" ]]; then
-        read -erp "Путь к папке RWP-Shop бота: " MIGRATION_TARGET_BOT_PATH
+        echo ""
+        echo "Стандартные пути:"
+        echo "  • /opt/private-remnawave-telegram-shop-bot"
+        echo "  • /opt/rwp-shop"
+        echo ""
+        read -erp "Введите путь к папке RWP-Shop бота: " MIGRATION_TARGET_BOT_PATH
         MIGRATION_TARGET_ENV_FILE="$MIGRATION_TARGET_BOT_PATH/.env"
+    fi
+    
+    if [[ ! -d "$MIGRATION_TARGET_BOT_PATH" ]]; then
+        print_message "ERROR" "Папка не найдена: $MIGRATION_TARGET_BOT_PATH"
+        read -erp "Enter..." dummy
+        return 1
     fi
     
     if [[ ! -f "$MIGRATION_TARGET_ENV_FILE" ]]; then
@@ -4929,11 +5191,46 @@ migrate_settings_configure_paths() {
         fi
     fi
     
-    print_message "SUCCESS" "Пути настроены"
+    # === Автопоиск контейнера БД RWP-Shop (если не настроен) ===
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        echo ""
+        echo -e "${YELLOW}=== КОНТЕЙНЕР БД RWP-Shop ===${RESET}"
+        
+        # Пробуем найти автоматически
+        local detected_db=""
+        for pattern in "rwp_shop_db" "telegram-shop-db" "telegram-shop_db"; do
+            detected_db=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE "^${pattern}$" | head -1)
+            [[ -n "$detected_db" ]] && break
+        done
+        
+        if [[ -n "$detected_db" ]]; then
+            echo -e "✅ Найден контейнер: ${GREEN}$detected_db${RESET}"
+            read -erp "Использовать его? (Y/n): " use_db
+            if [[ ! "$use_db" =~ ^[Nn]$ ]]; then
+                MIGRATION_TARGET_CONTAINER="$detected_db"
+                MIGRATION_TARGET_DB="${MIGRATION_TARGET_DB:-postgres}"
+                MIGRATION_TARGET_USER="${MIGRATION_TARGET_USER:-postgres}"
+            fi
+        else
+            echo -e "${YELLOW}⚠️  Контейнер БД не найден автоматически${RESET}"
+            echo "Укажите вручную или настройте через пункт 2 главного меню миграции"
+        fi
+    fi
+    
     echo ""
-    echo -e "Источник: ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
-    echo -e "Приёмник .env: ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
-    echo -e "Приёмник БД: ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
+    print_message "SUCCESS" "Настройка путей завершена"
+    echo ""
+    echo -e "┌─────────────────────────────────────────────────────────────┐"
+    echo -e "│ ${BOLD}ИТОГОВАЯ КОНФИГУРАЦИЯ${RESET}                                       │"
+    echo -e "├─────────────────────────────────────────────────────────────┤"
+    echo -e "│ Источник .env:   ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+    echo -e "│ Приёмник .env:   ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
+    if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+        echo -e "│ Контейнер БД:    ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
+    else
+        echo -e "│ Контейнер БД:    ${YELLOW}Не настроен${RESET}"
+    fi
+    echo -e "└─────────────────────────────────────────────────────────────┘"
     
     read -erp "Enter..." dummy
     return 0
