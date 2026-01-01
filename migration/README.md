@@ -269,57 +269,35 @@ df -h /
 
 ---
 
-### Шаг 2: Получение архива Bedolaga
+### Шаг 2: Размещение архива Bedolaga
 
-#### Вариант A: Архив уже есть (скачан из Telegram)
+> [!IMPORTANT]
+> **Архив бэкапа Bedolaga должен находиться рядом с docker-compose файлом RWP-Shop.**
+>
+> Обычно это папка `/opt/rwp-shop/` или `/opt/private-remnawave-telegram-shop-bot/`
 
-Если бот Bedolaga отправлял вам бэкапы в Telegram:
-
-```bash
-# 1. Скачайте архив из Telegram на свой компьютер
-
-# 2. Загрузите на сервер RWP-Shop
-scp ~/Downloads/backup_20250101_120000.tar.zip root@ваш-сервер:/root/
-
-# 3. Или через SFTP (FileZilla, WinSCP)
-#    Подключитесь к серверу и загрузите файл в /root/
-```
-
-#### Вариант B: Создать архив на сервере Bedolaga
-
-Если архива нет, создайте его на сервере с Bedolaga:
+#### Загрузка архива на сервер:
 
 ```bash
-# 1. Подключитесь к серверу Bedolaga
-ssh root@bedolaga-server
+# Если архив на вашем компьютере — загрузите через SCP:
+scp ~/Downloads/backup_20250101_120000.tar.zip root@ваш-сервер:/opt/rwp-shop/
 
-# 2. Перейдите в папку бота
-cd /opt/bedolaga  # или /opt/vpn-bot, /opt/telegram-shop-bot
-
-# 3. Остановите бота (рекомендуется для консистентности)
-docker compose down
-
-# 4. Создайте архив
-tar -czvf backup_$(date +%Y%m%d_%H%M%S).tar.gz .
-
-# 5. Запустите бота обратно
-docker compose up -d
-
-# 6. Скопируйте архив на сервер RWP-Shop
-scp backup_*.tar.gz root@rwp-shop-server:/root/
+# Или через SFTP (FileZilla, WinSCP и т.д.)
 ```
 
-#### Вариант C: Использовать встроенный бэкап Bedolaga
-
-Если Bedolaga настроен на автобэкапы:
+#### Проверка:
 
 ```bash
-# Найти архивы в папке бота
-ls -la /opt/bedolaga/backups/
+# Перейти в папку RWP-Shop
+cd /opt/rwp-shop  # или /opt/private-remnawave-telegram-shop-bot
 
-# Скопировать последний архив
-cp /opt/bedolaga/backups/backup_*.tar.gz /root/
+# Убедиться, что архив на месте
+ls -la backup_*.tar.*
 ```
+
+> [!NOTE]
+> **Как получить архив Bedolaga?**
+> Обратитесь к документации Bedolaga или к разработчикам за инструкцией по созданию бэкапа.
 
 ---
 
@@ -389,20 +367,23 @@ git pull origin main
 Убедитесь, что архив корректный:
 
 ```bash
-# 1. Проверить, что файл существует
-ls -la /root/backup_*.tar.gz
+# 1. Перейти в папку RWP-Shop (где лежит архив)
+cd /opt/rwp-shop
+
+# 2. Проверить, что файл существует
+ls -la backup_*.tar.gz
 # или
-ls -la /root/backup_*.tar.zip
+ls -la backup_*.tar.zip
 
-# 2. Проверить размер (должен быть > 1MB для реальных данных)
-du -h /root/backup_*.tar.*
+# 3. Проверить размер (должен быть > 1MB для реальных данных)
+du -h backup_*.tar.*
 
-# 3. Проверить содержимое архива
+# 4. Проверить содержимое архива
 # Для .tar.gz:
-tar -tzvf /root/backup_*.tar.gz | head -20
+tar -tzvf backup_*.tar.gz | head -20
 
 # Для .tar.zip (зашифрованный):
-unzip -l /root/backup_*.tar.zip
+unzip -l backup_*.tar.zip
 ```
 
 #### Что должно быть внутри архива:
@@ -425,20 +406,19 @@ backup_20250101_120000/
 
 Если ваш архив имеет расширение `.tar.zip` — он зашифрован.
 
-#### Где найти пароль:
-
-1. **В Telegram** — бот присылал пароль вместе с архивом
-2. **В настройках Bedolaga** — переменная `BACKUP_PASSWORD` в `.env`
-3. **По умолчанию** — пароль может быть пустым или стандартным
-
 #### Проверить, нужен ли пароль:
 
 ```bash
 # Попробовать распаковать без пароля
-unzip -t /root/backup_*.tar.zip
+unzip -t backup_*.tar.zip
 
 # Если выдаёт "incorrect password" — пароль нужен
 ```
+
+> [!NOTE]
+> **Где найти пароль?**
+> Пароль от архива вы должны были получить при создании бэкапа в Bedolaga.
+> Обратитесь к документации Bedolaga, если не знаете пароль.
 
 ---
 
@@ -450,7 +430,7 @@ unzip -t /root/backup_*.tar.zip
 |---|-------|--------|
 | 1 | RWP-Shop работает (`docker ps`) | ☐ |
 | 2 | Бэкап RWP-Shop создан | ☐ |
-| 3 | Архив Bedolaga загружен на сервер | ☐ |
+| 3 | Архив Bedolaga в папке RWP-Shop | ☐ |
 | 4 | LAZARUS установлен | ☐ |
 | 5 | Пароль от архива известен (если нужен) | ☐ |
 | 6 | 30-60 минут свободного времени | ☐ |
