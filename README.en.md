@@ -4,12 +4,19 @@
 
 # LAZARUS Backup Manager
 
+<div align="center">
+
+### 🌐 Language / Язык
+
+[![English](https://img.shields.io/badge/🇬🇧_English-green?style=for-the-badge)](README.en.md)
+[![Русский](https://img.shields.io/badge/🇷🇺_Русский-blue?style=for-the-badge)](README.md)
+
+</div>
+
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
 [![Version](https://img.shields.io/badge/version-4.27.0--dev-orange?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-
-**🇷🇺 [Русская версия](README.md)**
 
 **LAZARUS** — an advanced backup system for **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** with encryption, cloud storage support, and smart automation.
 
