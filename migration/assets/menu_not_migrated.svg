@@ -1,44 +1,51 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 420" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 520" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
   <!-- Background -->
-  <rect width="600" height="420" fill="#1a1a2e"/>
+  <rect width="620" height="520" fill="#1a1a2e"/>
   
   <!-- Terminal window frame -->
-  <rect x="10" y="10" width="580" height="400" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  <rect x="10" y="10" width="600" height="500" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
   
   <!-- Terminal header -->
-  <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
+  <rect x="10" y="10" width="600" height="30" rx="8" fill="#252540"/>
   <circle cx="30" cy="25" r="6" fill="#ff5f56"/>
   <circle cx="50" cy="25" r="6" fill="#ffbd2e"/>
   <circle cx="70" cy="25" r="6" fill="#27ca40"/>
-  <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — NOT_MIGRATED</text>
+  <text x="310" y="29" fill="#888" text-anchor="middle" font-size="12">NOT_MIGRATED — README.txt</text>
   
   <!-- Header -->
-  <text x="25" y="65" fill="#f59e0b" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
-  <text x="25" y="82" fill="#f59e0b" font-size="13" font-weight="bold">       📁 НЕПЕРЕНОСИМЫЕ ДАННЫЕ (NOT_MIGRATED)</text>
-  <text x="25" y="99" fill="#f59e0b" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <text x="25" y="60" fill="#f59e0b" font-size="10">═══════════════════════════════════════════════════════════════════════════════</text>
+  <text x="25" y="75" fill="#f59e0b" font-size="11" font-weight="bold">  ДАННЫЕ, КОТОРЫЕ НЕ БЫЛИ ПЕРЕНЕСЕНЫ АВТОМАТИЧЕСКИ</text>
+  <text x="25" y="90" fill="#f59e0b" font-size="10">  LAZARUS Migration Tool</text>
+  <text x="25" y="100" fill="#f59e0b" font-size="10">═══════════════════════════════════════════════════════════════════════════════</text>
   
   <!-- Description -->
-  <text x="25" y="130" fill="#888" font-size="11">Следующие данные сохранены, но НЕ перенесены в RWP-Shop:</text>
+  <text x="25" y="125" fill="#888" font-size="10">Эти файлы содержат данные из Bedolaga, которые не могут быть автоматически</text>
+  <text x="25" y="140" fill="#888" font-size="10">перенесены в RWP-Shop из-за различий в архитектуре ботов.</text>
   
-  <!-- File 1 -->
-  <text x="25" y="165" fill="#06b6d4" font-size="12">📄 user_balances.csv</text>
-  <text x="40" y="183" fill="#888" font-size="11">└─ Балансы пользователей (1,247 записей)</text>
-  <text x="55" y="200" fill="#555" font-size="10">RWP-Shop не поддерживает денежные балансы</text>
+  <!-- File 1: user_balances.csv -->
+  <text x="25" y="170" fill="#555" font-size="9">───────────────────────────────────────────────────────────────────────────────</text>
+  <text x="25" y="190" fill="#06b6d4" font-size="11">📄 user_balances.csv (если есть)</text>
+  <text x="40" y="208" fill="#888" font-size="10">Содержит: Балансы пользователей в КОПЕЙКАХ</text>
+  <text x="40" y="226" fill="#888" font-size="10">Причина: В RWP-Shop баланс не хранится в рублях.</text>
   
-  <!-- File 2 -->
-  <text x="25" y="230" fill="#06b6d4" font-size="12">📄 user_autopay_settings.csv</text>
-  <text x="40" y="248" fill="#888" font-size="11">└─ Индивидуальные настройки автоплатежа (89 записей)</text>
-  <text x="55" y="265" fill="#555" font-size="10">В RWP-Shop это глобальная настройка</text>
+  <!-- File 2: referral_balances.csv -->
+  <text x="25" y="256" fill="#555" font-size="9">───────────────────────────────────────────────────────────────────────────────</text>
+  <text x="25" y="276" fill="#06b6d4" font-size="11">📄 referral_balances.csv (если есть)</text>
+  <text x="40" y="294" fill="#888" font-size="10">Содержит: Реферальные балансы пользователей</text>
+  <text x="40" y="312" fill="#888" font-size="10">Причина: В RWP-Shop нет отдельного реферального баланса.</text>
   
-  <!-- File 3 -->
-  <text x="25" y="295" fill="#06b6d4" font-size="12">📄 promocodes_balance_type.csv</text>
-  <text x="40" y="313" fill="#888" font-size="11">└─ Промокоды на пополнение баланса (4 записи)</text>
-  <text x="55" y="330" fill="#555" font-size="10">RWP-Shop поддерживает только дни/скидки</text>
+  <!-- File 3: promocodes_balance_type.csv -->
+  <text x="25" y="342" fill="#555" font-size="9">───────────────────────────────────────────────────────────────────────────────</text>
+  <text x="25" y="362" fill="#06b6d4" font-size="11">📄 promocodes_balance_type.csv (если есть)</text>
+  <text x="40" y="380" fill="#888" font-size="10">Содержит: Промокоды, дающие деньги на баланс</text>
+  <text x="40" y="398" fill="#888" font-size="10">Причина: В RWP-Shop промокоды дают только дни или скидку.</text>
   
-  <!-- File 4 -->
-  <text x="25" y="360" fill="#06b6d4" font-size="12">📄 README.txt</text>
-  <text x="40" y="378" fill="#888" font-size="11">└─ Описание формата файлов и рекомендации</text>
+  <!-- File 4: unknown_payments.csv -->
+  <text x="25" y="428" fill="#555" font-size="9">───────────────────────────────────────────────────────────────────────────────</text>
+  <text x="25" y="448" fill="#06b6d4" font-size="11">📄 unknown_payments.csv (если есть)</text>
+  <text x="40" y="466" fill="#888" font-size="10">Содержит: Транзакции через неподдерживаемые платёжные системы</text>
+  <text x="40" y="484" fill="#888" font-size="10">Платёжки: heleket, pal24, mulenpay, cloudpayments, manual</text>
   
-  <!-- Path -->
-  <text x="25" y="405" fill="#555" font-size="10">📍 /lazarus/migration/work_20250101_120000/NOT_MIGRATED/</text>
+  <!-- Footer -->
+  <text x="25" y="508" fill="#555" font-size="9">Вопросы? Создайте issue: https://github.com/UnderGut/LAZARUS-Backup-Manager</text>
 </svg>

@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 480" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 520" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
   <!-- Background -->
-  <rect width="600" height="480" fill="#1a1a2e"/>
+  <rect width="600" height="520" fill="#1a1a2e"/>
   
   <!-- Terminal window frame -->
-  <rect x="10" y="10" width="580" height="460" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  <rect x="10" y="10" width="580" height="500" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
   
   <!-- Terminal header -->
   <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
@@ -12,37 +12,40 @@
   <circle cx="70" cy="25" r="6" fill="#27ca40"/>
   <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Автоматическая миграция</text>
   
-  <!-- Header -->
-  <text x="25" y="65" fill="#22c55e" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
-  <text x="25" y="82" fill="#22c55e" font-size="13" font-weight="bold">       🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ</text>
-  <text x="25" y="99" fill="#22c55e" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <!-- Header (GREEN) -->
+  <text x="25" y="65" fill="#22c55e" font-size="12" font-weight="bold">┌────────────────────────────────────────────────────────────────────┐</text>
+  <text x="25" y="82" fill="#22c55e" font-size="12" font-weight="bold">│  🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ                                        │</text>
+  <text x="25" y="99" fill="#22c55e" font-size="12" font-weight="bold">└────────────────────────────────────────────────────────────────────┘</text>
   
-  <!-- Progress steps -->
-  <text x="25" y="130" fill="#22c55e" font-size="12">✅ [1/10] Healthcheck архива и БД</text>
-  <text x="25" y="150" fill="#22c55e" font-size="12">✅ [2/10] Анализ архива Bedolaga</text>
-  <text x="25" y="170" fill="#22c55e" font-size="12">✅ [3/10] Создание бэкапа БД RWP-Shop</text>
-  <text x="25" y="190" fill="#22c55e" font-size="12">✅ [4/10] Экспорт данных из архива</text>
-  <text x="25" y="210" fill="#22c55e" font-size="12">✅ [5/10] Анализ балансов пользователей</text>
-  <text x="25" y="230" fill="#22c55e" font-size="12">✅ [6/10] Трансформация данных</text>
+  <!-- Steps list -->
+  <text x="25" y="130" fill="#e2e8f0" font-size="11">Будут выполнены следующие действия:</text>
+  
+  <text x="35" y="155" fill="#22c55e" font-size="11">✅ [1/10] 🏥 Healthcheck архива и БД</text>
+  <text x="35" y="173" fill="#22c55e" font-size="11">✅ [2/10] 🔍 Анализ архива Bedolaga</text>
+  <text x="35" y="191" fill="#22c55e" font-size="11">✅ [3/10] 💾 Создание бэкапа БД RWP-Shop</text>
+  <text x="35" y="209" fill="#22c55e" font-size="11">✅ [4/10] 📤 Экспорт данных из архива</text>
+  <text x="35" y="227" fill="#22c55e" font-size="11">✅ [5/10] 💰 Анализ и обработка балансов</text>
+  <text x="35" y="245" fill="#22c55e" font-size="11">✅ [6/10] 🔄 Трансформация данных</text>
   
   <!-- Current step (loading) -->
-  <text x="25" y="250" fill="#f59e0b" font-size="12">⏳ [7/10] Импорт в RWP-Shop...</text>
+  <text x="35" y="263" fill="#f59e0b" font-size="11">⏳ [7/10] 📥 Импорт в RWP-Shop...</text>
   
   <!-- Pending steps -->
-  <text x="25" y="270" fill="#555" font-size="12">⬜ [8/10] Сохранение непереносимых данных</text>
-  <text x="25" y="290" fill="#555" font-size="12">⬜ [9/10] Генерация отчёта + Healthcheck</text>
-  <text x="25" y="310" fill="#555" font-size="12">⬜ [10/10] Миграция настроек (опционально)</text>
+  <text x="35" y="281" fill="#555" font-size="11">⬜ [8/10] ⚙️  Миграция настроек (опционально)</text>
+  <text x="35" y="299" fill="#555" font-size="11">⬜ [9/10] 📁 Сохранение непереносимых данных</text>
+  <text x="35" y="317" fill="#555" font-size="11">⬜ [10/10] 📋 Генерация отчёта + Финальный healthcheck</text>
   
-  <!-- Progress bar -->
-  <text x="25" y="350" fill="#888" font-size="11">Прогресс:</text>
-  <rect x="25" y="360" width="550" height="20" rx="4" fill="#333"/>
-  <rect x="25" y="360" width="385" height="20" rx="4" fill="#22c55e"/>
-  <text x="300" y="375" fill="#fff" font-size="11" text-anchor="middle">70%</text>
+  <!-- Warning: ПОВЕДЕНИЕ ПРИ КОНФЛИКТАХ -->
+  <text x="25" y="355" fill="#f59e0b" font-size="11" font-weight="bold">⚠️ ПОВЕДЕНИЕ ПРИ КОНФЛИКТАХ:</text>
+  <text x="35" y="373" fill="#888" font-size="10">• customer: При совпадении telegram_id → ОБНОВИТ username, имя, статус</text>
+  <text x="35" y="389" fill="#888" font-size="10">• promo: При совпадении code → ОБНОВИТ счётчик использований</text>
+  <text x="35" y="405" fill="#888" font-size="10">• purchase: При совпадении id → ПРОПУСТИТ (ON CONFLICT DO NOTHING)</text>
   
-  <!-- Details -->
-  <text x="25" y="405" fill="#888" font-size="11">Импорт пользователей: 1,247 / 1,247</text>
-  <text x="25" y="422" fill="#888" font-size="11">Импорт подписок: 892 / 1,089</text>
+  <!-- Warning: НЕ ПЕРЕНОСЯТСЯ -->
+  <text x="25" y="435" fill="#f59e0b" font-size="11" font-weight="bold">⚠️ НЕ ПЕРЕНОСЯТСЯ (сохранятся в NOT_MIGRATED/):</text>
+  <text x="35" y="453" fill="#888" font-size="10">• Балансы пользователей (в RWP-Shop нет баланса)</text>
+  <text x="35" y="469" fill="#888" font-size="10">• Промокоды на баланс (только промокоды на дни)</text>
   
-  <!-- Spinner animation hint -->
-  <text x="25" y="455" fill="#555" font-size="10">Пожалуйста, подождите...</text>
+  <!-- Prompt -->
+  <text x="25" y="500" fill="#888" font-size="11">Продолжить? (y/N): <tspan fill="#22c55e">y█</tspan></text>
 </svg>
