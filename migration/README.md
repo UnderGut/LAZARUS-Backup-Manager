@@ -336,8 +336,8 @@ ls -la /root/rwp_shop_backup_*.sql
 ### Шаг 4: Установка LAZARUS Backup Manager
 
 ```bash
-# Установка одной командой
-curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/install.sh | bash
+# Установка одной командой (DEV-версия с миграцией)
+curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/install.sh | bash
 
 # LAZARUS будет установлен в /opt/lazarus-backup
 ```
@@ -345,9 +345,11 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 #### Если LAZARUS уже установлен:
 
 ```bash
-# Обновите до последней версии
+# Обновите до dev-версии с миграцией
 cd /opt/lazarus-backup
-git pull origin main
+git fetch origin
+git checkout dev
+git pull origin dev
 ```
 
 ---
