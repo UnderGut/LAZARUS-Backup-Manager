@@ -8243,6 +8243,458 @@ EOF
     sed -i "2a\\  Дата миграции: $(date '+%Y-%m-%d %H:%M:%S')" "$MIGRATION_NOT_MIGRATED_DIR/README.txt"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ███████╗ HEALTHCHECK FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+# Комплексные проверки валидности на всех этапах миграции
+
+# --- Функция: Healthcheck архива Bedolaga ---
+# Проверяет: целостность tar.gz, наличие database.json, структуру JSON
+migration_healthcheck_archive() {
+    local archive_path="${1:-$MIGRATION_SOURCE_BACKUP}"
+    local verbose="${2:-true}"
+    local errors=0
+    local warnings=0
+    
+    [[ "$verbose" == "true" ]] && echo -e "\n${CYAN}━━━ 🏥 HEALTHCHECK: Архив Bedolaga ━━━${RESET}\n"
+    
+    # 1) Файл существует
+    if [[ ! -f "$archive_path" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Файл не найден: $archive_path"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Файл существует"
+    
+    # 2) Размер файла > 0
+    local file_size=$(stat -c%s "$archive_path" 2>/dev/null || stat -f%z "$archive_path" 2>/dev/null)
+    if [[ -z "$file_size" || "$file_size" -eq 0 ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Файл пустой"
+        return 1
+    fi
+    local size_human=$(numfmt --to=iec-i --suffix=B "$file_size" 2>/dev/null || echo "${file_size} bytes")
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Размер файла: $size_human"
+    
+    # 3) Целостность gzip
+    if ! gzip -t "$archive_path" 2>/dev/null; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён gzip архив"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность gzip: OK"
+    
+    # 4) Целостность tar
+    if ! tar -tzf "$archive_path" &>/dev/null; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён tar архив"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность tar: OK"
+    
+    # 5) Наличие database.json
+    if ! tar -tzf "$archive_path" | grep -q "database.json"; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json в архиве"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} database.json присутствует"
+    
+    # 6) Проверка JSON структуры
+    local temp_dir=$(mktemp -d)
+    TEMP_DIRS+=("$temp_dir")
+    
+    tar -xzf "$archive_path" -C "$temp_dir" --wildcards '*/database.json' 2>/dev/null || \
+    tar -xzf "$archive_path" -C "$temp_dir" 'database.json' 2>/dev/null
+    
+    local json_file=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+    
+    if [[ -z "$json_file" || ! -f "$json_file" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не удалось извлечь database.json"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Проверка валидности JSON через Python
+    local python_cmd="${PYTHON_CMD:-python3}"
+    if ! $python_cmd -c "import json; json.load(open('$json_file'))" 2>/dev/null; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} database.json не является валидным JSON"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} JSON структура валидна"
+    
+    # 7) Проверка обязательных таблиц
+    local required_tables=("users")
+    local optional_tables=("transactions" "promocodes" "subscriptions" "tickets")
+    
+    for table in "${required_tables[@]}"; do
+        if $python_cmd -c "import json; d=json.load(open('$json_file')); exit(0 if '$table' in d else 1)" 2>/dev/null; then
+            local count=$($python_cmd -c "import json; d=json.load(open('$json_file')); print(len(d.get('$table', [])))" 2>/dev/null)
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Таблица '$table': $count записей"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Отсутствует обязательная таблица: $table"
+            ((errors++))
+        fi
+    done
+    
+    for table in "${optional_tables[@]}"; do
+        if $python_cmd -c "import json; d=json.load(open('$json_file')); exit(0 if '$table' in d else 1)" 2>/dev/null; then
+            local count=$($python_cmd -c "import json; d=json.load(open('$json_file')); print(len(d.get('$table', [])))" 2>/dev/null)
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Таблица '$table': $count записей"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Таблица '$table' отсутствует (опционально)"
+            ((warnings++))
+        fi
+    done
+    
+    rm -rf "$temp_dir"
+    
+    # Результат
+    if [[ "$verbose" == "true" ]]; then
+        echo ""
+        if [[ $errors -eq 0 ]]; then
+            echo -e "  ${GREEN}${BOLD}✅ АРХИВ ВАЛИДЕН${RESET}"
+            [[ $warnings -gt 0 ]] && echo -e "  ${YELLOW}   (предупреждений: $warnings)${RESET}"
+        else
+            echo -e "  ${RED}${BOLD}❌ АРХИВ НЕВАЛИДЕН${RESET} (ошибок: $errors)"
+        fi
+    fi
+    
+    debug_log "HEALTHCHECK" "Archive check: errors=$errors, warnings=$warnings, path=$archive_path"
+    
+    return $errors
+}
+
+# --- Функция: Healthcheck БД перед импортом ---
+# Проверяет: подключение, наличие таблиц, права на запись
+migration_healthcheck_db_pre() {
+    local verbose="${1:-true}"
+    local errors=0
+    local warnings=0
+    
+    [[ "$verbose" == "true" ]] && echo -e "\n${CYAN}━━━ 🏥 HEALTHCHECK: БД RWP-Shop (PRE-IMPORT) ━━━${RESET}\n"
+    
+    # Проверяем что контейнер задан
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не задан контейнер БД"
+        return 1
+    fi
+    
+    # 1) Контейнер запущен
+    if ! docker ps --format '{{.Names}}' | grep -q "^${MIGRATION_TARGET_CONTAINER}$"; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Контейнер не запущен: $MIGRATION_TARGET_CONTAINER"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Контейнер запущен: $MIGRATION_TARGET_CONTAINER"
+    
+    # 2) Healthcheck контейнера (pg_isready)
+    local db_user="${MIGRATION_TARGET_USER:-postgres}"
+    local db_name="${MIGRATION_TARGET_DB:-postgres}"
+    
+    if ! docker exec "$MIGRATION_TARGET_CONTAINER" pg_isready -U "$db_user" &>/dev/null; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} PostgreSQL не готов (pg_isready failed)"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} PostgreSQL готов к подключению"
+    
+    # 3) Подключение к БД
+    if ! docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -c "SELECT 1" &>/dev/null; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не удалось подключиться к БД: $db_name"
+        return 1
+    fi
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Подключение к БД: $db_name"
+    
+    # 4) Проверка обязательных таблиц
+    local required_tables=("customer" "promo" "purchase")
+    local optional_tables=("referral" "promo_usage" "support_ticket" "support_message" "broadcast")
+    
+    for table in "${required_tables[@]}"; do
+        local exists=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '$table')" 2>/dev/null)
+        if [[ "$exists" == "t" ]]; then
+            local count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+                "SELECT COUNT(*) FROM $table" 2>/dev/null)
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Таблица '$table': $count записей"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Отсутствует таблица: $table"
+            ((errors++))
+        fi
+    done
+    
+    for table in "${optional_tables[@]}"; do
+        local exists=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '$table')" 2>/dev/null)
+        if [[ "$exists" == "t" ]]; then
+            local count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+                "SELECT COUNT(*) FROM $table" 2>/dev/null)
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Таблица '$table': $count записей"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Таблица '$table' отсутствует"
+            ((warnings++))
+        fi
+    done
+    
+    # 5) Проверка прав на запись (создаём и удаляем тестовую запись)
+    local write_test=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+        "CREATE TEMP TABLE _lazarus_write_test (id int); INSERT INTO _lazarus_write_test VALUES (1); SELECT COUNT(*) FROM _lazarus_write_test;" 2>/dev/null)
+    if [[ "$write_test" == "1" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Права на запись: OK"
+    else
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Нет прав на запись в БД"
+        ((errors++))
+    fi
+    
+    # 6) Проверка свободного места в контейнере
+    local disk_free=$(docker exec "$MIGRATION_TARGET_CONTAINER" df -h /var/lib/postgresql/data 2>/dev/null | tail -1 | awk '{print $4}')
+    if [[ -n "$disk_free" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Свободное место: $disk_free"
+    fi
+    
+    # Результат
+    if [[ "$verbose" == "true" ]]; then
+        echo ""
+        if [[ $errors -eq 0 ]]; then
+            echo -e "  ${GREEN}${BOLD}✅ БД ГОТОВА К ИМПОРТУ${RESET}"
+            [[ $warnings -gt 0 ]] && echo -e "  ${YELLOW}   (предупреждений: $warnings)${RESET}"
+        else
+            echo -e "  ${RED}${BOLD}❌ БД НЕ ГОТОВА${RESET} (ошибок: $errors)"
+        fi
+    fi
+    
+    # Сохраняем счётчики ДО импорта для сравнения
+    HEALTHCHECK_PRE_COUNTS=""
+    for table in customer promo purchase referral; do
+        local count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+            "SELECT COUNT(*) FROM $table" 2>/dev/null || echo "0")
+        HEALTHCHECK_PRE_COUNTS+="$table:$count "
+    done
+    
+    debug_log "HEALTHCHECK" "DB pre-import: errors=$errors, warnings=$warnings, counts=$HEALTHCHECK_PRE_COUNTS"
+    
+    return $errors
+}
+
+# --- Функция: Healthcheck БД после импорта ---
+# Проверяет: изменение счётчиков, целостность FK, отсутствие orphans
+migration_healthcheck_db_post() {
+    local verbose="${1:-true}"
+    local errors=0
+    local warnings=0
+    
+    [[ "$verbose" == "true" ]] && echo -e "\n${CYAN}━━━ 🏥 HEALTHCHECK: БД RWP-Shop (POST-IMPORT) ━━━${RESET}\n"
+    
+    local db_user="${MIGRATION_TARGET_USER:-postgres}"
+    local db_name="${MIGRATION_TARGET_DB:-postgres}"
+    
+    # 1) Сравнение счётчиков (до/после)
+    [[ "$verbose" == "true" ]] && echo -e "  ${BLUE}📊 Изменение количества записей:${RESET}"
+    
+    for table in customer promo purchase referral; do
+        local pre_count=$(echo "$HEALTHCHECK_PRE_COUNTS" | grep -oP "$table:\K\d+")
+        local post_count=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+            "SELECT COUNT(*) FROM $table" 2>/dev/null || echo "0")
+        local diff=$((post_count - pre_count))
+        
+        if [[ $diff -gt 0 ]]; then
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} $table: $pre_count → $post_count (+$diff)"
+        elif [[ $diff -eq 0 ]]; then
+            [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} $table: $pre_count → $post_count (без изменений)"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} $table: $pre_count → $post_count ($diff) - УМЕНЬШИЛОСЬ!"
+            ((warnings++))
+        fi
+    done
+    
+    # 2) Проверка FK integrity (orphan referrals)
+    [[ "$verbose" == "true" ]] && echo -e "\n  ${BLUE}🔗 Проверка целостности связей:${RESET}"
+    
+    # Orphan referrals (referrer_id не существует в customer)
+    local orphan_referrers=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+        "SELECT COUNT(*) FROM referral r WHERE NOT EXISTS (SELECT 1 FROM customer c WHERE c.telegram_id = r.referrer_id)" 2>/dev/null || echo "0")
+    if [[ "$orphan_referrers" -eq 0 ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} referral.referrer_id → customer: OK"
+    else
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} referral.referrer_id → customer: $orphan_referrers orphans"
+        ((warnings++))
+    fi
+    
+    # Orphan referees
+    local orphan_referees=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+        "SELECT COUNT(*) FROM referral r WHERE NOT EXISTS (SELECT 1 FROM customer c WHERE c.telegram_id = r.referee_id)" 2>/dev/null || echo "0")
+    if [[ "$orphan_referees" -eq 0 ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} referral.referee_id → customer: OK"
+    else
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} referral.referee_id → customer: $orphan_referees orphans"
+        ((warnings++))
+    fi
+    
+    # Orphan promo_usage
+    local orphan_promo=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+        "SELECT COUNT(*) FROM promo_usage pu WHERE NOT EXISTS (SELECT 1 FROM promo p WHERE p.id = pu.promo_id)" 2>/dev/null || echo "0")
+    if [[ "$orphan_promo" -eq 0 ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} promo_usage.promo_id → promo: OK"
+    else
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} promo_usage.promo_id → promo: $orphan_promo orphans"
+        ((warnings++))
+    fi
+    
+    # 3) Проверка на NULL в обязательных полях
+    [[ "$verbose" == "true" ]] && echo -e "\n  ${BLUE}⚠️  Проверка данных:${RESET}"
+    
+    local null_telegram_id=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+        "SELECT COUNT(*) FROM customer WHERE telegram_id IS NULL" 2>/dev/null || echo "0")
+    if [[ "$null_telegram_id" -eq 0 ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} customer.telegram_id: нет NULL"
+    else
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} customer.telegram_id: $null_telegram_id NULL записей"
+        ((errors++))
+    fi
+    
+    # 4) Проверка дубликатов telegram_id
+    local dup_telegram=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
+        "SELECT COUNT(*) FROM (SELECT telegram_id FROM customer GROUP BY telegram_id HAVING COUNT(*) > 1) t" 2>/dev/null || echo "0")
+    if [[ "$dup_telegram" -eq 0 ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} customer.telegram_id: нет дубликатов"
+    else
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} customer.telegram_id: $dup_telegram дубликатов"
+        ((errors++))
+    fi
+    
+    # Результат
+    if [[ "$verbose" == "true" ]]; then
+        echo ""
+        if [[ $errors -eq 0 && $warnings -eq 0 ]]; then
+            echo -e "  ${GREEN}${BOLD}✅ ИМПОРТ ПРОШЁЛ УСПЕШНО${RESET}"
+        elif [[ $errors -eq 0 ]]; then
+            echo -e "  ${YELLOW}${BOLD}⚠️  ИМПОРТ ЗАВЕРШЁН С ПРЕДУПРЕЖДЕНИЯМИ${RESET} ($warnings)"
+        else
+            echo -e "  ${RED}${BOLD}❌ ОБНАРУЖЕНЫ ПРОБЛЕМЫ${RESET} (ошибок: $errors, предупреждений: $warnings)"
+        fi
+    fi
+    
+    debug_log "HEALTHCHECK" "DB post-import: errors=$errors, warnings=$warnings"
+    
+    return $errors
+}
+
+# --- Функция: Healthcheck CSV файлов ---
+# Проверяет: наличие файлов, заголовки, количество строк
+migration_healthcheck_csv() {
+    local export_dir="${1:-$MIGRATION_WORK_DIR/export}"
+    local verbose="${2:-true}"
+    local errors=0
+    local warnings=0
+    local total_records=0
+    
+    [[ "$verbose" == "true" ]] && echo -e "\n${CYAN}━━━ 🏥 HEALTHCHECK: Экспортированные CSV ━━━${RESET}\n"
+    
+    if [[ ! -d "$export_dir" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Папка экспорта не найдена: $export_dir"
+        return 1
+    fi
+    
+    # Обязательные файлы
+    local required_files=("users.csv")
+    local optional_files=("transactions.csv" "promocodes.csv" "subscriptions.csv" "referrals.csv" 
+                          "promocode_uses.csv" "tickets.csv" "ticket_messages.csv")
+    
+    for file in "${required_files[@]}"; do
+        if [[ -f "$export_dir/$file" ]]; then
+            local lines=$(wc -l < "$export_dir/$file")
+            local records=$((lines - 1))  # минус заголовок
+            total_records=$((total_records + records))
+            
+            if [[ $records -gt 0 ]]; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} $file: $records записей"
+            else
+                [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} $file: пустой (только заголовок)"
+                ((warnings++))
+            fi
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} $file: НЕ НАЙДЕН (обязательный)"
+            ((errors++))
+        fi
+    done
+    
+    for file in "${optional_files[@]}"; do
+        if [[ -f "$export_dir/$file" ]]; then
+            local lines=$(wc -l < "$export_dir/$file")
+            local records=$((lines - 1))
+            total_records=$((total_records + records))
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} $file: $records записей"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${DIM}○${RESET} $file: отсутствует (опционально)"
+        fi
+    done
+    
+    # Проверка заголовков CSV
+    [[ "$verbose" == "true" ]] && echo -e "\n  ${BLUE}📋 Проверка заголовков:${RESET}"
+    
+    if [[ -f "$export_dir/users.csv" ]]; then
+        local header=$(head -1 "$export_dir/users.csv")
+        if echo "$header" | grep -q "telegram_id"; then
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} users.csv: заголовок корректен"
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} users.csv: отсутствует telegram_id в заголовке"
+            ((errors++))
+        fi
+    fi
+    
+    # Результат
+    if [[ "$verbose" == "true" ]]; then
+        echo ""
+        echo -e "  ${BLUE}Всего записей для импорта:${RESET} $total_records"
+        echo ""
+        if [[ $errors -eq 0 ]]; then
+            echo -e "  ${GREEN}${BOLD}✅ CSV ФАЙЛЫ ВАЛИДНЫ${RESET}"
+        else
+            echo -e "  ${RED}${BOLD}❌ ПРОБЛЕМЫ С CSV${RESET} (ошибок: $errors)"
+        fi
+    fi
+    
+    debug_log "HEALTHCHECK" "CSV check: errors=$errors, total_records=$total_records, dir=$export_dir"
+    
+    return $errors
+}
+
+# --- Функция: Полный healthcheck (все проверки) ---
+migration_healthcheck_full() {
+    local verbose="${1:-true}"
+    local archive_ok=0
+    local db_pre_ok=0
+    local csv_ok=0
+    
+    echo -e "\n${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${MAGENTA}${BOLD}║              🏥 ПОЛНЫЙ HEALTHCHECK МИГРАЦИИ                        ║${RESET}"
+    echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════════════════╝${RESET}"
+    
+    # Архив
+    if [[ -n "$MIGRATION_SOURCE_BACKUP" ]]; then
+        migration_healthcheck_archive "$MIGRATION_SOURCE_BACKUP" "$verbose" && archive_ok=1
+    else
+        [[ "$verbose" == "true" ]] && echo -e "\n  ${YELLOW}○${RESET} Архив не выбран - пропуск проверки"
+    fi
+    
+    # БД
+    if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+        migration_healthcheck_db_pre "$verbose" && db_pre_ok=1
+    else
+        [[ "$verbose" == "true" ]] && echo -e "\n  ${YELLOW}○${RESET} Контейнер БД не задан - пропуск проверки"
+    fi
+    
+    # CSV (если есть)
+    if [[ -d "$MIGRATION_WORK_DIR/export" ]]; then
+        migration_healthcheck_csv "$MIGRATION_WORK_DIR/export" "$verbose" && csv_ok=1
+    fi
+    
+    # Итог
+    echo -e "\n${BLUE}━━━ ИТОГ ━━━${RESET}\n"
+    [[ $archive_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} Архив: OK" || echo -e "  ${RED}✗${RESET} Архив: ОШИБКА"
+    [[ $db_pre_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} БД: OK" || echo -e "  ${RED}✗${RESET} БД: ОШИБКА"
+    [[ -d "$MIGRATION_WORK_DIR/export" ]] && { [[ $csv_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} CSV: OK" || echo -e "  ${RED}✗${RESET} CSV: ОШИБКА"; }
+    
+    echo ""
+    read -erp "Нажмите Enter для продолжения..."
+    
+    return 0
+}
+
 # --- Функция: Сохранить непереносимые данные ---
 migration_save_not_migrated_data() {
     [[ -z "$MIGRATION_NOT_MIGRATED_DIR" ]] && migration_create_not_migrated_dir
@@ -8486,14 +8938,15 @@ migration_run_automatic() {
     
     echo "Будут выполнены следующие действия:"
     echo ""
-    echo "  [1/8] 🔍 Анализ архива Bedolaga"
-    echo "  [2/8] 💾 Создание бэкапа БД RWP-Shop"
-    echo "  [3/8] 📤 Экспорт данных из архива"
-    echo "  [4/8] 💰 Анализ и обработка балансов"
-    echo "  [5/8] 🔄 Трансформация данных"
-    echo "  [6/8] 📥 Импорт в RWP-Shop"
-    echo "  [7/8] 📁 Сохранение непереносимых данных"
-    echo "  [8/8] 📋 Генерация отчёта"
+    echo "  [1/9] 🏥 Healthcheck архива и БД"
+    echo "  [2/9] 🔍 Анализ архива Bedolaga"
+    echo "  [3/9] 💾 Создание бэкапа БД RWP-Shop"
+    echo "  [4/9] 📤 Экспорт данных из архива"
+    echo "  [5/9] 💰 Анализ и обработка балансов"
+    echo "  [6/9] 🔄 Трансформация данных"
+    echo "  [7/9] 📥 Импорт в RWP-Shop"
+    echo "  [8/9] 📁 Сохранение непереносимых данных"
+    echo "  [9/9] 📋 Генерация отчёта + Финальный healthcheck"
     echo ""
     
     echo -e "${YELLOW}⚠️  ПОВЕДЕНИЕ ПРИ КОНФЛИКТАХ:${RESET}"
@@ -8514,40 +8967,65 @@ migration_run_automatic() {
     
     local start_time=$(date +%s)
     
-    # [1/8] Анализ
+    # [1/9] HEALTHCHECK (архив + БД)
     echo ""
-    print_message "INFO" "[1/8] Анализ архива Bedolaga..."
+    print_message "INFO" "[1/9] Healthcheck архива и БД..."
+    
+    # Проверка архива
+    if ! migration_healthcheck_archive "$MIGRATION_SOURCE_BACKUP" "true"; then
+        print_message "ERROR" "Архив не прошёл проверку!"
+        read -erp "Продолжить несмотря на ошибки? (y/N): " force_archive
+        [[ ! "$force_archive" =~ ^[Yy]$ ]] && return 1
+    fi
+    
+    # Проверка БД
+    if ! migration_healthcheck_db_pre "true"; then
+        print_message "ERROR" "БД не прошла проверку!"
+        read -erp "Продолжить несмотря на ошибки? (y/N): " force_db
+        [[ ! "$force_db" =~ ^[Yy]$ ]] && return 1
+    fi
+    
+    print_message "SUCCESS" "Healthcheck пройден"
+    
+    # [2/9] Анализ
+    print_message "INFO" "[2/9] Анализ архива Bedolaga..."
     if ! migration_quick_analyze "$MIGRATION_SOURCE_BACKUP" > /dev/null; then
         print_message "ERROR" "Ошибка анализа архива"
         return 1
     fi
     print_message "SUCCESS" "Архив валиден"
     
-    # [2/8] Бэкап БД
-    print_message "INFO" "[2/8] Создание бэкапа БД RWP-Shop..."
+    # [3/9] Бэкап БД
+    print_message "INFO" "[3/9] Создание бэкапа БД RWP-Shop..."
     if ! migration_backup_target_db; then
         echo -e "${YELLOW}Продолжить без бэкапа? (y/N):${RESET} "
         read -r skip_backup
         [[ ! "$skip_backup" =~ ^[Yy]$ ]] && return 1
     fi
     
-    # [3/8] Экспорт
-    print_message "INFO" "[3/8] Экспорт данных из архива..."
+    # [4/9] Экспорт
+    print_message "INFO" "[4/9] Экспорт данных из архива..."
     if ! migrate_export_data; then
         print_message "ERROR" "Ошибка экспорта!"
         return 1
     fi
     
-    # [4/8] Балансы
-    print_message "INFO" "[4/8] Анализ балансов пользователей..."
+    # Healthcheck CSV после экспорта
+    print_message "INFO" "      Проверка экспортированных данных..."
+    if ! migration_healthcheck_csv "$MIGRATION_WORK_DIR/export" "false"; then
+        print_message "WARN" "Предупреждения при проверке CSV"
+    fi
+    
+    # [5/9] Балансы
+    print_message "INFO" "[5/9] Анализ балансов пользователей..."
     # Автоматически выбираем export_csv для сохранения
     BALANCE_HANDLING_MODE="export_csv"
     if ! migrate_handle_balances; then
         print_message "WARN" "Предупреждение при анализе балансов"
     fi
     
-    # [5/8] Трансформация
-    print_message "INFO" "[5/8] Трансформация данных..."
+    # [6/9] Трансформация
+    print_message "INFO" "[6/9] Трансформация данных..."
     if ! migrate_transform_data; then
         print_message "ERROR" "Ошибка трансформации!"
         return 1
@@ -8556,7 +9034,13 @@ migration_run_automatic() {
     # Применяем обработку балансов
     migrate_apply_balance_handling 2>/dev/null
     
-    # [6/8] Импорт - требует подтверждения!
+    # Healthcheck трансформированных CSV
+    print_message "INFO" "      Проверка трансформированных данных..."
+    if ! migration_healthcheck_csv "$MIGRATION_WORK_DIR/transform" "false"; then
+        print_message "WARN" "Предупреждения при проверке трансформации"
+    fi
+    
+    # [7/9] Импорт - требует подтверждения!
     migration_show_import_warning
     
     read -erp "Введите 'IMPORT' для подтверждения импорта: " import_confirm
@@ -8565,7 +9049,7 @@ migration_run_automatic() {
         return 0
     fi
     
-    print_message "INFO" "[6/8] Импорт в RWP-Shop..."
+    print_message "INFO" "[7/9] Импорт в RWP-Shop..."
     if ! migrate_import_data; then
         print_message "ERROR" "Ошибка импорта!"
         echo ""
@@ -8574,20 +9058,23 @@ migration_run_automatic() {
         return 1
     fi
     
-    # [7/8] Сохранение непереносимых данных
-    print_message "INFO" "[7/8] Сохранение непереносимых данных..."
+    # [8/9] Сохранение непереносимых данных
+    print_message "INFO" "[8/9] Сохранение непереносимых данных..."
     migration_save_not_migrated_data
     
-    # [8/8] Отчёт
-    print_message "INFO" "[8/8] Генерация отчёта..."
+    # [9/9] Отчёт + Финальный healthcheck
+    print_message "INFO" "[9/9] Генерация отчёта + Финальный healthcheck..."
     migrate_generate_report
+    
+    # Финальный healthcheck БД
+    migration_healthcheck_db_post "true"
     
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
     
     echo ""
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}${BOLD}  ✅ МИГРАЦИЯ ЗАВЕРШЕНА УСПЕШНО!                                    ${RESET}"
+    echo -e "${GREEN}${BOLD}  ✅ МИГРАЦИЯ ЗАВЕРШЕНА!                                            ${RESET}"
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
     echo ""
     echo "  Время выполнения: ${duration}с"
@@ -8655,22 +9142,23 @@ menu_migration() {
         echo " 2. 📥 Выбрать архив Bedolaga"
         echo " 3. 🎯 Настроить приёмник (RWP-Shop)"
         echo " 4. 📊 Анализ данных (превью миграции)"
+        echo -e " 5. 🏥 ${CYAN}Healthcheck${RESET} (проверить архив и БД)"
         echo ""
         
         echo " ─── РУЧНОЕ УПРАВЛЕНИЕ ───"
-        echo " 5. ▶️  Только экспорт данных"
-        echo " 6. 🔄 Только трансформация"
-        echo " 7. 📥 Только импорт в БД"
-        echo " 8. 💰 Анализ балансов пользователей"
+        echo " 6. ▶️  Только экспорт данных"
+        echo " 7. 🔄 Только трансформация"
+        echo " 8. 📥 Только импорт в БД"
+        echo " 9. 💰 Анализ балансов пользователей"
         echo ""
         
         echo -e " ─── НАСТРОЙКИ ───"
-        echo -e " ${CYAN}9. ⚙️  Миграция настроек бота${RESET}"
+        echo -e " ${CYAN}10. ⚙️  Миграция настроек бота${RESET}"
         echo ""
         
         echo " ─── ПОСЛЕ МИГРАЦИИ ───"
-        echo " 10. 📋 Посмотреть последний отчёт"
-        echo " 11. 📁 Открыть папку NOT_MIGRATED"
+        echo " 11. 📋 Посмотреть последний отчёт"
+        echo " 12. 📁 Открыть папку NOT_MIGRATED"
         echo ""
         
         echo " 0. ← Назад в главное меню"
@@ -8699,6 +9187,10 @@ menu_migration() {
                 read -erp "Нажмите Enter..." dummy
                 ;;
             5)
+                # Healthcheck
+                migration_healthcheck_full "true"
+                ;;
+            6)
                 # Только экспорт
                 if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
                     print_message "ERROR" "Сначала выберите архив (пункт 2)"
@@ -8707,22 +9199,26 @@ menu_migration() {
                 fi
                 mkdir -p "$MIGRATION_WORK_DIR"
                 migrate_export_data
+                # Показываем healthcheck CSV после экспорта
+                migration_healthcheck_csv "$MIGRATION_WORK_DIR/export" "true"
                 read -erp "Нажмите Enter..." dummy
                 ;;
-            6)
+            7)
                 # Только трансформация
                 if [[ ! -d "$MIGRATION_WORK_DIR/export" ]]; then
-                    print_message "ERROR" "Сначала выполните экспорт (пункт 5)"
+                    print_message "ERROR" "Сначала выполните экспорт (пункт 6)"
                     read -erp "Enter..." dummy
                     continue
                 fi
                 migrate_transform_data
+                # Показываем healthcheck CSV после трансформации
+                migration_healthcheck_csv "$MIGRATION_WORK_DIR/transform" "true"
                 read -erp "Нажмите Enter..." dummy
                 ;;
-            7)
+            8)
                 # Только импорт
                 if [[ ! -d "$MIGRATION_WORK_DIR/import" ]]; then
-                    print_message "ERROR" "Сначала выполните трансформацию (пункт 6)"
+                    print_message "ERROR" "Сначала выполните трансформацию (пункт 7)"
                     read -erp "Enter..." dummy
                     continue
                 fi
@@ -8732,6 +9228,9 @@ menu_migration() {
                     continue
                 fi
                 
+                # Healthcheck БД перед импортом
+                migration_healthcheck_db_pre "true"
+                
                 # Создаём бэкап перед импортом
                 migration_backup_target_db
                 migration_show_import_warning
@@ -8739,12 +9238,14 @@ menu_migration() {
                 read -erp "Введите 'IMPORT' для подтверждения: " confirm
                 if [[ "$confirm" == "IMPORT" ]]; then
                     migrate_import_data
+                    # Healthcheck БД после импорта
+                    migration_healthcheck_db_post "true"
                 else
                     print_message "INFO" "Импорт отменён"
                 fi
                 read -erp "Нажмите Enter..." dummy
                 ;;
-            8)
+            9)
                 # Анализ балансов
                 mkdir -p "$MIGRATION_WORK_DIR"
                 if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
@@ -8757,11 +9258,11 @@ menu_migration() {
                 fi
                 read -erp "Нажмите Enter..." dummy
                 ;;
-            9)
+            10)
                 # Миграция настроек
                 menu_migrate_settings
                 ;;
-            10)
+            11)
                 # Последний отчёт
                 local report_file="$MIGRATION_WORK_DIR/migration_report.txt"
                 if [[ -f "$report_file" ]]; then
@@ -8779,7 +9280,7 @@ menu_migration() {
                 fi
                 read -erp "Нажмите Enter..." dummy
                 ;;
-            11)
+            12)
                 # Открыть папку NOT_MIGRATED
                 local not_migrated_dir="$MIGRATION_WORK_DIR/NOT_MIGRATED"
                 if [[ -d "$not_migrated_dir" ]]; then
