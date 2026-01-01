@@ -9919,8 +9919,6 @@ migration_healthcheck_full() {
     [[ -d "$MIGRATION_WORK_DIR/export" ]] && { [[ $csv_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} CSV: OK" || echo -e "  ${RED}✗${RESET} CSV: ОШИБКА"; }
     
     echo ""
-    read -erp "Нажмите Enter для продолжения..."
-    
     return 0
 }
 
