@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 480" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+  <!-- Background -->
+  <rect width="600" height="480" fill="#1a1a2e"/>
+  
+  <!-- Terminal window frame -->
+  <rect x="10" y="10" width="580" height="460" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  
+  <!-- Terminal header -->
+  <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
+  <circle cx="30" cy="25" r="6" fill="#ff5f56"/>
+  <circle cx="50" cy="25" r="6" fill="#ffbd2e"/>
+  <circle cx="70" cy="25" r="6" fill="#27ca40"/>
+  <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Автоматическая миграция</text>
+  
+  <!-- Header -->
+  <text x="25" y="65" fill="#22c55e" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <text x="25" y="82" fill="#22c55e" font-size="13" font-weight="bold">       🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ</text>
+  <text x="25" y="99" fill="#22c55e" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  
+  <!-- Progress steps -->
+  <text x="25" y="130" fill="#22c55e" font-size="12">✅ [1/10] Healthcheck архива и БД</text>
+  <text x="25" y="150" fill="#22c55e" font-size="12">✅ [2/10] Анализ архива Bedolaga</text>
+  <text x="25" y="170" fill="#22c55e" font-size="12">✅ [3/10] Создание бэкапа БД RWP-Shop</text>
+  <text x="25" y="190" fill="#22c55e" font-size="12">✅ [4/10] Экспорт данных из архива</text>
+  <text x="25" y="210" fill="#22c55e" font-size="12">✅ [5/10] Анализ балансов пользователей</text>
+  <text x="25" y="230" fill="#22c55e" font-size="12">✅ [6/10] Трансформация данных</text>
+  
+  <!-- Current step (loading) -->
+  <text x="25" y="250" fill="#f59e0b" font-size="12">⏳ [7/10] Импорт в RWP-Shop...</text>
+  
+  <!-- Pending steps -->
+  <text x="25" y="270" fill="#555" font-size="12">⬜ [8/10] Сохранение непереносимых данных</text>
+  <text x="25" y="290" fill="#555" font-size="12">⬜ [9/10] Генерация отчёта + Healthcheck</text>
+  <text x="25" y="310" fill="#555" font-size="12">⬜ [10/10] Миграция настроек (опционально)</text>
+  
+  <!-- Progress bar -->
+  <text x="25" y="350" fill="#888" font-size="11">Прогресс:</text>
+  <rect x="25" y="360" width="550" height="20" rx="4" fill="#333"/>
+  <rect x="25" y="360" width="385" height="20" rx="4" fill="#22c55e"/>
+  <text x="300" y="375" fill="#fff" font-size="11" text-anchor="middle">70%</text>
+  
+  <!-- Details -->
+  <text x="25" y="405" fill="#888" font-size="11">Импорт пользователей: 1,247 / 1,247</text>
+  <text x="25" y="422" fill="#888" font-size="11">Импорт подписок: 892 / 1,089</text>
+  
+  <!-- Spinner animation hint -->
+  <text x="25" y="455" fill="#555" font-size="10">Пожалуйста, подождите...</text>
+</svg>
