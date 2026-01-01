@@ -318,7 +318,7 @@ cd /opt/lazarus-backup
 # 3. Выберите: 4. Полный бэкап (БД + файлы)
 # 4. Дождитесь завершения
 
-# Бэкап будет сохранён в /lazarus/backups/
+# Бэкап будет сохранён в /opt/lazarus-backup/backup/
 ```
 
 #### Способ 2: Ручной бэкап PostgreSQL
@@ -557,7 +557,7 @@ cd /opt/lazarus-backup
    → Подписок: 1089
    → Транзакций: 3456
 ✅ [3/10] Создание бэкапа БД RWP-Shop
-   → /lazarus/backups/pre_migration_20250101_120000.sql
+   → /opt/lazarus-backup/backup/pre_migration_20250101_120000.sql
 ✅ [4/10] Экспорт данных из архива
 ✅ [5/10] Анализ балансов
    ⚠️ 847 пользователей с ненулевым балансом
@@ -579,7 +579,7 @@ cd /opt/lazarus-backup
 │  • База данных: shop                                              │
 │                                                                    │
 │  🔒 Бэкап текущей БД создан:                                       │
-│     /lazarus/backups/pre_migration_20250101_120000.sql            │
+│     /opt/lazarus-backup/backup/pre_migration_20250101_120000.sql  │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 
@@ -614,8 +614,8 @@ cd /opt/lazarus-backup
 ═══════════════════════════════════════════════════════════════════
 
   Время выполнения: 47с
-  Рабочая папка: /lazarus/migration/work_20250101_120000
-  Непереносимые данные: /lazarus/migration/work_20250101_120000/NOT_MIGRATED
+  Рабочая папка: MIGRATION/20250101_120000
+  Непереносимые данные: MIGRATION/20250101_120000/NOT_MIGRATED
 
 ⚠️ Не забудьте:
   • Проверить работу бота
@@ -741,15 +741,23 @@ SELECT COUNT(*) as purchases FROM purchase;
 
 ### Шаг 5: Проверка непереносимых данных
 
+После миграции рабочая папка создаётся в папке RWP-Shop бота:
+
 ```bash
-# Посмотреть что не перенеслось
-ls -la /lazarus/migration/work_*/NOT_MIGRATED/
+# Перейти в папку RWP-Shop
+cd /opt/rwp-shop  # или /opt/private-remnawave-telegram-shop-bot
+
+# Посмотреть рабочие папки миграции
+ls -la MIGRATION/
+
+# Посмотреть что не перенеслось (в последней папке миграции)
+ls -la MIGRATION/*/NOT_MIGRATED/
 
 # Прочитать описание
-cat /lazarus/migration/work_*/NOT_MIGRATED/README.txt
+cat MIGRATION/*/NOT_MIGRATED/README.txt
 
 # Посмотреть балансы пользователей (если есть)
-head -20 /lazarus/migration/work_*/NOT_MIGRATED/user_balances.csv
+head -20 MIGRATION/*/NOT_MIGRATED/user_balances.csv
 ```
 
 ---
@@ -762,7 +770,7 @@ head -20 /lazarus/migration/work_*/NOT_MIGRATED/user_balances.csv
 
 ```bash
 # Посмотреть балансы
-cat /lazarus/migration/work_*/NOT_MIGRATED/user_balances.csv
+cat MIGRATION/*/NOT_MIGRATED/user_balances.csv
 
 # Формат: telegram_id,username,balance_kopeks,balance_rub
 # Пример: 123456789,username,15000,150.00
@@ -784,7 +792,7 @@ cat /lazarus/migration/work_*/NOT_MIGRATED/user_balances.csv
 
 ```bash
 # Посмотреть промокоды на баланс
-cat /lazarus/migration/work_*/NOT_MIGRATED/promocodes_balance_type.csv
+cat MIGRATION/*/NOT_MIGRATED/promocodes_balance_type.csv
 ```
 
 Эти промокоды давали деньги на баланс. В RWP-Shop они не работают.
@@ -829,8 +837,8 @@ stat /путь/к/архиву.tar.gz
 ./lazarus-backup
 # → Миграция → Выбрать архив → Ввести путь
 
-# 4. Если файл на другом сервере - скопировать
-scp user@old-server:/путь/архив.tar.gz /lazarus/archives/
+# 4. Если файл на другом сервере - скопировать в папку RWP-Shop
+scp user@old-server:/путь/архив.tar.gz /opt/rwp-shop/
 ```
 
 ---
@@ -860,7 +868,7 @@ docker exec -it rwp-shop-postgres psql -U shop -d shop -c "SELECT 1"
 docker compose down && docker compose up -d
 
 # 5. Проверить настройки в LAZARUS config.env
-cat /lazarus/config.env | grep RWP
+cat /opt/lazarus-backup/config.env | grep RWP
 ```
 
 **Правильные настройки в config.env:**
@@ -908,7 +916,7 @@ gpg --decrypt архив.tar.gz.gpg > архив.tar.gz
 
 ```bash
 # Вариант 1: Откатить к бэкапу и повторить
-docker exec -i rwp-shop-postgres psql -U shop -d shop < /lazarus/backups/pre_migration_XXXXXX.sql
+docker exec -i rwp-shop-postgres psql -U shop -d shop < /opt/lazarus-backup/backup/pre_migration_XXXXXX.sql
 
 # Вариант 2: Очистить таблицы (ОСТОРОЖНО!)
 docker exec -it rwp-shop-postgres psql -U shop -d shop
@@ -960,7 +968,7 @@ cat database_backups/users.json | python3 -m json.tool | head -50
 **Что делать:**
 - **Подождите** — процесс идёт нормально
 - Не прерывайте импорт!
-- Мониторьте прогресс по логу: `tail -f /lazarus/logs/lazarus.log`
+- Мониторьте прогресс по логу: `tail -f /var/log/lazarus_backup.log`
 
 ---
 
@@ -970,7 +978,7 @@ cat database_backups/users.json | python3 -m json.tool | head -50
 
 ```bash
 # 1. Найти бэкап (создаётся автоматически перед импортом)
-ls -la /lazarus/backups/ | grep pre_migration
+ls -la /opt/lazarus-backup/backup/ | grep pre_migration
 
 # Пример вывода:
 # -rw-r--r-- 1 root root 12M Jan 15 12:00 pre_migration_20250115_120000.sql
@@ -980,7 +988,7 @@ cd /opt/rwp-shop
 docker compose stop bot
 
 # 3. Восстановить БД
-docker exec -i rwp-shop-postgres psql -U shop -d shop < /lazarus/backups/pre_migration_20250115_120000.sql
+docker exec -i rwp-shop-postgres psql -U shop -d shop < /opt/lazarus-backup/backup/pre_migration_20250115_120000.sql
 
 # 4. Запустить бота
 docker compose start bot
@@ -1032,7 +1040,7 @@ docker exec -it rwp-shop-postgres psql -U shop -d shop -c "SELECT COUNT(*) FROM 
 
 ```bash
 # Логи LAZARUS
-tail -100 /lazarus/logs/lazarus.log
+tail -100 /var/log/lazarus_backup.log
 
 # Логи бота RWP-Shop
 docker compose logs bot --tail 100
@@ -1052,7 +1060,7 @@ docker compose logs 2>&1 | grep -i "error\|exception\|fail"
 
 1. **Проверьте логи:**
    ```bash
-   cat /lazarus/logs/lazarus.log | tail -100
+   tail -100 /var/log/lazarus_backup.log
    ```
 
 2. **Создайте Issue на GitHub:**
