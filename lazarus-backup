@@ -10116,26 +10116,21 @@ migration_show_detailed_analysis() {
     local balance_rub=$(echo "scale=2; ${total_balance:-0} / 100" | bc 2>/dev/null || echo "0")
     
     echo -e "${GREEN}  БУДЕТ ПЕРЕНЕСЕНО:${RESET}"
-    echo "  +------------------------------------+----------+--------------+"
-    printf "  | %-34s | %8s | %-12s |\n" "Данные" "Записей" "Статус"
-    echo "  +------------------------------------+----------+--------------+"
-    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Пользователи -> customer" "${users:-0}" "Готово"
-    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Реферальные связи -> referral" "${referrals:-0}" "Готово"
-    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Подписки -> customer.*" "${subscriptions:-0}" "Активные"
-    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Транзакции -> purchase" "${transactions:-0}" "Готово"
-    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Промокоды -> promo" "${promocodes:-0}" "Готово"
-    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Тикеты -> support_ticket" "${tickets:-0}" "Готово"
-    echo "  +------------------------------------+----------+--------------+"
+    echo ""
+    printf "    %-40s %10s   %s\n" "Bedolaga" "Записей" "RWP-Shop"
+    echo "    ────────────────────────────────────────────────────────────────"
+    printf "    %-40s %10s   %s\n" "users" "${users:-0}" "-> customer"
+    printf "    %-40s %10s   %s\n" "referrals" "${referrals:-0}" "-> referral"
+    printf "    %-40s %10s   %s\n" "subscriptions (active)" "${subscriptions:-0}" "-> customer.*"
+    printf "    %-40s %10s   %s\n" "transactions" "${transactions:-0}" "-> purchase"
+    printf "    %-40s %10s   %s\n" "promocodes" "${promocodes:-0}" "-> promo"
+    printf "    %-40s %10s   %s\n" "tickets" "${tickets:-0}" "-> support_ticket"
     echo ""
     
     if [[ "${users_with_balance:-0}" -gt 0 ]]; then
-        echo -e "${YELLOW}  НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в файлы):${RESET}"
-        echo "  +------------------------------------+------------------------------+"
-        printf "  | %-34s | %-28s |\n" "Данные" "Причина"
-        echo "  +------------------------------------+------------------------------+"
-        printf "  | %-34s | %-28s |\n" "Балансы ($users_with_balance юзеров)" "Разные единицы измерения"
-        printf "  |   %-32s | %-28s |\n" "Сумма: ${balance_rub} руб." "-> user_balances.csv"
-        echo "  +------------------------------------+------------------------------+"
+        echo -e "${YELLOW}  НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в CSV):${RESET}"
+        echo ""
+        printf "    %-40s %10s   %s\n" "balances ($users_with_balance users)" "${balance_rub} RUB" "-> NOT_MIGRATED/"
         echo ""
     fi
     
