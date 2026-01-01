@@ -5565,12 +5565,12 @@ migrate_transform_data() {
             # Конвертация balance из копеек в рубли
             local balance_rub=0
             if [[ -n "$balance_kopeks" && "$balance_kopeks" != "0" ]]; then
-                balance_rub=$(echo "scale=2; $balance_kopeks / 100" | bc 2>/dev/null || echo "0")
+                balance_rub=$(awk "BEGIN {printf \"%.2f\", $balance_kopeks/100}")
             fi
             
             local referral_rub=0
             if [[ -n "$referral_balance" && "$referral_balance" != "0" ]]; then
-                referral_rub=$(echo "scale=2; $referral_balance / 100" | bc 2>/dev/null || echo "0")
+                referral_rub=$(awk "BEGIN {printf \"%.2f\", $referral_balance/100}")
             fi
             
             # Язык: ru/en (Bedolaga) → ru/en (Remnawave)
@@ -5603,7 +5603,7 @@ migrate_transform_data() {
             # Конвертация amount из копеек в рубли
             local amount_rub=0
             if [[ -n "$amount" && "$amount" != "0" ]]; then
-                amount_rub=$(echo "scale=2; $amount / 100" | bc 2>/dev/null || echo "0")
+                amount_rub=$(awk "BEGIN {printf \"%.2f\", $amount/100}")
             fi
             
             # Маппинг payment_method → invoice_type (используем case вместо ассоциативного массива)
@@ -8900,11 +8900,11 @@ try:
         bal_kop = u.get('balance_kopeks', 0) or 0
         bal_rub = u.get('balance', 0) or 0
         # Если есть balance_kopeks — используем его, иначе конвертируем balance из рублей
-        if bal_kop > 0:
+        if bal_kop != 0:
             total_balance_kopeks += bal_kop
             users_with_balance += 1
-        elif bal_rub > 0:
-            total_balance_kopeks += int(bal_rub * 100)
+        elif bal_rub != 0:
+            total_balance_kopeks += int(float(bal_rub) * 100)
             users_with_balance += 1
     
     # Подсчёт рефералов
@@ -10112,8 +10112,13 @@ migration_show_detailed_analysis() {
     local total_balance=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^total_balance_kopeks:" | cut -d: -f2)
     local users_with_balance=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^users_with_balance:" | cut -d: -f2)
     
-    # Конвертируем копейки в рубли
-    local balance_rub=$(echo "scale=2; ${total_balance:-0} / 100" | bc 2>/dev/null || echo "0")
+    # Конвертируем копейки в рубли (без bc, используем awk)
+    local balance_rub
+    if [[ -n "$total_balance" && "$total_balance" != "0" ]]; then
+        balance_rub=$(awk "BEGIN {printf \"%.2f\", ${total_balance}/100}")
+    else
+        balance_rub="0.00"
+    fi
     
     echo -e "${GREEN}  БУДЕТ ПЕРЕНЕСЕНО:${RESET}"
     echo ""
