@@ -2,11 +2,14 @@
 
 <div align="center">
 
+### 🌐 Language / Язык
+
+[![English](https://img.shields.io/badge/🇬🇧_English-blue?style=for-the-badge)](README.en.md)
+[![Русский](https://img.shields.io/badge/🇷🇺_Русский-green?style=for-the-badge)](README.md)
+
 ![Version](https://img.shields.io/badge/version-1.0--beta-orange)
 ![Status](https://img.shields.io/badge/status-TESTING-yellow)
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
-
-**🇬🇧 [English version](README.en.md)**
 
 **Полное руководство по миграции данных из Telegram-бота Bedolaga в RWP-Shop (RemnaWave Panel Shop)**
 
