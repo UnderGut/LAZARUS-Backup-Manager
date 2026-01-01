@@ -8863,9 +8863,19 @@ try:
     subscriptions = tables.get('subscriptions', [])
     tickets = tables.get('tickets', [])
     
-    # Подсчёт балансов
-    total_balance = sum(u.get('balance', u.get('balance_kopeks', 0)) or 0 for u in users)
-    users_with_balance = sum(1 for u in users if (u.get('balance', u.get('balance_kopeks', 0)) or 0) > 0)
+    # Подсчёт балансов (учитываем что balance может быть в рублях, balance_kopeks - в копейках)
+    total_balance_kopeks = 0
+    users_with_balance = 0
+    for u in users:
+        bal_kop = u.get('balance_kopeks', 0) or 0
+        bal_rub = u.get('balance', 0) or 0
+        # Если есть balance_kopeks — используем его, иначе конвертируем balance из рублей
+        if bal_kop > 0:
+            total_balance_kopeks += bal_kop
+            users_with_balance += 1
+        elif bal_rub > 0:
+            total_balance_kopeks += int(bal_rub * 100)
+            users_with_balance += 1
     
     # Подсчёт рефералов
     referrals = sum(1 for u in users if u.get('referred_by_id'))
@@ -8876,7 +8886,7 @@ try:
     print(f"subscriptions:{len(subscriptions)}")
     print(f"tickets:{len(tickets)}")
     print(f"referrals:{referrals}")
-    print(f"total_balance_kopeks:{total_balance}")
+    print(f"total_balance_kopeks:{total_balance_kopeks}")
     print(f"users_with_balance:{users_with_balance}")
     
 except Exception as e:
@@ -9998,26 +10008,26 @@ migration_show_detailed_analysis() {
     local balance_rub=$(echo "scale=2; ${total_balance:-0} / 100" | bc 2>/dev/null || echo "0")
     
     echo -e "${GREEN}  БУДЕТ ПЕРЕНЕСЕНО:${RESET}"
-    echo "  +-------------------------------------+----------+----------------+"
-    printf "  | %-35s | %8s | %-14s |\n" "Данные" "Записей" "Статус"
-    echo "  +-------------------------------------+----------+----------------+"
-    printf "  | Пользователи -> customer           | %8s | ${GREEN}%-14s${RESET} |\n" "${users:-0}" "Готово"
-    printf "  | Реферальные связи -> referral      | %8s | ${GREEN}%-14s${RESET} |\n" "${referrals:-0}" "Готово"
-    printf "  | Подписки -> customer.*             | %8s | ${GREEN}%-14s${RESET} |\n" "${subscriptions:-0}" "Активные"
-    printf "  | Транзакции -> purchase             | %8s | ${GREEN}%-14s${RESET} |\n" "${transactions:-0}" "Готово"
-    printf "  | Промокоды -> promo                 | %8s | ${GREEN}%-14s${RESET} |\n" "${promocodes:-0}" "Готово"
-    printf "  | Тикеты -> support_ticket           | %8s | ${GREEN}%-14s${RESET} |\n" "${tickets:-0}" "Готово"
-    echo "  +-------------------------------------+----------+----------------+"
+    echo "  +------------------------------------+----------+--------------+"
+    printf "  | %-34s | %8s | %-12s |\n" "Данные" "Записей" "Статус"
+    echo "  +------------------------------------+----------+--------------+"
+    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Пользователи -> customer" "${users:-0}" "Готово"
+    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Реферальные связи -> referral" "${referrals:-0}" "Готово"
+    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Подписки -> customer.*" "${subscriptions:-0}" "Активные"
+    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Транзакции -> purchase" "${transactions:-0}" "Готово"
+    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Промокоды -> promo" "${promocodes:-0}" "Готово"
+    printf "  | %-34s | %8s | ${GREEN}%-12s${RESET} |\n" "Тикеты -> support_ticket" "${tickets:-0}" "Готово"
+    echo "  +------------------------------------+----------+--------------+"
     echo ""
     
     if [[ "${users_with_balance:-0}" -gt 0 ]]; then
         echo -e "${YELLOW}  НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в файлы):${RESET}"
-        echo "  +-------------------------------------+--------------------------------+"
-        printf "  | %-35s | %-30s |\n" "Данные" "Причина"
-        echo "  +-------------------------------------+--------------------------------+"
-        printf "  | Балансы (%-3s юзеров)               | Разные единицы измерения       |\n" "$users_with_balance"
-        printf "  |   Сумма: %-26s | -> user_balances.csv           |\n" "${balance_rub} руб."
-        echo "  +-------------------------------------+--------------------------------+"
+        echo "  +------------------------------------+------------------------------+"
+        printf "  | %-34s | %-28s |\n" "Данные" "Причина"
+        echo "  +------------------------------------+------------------------------+"
+        printf "  | %-34s | %-28s |\n" "Балансы ($users_with_balance юзеров)" "Разные единицы измерения"
+        printf "  |   %-32s | %-28s |\n" "Сумма: ${balance_rub} руб." "-> user_balances.csv"
+        echo "  +------------------------------------+------------------------------+"
         echo ""
     fi
     
