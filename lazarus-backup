@@ -6585,10 +6585,10 @@ extract_bedolaga_backup() {
     if [[ "$file_ext" == "zip" ]] || [[ "$file_name" == *.tar.zip ]]; then
         debug_log "MIGRATE" "Detected password-protected ZIP archive"
         
-        # Проверяем наличие unzip
-        if ! command -v unzip &>/dev/null; then
-            print_message "ERROR" "Для распаковки защищённых архивов требуется unzip"
-            print_message "INFO" "Установите: apt install unzip"
+        # Проверяем наличие unzip и устанавливаем если нет
+        if ! ensure_unzip_installed; then
+            print_message "ERROR" "Не удалось установить unzip автоматически"
+            print_message "INFO" "Установите вручную: apt install unzip / yum install unzip"
             return 1
         fi
         
@@ -8164,6 +8164,9 @@ migration_quick_analyze() {
         return 1
     fi
     
+    # Убеждаемся что unzip установлен (для ZIP архивов)
+    ensure_unzip_installed 2>/dev/null
+    
     # Создаём временную папку для анализа
     local temp_dir=$(mktemp -d)
     TEMP_DIRS+=("$temp_dir")
@@ -8466,6 +8469,38 @@ detect_bedolaga_archive_type() {
     esac
 }
 
+# --- Функция: Проверить и установить unzip если нужно ---
+ensure_unzip_installed() {
+    # Если уже установлен — ничего не делаем
+    command -v unzip &>/dev/null && return 0
+    
+    debug_log "MIGRATE" "unzip not found, attempting auto-install"
+    
+    # Пытаемся установить в зависимости от пакетного менеджера
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq 2>/dev/null && apt-get install -y -qq unzip >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q unzip >/dev/null 2>&1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q unzip >/dev/null 2>&1
+    elif command -v apk &>/dev/null; then
+        apk add --quiet unzip >/dev/null 2>&1
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm --quiet unzip >/dev/null 2>&1
+    elif command -v zypper &>/dev/null; then
+        zypper install -y -q unzip >/dev/null 2>&1
+    fi
+    
+    # Проверяем успешность
+    if command -v unzip &>/dev/null; then
+        debug_log "MIGRATE" "unzip installed successfully"
+        return 0
+    else
+        debug_log "MIGRATE" "Failed to install unzip"
+        return 1
+    fi
+}
+
 # --- Функция: Проверить, требует ли архив пароль ---
 is_archive_password_protected() {
     local archive_path="$1"
@@ -8474,6 +8509,9 @@ is_archive_password_protected() {
     if [[ "$archive_type" != "zip" ]]; then
         return 1  # Только ZIP может быть защищён паролем
     fi
+    
+    # Убеждаемся что unzip установлен
+    ensure_unzip_installed || return 1
     
     # Проверяем флаги шифрования в ZIP
     # unzip -t без пароля вернёт ошибку если архив защищён
@@ -8492,6 +8530,9 @@ migration_healthcheck_archive() {
     local verbose="${2:-true}"
     local errors=0
     local warnings=0
+    
+    # Убеждаемся что unzip установлен (для ZIP архивов)
+    ensure_unzip_installed 2>/dev/null
     
     [[ "$verbose" == "true" ]] && echo -e "\n${CYAN}━━━ 🏥 HEALTHCHECK: Архив Bedolaga ━━━${RESET}\n"
     
@@ -9288,6 +9329,9 @@ _migration_set_archive() {
     MIGRATION_SOURCE_TYPE="archive"
     MIGRATION_DATA_ANALYSIS=""  # Сбросить кэш анализа
     BEDOLAGA_BACKUP_PASSWORD=""  # Сбросить пароль
+    
+    # Убеждаемся что unzip установлен (для ZIP архивов)
+    ensure_unzip_installed 2>/dev/null
     
     # Проверяем, требуется ли пароль
     local archive_type=$(detect_bedolaga_archive_type "$archive_path" 2>/dev/null || echo "unknown")
