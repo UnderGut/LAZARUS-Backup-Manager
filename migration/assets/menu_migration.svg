@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 520" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 640" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
   <!-- Background -->
-  <rect width="600" height="520" fill="#1a1a2e"/>
+  <rect width="600" height="640" fill="#1a1a2e"/>
   
   <!-- Terminal window frame -->
-  <rect x="10" y="10" width="580" height="500" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  <rect x="10" y="10" width="580" height="620" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
   
   <!-- Terminal header -->
   <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
@@ -12,47 +12,47 @@
   <circle cx="70" cy="25" r="6" fill="#27ca40"/>
   <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Миграция</text>
   
-  <!-- Header -->
-  <text x="25" y="65" fill="#d946ef" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <!-- Header (MAGENTA) -->
+  <text x="25" y="65" fill="#d946ef" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════════</text>
   <text x="25" y="82" fill="#d946ef" font-size="13" font-weight="bold">       🔄 МИГРАЦИЯ: Bedolaga → RWP-Shop Private</text>
-  <text x="25" y="99" fill="#d946ef" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <text x="25" y="99" fill="#d946ef" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════════</text>
   
-  <!-- Status section -->
-  <text x="25" y="125" fill="#888" font-size="11">📦 Архив: bedolaga_backup_2025-01-01.tar.gz</text>
-  <text x="25" y="140" fill="#888" font-size="11">🎯 Цель:  rwp-shop-postgres (shop)</text>
+  <!-- Status section (from migration_show_status) -->
+  <text x="25" y="130" fill="#888" font-size="11">📦 Архив: bedolaga_backup_2025-01-01.tar.gz</text>
+  <text x="25" y="147" fill="#888" font-size="11">🎯 Цель:  rwp-shop-postgres (shop)</text>
   
-  <!-- Quick Start Section -->
-  <text x="25" y="170" fill="#22c55e" font-size="12" font-weight="bold">─── БЫСТРЫЙ СТАРТ ───</text>
-  <text x="25" y="190" fill="#22c55e" font-size="13" font-weight="bold"> 1. 🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ</text>
-  <text x="285" y="190" fill="#888" font-size="12">(рекомендуется)</text>
-  <text x="40" y="206" fill="#555" font-size="11">Перенесёт все данные с подтверждением на каждом этапе</text>
+  <!-- БЫСТРЫЙ СТАРТ (GREEN) -->
+  <text x="25" y="182" fill="#22c55e" font-size="12">─── БЫСТРЫЙ СТАРТ ───</text>
+  <text x="25" y="204" fill="#22c55e" font-size="13" font-weight="bold"> 1. 🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ</text>
+  <text x="295" y="204" fill="#888" font-size="12">(рекомендуется)</text>
+  <text x="40" y="222" fill="#555" font-size="11">Перенесёт все данные с подтверждением на каждом этапе</text>
   
-  <!-- Step-by-step Section -->
-  <text x="25" y="235" fill="#aaa" font-size="12">─── ПОШАГОВЫЙ РЕЖИМ ───</text>
-  <text x="25" y="255" fill="#e2e8f0" font-size="12"> 2. 📥 Выбрать архив Bedolaga</text>
-  <text x="25" y="273" fill="#e2e8f0" font-size="12"> 3. 🎯 Настроить приёмник (RWP-Shop)</text>
-  <text x="25" y="291" fill="#e2e8f0" font-size="12"> 4. 📊 Анализ данных (превью миграции)</text>
-  <text x="25" y="309" fill="#e2e8f0" font-size="12"> 5. 🏥 <tspan fill="#06b6d4">Healthcheck</tspan> (проверить архив и БД)</text>
+  <!-- ПОШАГОВЫЙ РЕЖИМ -->
+  <text x="25" y="257" fill="#e2e8f0" font-size="12">─── ПОШАГОВЫЙ РЕЖИМ ───</text>
+  <text x="25" y="279" fill="#e2e8f0" font-size="12"> 2. 📥 Выбрать архив Bedolaga</text>
+  <text x="25" y="297" fill="#e2e8f0" font-size="12"> 3. 🎯 Настроить приёмник (RWP-Shop)</text>
+  <text x="25" y="315" fill="#e2e8f0" font-size="12"> 4. 📊 Анализ данных (превью миграции)</text>
+  <text x="25" y="333" fill="#e2e8f0" font-size="12"> 5. 🏥 <tspan fill="#06b6d4">Healthcheck</tspan> (проверить архив и БД)</text>
   
-  <!-- Manual Control Section -->
-  <text x="25" y="338" fill="#aaa" font-size="12">─── РУЧНОЕ УПРАВЛЕНИЕ ───</text>
-  <text x="25" y="358" fill="#e2e8f0" font-size="12"> 6. ▶️  Только экспорт данных</text>
-  <text x="25" y="376" fill="#e2e8f0" font-size="12"> 7. 🔄 Только трансформация</text>
-  <text x="25" y="394" fill="#e2e8f0" font-size="12"> 8. 📥 Только импорт в БД</text>
-  <text x="25" y="412" fill="#e2e8f0" font-size="12"> 9. 💰 Анализ балансов пользователей</text>
+  <!-- РУЧНОЕ УПРАВЛЕНИЕ -->
+  <text x="25" y="368" fill="#e2e8f0" font-size="12">─── РУЧНОЕ УПРАВЛЕНИЕ ───</text>
+  <text x="25" y="390" fill="#e2e8f0" font-size="12"> 6. ▶️  Только экспорт данных</text>
+  <text x="25" y="408" fill="#e2e8f0" font-size="12"> 7. 🔄 Только трансформация</text>
+  <text x="25" y="426" fill="#e2e8f0" font-size="12"> 8. 📥 Только импорт в БД</text>
+  <text x="25" y="444" fill="#e2e8f0" font-size="12"> 9. 💰 Анализ балансов пользователей</text>
   
-  <!-- Settings Section -->
-  <text x="25" y="441" fill="#aaa" font-size="12">─── НАСТРОЙКИ ───</text>
-  <text x="25" y="461" fill="#06b6d4" font-size="12">10. ⚙️  Миграция настроек бота</text>
+  <!-- НАСТРОЙКИ -->
+  <text x="25" y="479" fill="#e2e8f0" font-size="12">─── НАСТРОЙКИ ───</text>
+  <text x="25" y="501" fill="#06b6d4" font-size="12">10. ⚙️  Миграция настроек бота</text>
   
-  <!-- After Migration Section -->
-  <text x="300" y="338" fill="#aaa" font-size="12">─── ПОСЛЕ МИГРАЦИИ ───</text>
-  <text x="300" y="358" fill="#e2e8f0" font-size="12">11. 📋 Посмотреть последний отчёт</text>
-  <text x="300" y="376" fill="#e2e8f0" font-size="12">12. 📁 Открыть папку NOT_MIGRATED</text>
+  <!-- ПОСЛЕ МИГРАЦИИ -->
+  <text x="25" y="536" fill="#e2e8f0" font-size="12">─── ПОСЛЕ МИГРАЦИИ ───</text>
+  <text x="25" y="558" fill="#e2e8f0" font-size="12">11. 📋 Посмотреть последний отчёт</text>
+  <text x="25" y="576" fill="#e2e8f0" font-size="12">12. 📁 Открыть папку NOT_MIGRATED</text>
   
   <!-- Back -->
-  <text x="25" y="490" fill="#e2e8f0" font-size="12"> 0. ← Назад в главное меню</text>
+  <text x="25" y="611" fill="#e2e8f0" font-size="12"> 0. ← Назад в главное меню</text>
   
   <!-- Cursor -->
-  <text x="25" y="508" fill="#888" font-size="11">Выбор (Enter - Назад): <tspan fill="#22c55e">█</tspan></text>
+  <text x="25" y="635" fill="#888" font-size="11">Выбор (Enter - Назад): <tspan fill="#22c55e">█</tspan></text>
 </svg>

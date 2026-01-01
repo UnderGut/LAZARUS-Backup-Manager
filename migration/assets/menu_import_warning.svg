@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 380" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
   <!-- Background -->
-  <rect width="600" height="400" fill="#1a1a2e"/>
+  <rect width="600" height="380" fill="#1a1a2e"/>
   
   <!-- Terminal window frame -->
-  <rect x="10" y="10" width="580" height="380" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  <rect x="10" y="10" width="580" height="360" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
   
   <!-- Terminal header -->
   <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
@@ -12,30 +12,57 @@
   <circle cx="70" cy="25" r="6" fill="#27ca40"/>
   <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Подтверждение импорта</text>
   
-  <!-- Header (warning) -->
-  <text x="25" y="65" fill="#ef4444" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
-  <text x="25" y="82" fill="#ef4444" font-size="13" font-weight="bold">       ⚠️  ВНИМАНИЕ: ИМПОРТ ДАННЫХ</text>
-  <text x="25" y="99" fill="#ef4444" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <!-- Warning box (RED) -->
+  <text x="25" y="65" fill="#ef4444" font-size="11" font-weight="bold">┌────────────────────────────────────────────────────────────────────┐</text>
+  <text x="25" y="82" fill="#ef4444" font-size="11" font-weight="bold">│  ⚠️ ВНИМАНИЕ! ИЗМЕНЕНИЕ БАЗЫ ДАННЫХ                               │</text>
+  <text x="25" y="99" fill="#ef4444" font-size="11" font-weight="bold">├────────────────────────────────────────────────────────────────────┤</text>
   
-  <!-- Warning message -->
-  <text x="25" y="130" fill="#f59e0b" font-size="12">Будет выполнен импорт данных в БД RWP-Shop!</text>
+  <!-- Content -->
+  <text x="25" y="116" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="563" y="116" fill="#ef4444" font-size="11" font-weight="bold">│</text>
   
-  <!-- Conflict box -->
-  <rect x="25" y="150" width="550" height="100" rx="4" fill="#1c1917" stroke="#f59e0b" stroke-width="1"/>
-  <text x="35" y="172" fill="#f59e0b" font-size="11" font-weight="bold">⚠️ КОНФЛИКТЫ (insert_mode = update):</text>
-  <text x="35" y="195" fill="#e2e8f0" font-size="11">• Если пользователь УЖЕ существует в RWP-Shop:</text>
-  <text x="45" y="212" fill="#06b6d4" font-size="11">→ Данные будут ОБНОВЛЕНЫ из Bedolaga</text>
-  <text x="35" y="235" fill="#e2e8f0" font-size="11">• Если транзакция с таким ID существует:</text>
-  <text x="45" y="252" fill="#06b6d4" font-size="11">→ Будет ОБНОВЛЕНА данными из Bedolaga</text>
+  <text x="25" y="133" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="35" y="133" fill="#e2e8f0" font-size="11">Сейчас будут внесены изменения в БД RWP-Shop:</text>
+  <text x="563" y="133" fill="#ef4444" font-size="11" font-weight="bold">│</text>
   
-  <!-- Backup info -->
-  <text x="25" y="285" fill="#22c55e" font-size="11">🛡️ Бэкап создан:</text>
-  <text x="25" y="302" fill="#888" font-size="10">/lazarus/backups/pre_migration_20250101_120000.sql</text>
+  <text x="25" y="150" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="563" y="150" fill="#ef4444" font-size="11" font-weight="bold">│</text>
   
-  <!-- Rollback hint -->
-  <text x="25" y="330" fill="#888" font-size="10">Для отката: docker exec -i postgres psql -U shop -d shop &lt; backup.sql</text>
+  <text x="25" y="167" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="35" y="167" fill="#e2e8f0" font-size="11">• Контейнер: <tspan fill="#f59e0b">rwp-shop-postgres</tspan></text>
+  <text x="563" y="167" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="184" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="35" y="184" fill="#e2e8f0" font-size="11">• База данных: <tspan fill="#f59e0b">shop</tspan></text>
+  <text x="563" y="184" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="201" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="563" y="201" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="218" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="35" y="218" fill="#22c55e" font-size="11">🔒 Бэкап текущей БД создан:</text>
+  <text x="563" y="218" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="235" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="45" y="235" fill="#555" font-size="10">/lazarus/backups/pre_migration_20250101_120000.sql</text>
+  <text x="563" y="235" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="252" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="563" y="252" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="269" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="35" y="269" fill="#e2e8f0" font-size="11">Для отката выполните:</text>
+  <text x="563" y="269" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="286" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="35" y="286" fill="#555" font-size="9">docker exec -i rwp-shop-postgres psql -U shop &lt; backup.sql</text>
+  <text x="563" y="286" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="303" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  <text x="563" y="303" fill="#ef4444" font-size="11" font-weight="bold">│</text>
+  
+  <text x="25" y="320" fill="#ef4444" font-size="11" font-weight="bold">└────────────────────────────────────────────────────────────────────┘</text>
   
   <!-- Prompt -->
-  <rect x="25" y="350" width="550" height="30" rx="4" fill="#1c1917" stroke="#ef4444" stroke-width="1"/>
-  <text x="35" y="370" fill="#ef4444" font-size="12">Введите 'IMPORT' для подтверждения: <tspan fill="#22c55e">█</tspan></text>
+  <text x="25" y="355" fill="#888" font-size="11">Введите 'IMPORT' для подтверждения: <tspan fill="#22c55e">█</tspan></text>
 </svg>

@@ -1,9 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 500" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 380" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
   <!-- Background -->
-  <rect width="600" height="500" fill="#1a1a2e"/>
+  <rect width="600" height="380" fill="#1a1a2e"/>
   
   <!-- Terminal window frame -->
-  <rect x="10" y="10" width="580" height="480" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  <rect x="10" y="10" width="580" height="360" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
   
   <!-- Terminal header -->
   <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
@@ -12,76 +12,24 @@
   <circle cx="70" cy="25" r="6" fill="#27ca40"/>
   <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Результаты миграции</text>
   
-  <!-- Header (success) -->
-  <text x="25" y="65" fill="#22c55e" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
-  <text x="25" y="82" fill="#22c55e" font-size="13" font-weight="bold">       ✅ МИГРАЦИЯ ЗАВЕРШЕНА!</text>
-  <text x="25" y="99" fill="#22c55e" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
-  
-  <!-- Results label -->
-  <text x="25" y="130" fill="#06b6d4" font-size="12" font-weight="bold">📊 Результаты импорта:</text>
-  
-  <!-- Results table header -->
-  <text x="25" y="155" fill="#22c55e" font-size="11">┌───────────────────────┬──────────┬──────────┬──────────┐</text>
-  <text x="25" y="172" fill="#22c55e" font-size="11">│ Тип данных            │  Всего   │  Успешно │  Ошибки  │</text>
-  <text x="25" y="189" fill="#22c55e" font-size="11">├───────────────────────┼──────────┼──────────┼──────────┤</text>
-  
-  <!-- Users -->
-  <text x="25" y="206" fill="#e2e8f0" font-size="11">│ 👤 Пользователи       │</text>
-  <text x="270" y="206" fill="#e2e8f0" font-size="11">1,247</text>
-  <text x="317" y="206" fill="#e2e8f0" font-size="11">│</text>
-  <text x="350" y="206" fill="#22c55e" font-size="11">1,247</text>
-  <text x="397" y="206" fill="#e2e8f0" font-size="11">│</text>
-  <text x="440" y="206" fill="#22c55e" font-size="11">0</text>
-  <text x="477" y="206" fill="#e2e8f0" font-size="11">│</text>
-  
-  <!-- Subscriptions -->
-  <text x="25" y="223" fill="#e2e8f0" font-size="11">│ 📋 Подписки           │</text>
-  <text x="270" y="223" fill="#e2e8f0" font-size="11">1,089</text>
-  <text x="317" y="223" fill="#e2e8f0" font-size="11">│</text>
-  <text x="350" y="223" fill="#22c55e" font-size="11">1,085</text>
-  <text x="397" y="223" fill="#e2e8f0" font-size="11">│</text>
-  <text x="440" y="223" fill="#f59e0b" font-size="11">4</text>
-  <text x="477" y="223" fill="#e2e8f0" font-size="11">│</text>
-  
-  <!-- Transactions -->
-  <text x="25" y="240" fill="#e2e8f0" font-size="11">│ 💳 Транзакции         │</text>
-  <text x="270" y="240" fill="#e2e8f0" font-size="11">3,456</text>
-  <text x="317" y="240" fill="#e2e8f0" font-size="11">│</text>
-  <text x="350" y="240" fill="#22c55e" font-size="11">3,456</text>
-  <text x="397" y="240" fill="#e2e8f0" font-size="11">│</text>
-  <text x="440" y="240" fill="#22c55e" font-size="11">0</text>
-  <text x="477" y="240" fill="#e2e8f0" font-size="11">│</text>
-  
-  <!-- Promocodes -->
-  <text x="25" y="257" fill="#e2e8f0" font-size="11">│ 🎟️ Промокоды          │</text>
-  <text x="277" y="257" fill="#e2e8f0" font-size="11">42</text>
-  <text x="317" y="257" fill="#e2e8f0" font-size="11">│</text>
-  <text x="357" y="257" fill="#22c55e" font-size="11">38</text>
-  <text x="397" y="257" fill="#e2e8f0" font-size="11">│</text>
-  <text x="440" y="257" fill="#f59e0b" font-size="11">4</text>
-  <text x="477" y="257" fill="#e2e8f0" font-size="11">│</text>
-  
-  <!-- Referrals -->
-  <text x="25" y="274" fill="#e2e8f0" font-size="11">│ 👥 Рефералы           │</text>
-  <text x="273" y="274" fill="#e2e8f0" font-size="11">234</text>
-  <text x="317" y="274" fill="#e2e8f0" font-size="11">│</text>
-  <text x="357" y="274" fill="#22c55e" font-size="11">234</text>
-  <text x="397" y="274" fill="#e2e8f0" font-size="11">│</text>
-  <text x="440" y="274" fill="#22c55e" font-size="11">0</text>
-  <text x="477" y="274" fill="#e2e8f0" font-size="11">│</text>
-  
-  <!-- Table footer -->
-  <text x="25" y="291" fill="#22c55e" font-size="11">└───────────────────────┴──────────┴──────────┴──────────┘</text>
+  <!-- Header (GREEN) -->
+  <text x="25" y="65" fill="#22c55e" font-size="12" font-weight="bold">═══════════════════════════════════════════════════════════════════</text>
+  <text x="25" y="82" fill="#22c55e" font-size="12" font-weight="bold">  ✅ МИГРАЦИЯ ЗАВЕРШЕНА!</text>
+  <text x="25" y="99" fill="#22c55e" font-size="12" font-weight="bold">═══════════════════════════════════════════════════════════════════</text>
   
   <!-- Stats -->
-  <text x="25" y="325" fill="#888" font-size="11">⏱️ Время выполнения: 47 секунд</text>
-  <text x="25" y="345" fill="#888" font-size="11">📁 Рабочая папка: /lazarus/migration/work_20250101_120000</text>
-  <text x="25" y="365" fill="#f59e0b" font-size="11">📁 Непереносимые: /lazarus/migration/.../NOT_MIGRATED</text>
+  <text x="35" y="130" fill="#e2e8f0" font-size="11">Время выполнения: <tspan fill="#06b6d4">47с</tspan></text>
+  <text x="35" y="150" fill="#e2e8f0" font-size="11">Рабочая папка: <tspan fill="#888">/lazarus/migration/work_20250101_120000</tspan></text>
+  <text x="35" y="170" fill="#e2e8f0" font-size="11">Непереносимые данные: <tspan fill="#888">/lazarus/migration/.../NOT_MIGRATED</tspan></text>
   
-  <!-- Reminder box -->
-  <rect x="25" y="385" width="550" height="85" rx="4" fill="#1c1917" stroke="#f59e0b" stroke-width="1"/>
-  <text x="35" y="407" fill="#f59e0b" font-size="11" font-weight="bold">⚠️ Не забудьте:</text>
-  <text x="35" y="427" fill="#e2e8f0" font-size="11">• Проверить работу бота</text>
-  <text x="35" y="447" fill="#e2e8f0" font-size="11">• Перезапустить бота: docker compose restart</text>
-  <text x="35" y="467" fill="#e2e8f0" font-size="11">• Проверить папку NOT_MIGRATED с сохранёнными данными</text>
+  <!-- Warning box -->
+  <text x="25" y="210" fill="#f59e0b" font-size="12" font-weight="bold">⚠️ Не забудьте:</text>
+  <text x="35" y="232" fill="#e2e8f0" font-size="11">• Проверить работу бота</text>
+  <text x="35" y="252" fill="#e2e8f0" font-size="11">• Перезапустить бота: <tspan fill="#06b6d4">docker compose restart</tspan></text>
+  
+  <!-- Additional info from report -->
+  <text x="25" y="295" fill="#555" font-size="10">Отчёт сохранён в: /lazarus/migration/work_20250101_120000/migration_report.txt</text>
+  
+  <!-- Prompt -->
+  <text x="25" y="345" fill="#888" font-size="11">Нажмите Enter...</text>
 </svg>

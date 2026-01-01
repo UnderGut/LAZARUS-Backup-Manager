@@ -1,58 +1,45 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 420" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 480" font-family="'Consolas', 'Monaco', 'Courier New', monospace">
   <!-- Background -->
-  <rect width="600" height="420" fill="#1a1a2e"/>
+  <rect width="600" height="480" fill="#1a1a2e"/>
   
   <!-- Terminal window frame -->
-  <rect x="10" y="10" width="580" height="400" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
+  <rect x="10" y="10" width="580" height="460" rx="8" fill="#0d0d1a" stroke="#333" stroke-width="1"/>
   
   <!-- Terminal header -->
   <rect x="10" y="10" width="580" height="30" rx="8" fill="#252540"/>
   <circle cx="30" cy="25" r="6" fill="#ff5f56"/>
   <circle cx="50" cy="25" r="6" fill="#ffbd2e"/>
   <circle cx="70" cy="25" r="6" fill="#27ca40"/>
-  <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Анализ архива</text>
+  <text x="300" y="29" fill="#888" text-anchor="middle" font-size="12">LAZARUS — Анализ данных</text>
   
-  <!-- Header -->
-  <text x="25" y="65" fill="#f59e0b" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
-  <text x="25" y="82" fill="#f59e0b" font-size="13" font-weight="bold">       📊 АНАЛИЗ АРХИВА BEDOLAGA</text>
-  <text x="25" y="99" fill="#f59e0b" font-size="13" font-weight="bold">═══════════════════════════════════════════════════════════════</text>
+  <!-- Header (CYAN) -->
+  <text x="25" y="65" fill="#06b6d4" font-size="12" font-weight="bold">+----------------------------------------------------------------------+</text>
+  <text x="25" y="82" fill="#06b6d4" font-size="12" font-weight="bold">|  АНАЛИЗ ДАННЫХ: backup_20250101_120000.tar.gz                        |</text>
+  <text x="25" y="99" fill="#06b6d4" font-size="12" font-weight="bold">+----------------------------------------------------------------------+</text>
   
-  <!-- Archive info -->
-  <text x="25" y="130" fill="#888" font-size="11">📦 Архив: bedolaga_backup_2025-01-01.tar.gz</text>
-  <text x="25" y="148" fill="#888" font-size="11">📅 Дата создания: 2025-01-01 12:00:00</text>
-  <text x="25" y="166" fill="#888" font-size="11">📁 Размер: 245 MB</text>
+  <!-- Section: БУДЕТ ПЕРЕНЕСЕНО -->
+  <text x="35" y="135" fill="#22c55e" font-size="12">БУДЕТ ПЕРЕНЕСЕНО:</text>
   
   <!-- Table header -->
-  <text x="25" y="200" fill="#22c55e" font-size="12">┌─────────────────────────┬────────────────┐</text>
-  <text x="25" y="218" fill="#22c55e" font-size="12">│ Тип данных              │   Количество   │</text>
-  <text x="25" y="236" fill="#22c55e" font-size="12">├─────────────────────────┼────────────────┤</text>
+  <text x="50" y="162" fill="#888" font-size="11">Bedolaga                                  Записей   RWP-Shop</text>
+  <text x="50" y="177" fill="#555" font-size="11">────────────────────────────────────────────────────────────────</text>
   
   <!-- Table rows -->
-  <text x="25" y="254" fill="#e2e8f0" font-size="12">│ 👤 Пользователи         │</text>
-  <text x="315" y="254" fill="#06b6d4" font-size="12" font-weight="bold">1,247</text>
-  <text x="370" y="254" fill="#e2e8f0" font-size="12">│</text>
+  <text x="50" y="195" fill="#e2e8f0" font-size="11">users                                       1,247   -&gt; customer</text>
+  <text x="50" y="213" fill="#e2e8f0" font-size="11">referrals                                     234   -&gt; referral</text>
+  <text x="50" y="231" fill="#e2e8f0" font-size="11">subscriptions (active)                      1,089   -&gt; customer.*</text>
+  <text x="50" y="249" fill="#e2e8f0" font-size="11">transactions                                3,456   -&gt; purchase</text>
+  <text x="50" y="267" fill="#e2e8f0" font-size="11">promocodes                                     42   -&gt; promo</text>
+  <text x="50" y="285" fill="#e2e8f0" font-size="11">tickets                                        15   -&gt; support_ticket</text>
   
-  <text x="25" y="272" fill="#e2e8f0" font-size="12">│ 📋 Подписки             │</text>
-  <text x="315" y="272" fill="#06b6d4" font-size="12" font-weight="bold">1,089</text>
-  <text x="370" y="272" fill="#e2e8f0" font-size="12">│</text>
+  <!-- Section: НЕ БУДЕТ ПЕРЕНЕСЕНО -->
+  <text x="35" y="325" fill="#f59e0b" font-size="12">НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в CSV):</text>
   
-  <text x="25" y="290" fill="#e2e8f0" font-size="12">│ 💳 Транзакции           │</text>
-  <text x="315" y="290" fill="#06b6d4" font-size="12" font-weight="bold">3,456</text>
-  <text x="370" y="290" fill="#e2e8f0" font-size="12">│</text>
+  <text x="50" y="352" fill="#e2e8f0" font-size="11">balances (847 users)                    12,450.00 RUB   -&gt; NOT_MIGRATED/</text>
   
-  <text x="25" y="308" fill="#e2e8f0" font-size="12">│ 🎟️ Промокоды            │</text>
-  <text x="323" y="308" fill="#06b6d4" font-size="12" font-weight="bold">42</text>
-  <text x="370" y="308" fill="#e2e8f0" font-size="12">│</text>
-  
-  <text x="25" y="326" fill="#e2e8f0" font-size="12">│ 👥 Рефералы             │</text>
-  <text x="315" y="326" fill="#06b6d4" font-size="12" font-weight="bold">234</text>
-  <text x="370" y="326" fill="#e2e8f0" font-size="12">│</text>
-  
-  <text x="25" y="344" fill="#22c55e" font-size="12">└─────────────────────────┴────────────────┘</text>
-  
-  <!-- Status -->
-  <text x="25" y="375" fill="#22c55e" font-size="12">✅ Архив валиден и готов к миграции</text>
+  <!-- Footer -->
+  <text x="35" y="395" fill="#555" font-size="11">Непереносимые данные сохранятся в: NOT_MIGRATED/</text>
   
   <!-- Prompt -->
-  <text x="25" y="400" fill="#888" font-size="11">Нажмите Enter для продолжения...</text>
+  <text x="25" y="445" fill="#888" font-size="11">Нажмите Enter...</text>
 </svg>
