@@ -4860,13 +4860,52 @@ PYTHON_SCRIPT
     print_message "SUCCESS" "Экспортировано транзакций: $tx_count"
     
     # --- Экспорт promocodes ---
+    # В Bedolaga промокоды могут давать:
+    # 1) subscription_days > 0 — дни подписки (мигрируются)
+    # 2) bonus_kopeks > 0 — деньги на баланс (НЕ мигрируются, сохраняются в NOT_MIGRATED)
     print_message "INFO" "Экспорт промокодов..."
     local promocodes_file="$export_dir/promocodes.csv"
-    parse_json_table "$db_json" "promocodes" "code,subscription_days,max_uses,current_uses,is_active,created_at" > "$promocodes_file"
+    local promocodes_balance_file="$export_dir/promocodes_balance_type.csv"
     
-    local promo_count=0
-    [[ -s "$promocodes_file" ]] && promo_count=$(($(wc -l < "$promocodes_file") - 1))
-    print_message "SUCCESS" "Экспортировано промокодов: $promo_count"
+    # Экспортируем с bonus_kopeks для разделения типов
+    parse_json_table "$db_json" "promocodes" "code,subscription_days,bonus_kopeks,max_uses,current_uses,is_active,created_at" > "$export_dir/promocodes_full.csv"
+    
+    # Разделяем: дни → promocodes.csv, баланс → promocodes_balance_type.csv
+    echo "code,subscription_days,max_uses,current_uses,is_active,created_at" > "$promocodes_file"
+    echo "code,bonus_kopeks,bonus_rub,max_uses,current_uses,is_active,created_at" > "$promocodes_balance_file"
+    
+    local promo_days_count=0
+    local promo_balance_count=0
+    
+    while IFS=',' read -r code sub_days bonus_kop max_uses cur_uses is_active created_at; do
+        [[ -z "$code" || "$code" == "code" ]] && continue
+        
+        # Проверяем тип промокода
+        local has_days=false
+        local has_balance=false
+        [[ -n "$sub_days" && "$sub_days" != "0" && "$sub_days" != "null" ]] && has_days=true
+        [[ -n "$bonus_kop" && "$bonus_kop" != "0" && "$bonus_kop" != "null" ]] && has_balance=true
+        
+        if [[ "$has_days" == "true" ]]; then
+            # Промокод на дни — мигрируется
+            echo "$code,$sub_days,$max_uses,$cur_uses,$is_active,$created_at" >> "$promocodes_file"
+            ((promo_days_count++))
+        elif [[ "$has_balance" == "true" ]]; then
+            # Промокод на баланс — НЕ мигрируется
+            local bonus_rub=$(awk "BEGIN {printf \"%.2f\", ${bonus_kop:-0}/100}")
+            echo "$code,$bonus_kop,$bonus_rub,$max_uses,$cur_uses,$is_active,$created_at" >> "$promocodes_balance_file"
+            ((promo_balance_count++))
+        fi
+    done < "$export_dir/promocodes_full.csv"
+    
+    print_message "SUCCESS" "Экспортировано промокодов (дни): $promo_days_count"
+    if [[ $promo_balance_count -gt 0 ]]; then
+        print_message "WARN" "Промокодов на баланс (не мигрируются): $promo_balance_count"
+        print_message "INFO" "Сохранены в: promocodes_balance_type.csv"
+    fi
+    
+    # Удаляем временный файл
+    rm -f "$export_dir/promocodes_full.csv"
     
     # --- Экспорт promocode_uses ---
     print_message "INFO" "Экспорт использований промокодов..."
@@ -5641,23 +5680,15 @@ migrate_transform_data() {
             
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$code")
             
-            # promo_type: всегда subscription (Bedolaga даёт только дни, не скидки)
-            # RWP-Shop поддерживает: subscription (дни) и discount (скидка)
-            # В Bedolaga нет скидочных промокодов
+            # promo_type: всегда subscription (промокоды на баланс уже отфильтрованы при экспорте)
             local promo_type="subscription"
-            
-            # Если bonus_days=0 — пропускаем (невалидный промокод)
-            if [[ "$bonus_days" == "0" || -z "$bonus_days" ]]; then
-                debug_log "MIGRATE" "Skipping promo with 0 days: $code"
-                continue
-            fi
             
             # active: is_active (bool)
             local active="true"
             [[ "$is_active" == "false" || "$is_active" == "0" || "$is_active" == "f" ]] && active="false"
             
-            # balance_bonus=0 (RWP-Shop не использует баланс, это поле для discount type)
-            echo "$uuid,$code,$promo_type,$bonus_days,0,$max_uses,${current_uses:-0},$active,$created_at,$created_at"
+            # balance_bonus=0 (в RWP-Shop это поле для discount type, не используется)
+            echo "$uuid,$code,$promo_type,${bonus_days:-0},0,$max_uses,${current_uses:-0},$active,$created_at,$created_at"
         done < "$export_dir/promocodes.csv" >> "$import_dir/promo.csv"
         
         print_message "SUCCESS" "promo.csv создан"
@@ -9170,6 +9201,19 @@ migration_create_not_migrated_dir() {
 
 ───────────────────────────────────────────────────────────────────────────────
 
+📄 promocodes_balance_type.csv (если есть)
+   Содержит: Промокоды, дающие деньги на баланс
+   Формат: code, bonus_kopeks, bonus_rub, max_uses, current_uses, is_active
+   
+   Причина: В RWP-Shop нет баланса пользователей.
+            Промокоды могут давать только дни подписки или скидку.
+   
+   Варианты действий:
+   • Создать новые промокоды на дни (пересчитав рубли в дни)
+   • Связаться с владельцами промокодов для компенсации
+
+───────────────────────────────────────────────────────────────────────────────
+
 📄 unknown_payments.csv (если есть)
    Содержит: Транзакции через неподдерживаемые платёжные системы
    Платёжки: heleket, pal24, mulenpay, cloudpayments, manual
@@ -10082,7 +10126,16 @@ migration_save_not_migrated_data() {
         print_message "INFO" "Сохранены реферальные балансы → NOT_MIGRATED/"
     fi
     
-    # 3) Неизвестные платежи (собираем из transactions)
+    # 3) Промокоды на баланс (не поддерживаются в RWP-Shop)
+    if [[ -f "$export_dir/promocodes_balance_type.csv" ]]; then
+        local balance_promo_count=$(($(wc -l < "$export_dir/promocodes_balance_type.csv") - 1))
+        if [[ $balance_promo_count -gt 0 ]]; then
+            cp "$export_dir/promocodes_balance_type.csv" "$MIGRATION_NOT_MIGRATED_DIR/"
+            print_message "INFO" "Сохранены промокоды на баланс ($balance_promo_count) → NOT_MIGRATED/"
+        fi
+    fi
+    
+    # 4) Неизвестные платежи (собираем из transactions)
     if [[ -f "$export_dir/transactions.csv" ]]; then
         # Фильтруем транзакции с unknown payment_method
         head -1 "$export_dir/transactions.csv" > "$MIGRATION_NOT_MIGRATED_DIR/unknown_payments.csv"
