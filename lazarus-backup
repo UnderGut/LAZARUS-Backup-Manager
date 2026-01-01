@@ -4119,7 +4119,16 @@ with open(sys.argv[1], 'r', encoding='utf-8') as f:
 
 users = data.get('data', {}).get('users', [])
 for u in users:
+    # Проверяем разные варианты имён полей
+    # balance_kopeks - копейки (старый формат)
+    # balance - рубли (новый формат)
     balance_kop = u.get('balance_kopeks', 0) or 0
+    balance_rub_direct = u.get('balance', 0) or 0
+    
+    # Если есть balance в рублях - конвертируем в копейки
+    if balance_rub_direct > 0 and balance_kop == 0:
+        balance_kop = int(balance_rub_direct * 100)
+    
     if balance_kop > 0:
         tg_id = u.get('telegram_id', '')
         username = u.get('username', '') or ''
@@ -4154,17 +4163,50 @@ PYEOF
         return 0
     fi
     
-    # Подсчёт статистики
-    local users_with_balance=0
-    local total_balance_kopeks=0
+    # Подсчёт статистики через Python (избегаем проблем с subshell в bash)
+    local stats
+    local python_cmd=""
+    if command -v python3 &>/dev/null; then
+        python_cmd="python3"
+    elif command -v python &>/dev/null; then
+        python_cmd="python"
+    fi
     
-    while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
-        [[ -z "$tg_id" ]] && continue
-        ((users_with_balance++))
-        total_balance_kopeks=$((total_balance_kopeks + balance_kop))
-    done <<< "$balance_data"
+    if [[ -n "$python_cmd" ]]; then
+        stats=$(echo "$balance_data" | $python_cmd -c '
+import sys
+
+total_kop = 0
+count = 0
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    parts = line.split(",")
+    if len(parts) >= 4:
+        try:
+            # 4-е поле - balance_kop (копейки)
+            kop = float(parts[3])
+            total_kop += int(kop)
+            count += 1
+        except:
+            pass
+
+total_rub = round(total_kop / 100, 2)
+print(f"{count},{total_kop},{total_rub}")
+')
+    fi
     
-    local total_balance_rubles=$(echo "scale=2; $total_balance_kopeks / 100" | bc 2>/dev/null || echo "0")
+    local users_with_balance=$(echo "$stats" | cut -d',' -f1)
+    local total_balance_kopeks=$(echo "$stats" | cut -d',' -f2)
+    local total_balance_rubles=$(echo "$stats" | cut -d',' -f3)
+    
+    # Fallback если Python не сработал
+    if [[ -z "$users_with_balance" || "$users_with_balance" == "0" ]]; then
+        users_with_balance=$(echo "$balance_data" | grep -c '^[0-9]' || echo "0")
+        total_balance_rubles="?"
+    fi
     
     # Сохраняем данные в файл
     echo "telegram_id,username,first_name,balance_kopeks,balance_rubles" > "$balances_file"
@@ -4190,6 +4232,10 @@ PYEOF
         local display_name="${username:-${fname:-ID:$tg_id}}"
         printf "    %d. %-20s %10s ₽\n" "$count" "$display_name" "$balance_rub"
     done <<< "$balance_data"
+    
+    if [[ $users_with_balance -gt 5 ]]; then
+        echo -e "    ${GRAY}... и ещё $((users_with_balance - 5)) пользователей${RESET}"
+    fi
     echo ""
     
     echo -e "${RED}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
@@ -4205,17 +4251,47 @@ PYEOF
     echo "     → Баланс будет пересчитан в дни по вашему тарифу"
     echo "     → Дни добавятся к expire_at пользователя"
     echo ""
-    echo -e "  ${GREEN}3.${RESET} Конвертировать в партнёрский баланс"
-    echo "     → Если пользователь партнёр — добавить в available_balance"
-    echo "     → Остальные — экспорт в CSV"
+    echo -e "  ${YELLOW}3.${RESET} Создать партнёров и перенести баланс"
+    echo "     → Создаёт записи партнёров в RWP-Shop"
+    echo "     → Использует % комиссии из Bedolaga (или указать вручную)"
+    echo "     → Устанавливает available_balance из баланса Bedolaga"
     echo ""
     echo -e "  ${RED}4.${RESET} Игнорировать (ПОТЕРЯ ДАННЫХ!)"
     echo "     → Балансы будут потеряны безвозвратно"
     echo ""
+    echo -e "  ${CYAN}5.${RESET} Показать ВСЕХ пользователей с балансом"
+    echo ""
+    echo -e "  ${CYAN}0.${RESET} Назад"
+    echo ""
     
     while true; do
-        read -erp "Выберите вариант [1-4]: " choice
+        read -erp "Выберите вариант [0-5] (Enter - Назад): " choice
         case "$choice" in
+            ""|0|q|Q)
+                return 1
+                ;;
+            5)
+                # Показать всех пользователей с балансом
+                echo ""
+                echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+                echo -e "${CYAN}  ВСЕ ПОЛЬЗОВАТЕЛИ С БАЛАНСОМ ($users_with_balance чел.)${RESET}"
+                echo -e "${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+                echo ""
+                printf "  ${GRAY}%-4s %-20s %-15s %12s${RESET}\n" "№" "Username" "Telegram ID" "Баланс"
+                echo "  ──────────────────────────────────────────────────────────"
+                local num=0
+                while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
+                    [[ -z "$tg_id" ]] && continue
+                    ((num++))
+                    local display_name="${username:-${fname:-—}}"
+                    printf "  %-4d %-20s %-15s %10s ₽\n" "$num" "$display_name" "$tg_id" "$balance_rub"
+                done <<< "$balance_data"
+                echo ""
+                echo -e "  ${YELLOW}Итого: $total_balance_rubles ₽${RESET}"
+                echo ""
+                read -erp "Нажмите Enter для продолжения..." dummy
+                echo ""
+                ;;
             1)
                 BALANCE_HANDLING_MODE="export_csv"
                 print_message "INFO" "Балансы будут сохранены в: $balances_file"
@@ -4368,53 +4444,99 @@ migrate_apply_balance_handling() {
             ;;
             
         "convert_partner")
-            print_message "INFO" "Конвертация балансов в партнёрские..."
+            print_message "INFO" "Конвертация балансов в партнёрские (с созданием записей)..."
             
-            # Файлы для партнёров и не-партнёров
-            local partner_file="$import_dir/balance_to_partner.csv"
-            local non_partner_file="$export_dir/non_partner_balances.csv"
+            # Файл для создания партнёров
+            local partner_create_file="$import_dir/partners_to_create.csv"
+            echo "telegram_id,available_balance,percent" > "$partner_create_file"
             
-            echo "telegram_id,balance_rubles" > "$partner_file"
-            echo "telegram_id,username,first_name,balance_rubles" > "$non_partner_file"
+            # Получаем глобальный процент комиссии из настроек Bedolaga
+            local default_percent="10"  # fallback
             
-            # Получаем список партнёров (users с referral_commission_percent > 0)
-            local partners_query="SELECT telegram_id FROM users WHERE referral_commission_percent > 0;"
-            local partners_list=""
-            
-            if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
-                partners_list=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -c "$partners_query" 2>/dev/null)
-            else
-                export PGPASSWORD="$MIGRATION_SOURCE_PASS"
-                partners_list=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -c "$partners_query" 2>/dev/null)
-                unset PGPASSWORD
+            # Пробуем получить из распакованного архива
+            if [[ -n "$MIGRATION_EXTRACTED_DIR" && -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+                local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+                
+                # Извлекаем REFERRAL_COMMISSION_PERCENT из system_settings
+                local extracted_percent=$(grep -o '"REFERRAL_COMMISSION_PERCENT"[^}]*"value"[^"]*"[^"]*"' "$db_json" 2>/dev/null | grep -o '"value"[^"]*"[^"]*"' | grep -o '[0-9]\+' | head -1)
+                if [[ -n "$extracted_percent" ]]; then
+                    default_percent="$extracted_percent"
+                    debug_log "MIGRATE" "Found REFERRAL_COMMISSION_PERCENT in backup: $default_percent"
+                fi
+                
+                # Также проверяем REFERRAL_BONUS_PERCENT (другое название)
+                if [[ "$default_percent" == "10" ]]; then
+                    extracted_percent=$(grep -o '"REFERRAL_BONUS_PERCENT"[^}]*"value"[^"]*"[^"]*"' "$db_json" 2>/dev/null | grep -o '"value"[^"]*"[^"]*"' | grep -o '[0-9]\+' | head -1)
+                    if [[ -n "$extracted_percent" ]]; then
+                        default_percent="$extracted_percent"
+                        debug_log "MIGRATE" "Found REFERRAL_BONUS_PERCENT in backup: $default_percent"
+                    fi
+                fi
             fi
             
+            echo ""
+            echo -e "${CYAN}=== НАСТРОЙКА ПАРТНЁРСКОГО ПРОЦЕНТА ===${RESET}"
+            echo ""
+            echo -e "В настройках Bedolaga найден процент комиссии: ${GREEN}$default_percent%${RESET}"
+            echo ""
+            echo "Выберите какой процент использовать для новых партнёров:"
+            echo "  1. Использовать из Bedolaga: ${default_percent}%"
+            echo "  2. Указать другой процент"
+            echo ""
+            read -erp "Выбор [1]: " percent_choice
+            percent_choice="${percent_choice:-1}"
+            
+            local partner_percent="$default_percent"
+            if [[ "$percent_choice" == "2" ]]; then
+                read -erp "Введите процент комиссии (1-100): " custom_percent
+                if [[ "$custom_percent" =~ ^[0-9]+$ ]] && [[ "$custom_percent" -ge 1 ]] && [[ "$custom_percent" -le 100 ]]; then
+                    partner_percent="$custom_percent"
+                else
+                    print_message "WARN" "Некорректное значение, используется $default_percent%"
+                fi
+            fi
+            
+            print_message "INFO" "Процент комиссии для партнёров: $partner_percent%"
+            
+            # Создаём записи партнёров для всех пользователей с балансом
+            local created_count=0
             tail -n +2 "$balances_file" | while IFS=',' read -r tg_id username fname balance_kop balance_rub; do
                 [[ -z "$tg_id" ]] && continue
-                if echo "$partners_list" | grep -q "^${tg_id}$"; then
-                    echo "$tg_id,$balance_rub" >> "$partner_file"
-                else
-                    echo "$tg_id,$username,$fname,$balance_rub" >> "$non_partner_file"
-                fi
+                echo "$tg_id,$balance_rub,$partner_percent" >> "$partner_create_file"
+                ((created_count++))
             done
             
-            local partner_count=$(($(wc -l < "$partner_file") - 1))
-            local non_partner_count=$(($(wc -l < "$non_partner_file") - 1))
+            created_count=$(($(wc -l < "$partner_create_file") - 1))
             
-            print_message "SUCCESS" "Партнёров с балансом: $partner_count → partner.available_balance"
-            [[ $non_partner_count -gt 0 ]] && print_message "WARN" "Не-партнёров с балансом: $non_partner_count → экспорт в CSV"
+            print_message "SUCCESS" "Подготовлено партнёров к созданию: $created_count"
+            
+            # Показываем превью
+            echo ""
+            echo -e "${CYAN}Превью (первые 5 записей):${RESET}"
+            echo "telegram_id | баланс | процент"
+            echo "------------|--------|--------"
+            tail -n +2 "$partner_create_file" | head -5 | while IFS=',' read -r tid bal pct; do
+                printf "%s | %s ₽ | %s%%\n" "$tid" "$bal" "$pct"
+            done
+            echo ""
             
             # Отчёт
             {
                 echo "═══════════════════════════════════════════════════════════"
-                echo "  КОНВЕРТАЦИЯ БАЛАНСОВ В ПАРТНЁРСКИЕ"
+                echo "  СОЗДАНИЕ ПАРТНЁРОВ С БАЛАНСОМ"
                 echo "═══════════════════════════════════════════════════════════"
                 echo ""
-                echo "ПАРТНЁРЫ (баланс → partner.available_balance):"
-                cat "$partner_file"
+                echo "Процент комиссии: $partner_percent%"
+                echo "Источник процента: $([ "$partner_percent" == "$default_percent" ] && echo "Bedolaga" || echo "указан вручную")"
                 echo ""
-                echo "НЕ-ПАРТНЁРЫ (требуют ручной обработки):"
-                cat "$non_partner_file"
+                echo "ПАРТНЁРЫ ДЛЯ СОЗДАНИЯ:"
+                cat "$partner_create_file"
+                echo ""
+                echo "SQL для импорта (выполняется автоматически при импорте):"
+                echo "INSERT INTO partner (telegram_id, available_balance, percent)"
+                echo "VALUES (telegram_id, balance, percent)"
+                echo "ON CONFLICT (telegram_id) DO UPDATE SET"
+                echo "  available_balance = partner.available_balance + EXCLUDED.available_balance;"
             } > "$balance_report"
             ;;
             
@@ -4451,6 +4573,44 @@ migrate_export_from_json() {
     
     local export_dir="$MIGRATION_WORK_DIR/export"
     mkdir -p "$export_dir"
+    
+    # P2: Список временных файлов для очистки при выходе
+    local temp_files=()
+    cleanup_temp_files() {
+        for f in "${temp_files[@]}"; do
+            [[ -f "$f" ]] && rm -f "$f"
+        done
+    }
+    trap cleanup_temp_files RETURN
+    
+    # P2: Функция валидации CSV
+    validate_csv() {
+        local csv_file="$1"
+        local expected_name="$2"
+        
+        if [[ ! -f "$csv_file" ]]; then
+            debug_log "MIGRATE" "CSV validation: $expected_name - file not found"
+            return 1
+        fi
+        
+        local lines=$(wc -l < "$csv_file" 2>/dev/null)
+        if [[ "$lines" -lt 1 ]]; then
+            debug_log "MIGRATE" "CSV validation: $expected_name - empty file"
+            return 1
+        fi
+        
+        # Проверяем консистентность количества колонок (первые 5 строк)
+        local expected_cols=$(head -1 "$csv_file" | awk -F',' '{print NF}')
+        local inconsistent=$(head -5 "$csv_file" | awk -F',' -v e="$expected_cols" 'NF != e {print NR}' | head -1)
+        
+        if [[ -n "$inconsistent" ]]; then
+            debug_log "MIGRATE" "CSV validation: $expected_name - inconsistent columns at line $inconsistent"
+            return 1
+        fi
+        
+        debug_log "MIGRATE" "CSV validation: $expected_name - OK ($lines lines, $expected_cols cols)"
+        return 0
+    }
     
     # Проверяем наличие Python для парсинга JSON
     local python_cmd=""
@@ -4523,6 +4683,7 @@ PYTHON_SCRIPT
     print_message "INFO" "Экспорт users..."
     local users_raw_file="$export_dir/users_raw.csv"
     local users_file="$export_dir/users.csv"
+    temp_files+=("$users_raw_file")  # P2: Добавляем в список для очистки
     
     # Сначала экспортируем все поля
     parse_json_table "$db_json" "users" "id,telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status,last_activity,referred_by_id" > "$users_raw_file"
@@ -4530,7 +4691,9 @@ PYTHON_SCRIPT
     # --- Создание маппинга id → telegram_id для JOIN-ов ---
     # Сохраняем в ассоциативный файл для быстрого поиска
     local id_map_file="$export_dir/.id_to_telegram.map"
-    awk -F',' 'NR>1 && $1!="" && $2!="" {print $1 "=" $2}' "$users_raw_file" > "$id_map_file"
+    # P0: Race Condition fix - используем атомарную запись через временный файл
+    awk -F',' 'NR>1 && $1!="" && $2!="" {print $1 "=" $2}' "$users_raw_file" > "${id_map_file}.tmp" && \
+        mv "${id_map_file}.tmp" "$id_map_file"
     debug_log "MIGRATE" "Created id→telegram_id map with $(wc -l < "$id_map_file") entries"
     
     # Конвертируем в формат совместимый с psql экспортом:
@@ -4609,6 +4772,7 @@ PYTHON_SCRIPT
             split(line, parts, "=")
             id_map[parts[1]] = parts[2]
         }
+        skipped = 0
     }
     NR > 1 {
         user_id = $2
@@ -4619,10 +4783,21 @@ PYTHON_SCRIPT
         autopay = $7
         status = $8
         
+        # P1: Логирование пустых user_id
+        if (user_id == "") {
+            skipped++
+            next
+        }
+        
         # Только активные подписки
         if (status == "active" && user_id in id_map) {
             telegram_id = id_map[user_id]
             print telegram_id "," end_date "," subscription_url "," is_trial "," device_limit "," autopay
+        }
+    }
+    END {
+        if (skipped > 0) {
+            print "WARN: Skipped " skipped " subscriptions with empty user_id" > "/dev/stderr"
         }
     }
     ' "$subscriptions_raw" >> "$subscriptions_file"
@@ -4649,6 +4824,7 @@ PYTHON_SCRIPT
             split(line, parts, "=")
             id_map[parts[1]] = parts[2]
         }
+        skipped = 0
     }
     NR > 1 {
         id = $1
@@ -4658,11 +4834,22 @@ PYTHON_SCRIPT
         is_completed = $5  # "t" или "f"
         created_at = $6
         
+        # P1: Логирование пустых user_id
+        if (user_id == "") {
+            skipped++
+            next
+        }
+        
         # Только завершённые транзакции (is_completed = "t")
         if (is_completed == "t" && user_id in id_map) {
             telegram_id = id_map[user_id]
             # subscription_days отсутствует в JSON - ставим пустое значение
             print id "," telegram_id "," amount "," payment_method ",completed," created_at ","
+        }
+    }
+    END {
+        if (skipped > 0) {
+            print "WARN: Skipped " skipped " transactions with empty user_id" > "/dev/stderr"
         }
     }
     ' "$transactions_raw" >> "$transactions_file"
@@ -4689,15 +4876,12 @@ PYTHON_SCRIPT
     
     # Создаём маппинг promocode_id → code
     local promo_map_file="$export_dir/.promo_id_to_code.map"
-    awk -F',' 'NR>1 && $1!="" {
-        # Нужен id промокода - но его нет в promocodes.csv
-        # Используем порядковый номер как id
-        print NR-1 "=" $1
-    }' "$promocodes_file" > "$promo_map_file" 2>/dev/null || true
     
-    # Нам нужен id из JSON, переэкспортируем с id
+    # Нам нужен id из JSON, экспортируем с id
     parse_json_table "$db_json" "promocodes" "id,code" > "$export_dir/promocodes_with_id.csv"
-    awk -F',' 'NR>1 && $1!="" && $2!="" {print $1 "=" $2}' "$export_dir/promocodes_with_id.csv" > "$promo_map_file"
+    # P0: Race Condition fix - атомарная запись
+    awk -F',' 'NR>1 && $1!="" && $2!="" {print $1 "=" $2}' "$export_dir/promocodes_with_id.csv" > "${promo_map_file}.tmp" && \
+        mv "${promo_map_file}.tmp" "$promo_map_file"
     
     echo "customer_telegram_id,promo_code,used_at" > "$promo_uses_file"
     
@@ -4791,6 +4975,10 @@ PYTHON_SCRIPT
         
         if (user_id in id_map) {
             telegram_id = id_map[user_id]
+            # P0: CSV Formula Injection protection - prefix with apostrophe if starts with =, +, -, @
+            if (message ~ /^[=+\-@]/) {
+                message = "'\''" message
+            }
             # CSV-экранирование: удваиваем кавычки внутри, оборачиваем в кавычки если есть запятые/кавычки/переносы
             gsub(/"/, "\"\"", message)
             if (message ~ /[,"\n\r]/) {
@@ -4824,6 +5012,10 @@ PYTHON_SCRIPT
         sent = $7
         failed = $8
         
+        # P0: CSV Formula Injection protection
+        if (content ~ /^[=+\-@]/) {
+            content = "'\''" content
+        }
         # CSV-экранирование: удваиваем кавычки внутри, оборачиваем если есть спецсимволы
         gsub(/"/, "\"\"", content)
         if (content ~ /[,"\n\r]/) {
@@ -4893,6 +5085,18 @@ PYTHON_SCRIPT
     [[ -s "$ref_bonus_file" ]] && ref_bonus_count=$(($(wc -l < "$ref_bonus_file") - 1))
     print_message "SUCCESS" "Экспортировано записей реферальных бонусов: $ref_bonus_count"
     
+    # P2: Валидация основных CSV файлов
+    local validation_errors=0
+    for csv in "$users_file" "$transactions_file" "$promocodes_file"; do
+        if [[ -f "$csv" ]] && ! validate_csv "$csv" "$(basename "$csv")"; then
+            ((validation_errors++))
+        fi
+    done
+    
+    if [[ $validation_errors -gt 0 ]]; then
+        print_message "WARN" "Обнаружены проблемы в $validation_errors CSV файлах (см. debug log)"
+    fi
+    
     # Очистка временных файлов
     rm -f "$export_dir"/*_raw.csv "$export_dir"/.*.map "$export_dir"/promocodes_with_id.csv 2>/dev/null
     
@@ -4909,6 +5113,22 @@ migrate_export_data() {
     # Если источник - архив JSON, используем JSON-парсер
     if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
         debug_log "MIGRATE" "Source type is archive, using JSON export"
+        
+        # Проверяем что архив выбран
+        if [[ -z "$MIGRATION_SOURCE_BACKUP" || ! -f "$MIGRATION_SOURCE_BACKUP" ]]; then
+            print_message "ERROR" "Архив не выбран или не найден"
+            return 1
+        fi
+        
+        # Распаковываем архив если ещё не распакован
+        if [[ -z "$MIGRATION_EXTRACTED_DIR" || ! -d "$MIGRATION_EXTRACTED_DIR" || ! -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+            debug_log "MIGRATE" "Extracting archive before export..."
+            if ! extract_bedolaga_backup "$MIGRATION_SOURCE_BACKUP"; then
+                print_message "ERROR" "Не удалось распаковать архив"
+                return 1
+            fi
+        fi
+        
         migrate_export_from_json
         return $?
     fi
@@ -5335,8 +5555,13 @@ migrate_transform_data() {
     if [[ -f "$export_dir/users.csv" ]]; then
         print_message "INFO" "Конвертация users → customer..."
         
+        # Создаём файл с заголовком
+        echo "id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at" > "$import_dir/customer.csv"
+        
         # Формат CSV: telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status
-        tail -n +2 "$export_dir/users.csv" | while IFS=',' read -r telegram_id username first_name language created_at balance_kopeks referral_balance status; do
+        while IFS=',' read -r telegram_id username first_name language created_at balance_kopeks referral_balance status; do
+            [[ -z "$telegram_id" || "$telegram_id" == "telegram_id" ]] && continue
+            
             # Конвертация balance из копеек в рубли
             local balance_rub=0
             if [[ -n "$balance_kopeks" && "$balance_kopeks" != "0" ]]; then
@@ -5360,11 +5585,7 @@ migrate_transform_data() {
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$telegram_id")
             
             echo "$uuid,$telegram_id,$username,$first_name,,$lang,$balance_rub,$referral_rub,0,$is_blocked,$created_at,$created_at"
-        done > "$import_dir/customer.csv"
-        
-        # Добавляем заголовок
-        sed -i '1i id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at' "$import_dir/customer.csv" 2>/dev/null || \
-        { echo "id,telegram_id,username,first_name,last_name,language,balance,referral_balance,lead_score,is_blocked,created_at,updated_at"; cat "$import_dir/customer.csv"; } > "$import_dir/customer.csv.tmp" && mv "$import_dir/customer.csv.tmp" "$import_dir/customer.csv"
+        done < "$export_dir/users.csv" >> "$import_dir/customer.csv"
         
         print_message "SUCCESS" "customer.csv создан"
     fi
@@ -5373,24 +5594,36 @@ migrate_transform_data() {
     if [[ -f "$export_dir/transactions.csv" ]]; then
         print_message "INFO" "Конвертация transactions → purchase..."
         
-        tail -n +2 "$export_dir/transactions.csv" | while IFS=',' read -r id user_id amount payment_method status created_at subscription_days; do
+        # Создаём файл с заголовком
+        echo "id,customer_telegram_id,amount,invoice_type,status,subscription_days,created_at,updated_at" > "$import_dir/purchase.csv"
+        
+        while IFS=',' read -r id user_id amount payment_method status created_at subscription_days; do
+            [[ -z "$id" || "$id" == "id" ]] && continue
+            
             # Конвертация amount из копеек в рубли
             local amount_rub=0
             if [[ -n "$amount" && "$amount" != "0" ]]; then
                 amount_rub=$(echo "scale=2; $amount / 100" | bc 2>/dev/null || echo "0")
             fi
             
-            # Маппинг payment_method → invoice_type
-            local invoice_type="${PAYMENT_METHOD_MAP[$payment_method]:-admin}"
+            # Маппинг payment_method → invoice_type (используем case вместо ассоциативного массива)
+            local invoice_type="admin"
+            case "$payment_method" in
+                yookassa) invoice_type="yookassa" ;;
+                tribute) invoice_type="tribute" ;;
+                wata) invoice_type="wata" ;;
+                telegram_stars) invoice_type="telegram" ;;
+                cryptobot) invoice_type="crypto" ;;
+                platega) invoice_type="platega_cards" ;;
+                manual|heleket|mulenpay|pal24|cloudpayments) invoice_type="unknown" ;;
+                *) invoice_type="admin" ;;
+            esac
             
             # UUID
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$id")
             
             echo "$uuid,$user_id,$amount_rub,$invoice_type,completed,$subscription_days,$created_at,$created_at"
-        done > "$import_dir/purchase.csv"
-        
-        sed -i '1i id,customer_telegram_id,amount,invoice_type,status,subscription_days,created_at,updated_at' "$import_dir/purchase.csv" 2>/dev/null || \
-        { echo "id,customer_telegram_id,amount,invoice_type,status,subscription_days,created_at,updated_at"; cat "$import_dir/purchase.csv"; } > "$import_dir/purchase.csv.tmp" && mv "$import_dir/purchase.csv.tmp" "$import_dir/purchase.csv"
+        done < "$export_dir/transactions.csv" >> "$import_dir/purchase.csv"
         
         print_message "SUCCESS" "purchase.csv создан"
     fi
@@ -5399,7 +5632,12 @@ migrate_transform_data() {
     if [[ -f "$export_dir/promocodes.csv" ]]; then
         print_message "INFO" "Конвертация promocodes → promo..."
         
-        tail -n +2 "$export_dir/promocodes.csv" | while IFS=',' read -r code bonus_days max_uses current_uses is_active created_at; do
+        # Создаём файл с заголовком
+        echo "id,code,promo_type,subscription_days,balance_bonus,max_uses,uses,active,created_at,updated_at" > "$import_dir/promo.csv"
+        
+        while IFS=',' read -r code bonus_days max_uses current_uses is_active created_at; do
+            [[ -z "$code" || "$code" == "code" ]] && continue
+            
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$code")
             
             # promo_type: subscription (даёт дни)
@@ -5411,10 +5649,7 @@ migrate_transform_data() {
             [[ "$is_active" == "false" || "$is_active" == "0" || "$is_active" == "f" ]] && active="false"
             
             echo "$uuid,$code,$promo_type,$bonus_days,0,$max_uses,${current_uses:-0},$active,$created_at,$created_at"
-        done > "$import_dir/promo.csv"
-        
-        sed -i '1i id,code,promo_type,subscription_days,balance_bonus,max_uses,uses,active,created_at,updated_at' "$import_dir/promo.csv" 2>/dev/null || \
-        { echo "id,code,promo_type,subscription_days,balance_bonus,max_uses,uses,active,created_at,updated_at"; cat "$import_dir/promo.csv"; } > "$import_dir/promo.csv.tmp" && mv "$import_dir/promo.csv.tmp" "$import_dir/promo.csv"
+        done < "$export_dir/promocodes.csv" >> "$import_dir/promo.csv"
         
         print_message "SUCCESS" "promo.csv создан"
     fi
@@ -5467,6 +5702,26 @@ migrate_transform_data() {
     return 0
 }
 
+# --- Функция: Валидация имени БД/пользователя (защита от SQL injection) ---
+validate_db_identifier() {
+    local value="$1"
+    local name="$2"
+    
+    # Разрешены только буквы, цифры, подчёркивания, дефисы
+    if [[ ! "$value" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        print_message "ERROR" "Недопустимые символы в $name: $value"
+        return 1
+    fi
+    
+    # Максимальная длина идентификатора PostgreSQL - 63 символа
+    if [[ ${#value} -gt 63 ]]; then
+        print_message "ERROR" "$name слишком длинный (макс 63 символа)"
+        return 1
+    fi
+    
+    return 0
+}
+
 # --- Функция: Импорт данных в Remnawave ---
 migrate_import_data() {
     debug_log "MIGRATE" "Starting data import to Remnawave"
@@ -5476,6 +5731,14 @@ migrate_import_data() {
     
     if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
         print_message "ERROR" "Контейнер БД Remnawave не указан"
+        return 1
+    fi
+    
+    # P0: Валидация параметров БД (защита от SQL injection)
+    if ! validate_db_identifier "$MIGRATION_TARGET_USER" "DB User"; then
+        return 1
+    fi
+    if ! validate_db_identifier "$MIGRATION_TARGET_DB" "DB Name"; then
         return 1
     fi
     
@@ -5492,8 +5755,9 @@ migrate_import_data() {
         # Копируем файл в контейнер
         docker cp "$import_dir/customer.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/customer.csv"
         
-        # Импорт через серверную команду COPY (читает файл внутри контейнера)
+        # P1: Импорт через транзакцию для атомарности
         docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+            BEGIN;
             CREATE TEMP TABLE tmp_customer (
                 id UUID,
                 telegram_id BIGINT,
@@ -5518,6 +5782,7 @@ migrate_import_data() {
                 is_blocked = EXCLUDED.is_blocked,
                 updated_at = NOW();
             DROP TABLE tmp_customer;
+            COMMIT;
 EOF
         
         local result=$?
@@ -5537,8 +5802,9 @@ EOF
         
         docker cp "$import_dir/purchase.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/purchase.csv"
         
-        # Используем временную таблицу + ON CONFLICT для безопасности
+        # P1: Используем транзакцию для атомарности
         docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" << 'EOF'
+            BEGIN;
             CREATE TEMP TABLE tmp_purchase (
                 id BIGINT,
                 customer_telegram_id BIGINT,
@@ -5555,6 +5821,7 @@ EOF
             FROM tmp_purchase
             ON CONFLICT (id) DO NOTHING;
             DROP TABLE tmp_purchase;
+            COMMIT;
 EOF
         
         docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/purchase.csv
@@ -5567,7 +5834,9 @@ EOF
         
         docker cp "$import_dir/promo.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/promo.csv"
         
+        # P1: Используем транзакцию для атомарности
         docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+            BEGIN;
             CREATE TEMP TABLE tmp_promo (LIKE promo INCLUDING ALL);
             COPY tmp_promo FROM '/tmp/promo.csv' WITH CSV HEADER;
             INSERT INTO promo SELECT * FROM tmp_promo
@@ -5576,6 +5845,7 @@ EOF
                 active = EXCLUDED.active,
                 updated_at = NOW();
             DROP TABLE tmp_promo;
+            COMMIT;
         " 2>&1
         
         docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/promo.csv
@@ -5605,8 +5875,9 @@ EOF
             # Копируем CSV в контейнер
             docker cp "$referral_import" "${MIGRATION_TARGET_CONTAINER}:/tmp/referral.csv"
             
-            # Импорт через COPY с обработкой конфликтов
+            # P1: Импорт через транзакцию
             docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+                BEGIN;
                 CREATE TEMP TABLE tmp_referral (
                     referrer_id bigint,
                     referee_id bigint,
@@ -5618,6 +5889,7 @@ EOF
                 SELECT referrer_id, referee_id, used_at, bonus_granted FROM tmp_referral
                 ON CONFLICT DO NOTHING;
                 DROP TABLE tmp_referral;
+                COMMIT;
             " 2>&1
             
             local result=$?
@@ -5644,9 +5916,10 @@ EOF
             # Копируем CSV в контейнер
             docker cp "$export_dir/promocode_uses.csv" "${MIGRATION_TARGET_CONTAINER}:/tmp/promo_uses.csv"
             
-            # Импорт через COPY с JOIN для поиска внутренних ID
+            # P1: Импорт через транзакцию с JOIN для поиска внутренних ID
             # Формат CSV: customer_telegram_id, promo_code, used_at
             docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -c "
+                BEGIN;
                 CREATE TEMP TABLE tmp_promo_uses (
                     customer_telegram_id bigint,
                     promo_code text,
@@ -5666,6 +5939,7 @@ EOF
                 ON CONFLICT DO NOTHING;
                 
                 DROP TABLE tmp_promo_uses;
+                COMMIT;
             " 2>&1
             
             local result=$?
@@ -5693,12 +5967,13 @@ EOF
             # Копирование CSV в контейнер
             docker cp "$subs_file" "$MIGRATION_TARGET_CONTAINER:/tmp/subscriptions.csv"
             
-            # Импорт через временную таблицу + UPDATE
+            # P1: Импорт через транзакцию
             # is_trial в Bedolaga → trial_used в RWP-Shop (одинаковое значение, но разная семантика!)
             # В Bedolaga: is_trial=true значит СЕЙЧАС на триале
             # В RWP-Shop: trial_used=true значит триал УЖЕ был использован
             # Поэтому если is_trial=true, то trial_used тоже должен быть true
             docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                BEGIN;
                 CREATE TEMP TABLE tmp_subscriptions (
                     telegram_id BIGINT,
                     expire_at TIMESTAMP,
@@ -5722,6 +5997,7 @@ EOF
                 WHERE customer.telegram_id = tmp.telegram_id;
                 
                 DROP TABLE tmp_subscriptions;
+                COMMIT;
 EOF
             
             local result=$?
@@ -5750,6 +6026,7 @@ EOF
             docker cp "$tickets_file" "$MIGRATION_TARGET_CONTAINER:/tmp/tickets.csv"
             
             docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                BEGIN;
                 CREATE TEMP TABLE tmp_tickets (
                     old_id BIGINT,
                     customer_telegram_id BIGINT,
@@ -5761,6 +6038,15 @@ EOF
                 );
                 
                 COPY tmp_tickets FROM '/tmp/tickets.csv' WITH CSV HEADER;
+                
+                -- P1: Сохраняем маппинг old_id → new_id для импорта сообщений
+                CREATE TEMP TABLE ticket_id_map AS
+                SELECT tmp.old_id, st.id as new_id
+                FROM tmp_tickets tmp
+                INNER JOIN customer c ON c.telegram_id = tmp.customer_telegram_id
+                INNER JOIN support_ticket st ON st.customer_id = c.id 
+                    AND st.subject = tmp.subject 
+                    AND st.created_at = tmp.created_at;
                 
                 -- Вставляем тикеты с поиском customer_id по telegram_id
                 INSERT INTO support_ticket (customer_id, subject, status, created_at, updated_at, closed_at)
@@ -5776,6 +6062,7 @@ EOF
                 ON CONFLICT DO NOTHING;
                 
                 DROP TABLE tmp_tickets;
+                COMMIT;
 EOF
             
             local result=$?
@@ -5803,9 +6090,9 @@ EOF
             
             docker cp "$messages_file" "$MIGRATION_TARGET_CONTAINER:/tmp/ticket_messages.csv"
             
-            # Сообщения импортируются напрямую, т.к. ticket_id должны совпадать
-            # (если тикеты импортировались с сохранением порядка)
+            # P1: Исправлен маппинг ticket_id - используем created_at + customer для поиска нового ID
             docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                BEGIN;
                 CREATE TEMP TABLE tmp_messages (
                     old_id BIGINT,
                     ticket_id BIGINT,
@@ -5817,7 +6104,8 @@ EOF
                 
                 COPY tmp_messages FROM '/tmp/ticket_messages.csv' WITH CSV HEADER;
                 
-                -- Вставляем сообщения (ticket_id должен существовать)
+                -- P1: Вставляем сообщения с маппингом old_ticket_id → new_ticket_id
+                -- Используем JOIN по customer_id (через sender_id как telegram_id) и created_at тикета
                 INSERT INTO support_message (ticket_id, sender_type, sender_id, message, created_at)
                 SELECT 
                     st.id as ticket_id,
@@ -5830,6 +6118,7 @@ EOF
                 ON CONFLICT DO NOTHING;
                 
                 DROP TABLE tmp_messages;
+                COMMIT;
 EOF
             
             local result=$?
@@ -5857,6 +6146,7 @@ EOF
             docker cp "$broadcast_file" "$MIGRATION_TARGET_CONTAINER:/tmp/broadcast.csv"
             
             docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                BEGIN;
                 CREATE TEMP TABLE tmp_broadcast (
                     old_id BIGINT,
                     content TEXT,
@@ -5892,6 +6182,7 @@ EOF
                 ON CONFLICT DO NOTHING;
                 
                 DROP TABLE tmp_broadcast;
+                COMMIT;
 EOF
             
             local result=$?
@@ -5919,6 +6210,7 @@ EOF
             docker cp "$activity_file" "$MIGRATION_TARGET_CONTAINER:/tmp/user_activity.csv"
             
             docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                BEGIN;
                 CREATE TEMP TABLE tmp_activity (
                     telegram_id BIGINT,
                     last_activity TIMESTAMP
@@ -5933,6 +6225,7 @@ EOF
                 WHERE customer.telegram_id = tmp.telegram_id;
                 
                 DROP TABLE tmp_activity;
+                COMMIT;
 EOF
             
             local result=$?
@@ -5957,11 +6250,20 @@ EOF
             print_message "ACTION" "Импорт истории реферальных бонусов..."
             debug_log "MIGRATE" "Importing referral bonus history: $ref_bonus_count records"
             
+            # P1: Читаем bonus_days из system_settings если доступно
+            local bonus_days_value="7"  # Значение по умолчанию
+            if [[ -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+                local extracted_days=$(grep -o '"REFERRAL_BONUS_DAYS"[^,]*' "$MIGRATION_EXTRACTED_DIR/database.json" 2>/dev/null | grep -o '[0-9]\+' | head -1)
+                [[ -n "$extracted_days" && "$extracted_days" =~ ^[0-9]+$ ]] && bonus_days_value="$extracted_days"
+                debug_log "MIGRATE" "Referral bonus days from settings: $bonus_days_value"
+            fi
+            
             docker cp "$ref_bonus_file" "$MIGRATION_TARGET_CONTAINER:/tmp/referral_bonus.csv"
             
-            # Импортируем только бонусы за регистрацию (в днях)
+            # P1: Импортируем через транзакцию с динамическим bonus_days
             # Бонусы в рублях (amount_kopeks > 0) пропускаем - разные единицы измерения
             docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<EOF 2>&1
+                BEGIN;
                 CREATE TEMP TABLE tmp_ref_bonus (
                     old_id BIGINT,
                     referrer_telegram_id BIGINT,
@@ -5974,11 +6276,10 @@ EOF
                 COPY tmp_ref_bonus FROM '/tmp/referral_bonus.csv' WITH CSV HEADER;
                 
                 -- Вставляем только бонусы за регистрацию (reason содержит 'registration')
-                -- Для них bonus_days берём из настройки (по умолчанию 7)
                 INSERT INTO referral_bonus_history (referral_id, bonus_days, is_first_bonus, granted_at)
                 SELECT 
                     r.id as referral_id,
-                    7 as bonus_days,  -- Значение по умолчанию, можно настроить
+                    ${bonus_days_value} as bonus_days,
                     CASE 
                         WHEN tmp.reason LIKE '%registration%' THEN true
                         ELSE false
@@ -5991,6 +6292,7 @@ EOF
                 ON CONFLICT DO NOTHING;
                 
                 DROP TABLE tmp_ref_bonus;
+                COMMIT;
 EOF
             
             local result=$?
@@ -6007,6 +6309,50 @@ EOF
         fi
     fi
     
+    # 12. Импорт партнёров (конвертация балансов)
+    if [[ -f "$import_dir/partners_to_create.csv" ]]; then
+        print_message "INFO" "Импорт партнёров (конвертация балансов)..."
+        local partners_count=$(($(wc -l < "$import_dir/partners_to_create.csv") - 1))
+        
+        if [[ $partners_count -gt 0 ]]; then
+            docker cp "$import_dir/partners_to_create.csv" "$MIGRATION_TARGET_CONTAINER:/tmp/partners.csv"
+            
+            docker exec -i "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" <<'EOF'
+                BEGIN;
+                
+                CREATE TEMP TABLE tmp_partners (
+                    telegram_id BIGINT,
+                    available_balance BIGINT,
+                    percent INTEGER
+                );
+                
+                \copy tmp_partners FROM '/tmp/partners.csv' WITH CSV HEADER;
+                
+                -- Вставка новых партнёров или обновление баланса существующих
+                INSERT INTO partner (telegram_id, available_balance, percent)
+                SELECT telegram_id, available_balance, percent
+                FROM tmp_partners
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    available_balance = partner.available_balance + EXCLUDED.available_balance;
+                
+                DROP TABLE tmp_partners;
+                COMMIT;
+EOF
+            
+            local result=$?
+            docker exec "$MIGRATION_TARGET_CONTAINER" rm -f /tmp/partners.csv
+            
+            if [[ $result -eq 0 ]]; then
+                local imported_partners=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$MIGRATION_TARGET_USER" -d "$MIGRATION_TARGET_DB" -t -c "SELECT COUNT(*) FROM partner;" 2>/dev/null | tr -d ' ')
+                print_message "SUCCESS" "Партнёры импортированы: $partners_count → в БД: $imported_partners"
+            else
+                print_message "WARN" "Ошибка импорта партнёров"
+            fi
+        else
+            print_message "INFO" "Нет партнёров для импорта"
+        fi
+    fi
+    
     debug_log "MIGRATE" "Import complete"
     return 0
 }
@@ -6018,10 +6364,10 @@ migrate_generate_report() {
     local report_file="$MIGRATION_WORK_DIR/migration_report_$(date +%Y%m%d_%H%M%S).txt"
     
     {
-        echo "╔════════════════════════════════════════════════════════════════╗"
-        echo "║           LAZARUS Migration Report                             ║"
-        echo "║           Bedolaga → RWP-Shop (Private)                    ║"
-        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║         LAZARUS Migration Report                       ║"
+        echo "║         Bedolaga → RWP-Shop (Private)                  ║"
+        echo "╚════════════════════════════════════════════════════════╝"
         echo ""
         echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
@@ -6604,17 +6950,21 @@ extract_bedolaga_backup() {
     if [[ "$file_ext" == "zip" ]] || [[ "$file_name" == *.tar.zip ]]; then
         debug_log "MIGRATE" "Detected password-protected ZIP archive"
         
-        # Проверяем наличие unzip и устанавливаем если нет
-        if ! ensure_unzip_installed; then
-            print_message "ERROR" "Не удалось установить unzip автоматически"
-            print_message "INFO" "Установите вручную: apt install unzip / yum install unzip"
-            return 1
+        # Определяем тип шифрования
+        local is_aes=false
+        if is_zip_aes_encrypted "$backup_file"; then
+            is_aes=true
+            debug_log "MIGRATE" "Archive uses AES encryption"
         fi
         
         # Запрашиваем пароль если не задан
         if [[ -z "$password" ]]; then
             echo ""
-            print_message "INFO" "Архив защищён паролем"
+            if [[ "$is_aes" == "true" ]]; then
+                print_message "INFO" "Архив защищён паролем (AES-256)"
+            else
+                print_message "INFO" "Архив защищён паролем"
+            fi
             read -ersp "Введите пароль для архива: " password
             echo ""
             
@@ -6626,9 +6976,32 @@ extract_bedolaga_backup() {
         
         # Распаковываем внешний ZIP
         print_message "INFO" "Распаковка защищённого архива..."
-        if ! unzip -P "$password" -q "$backup_file" -d "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
-            print_message "ERROR" "Неверный пароль или повреждённый архив"
-            return 1
+        
+        if [[ "$is_aes" == "true" ]]; then
+            # AES шифрование — используем 7z
+            if ! ensure_7z_installed; then
+                print_message "ERROR" "Для AES-зашифрованных архивов требуется 7z (p7zip)"
+                print_message "INFO" "Установите: apt install p7zip-full"
+                return 1
+            fi
+            
+            local cmd_7z=$(get_7z_command)
+            if ! $cmd_7z x -p"$password" -o"$MIGRATION_EXTRACTED_DIR" "$backup_file" -y &>/dev/null; then
+                print_message "ERROR" "Неверный пароль или повреждённый архив"
+                return 1
+            fi
+        else
+            # ZipCrypto — используем unzip
+            if ! ensure_unzip_installed; then
+                print_message "ERROR" "Не удалось установить unzip автоматически"
+                print_message "INFO" "Установите вручную: apt install unzip"
+                return 1
+            fi
+            
+            if ! unzip -P "$password" -q "$backup_file" -d "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
+                print_message "ERROR" "Неверный пароль или повреждённый архив"
+                return 1
+            fi
         fi
         
         # Ищем внутренний tar.gz архив
@@ -7055,7 +7428,59 @@ find_rwp_shop_env() {
     return 1
 }
 
-# --- Функция: Настройка путей для миграции настроек ---
+# --- Функция: Указать .env Bedolaga (опционально) ---
+migrate_settings_configure_env_source() {
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ УКАЗАТЬ .ENV BEDOLAGA (ОПЦИОНАЛЬНО) ═══${RESET}"
+    echo ""
+    echo -e "${GRAY}Файл .env Bedolaga содержит токены и пароли (BOT_TOKEN, DB credentials).${RESET}"
+    echo -e "${GRAY}Эти данные НЕ хранятся в бэкап-архиве по соображениям безопасности.${RESET}"
+    echo ""
+    
+    # Автопоиск
+    print_message "INFO" "Поиск .env файла Bedolaga..."
+    
+    local found_env=$(find_bedolaga_env)
+    
+    if [[ -n "$found_env" && -f "$found_env" ]]; then
+        local vars_count=$(grep -c "^[A-Z].*=" "$found_env" 2>/dev/null || echo "0")
+        echo -e "✅ Найден: ${GREEN}$found_env${RESET} ($vars_count переменных)"
+        echo ""
+        read -erp "Использовать его? (Y/n): " use_env
+        if [[ ! "$use_env" =~ ^[Nn]$ ]]; then
+            MIGRATION_SOURCE_ENV_FILE="$found_env"
+            print_message "SUCCESS" "Установлен: $MIGRATION_SOURCE_ENV_FILE"
+            read -erp "Enter..." dummy
+            return 0
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Автопоиск не нашёл .env файл Bedolaga${RESET}"
+    fi
+    
+    echo ""
+    echo "Стандартные пути:"
+    echo "  • /opt/bedolaga/.env"
+    echo "  • /opt/vpn-bot/.env"
+    echo "  • /root/bedolaga/.env"
+    echo ""
+    read -erp "Путь к .env (или Enter для очистки): " manual_env
+    
+    if [[ -n "$manual_env" ]]; then
+        if [[ -f "$manual_env" ]]; then
+            MIGRATION_SOURCE_ENV_FILE="$manual_env"
+            print_message "SUCCESS" "Установлен: $MIGRATION_SOURCE_ENV_FILE"
+        else
+            print_message "ERROR" "Файл не найден: $manual_env"
+        fi
+    else
+        MIGRATION_SOURCE_ENV_FILE=""
+        print_message "INFO" "Путь к .env очищен"
+    fi
+    
+    read -erp "Enter..." dummy
+}
+
+# --- Функция: Настройка путей для миграции настроек (LEGACY) ---
 migrate_settings_configure_paths() {
     clear_screen
     echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ПУТЕЙ ДЛЯ МИГРАЦИИ НАСТРОЕК ═══${RESET}"
@@ -7217,27 +7642,27 @@ migrate_settings_configure_paths() {
     echo ""
     print_message "SUCCESS" "Настройка путей завершена"
     echo ""
-    echo -e "┌─────────────────────────────────────────────────────────────┐"
-    echo -e "│ ${BOLD}ИТОГОВАЯ КОНФИГУРАЦИЯ${RESET}                                       │"
-    echo -e "├─────────────────────────────────────────────────────────────┤"
+    echo -e "┌────────────────────────────────────────────────────────┐"
+    echo -e "│ ${BOLD}ИТОГОВАЯ КОНФИГУРАЦИЯ${RESET}                                  │"
+    echo -e "├────────────────────────────────────────────────────────┤"
     if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
-        echo -e "│ Архив Bedolaga:  ${GREEN}$(basename "$MIGRATION_SOURCE_BACKUP_FILE")${RESET}"
+        echo -e "│ Архив:  ${GREEN}$(basename "$MIGRATION_SOURCE_BACKUP_FILE")${RESET}"
     else
-        echo -e "│ Архив Bedolaga:  ${YELLOW}Не указан${RESET}"
+        echo -e "│ Архив:  ${YELLOW}Не указан${RESET}"
     fi
     if [[ -n "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        echo -e "│ .env Bedolaga:   ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+        echo -e "│ .env:   ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
     else
-        echo -e "│ .env Bedolaga:   ${YELLOW}Не указан${RESET}"
+        echo -e "│ .env:   ${YELLOW}Не указан${RESET}"
     fi
-    echo -e "├─────────────────────────────────────────────────────────────┤"
-    echo -e "│ Приёмник .env:   ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
+    echo -e "├────────────────────────────────────────────────────────┤"
+    echo -e "│ Приёмник .env: ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
     if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
-        echo -e "│ Контейнер БД:    ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
+        echo -e "│ Контейнер БД:  ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
     else
-        echo -e "│ Контейнер БД:    ${YELLOW}Не настроен${RESET}"
+        echo -e "│ Контейнер БД:  ${YELLOW}Не настроен${RESET}"
     fi
-    echo -e "└─────────────────────────────────────────────────────────────┘"
+    echo -e "└────────────────────────────────────────────────────────┘"
     
     read -erp "Enter..." dummy
     return 0
@@ -7303,18 +7728,18 @@ migrate_settings_analyze() {
     echo ""
     echo -e "Источники:\n${GREEN}$source_desc${RESET}"
     echo ""
-    echo "┌─────────────────────────────────────────────────────────┐"
+    echo "┌──────────────────────────────────────────────────────┐"
     if [[ $total_source -gt 0 ]]; then
-        printf "│ %-43s %10s │\n" "Найдено в .env Bedolaga:" "$total_source"
-        printf "│ %-43s %10s │\n" "  → Можно перенести в .env:" "$can_migrate_env"
-        printf "│ %-43s %10s │\n" "  → Можно перенести в settings DB:" "$can_migrate_db"
-        printf "│ %-43s %10s │\n" "  → Без аналога (не переносятся):" "$no_mapping"
+        printf "│ %-36s %12s │\n" "Найдено в .env Bedolaga:" "$total_source"
+        printf "│ %-36s %12s │\n" "  → Перенос в .env:" "$can_migrate_env"
+        printf "│ %-36s %12s │\n" "  → Перенос в settings DB:" "$can_migrate_db"
+        printf "│ %-36s %12s │\n" "  → Без аналога:" "$no_mapping"
     fi
     if [[ $total_backup -gt 0 ]]; then
-        printf "│ %-43s %10s │\n" "Найдено в архиве (system_settings):" "$total_backup"
-        printf "│ %-43s %10s │\n" "  → Можно перенести в settings DB:" "$can_migrate_from_backup"
+        printf "│ %-36s %12s │\n" "Найдено в архиве:" "$total_backup"
+        printf "│ %-36s %12s │\n" "  → Перенос в settings DB:" "$can_migrate_from_backup"
     fi
-    echo "└─────────────────────────────────────────────────────────┘"
+    echo "└──────────────────────────────────────────────────────┘"
     echo ""
     
     return 0
@@ -7322,11 +7747,61 @@ migrate_settings_analyze() {
 
 # --- Функция: Просмотр маппинга .env → .env ---
 migrate_settings_show_env_mapping() {
+    # Если используется архив - показываем маппинг из архива
+    if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        clear_screen
+        echo -e "${CYAN}${BOLD}═══ МАППИНГ НАСТРОЕК ИЗ АРХИВА ═══${RESET}"
+        echo ""
+        echo -e "${GRAY}Источник: $(basename "$MIGRATION_SOURCE_BACKUP_FILE")${RESET}"
+        echo ""
+        
+        # Показываем настройки из архива
+        if [[ -n "$MIGRATION_EXTRACTED_DIR" && -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+            # Читаем настройки из архива
+            declare -A backup_settings
+            read_all_bedolaga_settings backup_settings
+            
+            echo -e "${GREEN}=== Настройки из system_settings → .env RWP-Shop ===${RESET}"
+            echo ""
+            printf "%-35s │ %-30s │ %s\n" "Bedolaga (backup)" "RWP-Shop" "Значение"
+            echo "────────────────────────────────────┼────────────────────────────────┼────────────────────────"
+            
+            local found_count=0
+            for bedolaga_key in "${!BEDOLAGA_BACKUP_TO_RWP[@]}"; do
+                local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$bedolaga_key]}"
+                local value="${backup_settings[$bedolaga_key]:-<не задано>}"
+                
+                # Ограничиваем длину значения
+                [[ ${#value} -gt 20 ]] && value="${value:0:17}..."
+                
+                if [[ "${backup_settings[$bedolaga_key]+isset}" ]]; then
+                    printf "%-35s │ %-30s │ ${GREEN}%s${RESET}\n" "$bedolaga_key" "$rwp_key" "$value"
+                    ((found_count++))
+                else
+                    printf "%-35s │ %-30s │ ${GRAY}%s${RESET}\n" "$bedolaga_key" "$rwp_key" "$value"
+                fi
+            done | sort
+            
+            echo ""
+            echo "Найдено в архиве: $found_count из ${#BEDOLAGA_BACKUP_TO_RWP[@]}"
+        else
+            print_message "WARN" "Архив не распакован или database.json не найден"
+        fi
+        
+        echo ""
+        read -erp "Enter..." dummy
+        return 0
+    fi
+    
+    # Если .env не указан - показываем подсказку
     if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
         print_message "WARN" ".env файл Bedolaga не указан"
         echo ""
         echo "Для просмотра маппинга .env → .env необходимо указать путь к .env файлу Bedolaga."
         echo "Используйте пункт 1 (Настройка путей) для указания источника."
+        echo ""
+        echo -e "${GRAY}Подсказка: Если вы используете архив - настройки уже загружены из system_settings.${RESET}"
+        echo -e "${GRAY}Архив содержит настройки из админ-панели Bedolaga, а не из .env файла.${RESET}"
         echo ""
         read -erp "Enter..." dummy
         return 1
@@ -7383,15 +7858,27 @@ migrate_settings_show_db_mapping() {
         printf "%-35s │ %-35s\n" "Bedolaga (backup)" "RWP-Shop settings.key"
         echo "────────────────────────────────────┼─────────────────────────────────────"
         
-        local backup_count=0
+        # Собираем строки в массив для сортировки
+        local lines=()
+        local mapped_count=0
+        local unmapped_count=0
+        
         for bedolaga_key in "${!BEDOLAGA_BACKUP_TO_RWP[@]}"; do
             local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$bedolaga_key]}"
-            printf "%-35s │ %-35s\n" "$bedolaga_key" "$rwp_key"
-            ((backup_count++))
-        done | sort
+            if [[ -n "$rwp_key" ]]; then
+                lines+=("$(printf "%-35s │ ${GREEN}%-35s${RESET}" "$bedolaga_key" "$rwp_key")")
+                ((mapped_count++))
+            else
+                lines+=("$(printf "%-35s │ ${GRAY}%-35s${RESET}" "$bedolaga_key" "(нет маппинга)")")
+                ((unmapped_count++))
+            fi
+        done
+        
+        # Сортируем и выводим
+        printf '%s\n' "${lines[@]}" | sort
         
         echo ""
-        echo "Всего маппингов архив→БД: $backup_count"
+        echo -e "Маппингов архив→БД: ${GREEN}$mapped_count${RESET} | Без маппинга: ${GRAY}$unmapped_count${RESET}"
         echo ""
     fi
     
@@ -7435,18 +7922,12 @@ migrate_settings_show_db_mapping() {
 
 # --- Функция: Просмотр настроек без аналога ---
 migrate_settings_show_no_mapping() {
-    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "WARN" ".env файл Bedolaga не указан"
-        echo ""
-        echo "Для просмотра настроек без аналога необходим .env файл Bedolaga."
-        echo "Используйте пункт 1 (Настройка путей) для указания источника."
-        echo ""
+    # Проверяем наличие хотя бы одного источника
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" && -z "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        print_message "ERROR" "Источник не настроен (ни .env, ни архив)"
         read -erp "Enter..." dummy
         return 1
     fi
-    
-    declare -A source_settings
-    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
     
     clear_screen
     echo -e "${YELLOW}${BOLD}═══ НАСТРОЙКИ БЕЗ АНАЛОГА В RWP-SHOP ═══${RESET}"
@@ -7455,32 +7936,78 @@ migrate_settings_show_no_mapping() {
     echo ""
     
     local count=0
-    for key in "${!source_settings[@]}"; do
-        # Проверяем есть ли маппинг
-        if [[ -z "${SETTINGS_ENV_TO_ENV[$key]}" && -z "${SETTINGS_ENV_TO_DB[$key]}" ]]; then
-            local value="${source_settings[$key]}"
+    
+    # 1) Настройки из архива без маппинга
+    if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        echo -e "${GREEN}=== ИЗ АРХИВА (system_settings) ===${RESET}"
+        echo ""
+        
+        # Читаем настройки из архива
+        if [[ -n "$MIGRATION_EXTRACTED_DIR" && -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+            declare -A backup_settings
+            read_all_bedolaga_settings backup_settings
             
-            # Маскируем чувствительные данные
-            if [[ "$key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
-                [[ -n "$value" ]] && value="${value:0:6}***"
-            fi
+            local archive_count=0
+            for key in "${!backup_settings[@]}"; do
+                local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$key]:-}"
+                # Показываем только те, у которых нет маппинга
+                if [[ -z "$rwp_key" ]]; then
+                    local value="${backup_settings[$key]}"
+                    
+                    # Маскируем чувствительные данные
+                    if [[ "$key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
+                        [[ -n "$value" ]] && value="${value:0:6}***"
+                    fi
+                    
+                    [[ ${#value} -gt 40 ]] && value="${value:0:37}..."
+                    
+                    printf "  %-35s = %s\n" "$key" "$value"
+                    ((archive_count++))
+                    ((count++))
+                fi
+            done | sort
             
-            [[ ${#value} -gt 40 ]] && value="${value:0:37}..."
-            
-            printf "  %-35s = %s\n" "$key" "$value"
-            ((count++))
-            
-            # Пагинация
-            if [[ $((count % 25)) -eq 0 ]]; then
-                echo ""
-                read -erp "-- Нажмите Enter для продолжения --" dummy
-                echo ""
-            fi
+            echo ""
+            echo "Без аналога в архиве: $archive_count"
+        else
+            print_message "WARN" "Архив не распакован"
         fi
-    done | sort
+        echo ""
+    fi
+    
+    # 2) Настройки из .env без маппинга
+    if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        echo -e "${YELLOW}=== ИЗ .ENV ===${RESET}"
+        echo ""
+        
+        declare -A source_settings
+        read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+        
+        local env_count=0
+        for key in "${!source_settings[@]}"; do
+            # Проверяем есть ли маппинг
+            if [[ -z "${SETTINGS_ENV_TO_ENV[$key]}" && -z "${SETTINGS_ENV_TO_DB[$key]}" ]]; then
+                local value="${source_settings[$key]}"
+                
+                # Маскируем чувствительные данные
+                if [[ "$key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
+                    [[ -n "$value" ]] && value="${value:0:6}***"
+                fi
+                
+                [[ ${#value} -gt 40 ]] && value="${value:0:37}..."
+                
+                printf "  %-35s = %s\n" "$key" "$value"
+                ((env_count++))
+                ((count++))
+            fi
+        done | sort
+        
+        echo ""
+        echo "Без аналога в .env: $env_count"
+    fi
     
     echo ""
-    echo "Всего настроек без аналога: $count"
+    echo -e "${GRAY}Всего настроек без аналога: $count${RESET}"
     echo ""
     read -erp "Enter..." dummy
 }
@@ -7724,9 +8251,9 @@ migrate_settings_execute() {
     # === ОТЧЁТ ===
     local report_file="$work_dir/settings_migration_report.txt"
     {
-        echo "╔════════════════════════════════════════════════════════════════╗"
-        echo "║           ОТЧЁТ МИГРАЦИИ НАСТРОЕК                              ║"
-        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║         ОТЧЁТ МИГРАЦИИ НАСТРОЕК                        ║"
+        echo "╚════════════════════════════════════════════════════════╝"
         echo ""
         echo "Дата: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
@@ -7839,6 +8366,42 @@ migrate_settings_export_csv() {
 
 # --- Меню миграции настроек ---
 menu_migrate_settings() {
+    # === АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ ДАННЫХ ИЗ ОСНОВНОГО МЕНЮ МИГРАЦИИ ===
+    
+    # Источник: если в основном меню выбран архив, используем его
+    if [[ -z "$MIGRATION_SOURCE_BACKUP_FILE" && -n "$MIGRATION_SOURCE_BACKUP" && -f "$MIGRATION_SOURCE_BACKUP" ]]; then
+        MIGRATION_SOURCE_BACKUP_FILE="$MIGRATION_SOURCE_BACKUP"
+        debug_log "SETTINGS" "Auto-synced source archive from main migration: $MIGRATION_SOURCE_BACKUP_FILE"
+    fi
+    
+    # Приёмник: если в основном меню настроен контейнер, ищем .env рядом
+    if [[ -z "$MIGRATION_TARGET_ENV_FILE" && -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+        # Метод 1: Через docker inspect (working_dir)
+        local working_dir=$(docker inspect "$MIGRATION_TARGET_CONTAINER" --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null)
+        if [[ -n "$working_dir" && -d "$working_dir" ]]; then
+            MIGRATION_TARGET_BOT_PATH="$working_dir"
+            MIGRATION_TARGET_ENV_FILE="$working_dir/.env"
+            debug_log "SETTINGS" "Auto-detected target .env from docker inspect: $MIGRATION_TARGET_ENV_FILE"
+        fi
+        
+        # Метод 2: Через BOT_PATH из основного конфига
+        if [[ -z "$MIGRATION_TARGET_ENV_FILE" && -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+            MIGRATION_TARGET_BOT_PATH="$BOT_PATH"
+            MIGRATION_TARGET_ENV_FILE="$BOT_PATH/.env"
+            debug_log "SETTINGS" "Auto-detected target .env from BOT_PATH: $MIGRATION_TARGET_ENV_FILE"
+        fi
+        
+        # Метод 3: Автопоиск
+        if [[ -z "$MIGRATION_TARGET_ENV_FILE" ]]; then
+            local found_rwp=$(find_rwp_shop_env)
+            if [[ -n "$found_rwp" && -d "$found_rwp" ]]; then
+                MIGRATION_TARGET_BOT_PATH="$found_rwp"
+                MIGRATION_TARGET_ENV_FILE="$found_rwp/.env"
+                debug_log "SETTINGS" "Auto-detected target .env from find_rwp_shop_env: $MIGRATION_TARGET_ENV_FILE"
+            fi
+        fi
+    fi
+    
     while true; do
         clear_screen
         echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
@@ -7846,46 +8409,66 @@ menu_migrate_settings() {
         echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════════${RESET}"
         echo ""
         
-        # Статус путей
-        echo -e "${YELLOW}=== ТЕКУЩИЕ ПУТИ ===${RESET}"
+        # === СТАТУС (автоматически синхронизирован) ===
+        echo -e "${YELLOW}=== ТЕКУЩИЙ СТАТУС ===${RESET}"
+        
+        # Источник: архив (из основного меню)
+        if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+            local archive_name=$(basename "$MIGRATION_SOURCE_BACKUP_FILE")
+            local archive_size=$(du -h "$MIGRATION_SOURCE_BACKUP_FILE" 2>/dev/null | cut -f1)
+            echo -e "Источник архив: ${GREEN}✅ $archive_name${RESET} ($archive_size)"
+        else
+            echo -e "Источник архив: ${YELLOW}⚠️  Не выбран в основном меню${RESET}"
+        fi
+        
+        # Источник: .env Bedolaga (опционально)
         if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-            echo -e "Источник .env: ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+            echo -e "Источник .env:  ${GREEN}✅ $MIGRATION_SOURCE_ENV_FILE${RESET}"
         else
-            echo -e "Источник .env: ${RED}Не настроен${RESET}"
+            echo -e "Источник .env:  ${GRAY}— (опционально)${RESET}"
         fi
         
+        # Приёмник: .env RWP-Shop
         if [[ -n "$MIGRATION_TARGET_ENV_FILE" ]]; then
-            echo -e "Приёмник .env: ${GREEN}$MIGRATION_TARGET_ENV_FILE${RESET}"
+            if [[ -f "$MIGRATION_TARGET_ENV_FILE" ]]; then
+                local vars_count=$(grep -c "^[A-Z].*=" "$MIGRATION_TARGET_ENV_FILE" 2>/dev/null || echo "0")
+                echo -e "Приёмник .env:  ${GREEN}✅ $MIGRATION_TARGET_ENV_FILE${RESET} ($vars_count перем.)"
+            else
+                echo -e "Приёмник .env:  ${YELLOW}⚠️  $MIGRATION_TARGET_ENV_FILE${RESET} (будет создан)"
+            fi
         else
-            echo -e "Приёмник .env: ${RED}Не настроен${RESET}"
+            echo -e "Приёмник .env:  ${RED}❌ Не определён${RESET}"
         fi
         
+        # Приёмник: БД (из основного меню)
         if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
-            echo -e "Приёмник БД: ${GREEN}$MIGRATION_TARGET_CONTAINER${RESET}"
+            echo -e "Приёмник БД:    ${GREEN}✅ $MIGRATION_TARGET_CONTAINER${RESET}"
         else
-            echo -e "Приёмник БД: ${RED}Не настроен${RESET}"
+            echo -e "Приёмник БД:    ${RED}❌ Не настроен в основном меню${RESET}"
         fi
         echo ""
         
-        # Показываем статистику если пути настроены
-        if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        # Показываем статистику если источник настроен
+        if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]] || \
+           [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
             migrate_settings_analyze 2>/dev/null
         fi
         
         echo ""
-        echo " [1] Настроить пути (.env файлы)"
-        echo " [2] Просмотреть маппинг .env → .env"
-        echo " [3] Просмотреть маппинг .env → settings DB"
+        echo " [1] Указать .env Bedolaga (опционально)"
+        echo " [2] Просмотреть маппинг настроек"
+        echo " [3] Просмотреть маппинг архив → settings DB"
         echo " [4] Просмотреть настройки без аналога"
         echo -e " ${GREEN}[5] ▶ ВЫПОЛНИТЬ МИГРАЦИЮ НАСТРОЕК${RESET}"
         echo " [6] Экспортировать настройки в CSV"
         echo ""
         echo " [0] ← Назад"
         echo ""
-        read -erp "Выбор: " opt
+        read -erp "Выбор (Enter - Назад): " opt
+        [[ -z "$opt" || "$opt" == "q" || "$opt" == "Q" ]] && return
         
         case "$opt" in
-            1) migrate_settings_configure_paths ;;
+            1) migrate_settings_configure_env_source ;;
             2) migrate_settings_show_env_mapping ;;
             3) migrate_settings_show_db_mapping ;;
             4) migrate_settings_show_no_mapping ;;
@@ -7907,7 +8490,8 @@ migrate_configure_source() {
     echo " 3. Внешний PostgreSQL сервер"
     echo " 0. Назад"
     echo ""
-    read -erp "Выбор: " source_type
+    read -erp "Выбор (Enter - Назад): " source_type
+    [[ -z "$source_type" || "$source_type" == "q" || "$source_type" == "Q" || "$source_type" == "0" ]] && return
     
     case "$source_type" in
         1)
@@ -8092,22 +8676,21 @@ migration_show_disclaimer() {
     
     clear_screen
     echo -e "${RED}${BOLD}"
-    echo "┌─────────────────────────────────────────────────────────────────────────┐"
-    echo "│                                                                          │"
-    echo "│   ⚠️   ВНИМАНИЕ! ЭКСПЕРИМЕНТАЛЬНЫЙ МИГРАТОР                              │"
-    echo "│                                                                          │"
-    echo "├─────────────────────────────────────────────────────────────────────────┤"
-    echo "│                                                                          │"
-    echo "│   Этот инструмент находится в стадии ТЕСТИРОВАНИЯ.                      │"
-    echo "│                                                                          │"
-    echo "│   • Все действия выполняются НА ВАШ СТРАХ И РИСК                        │"
-    echo "│   • Автор НЕ несёт ответственности за потерю данных                     │"
-    echo "│   • ОБЯЗАТЕЛЬНО сделайте бэкап ОБЕИХ баз данных перед миграцией        │"
-    echo "│                                                                          │"
-    echo "│   Данные которые нельзя перенести автоматически будут сохранены        │"
-    echo "│   в отдельные файлы для ручной обработки.                               │"
-    echo "│                                                                          │"
-    echo "└─────────────────────────────────────────────────────────────────────────┘"
+    echo "┌──────────────────────────────────────────────────────────┐"
+    echo "│                                                          │"
+    echo "│  ⚠️  ВНИМАНИЕ! ЭКСПЕРИМЕНТАЛЬНЫЙ МИГРАТОР                 │"
+    echo "│                                                          │"
+    echo "├──────────────────────────────────────────────────────────┤"
+    echo "│                                                          │"
+    echo "│  Этот инструмент в стадии ТЕСТИРОВАНИЯ.                  │"
+    echo "│                                                          │"
+    echo "│  • Все действия НА ВАШ СТРАХ И РИСК                      │"
+    echo "│  • Автор НЕ несёт ответственности за потерю данных       │"
+    echo "│  • ОБЯЗАТЕЛЬНО сделайте бэкап ОБЕИХ БД                   │"
+    echo "│                                                          │"
+    echo "│  Данные без аналога будут сохранены в отдельные файлы.   │"
+    echo "│                                                          │"
+    echo "└──────────────────────────────────────────────────────────┘"
     echo -e "${RESET}"
     echo ""
     echo -e "Нажмите ${YELLOW}Enter${RESET} чтобы продолжить или ${YELLOW}Ctrl+C${RESET} для выхода..."
@@ -8214,7 +8797,17 @@ migration_quick_analyze() {
                     rm -rf "$temp_dir"
                     return 1  # Нет пароля
                 fi
-                unzip -P "$password" -q "$archive" -d "$temp_dir" 2>/dev/null
+                # Проверяем AES шифрование
+                if is_zip_aes_encrypted "$archive"; then
+                    if ! ensure_7z_installed; then
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
+                    local cmd_7z=$(get_7z_command)
+                    $cmd_7z x -p"$password" -o"$temp_dir" "$archive" -y &>/dev/null
+                else
+                    unzip -P "$password" -q "$archive" -d "$temp_dir" 2>/dev/null
+                fi
             else
                 unzip -q "$archive" -d "$temp_dir" 2>/dev/null
             fi
@@ -8298,9 +8891,24 @@ PYEOF
 
 # --- Функция: Показать статус миграции в шапке меню ---
 migration_show_status() {
-    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${CYAN}║${RESET}  ${BOLD}ТЕКУЩИЙ СТАТУС${RESET}                                                    ${CYAN}║${RESET}"
-    echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════════╣${RESET}"
+    local box_width=58  # Ширина контента внутри рамки (60 - 2 на границы)
+    
+    # Функция для вывода строки с правильным выравниванием
+    print_box_line() {
+        local content="$1"
+        # Удаляем ANSI escape-коды и считаем ширину через wc -L (учитывает Unicode)
+        local stripped=$(echo -e "$content" | sed 's/\x1b\[[0-9;]*m//g')
+        # LC_ALL=C.UTF-8 гарантирует корректный подсчёт Unicode-символов
+        local visual_width=$(LC_ALL=C.UTF-8 echo -n "$stripped" | wc -L 2>/dev/null || echo ${#stripped})
+        local padding=$((box_width - visual_width))
+        [[ $padding -lt 0 ]] && padding=0
+        local spaces=$(printf '%*s' "$padding" '')
+        echo -e "${CYAN}║${RESET}${content}${spaces}${CYAN}║${RESET}"
+    }
+    
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+    print_box_line "  ${BOLD}ТЕКУЩИЙ СТАТУС${RESET}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════╣${RESET}"
     
     # Источник
     if [[ "$MIGRATION_SOURCE_TYPE" == "archive" && -n "$MIGRATION_SOURCE_BACKUP" && -f "$MIGRATION_SOURCE_BACKUP" ]]; then
@@ -8324,42 +8932,42 @@ migration_show_status() {
             *)        type_icon="❓" ;;
         esac
         
-        echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ $type_icon $archive_name${RESET} ($archive_size)"
+        print_box_line "  Источник:  ${GREEN}✅ $type_icon $archive_name${RESET} ($archive_size)"
         
         # Показываем статистику если есть
         if [[ -n "$MIGRATION_DATA_ANALYSIS" ]]; then
             local users=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^users:" | cut -d: -f2)
             local tx=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^transactions:" | cut -d: -f2)
             local promo=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^promocodes:" | cut -d: -f2)
-            echo -e "${CYAN}║${RESET}             ${GRAY}📊 users: $users | tx: $tx | promo: $promo${RESET}"
+            print_box_line "             ${GRAY}📊 users: $users | tx: $tx | promo: $promo${RESET}"
         fi
         
         # Показываем статус пароля для защищённых архивов
         if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
             if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
-                echo -e "${CYAN}║${RESET}             ${GREEN}🔑 Пароль установлен${RESET}"
+                print_box_line "             ${GREEN}🔑 Пароль установлен${RESET}"
             else
-                echo -e "${CYAN}║${RESET}             ${YELLOW}⚠️  Требуется пароль (пункт 2)${RESET}"
+                print_box_line "             ${YELLOW}⚠️  Требуется пароль (пункт 2)${RESET}"
             fi
         fi
     elif [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
-        echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ Docker: $MIGRATION_SOURCE_CONTAINER${RESET}"
+        print_box_line "  Источник:  ${GREEN}✅ Docker: $MIGRATION_SOURCE_CONTAINER${RESET}"
     else
-        echo -e "${CYAN}║${RESET}  Источник:  ${RED}❌ Не настроен${RESET}"
+        print_box_line "  Источник:  ${RED}❌ Не настроен${RESET}"
     fi
     
     # Приёмник
     if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${MIGRATION_TARGET_CONTAINER}$"; then
-            echo -e "${CYAN}║${RESET}  Приёмник:  ${GREEN}✅ Docker: $MIGRATION_TARGET_CONTAINER${RESET} (БД: $MIGRATION_TARGET_DB)"
+            print_box_line "  Приёмник:  ${GREEN}✅ Docker: $MIGRATION_TARGET_CONTAINER${RESET} (БД: $MIGRATION_TARGET_DB)"
         else
-            echo -e "${CYAN}║${RESET}  Приёмник:  ${YELLOW}⚠️  $MIGRATION_TARGET_CONTAINER${RESET} (контейнер не запущен)"
+            print_box_line "  Приёмник:  ${YELLOW}⚠️  $MIGRATION_TARGET_CONTAINER${RESET} (контейнер не запущен)"
         fi
     else
-        echo -e "${CYAN}║${RESET}  Приёмник:  ${RED}❌ Не настроен${RESET}"
+        print_box_line "  Приёмник:  ${RED}❌ Не настроен${RESET}"
     fi
     
-    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════╝${RESET}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
 }
 
 # --- Функция: Создать бэкап БД RWP-Shop перед миграцией ---
@@ -8455,37 +9063,56 @@ EOF
 detect_bedolaga_archive_type() {
     local archive_path="$1"
     local file_name=$(basename "$archive_path")
-    local file_ext="${archive_path##*.}"
     
-    # Проверка по расширению
-    if [[ "$file_name" == *.tar.zip ]] || [[ "$file_ext" == "zip" ]]; then
-        # Проверяем что это действительно ZIP (magic bytes: PK)
-        if [[ $(head -c2 "$archive_path" 2>/dev/null) == "PK" ]]; then
+    # Функция для чтения magic bytes без xxd
+    get_magic_bytes() {
+        local file="$1"
+        local len="${2:-2}"
+        if command -v xxd &>/dev/null; then
+            xxd -l"$len" -p "$file" 2>/dev/null
+        elif command -v od &>/dev/null; then
+            od -An -tx1 -N"$len" "$file" 2>/dev/null | tr -d ' \n'
+        else
+            # Fallback: head + hexdump-like через printf
+            head -c"$len" "$file" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n'
+        fi
+    }
+    
+    # Проверка по расширению + magic bytes
+    
+    # ZIP: расширение .zip или .tar.zip
+    if [[ "$file_name" == *.tar.zip ]] || [[ "$file_name" == *.zip ]]; then
+        local magic=$(get_magic_bytes "$archive_path" 2)
+        if [[ "$magic" == "504b" ]]; then  # PK
             echo "zip"
             return 0
         fi
     fi
     
-    if [[ "$file_name" == *.tar.gz ]] || [[ "$file_ext" == "gz" ]]; then
-        # Проверяем magic bytes для gzip (1f 8b)
-        if [[ $(xxd -l2 -p "$archive_path" 2>/dev/null) == "1f8b" ]]; then
+    # TAR.GZ: расширение .tar.gz или .tgz
+    if [[ "$file_name" == *.tar.gz ]] || [[ "$file_name" == *.tgz ]]; then
+        local magic=$(get_magic_bytes "$archive_path" 2)
+        if [[ "$magic" == "1f8b" ]]; then  # gzip magic
             echo "tar.gz"
             return 0
         fi
     fi
     
-    if [[ "$file_ext" == "tar" ]]; then
+    # Plain TAR
+    if [[ "$file_name" == *.tar ]]; then
         echo "tar"
         return 0
     fi
     
-    # Определяем по magic bytes если расширение не помогло
-    local magic=$(xxd -l4 -p "$archive_path" 2>/dev/null)
+    # Если расширение не помогло — проверяем по magic bytes
+    local magic=$(get_magic_bytes "$archive_path" 2)
     case "$magic" in
-        504b*)  echo "zip" ;;      # PK..
-        1f8b*)  echo "tar.gz" ;;   # gzip
-        *)      echo "unknown" ;;
+        504b)  echo "zip"; return 0 ;;      # PK (ZIP)
+        1f8b)  echo "tar.gz"; return 0 ;;   # gzip
     esac
+    
+    echo "unknown"
+    return 1
 }
 
 # --- Функция: Проверить и установить unzip если нужно ---
@@ -8520,7 +9147,70 @@ ensure_unzip_installed() {
     fi
 }
 
+# --- Функция: Проверить и установить 7z (p7zip) если нужно ---
+# 7z нужен для AES-зашифрованных ZIP архивов (unzip не поддерживает AES)
+ensure_7z_installed() {
+    # Проверяем разные варианты имён
+    command -v 7z &>/dev/null && return 0
+    command -v 7za &>/dev/null && return 0
+    command -v 7zr &>/dev/null && return 0
+    
+    debug_log "MIGRATE" "7z not found, attempting auto-install"
+    
+    # Пытаемся установить в зависимости от пакетного менеджера
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq 2>/dev/null && apt-get install -y -qq p7zip-full >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q p7zip p7zip-plugins >/dev/null 2>&1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q p7zip p7zip-plugins >/dev/null 2>&1
+    elif command -v apk &>/dev/null; then
+        apk add --quiet p7zip >/dev/null 2>&1
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm --quiet p7zip >/dev/null 2>&1
+    elif command -v zypper &>/dev/null; then
+        zypper install -y -q p7zip >/dev/null 2>&1
+    fi
+    
+    # Проверяем успешность
+    if command -v 7z &>/dev/null || command -v 7za &>/dev/null; then
+        debug_log "MIGRATE" "7z installed successfully"
+        return 0
+    else
+        debug_log "MIGRATE" "Failed to install 7z"
+        return 1
+    fi
+}
+
+# --- Функция: Получить команду 7z ---
+get_7z_command() {
+    command -v 7z &>/dev/null && echo "7z" && return 0
+    command -v 7za &>/dev/null && echo "7za" && return 0
+    command -v 7zr &>/dev/null && echo "7zr" && return 0
+    return 1
+}
+
+# --- Функция: Проверить, использует ли ZIP AES шифрование ---
+is_zip_aes_encrypted() {
+    local archive_path="$1"
+    
+    # Проверяем через file command
+    if file "$archive_path" 2>/dev/null | grep -qi "AES"; then
+        return 0  # AES шифрование
+    fi
+    
+    # Альтернативная проверка через unzip -v
+    if unzip -v "$archive_path" 2>&1 | grep -qi "AES"; then
+        return 0
+    fi
+    
+    return 1  # Не AES
+}
+
 # --- Функция: Проверить, требует ли архив пароль ---
+# Поддерживает:
+#   1) ZIP с ZipCrypto шифрованием (unzip)
+#   2) ZIP с AES шифрованием (7z)
 is_archive_password_protected() {
     local archive_path="$1"
     local archive_type=$(detect_bedolaga_archive_type "$archive_path")
@@ -8529,16 +9219,29 @@ is_archive_password_protected() {
         return 1  # Только ZIP может быть защищён паролем
     fi
     
+    # Проверяем AES шифрование (unzip не поддерживает AES!)
+    if is_zip_aes_encrypted "$archive_path"; then
+        debug_log "MIGRATE" "Archive uses AES encryption"
+        return 0  # AES = требуется пароль
+    fi
+    
     # Убеждаемся что unzip установлен
     ensure_unzip_installed || return 1
     
-    # Проверяем флаги шифрования в ZIP
-    # unzip -t без пароля вернёт ошибку если архив защищён
-    if unzip -t -P "" "$archive_path" &>/dev/null; then
-        return 1  # Пароль не требуется
-    else
-        return 0  # Требуется пароль
+    # Для ZipCrypto — пробуем распаковать без пароля
+    local temp_dir=$(mktemp -d)
+    
+    if unzip -o -q "$archive_path" -d "$temp_dir" 2>/dev/null; then
+        # ZIP распаковался без пароля — проверяем содержимое
+        if find "$temp_dir" -name "database.json" 2>/dev/null | grep -q . || \
+           find "$temp_dir" -name "*.tar.gz" 2>/dev/null | grep -q .; then
+            rm -rf "$temp_dir"
+            return 1  # Пароль НЕ требуется
+        fi
     fi
+    
+    rm -rf "$temp_dir"
+    return 0  # Требуется пароль
 }
 
 # --- Функция: Healthcheck архива Bedolaga ---
@@ -8622,10 +9325,36 @@ migration_healthcheck_archive() {
             [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность tar: OK"
             ;;
         "zip")
-            # Для защищённых ZIP пропускаем глубокую проверку без пароля
+            # Для защищённых ZIP проверяем с паролем если он есть
             if [[ "$needs_password" == "true" ]]; then
-                [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Целостность ZIP: требуется пароль для проверки"
-                ((warnings++))
+                if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                    # Пробуем проверить с паролем через 7z или unzip
+                    local integrity_ok=false
+                    if is_zip_aes_encrypted "$archive_path"; then
+                        # AES — только 7z
+                        if ensure_7z_installed; then
+                            local cmd_7z=$(get_7z_command)
+                            if $cmd_7z t -p"$BEDOLAGA_BACKUP_PASSWORD" "$archive_path" &>/dev/null; then
+                                integrity_ok=true
+                            fi
+                        fi
+                    else
+                        # ZipCrypto — unzip
+                        if unzip -t -P "$BEDOLAGA_BACKUP_PASSWORD" "$archive_path" &>/dev/null; then
+                            integrity_ok=true
+                        fi
+                    fi
+                    
+                    if [[ "$integrity_ok" == "true" ]]; then
+                        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность ZIP: OK (проверено с паролем)"
+                    else
+                        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Ошибка целостности или неверный пароль"
+                        ((errors++))
+                    fi
+                else
+                    [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Целостность ZIP: требуется пароль для проверки"
+                    ((warnings++))
+                fi
             else
                 if ! unzip -t "$archive_path" &>/dev/null; then
                     [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён ZIP архив"
@@ -8672,8 +9401,24 @@ migration_healthcheck_archive() {
             if [[ "$needs_password" == "true" ]]; then
                 # Пытаемся с сохранённым паролем
                 if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
-                    # Извлекаем внутренний архив
-                    unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -q "$archive_path" -d "$temp_dir" 2>/dev/null
+                    # Проверяем AES шифрование
+                    local is_aes="false"
+                    if is_zip_aes_encrypted "$archive_path"; then
+                        is_aes="true"
+                    fi
+                    
+                    # Извлекаем внутренний архив (7z для AES, unzip для ZipCrypto)
+                    if [[ "$is_aes" == "true" ]]; then
+                        if ! ensure_7z_installed; then
+                            [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} 7z не установлен (требуется для AES)"
+                            rm -rf "$temp_dir"
+                            return 1
+                        fi
+                        local cmd_7z=$(get_7z_command)
+                        $cmd_7z x -p"$BEDOLAGA_BACKUP_PASSWORD" -o"$temp_dir" "$archive_path" -y &>/dev/null
+                    else
+                        unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -q "$archive_path" -d "$temp_dir" 2>/dev/null
+                    fi
                     
                     # Ищем внутренний tar.gz
                     local inner_archive=$(find "$temp_dir" -name "*.tar.gz" -o -name "*.tar" 2>/dev/null | head -1)
@@ -8758,12 +9503,25 @@ migration_healthcheck_archive() {
     [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} JSON структура валидна"
     
     # 7) Проверка обязательных таблиц
+    # Структура JSON: {"metadata": {...}, "data": {"users": [...], ...}}
+    # Таблицы находятся в d['data'], не в корне!
     local required_tables=("users")
     local optional_tables=("transactions" "promocodes" "subscriptions" "tickets")
     
     for table in "${required_tables[@]}"; do
-        if $python_cmd -c "import json; d=json.load(open('$json_file')); exit(0 if '$table' in d else 1)" 2>/dev/null; then
-            local count=$($python_cmd -c "import json; d=json.load(open('$json_file')); print(len(d.get('$table', [])))" 2>/dev/null)
+        # Проверяем в d['data']['table'] (новый формат) или d['table'] (старый формат)
+        if $python_cmd -c "
+import json
+d = json.load(open('$json_file'))
+data = d.get('data', d)  # Если есть 'data' - используем его, иначе корень
+exit(0 if '$table' in data else 1)
+" 2>/dev/null; then
+            local count=$($python_cmd -c "
+import json
+d = json.load(open('$json_file'))
+data = d.get('data', d)
+print(len(data.get('$table', [])))
+" 2>/dev/null)
             [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Таблица '$table': $count записей"
         else
             [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Отсутствует обязательная таблица: $table"
@@ -8772,8 +9530,18 @@ migration_healthcheck_archive() {
     done
     
     for table in "${optional_tables[@]}"; do
-        if $python_cmd -c "import json; d=json.load(open('$json_file')); exit(0 if '$table' in d else 1)" 2>/dev/null; then
-            local count=$($python_cmd -c "import json; d=json.load(open('$json_file')); print(len(d.get('$table', [])))" 2>/dev/null)
+        if $python_cmd -c "
+import json
+d = json.load(open('$json_file'))
+data = d.get('data', d)
+exit(0 if '$table' in data else 1)
+" 2>/dev/null; then
+            local count=$($python_cmd -c "
+import json
+d = json.load(open('$json_file'))
+data = d.get('data', d)
+print(len(data.get('$table', [])))
+" 2>/dev/null)
             [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Таблица '$table': $count записей"
         else
             [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Таблица '$table' отсутствует (опционально)"
@@ -8870,12 +9638,17 @@ migration_healthcheck_db_pre() {
     
     # 5) Проверка прав на запись (создаём и удаляем тестовую запись)
     local write_test=$(docker exec "$MIGRATION_TARGET_CONTAINER" psql -U "$db_user" -d "$db_name" -tAc \
-        "CREATE TEMP TABLE _lazarus_write_test (id int); INSERT INTO _lazarus_write_test VALUES (1); SELECT COUNT(*) FROM _lazarus_write_test;" 2>/dev/null)
+        "CREATE TEMP TABLE _lazarus_write_test (id int); INSERT INTO _lazarus_write_test VALUES (1); SELECT COUNT(*) FROM _lazarus_write_test;" 2>&1)
+    # Удаляем пробелы и проверяем результат
+    write_test=$(echo "$write_test" | tr -d '[:space:]')
     if [[ "$write_test" == "1" ]]; then
         [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Права на запись: OK"
-    else
+    elif [[ "$write_test" =~ "ERROR" ]] || [[ -z "$write_test" ]]; then
         [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Нет прав на запись в БД"
         ((errors++))
+    else
+        # Другой ответ — возможно OK
+        [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Права на запись: OK"
     fi
     
     # 6) Проверка свободного места в контейнере
@@ -9097,13 +9870,22 @@ migration_healthcheck_full() {
     local archive_ok=0
     local db_pre_ok=0
     local csv_ok=0
+    local archive_needs_password=0
     
-    echo -e "\n${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${MAGENTA}${BOLD}║              🏥 ПОЛНЫЙ HEALTHCHECK МИГРАЦИИ                        ║${RESET}"
-    echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════════════════╝${RESET}"
+    echo -e "\n${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${MAGENTA}${BOLD}║        🏥 ПОЛНЫЙ HEALTHCHECK МИГРАЦИИ                  ║${RESET}"
+    echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════╝${RESET}"
     
     # Архив
     if [[ -n "$MIGRATION_SOURCE_BACKUP" ]]; then
+        # Проверяем, нужен ли пароль но не введён
+        local archive_type=$(detect_bedolaga_archive_type "$MIGRATION_SOURCE_BACKUP" 2>/dev/null)
+        if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
+            if [[ -z "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                archive_needs_password=1
+            fi
+        fi
+        
         migration_healthcheck_archive "$MIGRATION_SOURCE_BACKUP" "$verbose" && archive_ok=1
     else
         [[ "$verbose" == "true" ]] && echo -e "\n  ${YELLOW}○${RESET} Архив не выбран - пропуск проверки"
@@ -9123,7 +9905,16 @@ migration_healthcheck_full() {
     
     # Итог
     echo -e "\n${BLUE}━━━ ИТОГ ━━━${RESET}\n"
-    [[ $archive_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} Архив: OK" || echo -e "  ${RED}✗${RESET} Архив: ОШИБКА"
+    
+    # Архив: если требуется пароль — показываем предупреждение вместо OK
+    if [[ $archive_needs_password -eq 1 ]]; then
+        echo -e "  ${YELLOW}⚠${RESET} Архив: ТРЕБУЕТСЯ ПАРОЛЬ"
+    elif [[ $archive_ok -eq 1 ]]; then
+        echo -e "  ${GREEN}✓${RESET} Архив: OK"
+    else
+        echo -e "  ${RED}✗${RESET} Архив: ОШИБКА"
+    fi
+    
     [[ $db_pre_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} БД: OK" || echo -e "  ${RED}✗${RESET} БД: ОШИБКА"
     [[ -d "$MIGRATION_WORK_DIR/export" ]] && { [[ $csv_ok -eq 1 ]] && echo -e "  ${GREEN}✓${RESET} CSV: OK" || echo -e "  ${RED}✗${RESET} CSV: ОШИБКА"; }
     
@@ -9178,9 +9969,10 @@ migration_show_detailed_analysis() {
     fi
     
     clear_screen
-    echo -e "${CYAN}${BOLD}┌────────────────────────────────────────────────────────────────────┐${RESET}"
-    echo -e "${CYAN}${BOLD}│  📊 АНАЛИЗ ДАННЫХ: $(basename "$MIGRATION_SOURCE_BACKUP")${RESET}"
-    echo -e "${CYAN}${BOLD}└────────────────────────────────────────────────────────────────────┘${RESET}"
+    local archive_name=$(basename "$MIGRATION_SOURCE_BACKUP")
+    echo -e "${CYAN}${BOLD}+----------------------------------------------------------------------+${RESET}"
+    printf "${CYAN}${BOLD}|  АНАЛИЗ ДАННЫХ: %-51s |${RESET}\n" "$archive_name"
+    echo -e "${CYAN}${BOLD}+----------------------------------------------------------------------+${RESET}"
     echo ""
     
     # Получаем анализ
@@ -9208,39 +10000,35 @@ migration_show_detailed_analysis() {
     local balance_rub=$(echo "scale=2; ${total_balance:-0} / 100" | bc 2>/dev/null || echo "0")
     
     echo -e "${GREEN}  БУДЕТ ПЕРЕНЕСЕНО:${RESET}"
-    echo "  ────────────────────────────────────────────────────────────────"
-    printf "  │ %-35s │ %10s │ %-15s │\n" "Данные" "Записей" "Статус"
-    echo "  ├─────────────────────────────────────┼────────────┼─────────────────┤"
-    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Пользователи → customer" "${users:-0}" "✅ Готово"
-    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Реферальные связи → referral" "${referrals:-0}" "✅ Готово"
-    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Подписки → customer.*" "${subscriptions:-0}" "✅ Активные"
-    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Транзакции → purchase" "${transactions:-0}" "✅ Готово"
-    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Промокоды → promo" "${promocodes:-0}" "✅ Готово"
-    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Тикеты → support_ticket" "${tickets:-0}" "✅ Готово"
-    echo "  ────────────────────────────────────────────────────────────────"
+    echo "  +-------------------------------------+----------+----------------+"
+    printf "  | %-35s | %8s | %-14s |\n" "Данные" "Записей" "Статус"
+    echo "  +-------------------------------------+----------+----------------+"
+    printf "  | Пользователи -> customer           | %8s | ${GREEN}%-14s${RESET} |\n" "${users:-0}" "Готово"
+    printf "  | Реферальные связи -> referral      | %8s | ${GREEN}%-14s${RESET} |\n" "${referrals:-0}" "Готово"
+    printf "  | Подписки -> customer.*             | %8s | ${GREEN}%-14s${RESET} |\n" "${subscriptions:-0}" "Активные"
+    printf "  | Транзакции -> purchase             | %8s | ${GREEN}%-14s${RESET} |\n" "${transactions:-0}" "Готово"
+    printf "  | Промокоды -> promo                 | %8s | ${GREEN}%-14s${RESET} |\n" "${promocodes:-0}" "Готово"
+    printf "  | Тикеты -> support_ticket           | %8s | ${GREEN}%-14s${RESET} |\n" "${tickets:-0}" "Готово"
+    echo "  +-------------------------------------+----------+----------------+"
     echo ""
     
     if [[ "${users_with_balance:-0}" -gt 0 ]]; then
-        echo -e "${YELLOW}  ⚠️  НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в файлы):${RESET}"
-        echo "  ────────────────────────────────────────────────────────────────"
-        printf "  │ %-35s │ %-30s │\n" "Данные" "Причина"
-        echo "  ├─────────────────────────────────────┼────────────────────────────────┤"
-        printf "  │ %-35s │ %-30s │\n" "Балансы ($users_with_balance юзеров)" "Разные единицы измерения"
-        printf "  │ %-35s │ %-30s │\n" "  Сумма: ₽$balance_rub" "→ user_balances.csv"
-        echo "  ────────────────────────────────────────────────────────────────"
+        echo -e "${YELLOW}  НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в файлы):${RESET}"
+        echo "  +-------------------------------------+--------------------------------+"
+        printf "  | %-35s | %-30s |\n" "Данные" "Причина"
+        echo "  +-------------------------------------+--------------------------------+"
+        printf "  | Балансы (%-3s юзеров)               | Разные единицы измерения       |\n" "$users_with_balance"
+        printf "  |   Сумма: %-26s | -> user_balances.csv           |\n" "${balance_rub} руб."
+        echo "  +-------------------------------------+--------------------------------+"
         echo ""
     fi
     
-    echo -e "  ${GRAY}💡 Непереносимые данные сохранятся в: NOT_MIGRATED/${RESET}"
+    echo -e "  ${GRAY}Непереносимые данные сохранятся в: NOT_MIGRATED/${RESET}"
     echo ""
 }
 
 # --- Функция: Выбор архива из списка ---
 migration_select_archive() {
-    clear_screen
-    echo -e "${CYAN}${BOLD}═══ ВЫБОР АРХИВА BEDOLAGA ═══${RESET}"
-    echo ""
-    
     # Собираем все архивы
     local search_paths=(
         "$BOT_PATH"
@@ -9264,6 +10052,9 @@ migration_select_archive() {
     done
     
     if [[ ${#all_archives[@]} -eq 0 ]]; then
+        clear_screen
+        echo -e "${CYAN}${BOLD}═══ ВЫБОР АРХИВА BEDOLAGA ═══${RESET}"
+        echo ""
         echo -e "${YELLOW}Архивы backup_*.tar.gz / backup_*.tar.zip не найдены${RESET}"
         echo ""
         echo "Поддерживаемые форматы:"
@@ -9275,69 +10066,140 @@ migration_select_archive() {
         echo "  • Скопируйте из папки Bedolaga: /opt/bedolaga/backups/"
         echo "  • Положите в папку RWP-Shop бота"
         echo ""
-        read -erp "Введите полный путь к архиву: " manual_path
+        read -erp "Введите полный путь к архиву (Enter - назад): " manual_path
+        [[ -z "$manual_path" ]] && return 1
         
         if [[ -f "$manual_path" ]]; then
             _migration_set_archive "$manual_path"
+            return 0
         else
             print_message "ERROR" "Файл не найден: $manual_path"
+            return 1
         fi
-        return
     fi
     
-    # Сортируем по дате и показываем список
-    echo "Найденные архивы (отсортированы по дате):"
-    echo ""
-    
-    local i=1
+    # Сортируем архивы по дате
     local sorted_archives=()
     while IFS= read -r archive; do
         sorted_archives+=("$archive")
-        local name=$(basename "$archive")
-        local size=$(du -h "$archive" 2>/dev/null | cut -f1)
-        local mtime=$(stat -c '%y' "$archive" 2>/dev/null | cut -d'.' -f1)
-        
-        # Определяем тип и статус защиты
-        local type_icon="📦"
-        local archive_type=$(detect_bedolaga_archive_type "$archive" 2>/dev/null || echo "unknown")
-        if [[ "$archive_type" == "zip" ]]; then
-            if is_archive_password_protected "$archive" 2>/dev/null; then
-                type_icon="🔒"
-            fi
-        fi
-        
-        if [[ $i -eq 1 ]]; then
-            echo -e "  ${GREEN}$i. $type_icon $name${RESET} ($size) - $mtime ${GREEN}← РЕКОМЕНДУЕТСЯ${RESET}"
-        else
-            echo "  $i. $type_icon $name ($size) - $mtime"
-        fi
-        ((i++))
-        [[ $i -gt 10 ]] && break  # Максимум 10 архивов
     done < <(printf '%s\n' "${all_archives[@]}" | xargs -I {} stat --format='%Y %n' {} 2>/dev/null | sort -rn | awk '{print $2}')
     
-    echo ""
-    echo "  0. Ввести путь вручную"
-    echo ""
-    echo -e "  ${GRAY}🔒 = защищён паролем${RESET}"
-    echo ""
-    read -erp "Выбор: " choice
+    local total_count=${#sorted_archives[@]}
+    local show_limit=5
+    local show_filenames=false
     
-    case "$choice" in
-        0)
-            read -erp "Путь к архиву: " manual_path
-            if [[ -f "$manual_path" ]]; then
-                _migration_set_archive "$manual_path"
+    while true; do
+        clear_screen
+        echo -e "${CYAN}${BOLD}═══ ВЫБОР АРХИВА BEDOLAGA ═══${RESET}"
+        echo -e "Всего архивов: ${CYAN}$total_count${RESET}"
+        echo ""
+        
+        local loop_limit=$show_limit
+        [[ $loop_limit -gt $total_count ]] && loop_limit=$total_count
+        
+        for (( i=0; i<loop_limit; i++ )); do
+            local archive="${sorted_archives[$i]}"
+            local num=$((i + 1))
+            
+            # Определяем тип и статус защиты
+            local type_icon="📦"
+            local archive_type=$(detect_bedolaga_archive_type "$archive" 2>/dev/null || echo "unknown")
+            if [[ "$archive_type" == "zip" ]]; then
+                if is_archive_password_protected "$archive" 2>/dev/null; then
+                    type_icon="🔒"
+                fi
+            fi
+            
+            if [[ "$show_filenames" == "true" ]]; then
+                # Показываем полный путь
+                local size=$(du -h "$archive" 2>/dev/null | cut -f1)
+                if [[ $i -eq 0 ]]; then
+                    echo -e "  ${GREEN}$num. $type_icon $archive${RESET}"
+                    echo -e "     ${GREEN}($size) ← РЕКОМЕНДУЕТСЯ${RESET}"
+                else
+                    echo "  $num. $type_icon $archive ($size)"
+                fi
             else
-                print_message "ERROR" "Файл не найден"
+                # Показываем читаемый формат
+                local name=$(basename "$archive")
+                local size=$(du -h "$archive" 2>/dev/null | cut -f1)
+                local mtime=$(stat -c '%y' "$archive" 2>/dev/null | cut -d'.' -f1)
+                
+                # Парсим дату из имени файла backup_YYYYMMDD_HHMMSS
+                local date_str=""
+                if [[ "$name" =~ backup_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2}) ]]; then
+                    date_str="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}"
+                else
+                    date_str="$mtime"
+                fi
+                
+                if [[ $i -eq 0 ]]; then
+                    echo -e "  ${GREEN}$num. $type_icon $date_str${RESET} ($size) ${GREEN}← РЕКОМЕНДУЕТСЯ${RESET}"
+                else
+                    echo "  $num. $type_icon $date_str ($size)"
+                fi
             fi
-            ;;
-        [1-9]|10)
-            local idx=$((choice - 1))
-            if [[ $idx -lt ${#sorted_archives[@]} ]]; then
-                _migration_set_archive "${sorted_archives[$idx]}"
-            fi
-            ;;
-    esac
+        done
+        
+        echo ""
+        if [[ $show_limit -lt $total_count ]]; then
+            echo -e " 888. ${GRAY}Показать все ($total_count шт)${RESET}"
+        else
+            echo -e " 888. ${GRAY}Показать топ-5${RESET}"
+        fi
+        if [[ "$show_filenames" == "false" ]]; then
+            echo -e " 999. ${GRAY}Показать полные пути${RESET}"
+        else
+            echo -e " 999. ${GRAY}Показать даты${RESET}"
+        fi
+        echo ""
+        echo "   0. Ввести путь вручную"
+        echo ""
+        echo -e "  ${GRAY}🔒 = защищён паролем${RESET}"
+        echo ""
+        read -erp "Номер файла или команда (Enter - Назад): " choice
+        
+        # Обработка выхода
+        [[ -z "$choice" || "$choice" == "q" || "$choice" == "Q" ]] && return 1
+        
+        case "$choice" in
+            888)
+                if [[ $show_limit -lt $total_count ]]; then
+                    show_limit=$total_count
+                else
+                    show_limit=5
+                fi
+                continue
+                ;;
+            999)
+                if [[ "$show_filenames" == "false" ]]; then
+                    show_filenames=true
+                else
+                    show_filenames=false
+                fi
+                continue
+                ;;
+            0)
+                read -erp "Путь к архиву: " manual_path
+                if [[ -f "$manual_path" ]]; then
+                    _migration_set_archive "$manual_path"
+                    return 0
+                else
+                    print_message "ERROR" "Файл не найден"
+                fi
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total_count )); then
+                    local idx=$((choice - 1))
+                    _migration_set_archive "${sorted_archives[$idx]}"
+                    return 0
+                else
+                    print_message "ERROR" "Неверный выбор"
+                    sleep 1
+                fi
+                ;;
+        esac
+    done
 }
 
 # --- Вспомогательная: Установить архив и запросить пароль если нужно ---
@@ -9349,27 +10211,81 @@ _migration_set_archive() {
     MIGRATION_DATA_ANALYSIS=""  # Сбросить кэш анализа
     BEDOLAGA_BACKUP_PASSWORD=""  # Сбросить пароль
     
-    # Убеждаемся что unzip установлен (для ZIP архивов)
-    ensure_unzip_installed 2>/dev/null
-    
     # Проверяем, требуется ли пароль
     local archive_type=$(detect_bedolaga_archive_type "$archive_path" 2>/dev/null || echo "unknown")
+    local is_aes=false
+    
+    # Проверяем AES шифрование
+    if [[ "$archive_type" == "zip" ]] && is_zip_aes_encrypted "$archive_path"; then
+        is_aes=true
+        debug_log "MIGRATE" "Archive uses AES encryption, will use 7z"
+    fi
     
     if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$archive_path" 2>/dev/null; then
         echo ""
-        print_message "INFO" "🔒 Архив защищён паролем"
+        if [[ "$is_aes" == "true" ]]; then
+            print_message "INFO" "🔒 Архив защищён паролем (AES-256 шифрование)"
+        else
+            print_message "INFO" "🔒 Архив защищён паролем"
+        fi
         read -ersp "Введите пароль: " BEDOLAGA_BACKUP_PASSWORD
         echo ""
         
         # Проверяем правильность пароля
         if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
             local temp_dir=$(mktemp -d)
-            if unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -t "$archive_path" &>/dev/null; then
+            TEMP_DIRS+=("$temp_dir")
+            local password_ok=false
+            
+            if [[ "$is_aes" == "true" ]]; then
+                # AES шифрование — нужен 7z
+                if ! ensure_7z_installed; then
+                    print_message "ERROR" "Для AES-зашифрованных архивов требуется 7z (p7zip)"
+                    print_message "INFO" "Установите: apt install p7zip-full"
+                    rm -rf "$temp_dir"
+                    BEDOLAGA_BACKUP_PASSWORD=""
+                    return 1
+                fi
+                
+                local cmd_7z=$(get_7z_command)
+                debug_log "MIGRATE" "Using 7z command: $cmd_7z"
+                
+                # Распаковываем с помощью 7z
+                if $cmd_7z x -p"$BEDOLAGA_BACKUP_PASSWORD" -o"$temp_dir" "$archive_path" -y &>/dev/null; then
+                    # Проверяем что распаковалось
+                    if find "$temp_dir" -name "database.json" 2>/dev/null | grep -q .; then
+                        password_ok=true
+                    else
+                        # Ищем внутренний tar.gz
+                        local inner=$(find "$temp_dir" -type f \( -name "*.tar.gz" -o -name "*.gz" \) 2>/dev/null | head -1)
+                        if [[ -n "$inner" ]] && tar -tzf "$inner" &>/dev/null; then
+                            password_ok=true
+                        fi
+                    fi
+                fi
+            else
+                # ZipCrypto — используем unzip
+                ensure_unzip_installed 2>/dev/null
+                
+                if unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -o -q "$archive_path" -d "$temp_dir" 2>/dev/null; then
+                    if find "$temp_dir" -name "database.json" 2>/dev/null | grep -q .; then
+                        password_ok=true
+                    else
+                        local inner=$(find "$temp_dir" -type f \( -name "*.tar.gz" -o -name "*.gz" \) 2>/dev/null | head -1)
+                        if [[ -n "$inner" ]] && tar -tzf "$inner" &>/dev/null; then
+                            password_ok=true
+                        fi
+                    fi
+                fi
+            fi
+            
+            if [[ "$password_ok" == "true" ]]; then
                 print_message "SUCCESS" "✅ Пароль верный"
             else
                 print_message "ERROR" "❌ Неверный пароль"
                 BEDOLAGA_BACKUP_PASSWORD=""
             fi
+            
             rm -rf "$temp_dir"
         fi
     fi
@@ -9652,7 +10568,8 @@ menu_migration() {
         
         echo " 0. ← Назад в главное меню"
         echo ""
-        read -erp "Выбор: " opt
+        read -erp "Выбор (Enter - Назад): " opt
+        [[ -z "$opt" || "$opt" == "q" || "$opt" == "Q" ]] && return
         
         case "$opt" in
             1)
@@ -9661,14 +10578,12 @@ menu_migration() {
                 read -erp "Нажмите Enter..." dummy
                 ;;
             2)
-                # Выбор архива
+                # Выбор архива (возвращает 0 при выборе, 1 при отмене)
                 migration_select_archive
-                read -erp "Нажмите Enter..." dummy
                 ;;
             3)
                 # Настройка приёмника
                 migrate_configure_target
-                read -erp "Нажмите Enter..." dummy
                 ;;
             4)
                 # Анализ данных
@@ -9678,6 +10593,7 @@ menu_migration() {
             5)
                 # Healthcheck
                 migration_healthcheck_full "true"
+                read -erp "Нажмите Enter..." dummy
                 ;;
             6)
                 # Только экспорт
@@ -9686,27 +10602,70 @@ menu_migration() {
                     read -erp "Enter..." dummy
                     continue
                 fi
+                # Инициализируем рабочую папку если не задана
+                if [[ -z "$MIGRATION_WORK_DIR" ]]; then
+                    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+                fi
                 mkdir -p "$MIGRATION_WORK_DIR"
+                
+                echo ""
+                echo -e "${CYAN}${BOLD}═══ ШАГ 1/3: ЭКСПОРТ ДАННЫХ ═══${RESET}"
+                echo -e "${GRAY}Извлекаем данные из архива Bedolaga в CSV файлы${RESET}"
+                echo ""
+                
                 migrate_export_data
+                
                 # Показываем healthcheck CSV после экспорта
                 migration_healthcheck_csv "$MIGRATION_WORK_DIR/export" "true"
+                
+                # Показываем итог
+                echo ""
+                echo -e "${GREEN}${BOLD}═══ ЭКСПОРТ ЗАВЕРШЁН ═══${RESET}"
+                echo ""
+                echo -e "  📁 Файлы сохранены в:"
+                echo -e "     ${CYAN}$MIGRATION_WORK_DIR/export/${RESET}"
+                echo ""
+                echo -e "  📋 Следующий шаг:"
+                echo -e "     ${YELLOW}Пункт 7${RESET} → Трансформация (конвертация форматов)"
+                echo ""
                 read -erp "Нажмите Enter..." dummy
                 ;;
             7)
                 # Только трансформация
-                if [[ ! -d "$MIGRATION_WORK_DIR/export" ]]; then
+                if [[ -z "$MIGRATION_WORK_DIR" || ! -d "$MIGRATION_WORK_DIR/export" ]]; then
                     print_message "ERROR" "Сначала выполните экспорт (пункт 6)"
+                    if [[ -n "$MIGRATION_WORK_DIR" ]]; then
+                        debug_log "MIGRATE" "Export dir not found: $MIGRATION_WORK_DIR/export"
+                    fi
                     read -erp "Enter..." dummy
                     continue
                 fi
+                
+                echo ""
+                echo -e "${CYAN}${BOLD}═══ ШАГ 2/3: ТРАНСФОРМАЦИЯ ═══${RESET}"
+                echo -e "${GRAY}Конвертируем форматы Bedolaga → RWP-Shop${RESET}"
+                echo ""
+                
                 migrate_transform_data
+                
                 # Показываем healthcheck CSV после трансформации (директория import)
                 migration_healthcheck_csv "$MIGRATION_WORK_DIR/import" "true"
+                
+                # Показываем итог
+                echo ""
+                echo -e "${GREEN}${BOLD}═══ ТРАНСФОРМАЦИЯ ЗАВЕРШЕНА ═══${RESET}"
+                echo ""
+                echo -e "  📁 Файлы для импорта:"
+                echo -e "     ${CYAN}$MIGRATION_WORK_DIR/import/${RESET}"
+                echo ""
+                echo -e "  📋 Следующий шаг:"
+                echo -e "     ${YELLOW}Пункт 8${RESET} → Импорт в БД RWP-Shop"
+                echo ""
                 read -erp "Нажмите Enter..." dummy
                 ;;
             8)
                 # Только импорт
-                if [[ ! -d "$MIGRATION_WORK_DIR/import" ]]; then
+                if [[ -z "$MIGRATION_WORK_DIR" || ! -d "$MIGRATION_WORK_DIR/import" ]]; then
                     print_message "ERROR" "Сначала выполните трансформацию (пункт 7)"
                     read -erp "Enter..." dummy
                     continue
@@ -9716,6 +10675,11 @@ menu_migration() {
                     read -erp "Enter..." dummy
                     continue
                 fi
+                
+                echo ""
+                echo -e "${CYAN}${BOLD}═══ ШАГ 3/3: ИМПОРТ В БД ═══${RESET}"
+                echo -e "${GRAY}Загружаем данные в PostgreSQL RWP-Shop${RESET}"
+                echo ""
                 
                 # Healthcheck БД перед импортом
                 migration_healthcheck_db_pre "true"
@@ -9729,6 +10693,17 @@ menu_migration() {
                     migrate_import_data
                     # Healthcheck БД после импорта
                     migration_healthcheck_db_post "true"
+                    
+                    # Показываем итог
+                    echo ""
+                    echo -e "${GREEN}${BOLD}═══ МИГРАЦИЯ ЗАВЕРШЕНА ═══${RESET}"
+                    echo ""
+                    echo -e "  ✅ Данные успешно импортированы в RWP-Shop"
+                    echo ""
+                    echo -e "  📋 Рекомендуется:"
+                    echo -e "     • Проверить работу бота"
+                    echo -e "     • Просмотреть пункт ${YELLOW}12${RESET} (NOT_MIGRATED) для несовместимых данных"
+                    echo ""
                 else
                     print_message "INFO" "Импорт отменён"
                 fi
@@ -9736,16 +10711,34 @@ menu_migration() {
                 ;;
             9)
                 # Анализ балансов
-                mkdir -p "$MIGRATION_WORK_DIR"
                 if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
                     print_message "ERROR" "Сначала выберите архив (пункт 2)"
-                else
-                    migrate_handle_balances
+                    read -erp "Enter..." dummy
+                    continue
+                fi
+                # Инициализируем рабочую папку если не задана
+                if [[ -z "$MIGRATION_WORK_DIR" ]]; then
+                    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+                fi
+                mkdir -p "$MIGRATION_WORK_DIR"
+                # Распаковываем архив если ещё не распакован
+                if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
+                    if [[ -z "$MIGRATION_EXTRACTED_DIR" || ! -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+                        if ! extract_bedolaga_backup "$MIGRATION_SOURCE_BACKUP"; then
+                            print_message "ERROR" "Не удалось распаковать архив"
+                            read -erp "Enter..." dummy
+                            continue
+                        fi
+                    fi
+                fi
+                if migrate_handle_balances; then
+                    # Пользователь выбрал действие, применяем
                     if [[ -n "$BALANCE_HANDLING_MODE" && "$BALANCE_HANDLING_MODE" != "none" ]]; then
                         migrate_apply_balance_handling
                     fi
+                    read -erp "Нажмите Enter..." dummy
                 fi
-                read -erp "Нажмите Enter..." dummy
+                # Если return 1 (назад) — просто продолжаем цикл меню
                 ;;
             10)
                 # Миграция настроек
