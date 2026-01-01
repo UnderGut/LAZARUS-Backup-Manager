@@ -3926,15 +3926,19 @@ menu_settings() {
 # =============================================================================
 
 # Конфигурация миграции
+MIGRATION_SOURCE_TYPE=""        # archive | docker | postgresql
+MIGRATION_SOURCE_BACKUP=""      # Путь к архиву бэкапа (.tar.gz)
 MIGRATION_SOURCE_HOST=""
 MIGRATION_SOURCE_PORT="5432"
 MIGRATION_SOURCE_DB=""
 MIGRATION_SOURCE_USER=""
 MIGRATION_SOURCE_PASS=""
+MIGRATION_SOURCE_CONTAINER=""   # Docker контейнер БД Bedolaga
 MIGRATION_TARGET_CONTAINER=""
 MIGRATION_TARGET_DB=""
 MIGRATION_TARGET_USER=""
 MIGRATION_WORK_DIR=""
+MIGRATION_EXTRACTED_DIR=""      # Временная папка с распакованным архивом
 
 # Маппинг payment_method (Bedolaga) → invoice_type (RWP-Shop)
 # 
@@ -4008,24 +4012,42 @@ migrate_check_compatibility() {
     local required_tables=("users" "transactions" "promocodes")
     local missing_tables=()
     
-    for table in "${required_tables[@]}"; do
-        local exists=""
-        if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
-            exists=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
-                SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1;
-            " 2>/dev/null | tr -d ' ')
-        else
-            export PGPASSWORD="$MIGRATION_SOURCE_PASS"
-            exists=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
-                SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1;
-            " 2>/dev/null | tr -d ' ')
-            unset PGPASSWORD
+    # Для архива - проверяем наличие таблиц в database.json
+    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
+        local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+        
+        if [[ ! -f "$db_json" ]]; then
+            print_message "ERROR" "Файл database.json не найден"
+            return 1
         fi
         
-        if [[ "$exists" != "1" ]]; then
-            missing_tables+=("$table")
-        fi
-    done
+        for table in "${required_tables[@]}"; do
+            # Проверяем наличие таблицы в JSON
+            if ! grep -q "\"$table\":" "$db_json"; then
+                missing_tables+=("$table")
+            fi
+        done
+    else
+        # Для PostgreSQL - проверяем через psql
+        for table in "${required_tables[@]}"; do
+            local exists=""
+            if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+                exists=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
+                    SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1;
+                " 2>/dev/null | tr -d ' ')
+            else
+                export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+                exists=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
+                    SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='$table' LIMIT 1;
+                " 2>/dev/null | tr -d ' ')
+                unset PGPASSWORD
+            fi
+            
+            if [[ "$exists" != "1" ]]; then
+                missing_tables+=("$table")
+            fi
+        done
+    fi
     
     if [[ ${#missing_tables[@]} -gt 0 ]]; then
         print_message "ERROR" "Отсутствуют обязательные таблицы: ${missing_tables[*]}"
@@ -4048,24 +4070,60 @@ migrate_handle_balances() {
     print_message "INFO" "Анализ балансов пользователей..."
     
     local export_dir="$MIGRATION_WORK_DIR/export"
+    mkdir -p "$export_dir"
     local balances_file="$export_dir/user_balances.csv"
     
-    # Получаем пользователей с ненулевым балансом
-    local balance_query="
-        SELECT telegram_id, username, first_name, balance_kopeks, 
-               ROUND(balance_kopeks::numeric / 100, 2) as balance_rubles
-        FROM users 
-        WHERE balance_kopeks > 0 
-        ORDER BY balance_kopeks DESC;
-    "
-    
     local balance_data=""
-    if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
-        balance_data=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -F',' -c "$balance_query" 2>/dev/null)
+    
+    # Для архива - читаем из database.json через Python
+    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
+        local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+        
+        # Используем Python для извлечения пользователей с балансом > 0
+        local python_cmd=""
+        if command -v python3 &>/dev/null; then
+            python_cmd="python3"
+        elif command -v python &>/dev/null; then
+            python_cmd="python"
+        fi
+        
+        if [[ -n "$python_cmd" ]]; then
+            balance_data=$($python_cmd - "$db_json" << 'PYEOF'
+import sys
+import json
+
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+users = data.get('data', {}).get('users', [])
+for u in users:
+    balance_kop = u.get('balance_kopeks', 0) or 0
+    if balance_kop > 0:
+        tg_id = u.get('telegram_id', '')
+        username = u.get('username', '') or ''
+        fname = u.get('first_name', '') or ''
+        balance_rub = round(balance_kop / 100, 2)
+        print(f"{tg_id},{username},{fname},{balance_kop},{balance_rub}")
+PYEOF
+)
+        fi
     else
-        export PGPASSWORD="$MIGRATION_SOURCE_PASS"
-        balance_data=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -F',' -c "$balance_query" 2>/dev/null)
-        unset PGPASSWORD
+        # Для PostgreSQL - запрос через psql
+        local balance_query="
+            SELECT telegram_id, username, first_name, balance_kopeks, 
+                   ROUND(balance_kopeks::numeric / 100, 2) as balance_rubles
+            FROM users 
+            WHERE balance_kopeks > 0 
+            ORDER BY balance_kopeks DESC;
+        "
+        
+        if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+            balance_data=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -F',' -c "$balance_query" 2>/dev/null)
+        else
+            export PGPASSWORD="$MIGRATION_SOURCE_PASS"
+            balance_data=$(psql -h "$MIGRATION_SOURCE_HOST" -p "$MIGRATION_SOURCE_PORT" -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -A -F',' -c "$balance_query" 2>/dev/null)
+            unset PGPASSWORD
+        fi
     fi
     
     if [[ -z "$balance_data" ]]; then
@@ -4356,10 +4414,478 @@ migrate_apply_balance_handling() {
     return 0
 }
 
+# --- Функция: Экспорт данных из JSON бэкапа Bedolaga ---
+# Парсит database.json и создаёт CSV файлы для импорта
+migrate_export_from_json() {
+    debug_log "MIGRATE" "Starting JSON export from backup archive"
+    print_message "INFO" "Экспорт данных из JSON бэкапа Bedolaga..."
+    
+    local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+    
+    if [[ ! -f "$db_json" ]]; then
+        print_message "ERROR" "Файл database.json не найден в распакованном архиве"
+        return 1
+    fi
+    
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    mkdir -p "$export_dir"
+    
+    # Проверяем наличие Python для парсинга JSON
+    local python_cmd=""
+    if command -v python3 &>/dev/null; then
+        python_cmd="python3"
+    elif command -v python &>/dev/null; then
+        python_cmd="python"
+    fi
+    
+    if [[ -z "$python_cmd" ]]; then
+        print_message "ERROR" "Python не найден. Установите python3 для парсинга JSON бэкапа"
+        return 1
+    fi
+    
+    debug_log "MIGRATE" "Using Python: $python_cmd"
+    
+    # Вспомогательная функция для парсинга JSON массива через Python
+    # Использует встроенный модуль json, без зависимости от jq
+    parse_json_table() {
+        local json_file="$1"
+        local table_name="$2"
+        local fields="$3"  # Comma-separated list of fields
+        
+        debug_log "MIGRATE" "Parsing table: $table_name, fields: $fields"
+        
+        $python_cmd - "$json_file" "$table_name" "$fields" << 'PYTHON_SCRIPT'
+import sys
+import json
+import csv
+
+json_file = sys.argv[1]
+table_name = sys.argv[2]
+fields = [f.strip() for f in sys.argv[3].split(',')]
+
+try:
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception as e:
+    sys.stderr.write(f"Error loading JSON: {e}\n")
+    sys.exit(1)
+
+# Получаем таблицу из data
+table_data = data.get('data', {}).get(table_name, [])
+
+if not table_data:
+    # Пустая таблица - выводим только заголовок
+    print(','.join(fields))
+    sys.exit(0)
+
+# Записываем CSV в stdout
+writer = csv.writer(sys.stdout)
+writer.writerow(fields)
+
+for row in table_data:
+    values = []
+    for field in fields:
+        val = row.get(field, '')
+        if val is None:
+            val = ''
+        elif isinstance(val, bool):
+            val = 't' if val else 'f'
+        elif isinstance(val, (int, float)):
+            val = str(val)
+        values.append(val)
+    writer.writerow(values)
+PYTHON_SCRIPT
+    }
+    
+    # --- Экспорт users ---
+    print_message "INFO" "Экспорт users..."
+    local users_raw_file="$export_dir/users_raw.csv"
+    local users_file="$export_dir/users.csv"
+    
+    # Сначала экспортируем все поля
+    parse_json_table "$db_json" "users" "id,telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status,last_activity,referred_by_id" > "$users_raw_file"
+    
+    # --- Создание маппинга id → telegram_id для JOIN-ов ---
+    # Сохраняем в ассоциативный файл для быстрого поиска
+    local id_map_file="$export_dir/.id_to_telegram.map"
+    awk -F',' 'NR>1 && $1!="" && $2!="" {print $1 "=" $2}' "$users_raw_file" > "$id_map_file"
+    debug_log "MIGRATE" "Created id→telegram_id map with $(wc -l < "$id_map_file") entries"
+    
+    # Конвертируем в формат совместимый с psql экспортом:
+    # telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status
+    echo "telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status" > "$users_file"
+    awk -F',' 'NR > 1 {
+        # Поля: id,telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status,...
+        telegram_id = $2
+        username = $3
+        first_name = $4
+        language = $5
+        created_at = $6
+        balance_kopeks = $7
+        referral_balance = $8
+        status = $9
+        
+        # Обработка пустых значений
+        if (balance_kopeks == "") balance_kopeks = "0"
+        if (referral_balance == "") referral_balance = "0"
+        if (status == "") status = "active"
+        
+        print telegram_id "," username "," first_name "," language "," created_at "," balance_kopeks "," referral_balance "," status
+    }' "$users_raw_file" >> "$users_file"
+    
+    local user_count=0
+    [[ -s "$users_file" ]] && user_count=$(($(wc -l < "$users_file") - 1))
+    print_message "SUCCESS" "Экспортировано пользователей: $user_count"
+    debug_log "MIGRATE" "Users exported: $user_count"
+    
+    # --- Экспорт реферальных связей ---
+    print_message "INFO" "Экспорт реферальных связей..."
+    local referrals_file="$export_dir/referrals.csv"
+    
+    # Нужен JOIN: users.referred_by_id → users.id → telegram_id
+    # Создаём CSV с telegram_id вместо internal id
+    # Читаем из users_raw_file т.к. там есть referred_by_id (поле $11)
+    echo "referee_telegram_id,referrer_telegram_id,created_at" > "$referrals_file"
+    
+    awk -F',' -v mapfile="$id_map_file" '
+    BEGIN {
+        while ((getline line < mapfile) > 0) {
+            split(line, parts, "=")
+            id_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        # Формат users_raw: id,telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status,last_activity,referred_by_id
+        telegram_id = $2
+        referred_by_id = $11
+        created_at = $6
+        
+        if (referred_by_id != "" && referred_by_id in id_map) {
+            referrer_tg = id_map[referred_by_id]
+            print telegram_id "," referrer_tg "," created_at
+        }
+    }
+    ' "$users_raw_file" >> "$referrals_file"
+    
+    local referral_count=0
+    [[ -s "$referrals_file" ]] && referral_count=$(($(wc -l < "$referrals_file") - 1))
+    print_message "SUCCESS" "Экспортировано реферальных связей: $referral_count"
+    
+    # --- Экспорт subscriptions ---
+    print_message "INFO" "Экспорт подписок..."
+    local subscriptions_raw="$export_dir/subscriptions_raw.csv"
+    local subscriptions_file="$export_dir/subscriptions.csv"
+    
+    parse_json_table "$db_json" "subscriptions" "id,user_id,end_date,subscription_url,is_trial,device_limit,autopay_enabled,status" > "$subscriptions_raw"
+    
+    # JOIN с users для получения telegram_id и фильтрация активных
+    echo "telegram_id,expire_at,subscription_link,is_trial,device_limit,autopay_enabled" > "$subscriptions_file"
+    
+    awk -F',' -v mapfile="$id_map_file" '
+    BEGIN {
+        while ((getline line < mapfile) > 0) {
+            split(line, parts, "=")
+            id_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        user_id = $2
+        end_date = $3
+        subscription_url = $4
+        is_trial = $5
+        device_limit = $6
+        autopay = $7
+        status = $8
+        
+        # Только активные подписки
+        if (status == "active" && user_id in id_map) {
+            telegram_id = id_map[user_id]
+            print telegram_id "," end_date "," subscription_url "," is_trial "," device_limit "," autopay
+        }
+    }
+    ' "$subscriptions_raw" >> "$subscriptions_file"
+    
+    local subs_count=0
+    [[ -s "$subscriptions_file" ]] && subs_count=$(($(wc -l < "$subscriptions_file") - 1))
+    print_message "SUCCESS" "Экспортировано активных подписок: $subs_count"
+    
+    # --- Экспорт transactions ---
+    print_message "INFO" "Экспорт транзакций..."
+    local transactions_raw="$export_dir/transactions_raw.csv"
+    local transactions_file="$export_dir/transactions.csv"
+    
+    # В JSON поле is_completed (boolean), не status
+    parse_json_table "$db_json" "transactions" "id,user_id,amount_kopeks,payment_method,is_completed,created_at" > "$transactions_raw"
+    
+    # JOIN с users и фильтрация по is_completed
+    # Формат вывода для совместимости с transform: id,user_id,amount,payment_method,status,created_at,subscription_days
+    echo "id,user_id,amount,payment_method,status,created_at,subscription_days" > "$transactions_file"
+    
+    awk -F',' -v mapfile="$id_map_file" '
+    BEGIN {
+        while ((getline line < mapfile) > 0) {
+            split(line, parts, "=")
+            id_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        id = $1
+        user_id = $2
+        amount = $3
+        payment_method = $4
+        is_completed = $5  # "t" или "f"
+        created_at = $6
+        
+        # Только завершённые транзакции (is_completed = "t")
+        if (is_completed == "t" && user_id in id_map) {
+            telegram_id = id_map[user_id]
+            # subscription_days отсутствует в JSON - ставим пустое значение
+            print id "," telegram_id "," amount "," payment_method ",completed," created_at ","
+        }
+    }
+    ' "$transactions_raw" >> "$transactions_file"
+    
+    local tx_count=0
+    [[ -s "$transactions_file" ]] && tx_count=$(($(wc -l < "$transactions_file") - 1))
+    print_message "SUCCESS" "Экспортировано транзакций: $tx_count"
+    
+    # --- Экспорт promocodes ---
+    print_message "INFO" "Экспорт промокодов..."
+    local promocodes_file="$export_dir/promocodes.csv"
+    parse_json_table "$db_json" "promocodes" "code,subscription_days,max_uses,current_uses,is_active,created_at" > "$promocodes_file"
+    
+    local promo_count=0
+    [[ -s "$promocodes_file" ]] && promo_count=$(($(wc -l < "$promocodes_file") - 1))
+    print_message "SUCCESS" "Экспортировано промокодов: $promo_count"
+    
+    # --- Экспорт promocode_uses ---
+    print_message "INFO" "Экспорт использований промокодов..."
+    local promo_uses_raw="$export_dir/promocode_uses_raw.csv"
+    local promo_uses_file="$export_dir/promocode_uses.csv"
+    
+    parse_json_table "$db_json" "promocode_uses" "user_id,promocode_id,used_at" > "$promo_uses_raw"
+    
+    # Создаём маппинг promocode_id → code
+    local promo_map_file="$export_dir/.promo_id_to_code.map"
+    awk -F',' 'NR>1 && $1!="" {
+        # Нужен id промокода - но его нет в promocodes.csv
+        # Используем порядковый номер как id
+        print NR-1 "=" $1
+    }' "$promocodes_file" > "$promo_map_file" 2>/dev/null || true
+    
+    # Нам нужен id из JSON, переэкспортируем с id
+    parse_json_table "$db_json" "promocodes" "id,code" > "$export_dir/promocodes_with_id.csv"
+    awk -F',' 'NR>1 && $1!="" && $2!="" {print $1 "=" $2}' "$export_dir/promocodes_with_id.csv" > "$promo_map_file"
+    
+    echo "customer_telegram_id,promo_code,used_at" > "$promo_uses_file"
+    
+    awk -F',' -v usermap="$id_map_file" -v promomap="$promo_map_file" '
+    BEGIN {
+        while ((getline line < usermap) > 0) {
+            split(line, parts, "=")
+            user_map[parts[1]] = parts[2]
+        }
+        while ((getline line < promomap) > 0) {
+            split(line, parts, "=")
+            promo_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        user_id = $1
+        promo_id = $2
+        used_at = $3
+        
+        if (user_id in user_map && promo_id in promo_map) {
+            print user_map[user_id] "," promo_map[promo_id] "," used_at
+        }
+    }
+    ' "$promo_uses_raw" >> "$promo_uses_file"
+    
+    local promo_uses_count=0
+    [[ -s "$promo_uses_file" ]] && promo_uses_count=$(($(wc -l < "$promo_uses_file") - 1))
+    print_message "SUCCESS" "Экспортировано использований промокодов: $promo_uses_count"
+    
+    # --- Экспорт tickets ---
+    print_message "INFO" "Экспорт тикетов..."
+    local tickets_raw="$export_dir/tickets_raw.csv"
+    local tickets_file="$export_dir/tickets.csv"
+    
+    parse_json_table "$db_json" "tickets" "id,user_id,title,status,created_at,updated_at,closed_at" > "$tickets_raw"
+    
+    echo "id,customer_telegram_id,subject,status,created_at,updated_at,closed_at" > "$tickets_file"
+    
+    awk -F',' -v mapfile="$id_map_file" '
+    BEGIN {
+        while ((getline line < mapfile) > 0) {
+            split(line, parts, "=")
+            id_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        id = $1
+        user_id = $2
+        title = $3
+        status = $4
+        created_at = $5
+        updated_at = $6
+        closed_at = $7
+        
+        if (user_id in id_map) {
+            telegram_id = id_map[user_id]
+            print id "," telegram_id "," title "," status "," created_at "," updated_at "," closed_at
+        }
+    }
+    ' "$tickets_raw" >> "$tickets_file"
+    
+    local tickets_count=0
+    [[ -s "$tickets_file" ]] && tickets_count=$(($(wc -l < "$tickets_file") - 1))
+    print_message "SUCCESS" "Экспортировано тикетов: $tickets_count"
+    
+    # --- Экспорт ticket_messages ---
+    print_message "INFO" "Экспорт сообщений тикетов..."
+    local messages_raw="$export_dir/ticket_messages_raw.csv"
+    local messages_file="$export_dir/ticket_messages.csv"
+    
+    parse_json_table "$db_json" "ticket_messages" "id,ticket_id,user_id,message_text,is_from_admin,created_at" > "$messages_raw"
+    
+    echo "id,ticket_id,sender_type,sender_id,message,created_at" > "$messages_file"
+    
+    awk -F',' -v mapfile="$id_map_file" '
+    BEGIN {
+        while ((getline line < mapfile) > 0) {
+            split(line, parts, "=")
+            id_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        id = $1
+        ticket_id = $2
+        user_id = $3
+        message = $4
+        is_admin = $5
+        created_at = $6
+        
+        sender_type = (is_admin == "t" || is_admin == "true" || is_admin == "True") ? "admin" : "customer"
+        
+        if (user_id in id_map) {
+            telegram_id = id_map[user_id]
+            # Экранируем запятые в сообщении
+            gsub(/,/, "&#44;", message)
+            print id "," ticket_id "," sender_type "," telegram_id "," message "," created_at
+        }
+    }
+    ' "$messages_raw" >> "$messages_file"
+    
+    local messages_count=0
+    [[ -s "$messages_file" ]] && messages_count=$(($(wc -l < "$messages_file") - 1))
+    print_message "SUCCESS" "Экспортировано сообщений тикетов: $messages_count"
+    
+    # --- Экспорт broadcast_history ---
+    print_message "INFO" "Экспорт истории рассылок..."
+    local broadcast_file="$export_dir/broadcast.csv"
+    
+    parse_json_table "$db_json" "broadcast_history" "id,message_text,target_type,created_at,status,total_count,sent_count,failed_count" > "$export_dir/broadcast_raw.csv"
+    
+    # Добавляем заголовок с нужными полями
+    echo "id,content,type,language,created_at,status,total_count,sent_count,failed_count" > "$broadcast_file"
+    
+    awk -F',' 'NR > 1 {
+        id = $1
+        content = $2
+        type = $3
+        created_at = $4
+        status = $5
+        total = $6
+        sent = $7
+        failed = $8
+        
+        # Экранируем запятые в content
+        gsub(/,/, "&#44;", content)
+        print id "," content "," type ",," created_at "," status "," total "," sent "," failed
+    }' "$export_dir/broadcast_raw.csv" >> "$broadcast_file"
+    
+    local broadcast_count=0
+    [[ -s "$broadcast_file" ]] && broadcast_count=$(($(wc -l < "$broadcast_file") - 1))
+    print_message "SUCCESS" "Экспортировано рассылок: $broadcast_count"
+    
+    # --- Экспорт user_activity ---
+    print_message "INFO" "Экспорт активности пользователей..."
+    local activity_file="$export_dir/user_activity.csv"
+    
+    echo "telegram_id,last_activity" > "$activity_file"
+    
+    # Читаем из users_raw_file т.к. там есть last_activity (поле $10)
+    # Формат users_raw: id,telegram_id,username,first_name,language,created_at,balance_kopeks,referral_balance,status,last_activity,referred_by_id
+    awk -F',' 'NR > 1 {
+        telegram_id = $2
+        last_activity = $10
+        
+        if (telegram_id != "" && last_activity != "") {
+            print telegram_id "," last_activity
+        }
+    }' "$users_raw_file" >> "$activity_file"
+    
+    local activity_count=0
+    [[ -s "$activity_file" ]] && activity_count=$(($(wc -l < "$activity_file") - 1))
+    print_message "SUCCESS" "Экспортировано записей активности: $activity_count"
+    
+    # --- Экспорт referral_earnings ---
+    print_message "INFO" "Экспорт реферальных бонусов..."
+    local ref_bonus_raw="$export_dir/referral_earnings_raw.csv"
+    local ref_bonus_file="$export_dir/referral_bonus.csv"
+    
+    parse_json_table "$db_json" "referral_earnings" "id,user_id,referral_id,reason,amount_kopeks,created_at" > "$ref_bonus_raw"
+    
+    echo "id,referrer_telegram_id,referee_telegram_id,reason,amount_kopeks,created_at" > "$ref_bonus_file"
+    
+    awk -F',' -v mapfile="$id_map_file" '
+    BEGIN {
+        while ((getline line < mapfile) > 0) {
+            split(line, parts, "=")
+            id_map[parts[1]] = parts[2]
+        }
+    }
+    NR > 1 {
+        id = $1
+        user_id = $2      # referrer (кто получил бонус)
+        referral_id = $3  # referee (за кого получен бонус)
+        reason = $4
+        amount = $5
+        created_at = $6
+        
+        if (user_id in id_map && referral_id in id_map) {
+            referrer_tg = id_map[user_id]
+            referee_tg = id_map[referral_id]
+            print id "," referrer_tg "," referee_tg "," reason "," amount "," created_at
+        }
+    }
+    ' "$ref_bonus_raw" >> "$ref_bonus_file"
+    
+    local ref_bonus_count=0
+    [[ -s "$ref_bonus_file" ]] && ref_bonus_count=$(($(wc -l < "$ref_bonus_file") - 1))
+    print_message "SUCCESS" "Экспортировано записей реферальных бонусов: $ref_bonus_count"
+    
+    # Очистка временных файлов
+    rm -f "$export_dir"/*_raw.csv "$export_dir"/.*.map "$export_dir"/promocodes_with_id.csv 2>/dev/null
+    
+    debug_log "MIGRATE" "JSON export complete: users=$user_count, referrals=$referral_count, subs=$subs_count, tx=$tx_count, promo=$promo_count, tickets=$tickets_count, messages=$messages_count, broadcast=$broadcast_count"
+    
+    print_message "SUCCESS" "Экспорт из JSON завершён!"
+    return 0
+}
+
 # --- Функция: Экспорт данных из источника ---
 migrate_export_data() {
     debug_log "MIGRATE" "Starting data export"
-    print_message "INFO" "Экспорт данных из Bedolaga..."
+    
+    # Если источник - архив JSON, используем JSON-парсер
+    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
+        debug_log "MIGRATE" "Source type is archive, using JSON export"
+        migrate_export_from_json
+        return $?
+    fi
+    
+    print_message "INFO" "Экспорт данных из Bedolaga (PostgreSQL)..."
     
     local export_dir="$MIGRATION_WORK_DIR/export"
     mkdir -p "$export_dir"
@@ -7166,15 +7692,90 @@ migrate_configure_source() {
     clear_screen
     echo -e "${CYAN}${BOLD}═══ НАСТРОЙКА ИСТОЧНИКА (Bedolaga) ═══${RESET}"
     echo ""
-    echo "Выберите способ подключения к БД Bedolaga:"
-    echo " 1. Docker контейнер (на этом сервере)"
-    echo " 2. Внешний PostgreSQL сервер"
+    echo "Выберите источник данных Bedolaga:"
+    echo -e " ${GREEN}1. Бэкап-архив (.tar.gz с database.json)${RESET} ← Рекомендуется"
+    echo " 2. Docker контейнер (на этом сервере)"
+    echo " 3. Внешний PostgreSQL сервер"
     echo " 0. Назад"
     echo ""
     read -erp "Выбор: " source_type
     
     case "$source_type" in
         1)
+            # Источник: бэкап-архив Bedolaga
+            MIGRATION_SOURCE_TYPE="archive"
+            MIGRATION_SOURCE_CONTAINER=""
+            MIGRATION_SOURCE_HOST=""
+            
+            echo ""
+            print_message "INFO" "Поиск бэкап-архивов Bedolaga..."
+            
+            # Автопоиск архивов
+            local found_backups=()
+            local search_paths=("/opt/bedolaga/backups" "/opt/bedolaga/backup" "/root/backups" "/opt/vpn-bot/backups" "$HOME/backups")
+            
+            for search_path in "${search_paths[@]}"; do
+                [[ ! -d "$search_path" ]] && continue
+                while IFS= read -r -d '' backup_file; do
+                    found_backups+=("$backup_file")
+                done < <(find "$search_path" -maxdepth 2 -name "backup_*.tar.gz" -type f -print0 2>/dev/null | head -z -n 10)
+            done
+            
+            if [[ ${#found_backups[@]} -gt 0 ]]; then
+                echo ""
+                echo "Найденные бэкапы:"
+                local i=1
+                for backup in "${found_backups[@]}"; do
+                    local size=$(du -h "$backup" 2>/dev/null | cut -f1)
+                    local date=$(stat -c %y "$backup" 2>/dev/null | cut -d' ' -f1)
+                    echo "  $i. $backup ($size, $date)"
+                    ((i++))
+                done
+                echo ""
+                echo "  M. Ввести путь вручную"
+                echo ""
+                read -erp "Выберите архив [1]: " backup_choice
+                backup_choice="${backup_choice:-1}"
+                
+                if [[ "$backup_choice" == "M" || "$backup_choice" == "m" ]]; then
+                    read -erp "Путь к архиву: " MIGRATION_SOURCE_BACKUP
+                elif [[ "$backup_choice" =~ ^[0-9]+$ ]] && (( backup_choice >= 1 && backup_choice <= ${#found_backups[@]} )); then
+                    MIGRATION_SOURCE_BACKUP="${found_backups[$((backup_choice-1))]}"
+                else
+                    print_message "ERROR" "Неверный выбор"
+                    return 1
+                fi
+            else
+                echo ""
+                print_message "WARN" "Архивы не найдены автоматически"
+                read -erp "Путь к архиву бэкапа Bedolaga: " MIGRATION_SOURCE_BACKUP
+            fi
+            
+            # Проверка архива
+            if [[ ! -f "$MIGRATION_SOURCE_BACKUP" ]]; then
+                print_message "ERROR" "Файл не найден: $MIGRATION_SOURCE_BACKUP"
+                return 1
+            fi
+            
+            # Распаковка архива
+            print_message "INFO" "Распаковка архива..."
+            if ! extract_bedolaga_backup "$MIGRATION_SOURCE_BACKUP"; then
+                print_message "ERROR" "Не удалось распаковать архив"
+                return 1
+            fi
+            
+            # Показать информацию о бэкапе
+            echo ""
+            print_message "INFO" "Информация о бэкапе:"
+            get_bedolaga_backup_info "$MIGRATION_SOURCE_BACKUP"
+            
+            print_message "SUCCESS" "Источник настроен: архив"
+            ;;
+        2)
+            # Источник: Docker контейнер
+            MIGRATION_SOURCE_TYPE="docker"
+            MIGRATION_SOURCE_BACKUP=""
+            
             echo ""
             echo "Доступные PostgreSQL контейнеры:"
             docker ps --format '{{.Names}}' | grep -iE 'postgres|db|bedolaga' | while read -r name; do
@@ -7188,8 +7789,15 @@ migrate_configure_source() {
             MIGRATION_SOURCE_USER="${MIGRATION_SOURCE_USER:-postgres}"
             MIGRATION_SOURCE_HOST=""
             MIGRATION_SOURCE_PASS=""
+            
+            print_message "SUCCESS" "Источник настроен: Docker контейнер"
             ;;
-        2)
+        3)
+            # Источник: внешний PostgreSQL
+            MIGRATION_SOURCE_TYPE="postgresql"
+            MIGRATION_SOURCE_CONTAINER=""
+            MIGRATION_SOURCE_BACKUP=""
+            
             echo ""
             read -erp "Хост PostgreSQL: " MIGRATION_SOURCE_HOST
             read -erp "Порт [5432]: " MIGRATION_SOURCE_PORT
@@ -7198,12 +7806,11 @@ migrate_configure_source() {
             read -erp "Пользователь: " MIGRATION_SOURCE_USER
             read -serp "Пароль: " MIGRATION_SOURCE_PASS
             echo ""
-            MIGRATION_SOURCE_CONTAINER=""
+            
+            print_message "SUCCESS" "Источник настроен: внешний PostgreSQL"
             ;;
         0) return ;;
     esac
-    
-    print_message "SUCCESS" "Источник настроен"
 }
 
 # --- Функция: Настройка приёмника ---
@@ -7260,10 +7867,13 @@ menu_migration() {
         
         # Статус настроек
         echo -e "${CYAN}=== ТЕКУЩИЕ НАСТРОЙКИ ===${RESET}"
-        if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        if [[ "$MIGRATION_SOURCE_TYPE" == "archive" && -n "$MIGRATION_SOURCE_BACKUP" ]]; then
+            local backup_name=$(basename "$MIGRATION_SOURCE_BACKUP")
+            echo -e "Источник: ${GREEN}Архив: $backup_name${RESET}"
+        elif [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
             echo -e "Источник: ${GREEN}Docker: $MIGRATION_SOURCE_CONTAINER${RESET} (DB: $MIGRATION_SOURCE_DB)"
         elif [[ -n "$MIGRATION_SOURCE_HOST" ]]; then
-            echo -e "Источник: ${GREEN}$MIGRATION_SOURCE_HOST:$MIGRATION_SOURCE_PORT${RESET} (DB: $MIGRATION_SOURCE_DB)"
+            echo -e "Источник: ${GREEN}PostgreSQL: $MIGRATION_SOURCE_HOST:$MIGRATION_SOURCE_PORT${RESET} (DB: $MIGRATION_SOURCE_DB)"
         else
             echo -e "Источник: ${RED}Не настроен${RESET}"
         fi
@@ -7304,8 +7914,12 @@ menu_migration() {
             2) migrate_configure_target ;;
             3)
                 echo ""
-                if [[ -n "$MIGRATION_SOURCE_CONTAINER" || -n "$MIGRATION_SOURCE_HOST" ]]; then
-                    migrate_analyze_source && print_message "SUCCESS" "Источник доступен"
+                if [[ -n "$MIGRATION_SOURCE_TYPE" ]]; then
+                    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
+                        print_message "SUCCESS" "Источник: архив ${MIGRATION_SOURCE_BACKUP##*/}"
+                    else
+                        migrate_analyze_source && print_message "SUCCESS" "Источник доступен"
+                    fi
                 else
                     print_message "ERROR" "Источник не настроен"
                 fi
@@ -7327,6 +7941,18 @@ menu_migration() {
                 ;;
             5)
                 # Полная миграция
+                # Проверка что источник и приёмник настроены
+                if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
+                    print_message "ERROR" "Сначала настройте источник (пункт 1)"
+                    read -erp "Enter..." dummy
+                    continue
+                fi
+                if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+                    print_message "ERROR" "Сначала настройте приёмник (пункт 2)"
+                    read -erp "Enter..." dummy
+                    continue
+                fi
+                
                 echo ""
                 echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
                 echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ! ПОЛНАЯ МИГРАЦИЯ ДАННЫХ!           ${RESET}"
@@ -7421,7 +8047,7 @@ menu_migration() {
                 ;;
             9)
                 mkdir -p "$MIGRATION_WORK_DIR"
-                if [[ -z "$MIGRATION_SOURCE_CONTAINER" && -z "$MIGRATION_SOURCE_HOST" ]]; then
+                if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
                     print_message "ERROR" "Сначала настройте источник (пункт 1)"
                 else
                     migrate_handle_balances
