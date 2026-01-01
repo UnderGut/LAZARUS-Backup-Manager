@@ -6562,6 +6562,7 @@ find_bedolaga_backup() {
 # --- Функция: Извлечение архива Bedolaga во временную папку ---
 extract_bedolaga_backup() {
     local backup_file="$1"
+    local password="${2:-$BEDOLAGA_BACKUP_PASSWORD}"
     
     if [[ ! -f "$backup_file" ]]; then
         print_message "ERROR" "Файл бэкапа не найден: $backup_file"
@@ -6574,9 +6575,114 @@ extract_bedolaga_backup() {
     
     debug_log "MIGRATE" "Extracting backup to: $MIGRATION_EXTRACTED_DIR"
     
-    if ! tar -xzf "$backup_file" -C "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
-        print_message "ERROR" "Не удалось распаковать архив"
+    local actual_archive="$backup_file"
+    
+    # Проверяем тип архива
+    local file_ext="${backup_file##*.}"
+    local file_name=$(basename "$backup_file")
+    
+    # Если это .zip или .tar.zip — это запароленный внешний архив
+    if [[ "$file_ext" == "zip" ]] || [[ "$file_name" == *.tar.zip ]]; then
+        debug_log "MIGRATE" "Detected password-protected ZIP archive"
+        
+        # Проверяем наличие unzip
+        if ! command -v unzip &>/dev/null; then
+            print_message "ERROR" "Для распаковки защищённых архивов требуется unzip"
+            print_message "INFO" "Установите: apt install unzip"
+            return 1
+        fi
+        
+        # Запрашиваем пароль если не задан
+        if [[ -z "$password" ]]; then
+            echo ""
+            print_message "INFO" "Архив защищён паролем"
+            read -ersp "Введите пароль для архива: " password
+            echo ""
+            
+            if [[ -z "$password" ]]; then
+                print_message "ERROR" "Пароль не указан"
+                return 1
+            fi
+        fi
+        
+        # Распаковываем внешний ZIP
+        print_message "INFO" "Распаковка защищённого архива..."
+        if ! unzip -P "$password" -q "$backup_file" -d "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
+            print_message "ERROR" "Неверный пароль или повреждённый архив"
+            return 1
+        fi
+        
+        # Ищем внутренний tar.gz архив
+        actual_archive=$(find "$MIGRATION_EXTRACTED_DIR" -name "*.tar.gz" -o -name "*.tar" 2>/dev/null | head -1)
+        
+        if [[ -z "$actual_archive" ]]; then
+            # Проверяем, может database.json уже распакован напрямую
+            if [[ -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+                debug_log "MIGRATE" "database.json found directly in ZIP"
+                return 0
+            fi
+            print_message "ERROR" "Внутри ZIP не найден tar.gz архив"
+            return 1
+        fi
+        
+        debug_log "MIGRATE" "Found inner archive: $actual_archive"
+        
+        # Создаём подпапку для содержимого внутреннего архива
+        local inner_dir="$MIGRATION_EXTRACTED_DIR/extracted"
+        mkdir -p "$inner_dir"
+        
+        # Распаковываем внутренний архив
+        if [[ "$actual_archive" == *.tar.gz ]]; then
+            if ! tar -xzf "$actual_archive" -C "$inner_dir" 2>/dev/null; then
+                print_message "ERROR" "Не удалось распаковать внутренний tar.gz"
+                return 1
+            fi
+        else
+            if ! tar -xf "$actual_archive" -C "$inner_dir" 2>/dev/null; then
+                print_message "ERROR" "Не удалось распаковать внутренний tar"
+                return 1
+            fi
+        fi
+        
+        # Перемещаем содержимое в основную папку
+        # database.json может быть в корне или в подпапке
+        local db_json=$(find "$inner_dir" -name "database.json" -type f 2>/dev/null | head -1)
+        if [[ -n "$db_json" ]]; then
+            local db_dir=$(dirname "$db_json")
+            # Копируем всё из папки с database.json
+            cp -r "$db_dir"/* "$MIGRATION_EXTRACTED_DIR/" 2>/dev/null || true
+        fi
+        
+        # Удаляем промежуточные файлы
+        rm -rf "$MIGRATION_EXTRACTED_DIR/extracted"
+        rm -f "$actual_archive"
+        
+    # Обычный tar.gz
+    elif [[ "$file_ext" == "gz" ]] || [[ "$file_name" == *.tar.gz ]]; then
+        if ! tar -xzf "$backup_file" -C "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
+            print_message "ERROR" "Не удалось распаковать архив"
+            return 1
+        fi
+        
+    # Обычный tar
+    elif [[ "$file_ext" == "tar" ]]; then
+        if ! tar -xf "$backup_file" -C "$MIGRATION_EXTRACTED_DIR" 2>/dev/null; then
+            print_message "ERROR" "Не удалось распаковать архив"
+            return 1
+        fi
+    else
+        print_message "ERROR" "Неподдерживаемый формат архива: $file_ext"
         return 1
+    fi
+    
+    # database.json может быть в подпапке — ищем и перемещаем в корень
+    if [[ ! -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+        local found_json=$(find "$MIGRATION_EXTRACTED_DIR" -name "database.json" -type f 2>/dev/null | head -1)
+        if [[ -n "$found_json" ]]; then
+            local found_dir=$(dirname "$found_json")
+            # Перемещаем содержимое в корень
+            mv "$found_dir"/* "$MIGRATION_EXTRACTED_DIR/" 2>/dev/null || true
+        fi
     fi
     
     # Проверяем наличие ключевых файлов
@@ -6586,6 +6692,7 @@ extract_bedolaga_backup() {
     fi
     
     debug_log "MIGRATE" "Backup extracted successfully"
+    print_message "SUCCESS" "Архив распакован"
     return 0
 }
 
@@ -8006,6 +8113,8 @@ migration_auto_find_archive() {
     search_paths+=(
         "/opt/private-remnawave-telegram-shop-bot"
         "/opt/rwp-shop"
+        "/opt/bedolaga"
+        "/opt/vpn-bot"
         "/root"
         "/tmp"
         "$HOME"
@@ -8019,10 +8128,10 @@ migration_auto_find_archive() {
     for path in "${search_paths[@]}"; do
         [[ ! -d "$path" ]] && continue
         
-        # Ищем архивы backup_*.tar.gz (формат Bedolaga)
+        # Ищем архивы backup_*.tar.gz И backup_*.tar.zip (запароленные)
         while IFS= read -r -d '' archive; do
             all_archives+=("$archive")
-        done < <(find "$path" -maxdepth 2 -name "backup_*.tar.gz" -type f -print0 2>/dev/null)
+        done < <(find "$path" -maxdepth 3 -type f \( -name "backup_*.tar.gz" -o -name "backup_*.tar.zip" -o -name "backup_*.zip" \) -print0 2>/dev/null)
     done
     
     if [[ ${#all_archives[@]} -eq 0 ]]; then
@@ -8049,6 +8158,7 @@ migration_auto_find_archive() {
 # --- Функция: Быстрый анализ архива (без полной распаковки) ---
 migration_quick_analyze() {
     local archive="$1"
+    local password="${2:-$BEDOLAGA_BACKUP_PASSWORD}"
     
     if [[ ! -f "$archive" ]]; then
         return 1
@@ -8058,14 +8168,57 @@ migration_quick_analyze() {
     local temp_dir=$(mktemp -d)
     TEMP_DIRS+=("$temp_dir")
     
-    # Распаковываем только database.json
-    if ! tar -xzf "$archive" -C "$temp_dir" "database.json" 2>/dev/null; then
-        rm -rf "$temp_dir"
-        return 1
-    fi
+    local db_json=""
+    local archive_type=$(detect_bedolaga_archive_type "$archive" 2>/dev/null || echo "unknown")
     
-    local db_json="$temp_dir/database.json"
-    if [[ ! -f "$db_json" ]]; then
+    case "$archive_type" in
+        "tar.gz")
+            # Распаковываем только database.json
+            if ! tar -xzf "$archive" -C "$temp_dir" "database.json" 2>/dev/null; then
+                # Может быть в подпапке
+                tar -xzf "$archive" -C "$temp_dir" --wildcards "*/database.json" 2>/dev/null
+            fi
+            db_json=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+            ;;
+        "tar")
+            tar -xf "$archive" -C "$temp_dir" "database.json" 2>/dev/null || \
+            tar -xf "$archive" -C "$temp_dir" --wildcards "*/database.json" 2>/dev/null
+            db_json=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+            ;;
+        "zip")
+            # Проверяем наличие пароля
+            if is_archive_password_protected "$archive" 2>/dev/null; then
+                if [[ -z "$password" ]]; then
+                    rm -rf "$temp_dir"
+                    return 1  # Нет пароля
+                fi
+                unzip -P "$password" -q "$archive" -d "$temp_dir" 2>/dev/null
+            else
+                unzip -q "$archive" -d "$temp_dir" 2>/dev/null
+            fi
+            
+            # Ищем внутренний архив
+            local inner_archive=$(find "$temp_dir" -type f \( -name "*.tar.gz" -o -name "*.tar" \) 2>/dev/null | head -1)
+            if [[ -n "$inner_archive" ]]; then
+                local inner_dir="$temp_dir/inner"
+                mkdir -p "$inner_dir"
+                if [[ "$inner_archive" == *.tar.gz ]]; then
+                    tar -xzf "$inner_archive" -C "$inner_dir" 2>/dev/null
+                else
+                    tar -xf "$inner_archive" -C "$inner_dir" 2>/dev/null
+                fi
+                db_json=$(find "$inner_dir" -name "database.json" -type f 2>/dev/null | head -1)
+            else
+                db_json=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+            fi
+            ;;
+        *)
+            rm -rf "$temp_dir"
+            return 1
+            ;;
+    esac
+    
+    if [[ -z "$db_json" || ! -f "$db_json" ]]; then
         rm -rf "$temp_dir"
         return 1
     fi
@@ -8131,7 +8284,25 @@ migration_show_status() {
     if [[ "$MIGRATION_SOURCE_TYPE" == "archive" && -n "$MIGRATION_SOURCE_BACKUP" && -f "$MIGRATION_SOURCE_BACKUP" ]]; then
         local archive_name=$(basename "$MIGRATION_SOURCE_BACKUP")
         local archive_size=$(du -h "$MIGRATION_SOURCE_BACKUP" 2>/dev/null | cut -f1)
-        echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ $archive_name${RESET} ($archive_size)"
+        local archive_type=$(detect_bedolaga_archive_type "$MIGRATION_SOURCE_BACKUP" 2>/dev/null || echo "unknown")
+        
+        # Определяем иконку по типу
+        local type_icon=""
+        case "$archive_type" in
+            "zip")
+                if is_archive_password_protected "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
+                    type_icon="🔒"
+                    [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]] && type_icon="🔓"
+                else
+                    type_icon="📦"
+                fi
+                ;;
+            "tar.gz") type_icon="📦" ;;
+            "tar")    type_icon="📁" ;;
+            *)        type_icon="❓" ;;
+        esac
+        
+        echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ $type_icon $archive_name${RESET} ($archive_size)"
         
         # Показываем статистику если есть
         if [[ -n "$MIGRATION_DATA_ANALYSIS" ]]; then
@@ -8139,6 +8310,15 @@ migration_show_status() {
             local tx=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^transactions:" | cut -d: -f2)
             local promo=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^promocodes:" | cut -d: -f2)
             echo -e "${CYAN}║${RESET}             ${GRAY}📊 users: $users | tx: $tx | promo: $promo${RESET}"
+        fi
+        
+        # Показываем статус пароля для защищённых архивов
+        if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
+            if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                echo -e "${CYAN}║${RESET}             ${GREEN}🔑 Пароль установлен${RESET}"
+            else
+                echo -e "${CYAN}║${RESET}             ${YELLOW}⚠️  Требуется пароль (пункт 2)${RESET}"
+            fi
         fi
     elif [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
         echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ Docker: $MIGRATION_SOURCE_CONTAINER${RESET}"
@@ -8248,8 +8428,65 @@ EOF
 # ═══════════════════════════════════════════════════════════════════════════════
 # Комплексные проверки валидности на всех этапах миграции
 
+# --- Функция: Определить тип архива Bedolaga ---
+# Возвращает: tar.gz | zip | tar | unknown
+detect_bedolaga_archive_type() {
+    local archive_path="$1"
+    local file_name=$(basename "$archive_path")
+    local file_ext="${archive_path##*.}"
+    
+    # Проверка по расширению
+    if [[ "$file_name" == *.tar.zip ]] || [[ "$file_ext" == "zip" ]]; then
+        # Проверяем что это действительно ZIP (magic bytes: PK)
+        if [[ $(head -c2 "$archive_path" 2>/dev/null) == "PK" ]]; then
+            echo "zip"
+            return 0
+        fi
+    fi
+    
+    if [[ "$file_name" == *.tar.gz ]] || [[ "$file_ext" == "gz" ]]; then
+        # Проверяем magic bytes для gzip (1f 8b)
+        if [[ $(xxd -l2 -p "$archive_path" 2>/dev/null) == "1f8b" ]]; then
+            echo "tar.gz"
+            return 0
+        fi
+    fi
+    
+    if [[ "$file_ext" == "tar" ]]; then
+        echo "tar"
+        return 0
+    fi
+    
+    # Определяем по magic bytes если расширение не помогло
+    local magic=$(xxd -l4 -p "$archive_path" 2>/dev/null)
+    case "$magic" in
+        504b*)  echo "zip" ;;      # PK..
+        1f8b*)  echo "tar.gz" ;;   # gzip
+        *)      echo "unknown" ;;
+    esac
+}
+
+# --- Функция: Проверить, требует ли архив пароль ---
+is_archive_password_protected() {
+    local archive_path="$1"
+    local archive_type=$(detect_bedolaga_archive_type "$archive_path")
+    
+    if [[ "$archive_type" != "zip" ]]; then
+        return 1  # Только ZIP может быть защищён паролем
+    fi
+    
+    # Проверяем флаги шифрования в ZIP
+    # unzip -t без пароля вернёт ошибку если архив защищён
+    if unzip -t -P "" "$archive_path" &>/dev/null; then
+        return 1  # Пароль не требуется
+    else
+        return 0  # Требуется пароль
+    fi
+}
+
 # --- Функция: Healthcheck архива Bedolaga ---
-# Проверяет: целостность tar.gz, наличие database.json, структуру JSON
+# Проверяет: целостность архива, наличие database.json, структуру JSON
+# Поддерживает: tar.gz, tar, zip (в т.ч. запароленный)
 migration_healthcheck_archive() {
     local archive_path="${1:-$MIGRATION_SOURCE_BACKUP}"
     local verbose="${2:-true}"
@@ -8274,37 +8511,178 @@ migration_healthcheck_archive() {
     local size_human=$(numfmt --to=iec-i --suffix=B "$file_size" 2>/dev/null || echo "${file_size} bytes")
     [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Размер файла: $size_human"
     
-    # 3) Целостность gzip
-    if ! gzip -t "$archive_path" 2>/dev/null; then
-        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён gzip архив"
+    # 3) Определяем тип архива
+    local archive_type=$(detect_bedolaga_archive_type "$archive_path")
+    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Тип архива: $archive_type"
+    
+    if [[ "$archive_type" == "unknown" ]]; then
+        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Неизвестный формат архива"
         return 1
     fi
-    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность gzip: OK"
     
-    # 4) Целостность tar
-    if ! tar -tzf "$archive_path" &>/dev/null; then
-        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён tar архив"
-        return 1
+    # 4) Проверка защиты паролем (только для ZIP)
+    local needs_password=false
+    if [[ "$archive_type" == "zip" ]]; then
+        if is_archive_password_protected "$archive_path"; then
+            needs_password=true
+            [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}🔒${RESET} Архив защищён паролем"
+            
+            # Проверяем есть ли сохранённый пароль
+            if [[ -z "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Пароль потребуется при распаковке"
+                ((warnings++))
+            else
+                [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Пароль сохранён"
+            fi
+        else
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Архив не защищён паролем"
+        fi
     fi
-    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность tar: OK"
     
-    # 5) Наличие database.json
-    if ! tar -tzf "$archive_path" | grep -q "database.json"; then
-        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json в архиве"
-        return 1
-    fi
-    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} database.json присутствует"
+    # 5) Проверка целостности
+    case "$archive_type" in
+        "tar.gz")
+            if ! gzip -t "$archive_path" 2>/dev/null; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён gzip архив"
+                return 1
+            fi
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность gzip: OK"
+            
+            if ! tar -tzf "$archive_path" &>/dev/null; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён tar архив"
+                return 1
+            fi
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность tar: OK"
+            ;;
+        "tar")
+            if ! tar -tf "$archive_path" &>/dev/null; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён tar архив"
+                return 1
+            fi
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность tar: OK"
+            ;;
+        "zip")
+            # Для защищённых ZIP пропускаем глубокую проверку без пароля
+            if [[ "$needs_password" == "true" ]]; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Целостность ZIP: требуется пароль для проверки"
+                ((warnings++))
+            else
+                if ! unzip -t "$archive_path" &>/dev/null; then
+                    [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Повреждён ZIP архив"
+                    return 1
+                fi
+                [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} Целостность ZIP: OK"
+            fi
+            ;;
+    esac
     
-    # 6) Проверка JSON структуры
+    # 6) Проверка содержимого (database.json)
     local temp_dir=$(mktemp -d)
     TEMP_DIRS+=("$temp_dir")
+    local json_file=""
     
-    tar -xzf "$archive_path" -C "$temp_dir" --wildcards '*/database.json' 2>/dev/null || \
-    tar -xzf "$archive_path" -C "$temp_dir" 'database.json' 2>/dev/null
+    case "$archive_type" in
+        "tar.gz")
+            # Проверяем наличие database.json
+            if ! tar -tzf "$archive_path" | grep -q "database.json"; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json в архиве"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} database.json присутствует"
+            
+            # Извлекаем для проверки JSON
+            tar -xzf "$archive_path" -C "$temp_dir" --wildcards '*/database.json' 2>/dev/null || \
+            tar -xzf "$archive_path" -C "$temp_dir" 'database.json' 2>/dev/null
+            json_file=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+            ;;
+        "tar")
+            if ! tar -tf "$archive_path" | grep -q "database.json"; then
+                [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json в архиве"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} database.json присутствует"
+            
+            tar -xf "$archive_path" -C "$temp_dir" --wildcards '*/database.json' 2>/dev/null || \
+            tar -xf "$archive_path" -C "$temp_dir" 'database.json' 2>/dev/null
+            json_file=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+            ;;
+        "zip")
+            if [[ "$needs_password" == "true" ]]; then
+                # Пытаемся с сохранённым паролем
+                if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                    # Извлекаем внутренний архив
+                    unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -q "$archive_path" -d "$temp_dir" 2>/dev/null
+                    
+                    # Ищем внутренний tar.gz
+                    local inner_archive=$(find "$temp_dir" -name "*.tar.gz" -o -name "*.tar" 2>/dev/null | head -1)
+                    if [[ -n "$inner_archive" ]]; then
+                        local inner_temp="$temp_dir/inner"
+                        mkdir -p "$inner_temp"
+                        if [[ "$inner_archive" == *.tar.gz ]]; then
+                            tar -xzf "$inner_archive" -C "$inner_temp" 2>/dev/null
+                        else
+                            tar -xf "$inner_archive" -C "$inner_temp" 2>/dev/null
+                        fi
+                        json_file=$(find "$inner_temp" -name "database.json" -type f 2>/dev/null | head -1)
+                    else
+                        json_file=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
+                    fi
+                    
+                    if [[ -z "$json_file" ]]; then
+                        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json в архиве"
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
+                    [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} database.json присутствует"
+                else
+                    [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} database.json: требуется пароль для проверки"
+                    ((warnings++))
+                fi
+            else
+                # Без пароля — проверяем содержимое
+                if ! unzip -l "$archive_path" 2>/dev/null | grep -q "database.json"; then
+                    # Проверяем внутренний архив
+                    unzip -q "$archive_path" -d "$temp_dir" 2>/dev/null
+                    local inner_archive=$(find "$temp_dir" -name "*.tar.gz" -o -name "*.tar" 2>/dev/null | head -1)
+                    if [[ -n "$inner_archive" ]]; then
+                        if [[ "$inner_archive" == *.tar.gz ]]; then
+                            if ! tar -tzf "$inner_archive" | grep -q "database.json"; then
+                                [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json"
+                                rm -rf "$temp_dir"
+                                return 1
+                            fi
+                        fi
+                    else
+                        [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не найден database.json"
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
+                fi
+                [[ "$verbose" == "true" ]] && echo -e "  ${GREEN}✓${RESET} database.json присутствует"
+            fi
+            ;;
+    esac
     
-    local json_file=$(find "$temp_dir" -name "database.json" -type f 2>/dev/null | head -1)
-    
+    # Если json_file не найден и нет пароля — пропускаем проверку JSON
     if [[ -z "$json_file" || ! -f "$json_file" ]]; then
+        if [[ "$needs_password" == "true" && -z "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+            [[ "$verbose" == "true" ]] && echo -e "  ${YELLOW}○${RESET} Проверка JSON структуры: требуется пароль"
+            ((warnings++))
+            rm -rf "$temp_dir"
+            
+            # Результат с предупреждением
+            if [[ "$verbose" == "true" ]]; then
+                echo ""
+                echo -e "  ${YELLOW}${BOLD}⚠️  АРХИВ ТРЕБУЕТ ПАРОЛЬ${RESET}"
+                echo -e "  ${YELLOW}   Укажите пароль для полной проверки${RESET}"
+            fi
+            
+            debug_log "HEALTHCHECK" "Archive check: password required, path=$archive_path"
+            return 0  # Возвращаем успех, т.к. базовые проверки пройдены
+        fi
+        
         [[ "$verbose" == "true" ]] && echo -e "  ${RED}✗${RESET} Не удалось извлечь database.json"
         rm -rf "$temp_dir"
         return 1
@@ -8808,6 +9186,8 @@ migration_select_archive() {
         "$BOT_PATH"
         "/opt/private-remnawave-telegram-shop-bot"
         "/opt/rwp-shop"
+        "/opt/bedolaga"
+        "/opt/vpn-bot"
         "/root"
         "$BACKUP_DIR"
         "$HOME"
@@ -8817,15 +9197,20 @@ migration_select_archive() {
     
     for path in "${search_paths[@]}"; do
         [[ ! -d "$path" ]] && continue
+        # Ищем tar.gz И tar.zip (запароленные)
         while IFS= read -r -d '' archive; do
             all_archives+=("$archive")
-        done < <(find "$path" -maxdepth 2 -name "backup_*.tar.gz" -type f -print0 2>/dev/null)
+        done < <(find "$path" -maxdepth 3 -type f \( -name "backup_*.tar.gz" -o -name "backup_*.tar.zip" -o -name "backup_*.zip" \) -print0 2>/dev/null)
     done
     
     if [[ ${#all_archives[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Архивы backup_*.tar.gz не найдены автоматически${RESET}"
+        echo -e "${YELLOW}Архивы backup_*.tar.gz / backup_*.tar.zip не найдены${RESET}"
         echo ""
-        echo "Где искать архив:"
+        echo "Поддерживаемые форматы:"
+        echo "  • backup_*.tar.gz      — обычный архив"
+        echo "  • backup_*.tar.zip     — запароленный архив"
+        echo ""
+        echo "Где найти архив:"
         echo "  • Скачайте бэкап из Telegram (если бот отправлял)"
         echo "  • Скопируйте из папки Bedolaga: /opt/bedolaga/backups/"
         echo "  • Положите в папку RWP-Shop бота"
@@ -8833,10 +9218,7 @@ migration_select_archive() {
         read -erp "Введите полный путь к архиву: " manual_path
         
         if [[ -f "$manual_path" ]]; then
-            MIGRATION_SOURCE_BACKUP="$manual_path"
-            MIGRATION_SOURCE_TYPE="archive"
-            MIGRATION_DATA_ANALYSIS=""  # Сбросить кэш анализа
-            print_message "SUCCESS" "Архив выбран: $manual_path"
+            _migration_set_archive "$manual_path"
         else
             print_message "ERROR" "Файл не найден: $manual_path"
         fi
@@ -8855,10 +9237,19 @@ migration_select_archive() {
         local size=$(du -h "$archive" 2>/dev/null | cut -f1)
         local mtime=$(stat -c '%y' "$archive" 2>/dev/null | cut -d'.' -f1)
         
+        # Определяем тип и статус защиты
+        local type_icon="📦"
+        local archive_type=$(detect_bedolaga_archive_type "$archive" 2>/dev/null || echo "unknown")
+        if [[ "$archive_type" == "zip" ]]; then
+            if is_archive_password_protected "$archive" 2>/dev/null; then
+                type_icon="🔒"
+            fi
+        fi
+        
         if [[ $i -eq 1 ]]; then
-            echo -e "  ${GREEN}$i. $name${RESET} ($size) - $mtime ${GREEN}← РЕКОМЕНДУЕТСЯ${RESET}"
+            echo -e "  ${GREEN}$i. $type_icon $name${RESET} ($size) - $mtime ${GREEN}← РЕКОМЕНДУЕТСЯ${RESET}"
         else
-            echo "  $i. $name ($size) - $mtime"
+            echo "  $i. $type_icon $name ($size) - $mtime"
         fi
         ((i++))
         [[ $i -gt 10 ]] && break  # Максимум 10 архивов
@@ -8867,16 +9258,15 @@ migration_select_archive() {
     echo ""
     echo "  0. Ввести путь вручную"
     echo ""
+    echo -e "  ${GRAY}🔒 = защищён паролем${RESET}"
+    echo ""
     read -erp "Выбор: " choice
     
     case "$choice" in
         0)
             read -erp "Путь к архиву: " manual_path
             if [[ -f "$manual_path" ]]; then
-                MIGRATION_SOURCE_BACKUP="$manual_path"
-                MIGRATION_SOURCE_TYPE="archive"
-                MIGRATION_DATA_ANALYSIS=""
-                print_message "SUCCESS" "Архив выбран"
+                _migration_set_archive "$manual_path"
             else
                 print_message "ERROR" "Файл не найден"
             fi
@@ -8884,13 +9274,49 @@ migration_select_archive() {
         [1-9]|10)
             local idx=$((choice - 1))
             if [[ $idx -lt ${#sorted_archives[@]} ]]; then
-                MIGRATION_SOURCE_BACKUP="${sorted_archives[$idx]}"
-                MIGRATION_SOURCE_TYPE="archive"
-                MIGRATION_DATA_ANALYSIS=""
-                print_message "SUCCESS" "Архив выбран: $(basename "${sorted_archives[$idx]}")"
+                _migration_set_archive "${sorted_archives[$idx]}"
             fi
             ;;
     esac
+}
+
+# --- Вспомогательная: Установить архив и запросить пароль если нужно ---
+_migration_set_archive() {
+    local archive_path="$1"
+    
+    MIGRATION_SOURCE_BACKUP="$archive_path"
+    MIGRATION_SOURCE_TYPE="archive"
+    MIGRATION_DATA_ANALYSIS=""  # Сбросить кэш анализа
+    BEDOLAGA_BACKUP_PASSWORD=""  # Сбросить пароль
+    
+    # Проверяем, требуется ли пароль
+    local archive_type=$(detect_bedolaga_archive_type "$archive_path" 2>/dev/null || echo "unknown")
+    
+    if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$archive_path" 2>/dev/null; then
+        echo ""
+        print_message "INFO" "🔒 Архив защищён паролем"
+        read -ersp "Введите пароль: " BEDOLAGA_BACKUP_PASSWORD
+        echo ""
+        
+        # Проверяем правильность пароля
+        if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+            local temp_dir=$(mktemp -d)
+            if unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -t "$archive_path" &>/dev/null; then
+                print_message "SUCCESS" "✅ Пароль верный"
+            else
+                print_message "ERROR" "❌ Неверный пароль"
+                BEDOLAGA_BACKUP_PASSWORD=""
+            fi
+            rm -rf "$temp_dir"
+        fi
+    fi
+    
+    print_message "SUCCESS" "Архив выбран: $(basename "$archive_path")"
+    
+    # Пытаемся получить анализ данных
+    if [[ "$archive_type" != "zip" ]] || [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+        MIGRATION_DATA_ANALYSIS=$(migration_quick_analyze "$archive_path" 2>/dev/null)
+    fi
 }
 
 # --- Функция: Показать предупреждение перед импортом ---
