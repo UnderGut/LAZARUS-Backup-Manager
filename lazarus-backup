@@ -9983,14 +9983,34 @@ migration_show_detailed_analysis() {
     echo -e "${CYAN}${BOLD}+----------------------------------------------------------------------+${RESET}"
     echo ""
     
+    # Проверяем, требуется ли пароль
+    local archive_type=$(detect_bedolaga_archive_type "$MIGRATION_SOURCE_BACKUP" 2>/dev/null)
+    if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
+        if [[ -z "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+            echo -e "${YELLOW}  ⚠️  Архив защищён паролем${RESET}"
+            echo ""
+            echo "  Для анализа данных необходимо ввести пароль."
+            echo "  Используйте пункт 2 в меню миграции для выбора архива"
+            echo "  и ввода пароля."
+            echo ""
+            return 1
+        fi
+    fi
+    
     # Получаем анализ
     if [[ -z "$MIGRATION_DATA_ANALYSIS" ]]; then
         print_message "INFO" "Анализ архива..."
-        MIGRATION_DATA_ANALYSIS=$(migration_quick_analyze "$MIGRATION_SOURCE_BACKUP")
+        MIGRATION_DATA_ANALYSIS=$(migration_quick_analyze "$MIGRATION_SOURCE_BACKUP" "$BEDOLAGA_BACKUP_PASSWORD")
     fi
     
     if [[ -z "$MIGRATION_DATA_ANALYSIS" ]]; then
         print_message "ERROR" "Не удалось проанализировать архив"
+        echo ""
+        echo "  Возможные причины:"
+        echo "  • Неверный пароль (попробуйте выбрать архив заново — пункт 2)"
+        echo "  • Повреждённый архив"
+        echo "  • Архив не содержит database.json"
+        echo ""
         return 1
     fi
     
