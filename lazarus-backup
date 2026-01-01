@@ -3926,6 +3926,7 @@ MIGRATION_SOURCE_CONTAINER=""   # Docker контейнер БД Bedolaga
 MIGRATION_TARGET_CONTAINER=""
 MIGRATION_TARGET_DB=""
 MIGRATION_TARGET_USER=""
+MIGRATION_TARGET_PATH=""            # Путь к папке RWP-Shop (где docker-compose)
 MIGRATION_WORK_DIR=""
 MIGRATION_EXTRACTED_DIR=""      # Временная папка с распакованным архивом
 
@@ -8683,7 +8684,11 @@ migrate_configure_target() {
     read -erp "Пользователь БД [postgres]: " MIGRATION_TARGET_USER
     MIGRATION_TARGET_USER="${MIGRATION_TARGET_USER:-postgres}"
     
+    # Определяем путь к RWP-Shop
+    migration_detect_target_path
+    
     print_message "SUCCESS" "Приёмник настроен"
+    [[ -n "$MIGRATION_TARGET_PATH" ]] && print_message "INFO" "Путь RWP-Shop: $MIGRATION_TARGET_PATH"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8739,6 +8744,83 @@ migration_show_disclaimer() {
     read -r
     
     MIGRATION_DISCLAIMER_SHOWN=true
+}
+
+# --- Функция: Определить путь к RWP-Shop по контейнеру ---
+migration_detect_target_path() {
+    debug_log "MIGRATE" "Detecting RWP-Shop path..."
+    
+    # Если уже установлен — не перезаписываем
+    if [[ -n "$MIGRATION_TARGET_PATH" && -d "$MIGRATION_TARGET_PATH" ]]; then
+        debug_log "MIGRATE" "Target path already set: $MIGRATION_TARGET_PATH"
+        return 0
+    fi
+    
+    local detected_path=""
+    
+    # 1) Пробуем получить путь из docker inspect (working directory или compose file)
+    if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+        # Ищем compose project working dir
+        local compose_project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$MIGRATION_TARGET_CONTAINER" 2>/dev/null)
+        if [[ -n "$compose_project" && -d "$compose_project" ]]; then
+            detected_path="$compose_project"
+            debug_log "MIGRATE" "Found path from compose label: $detected_path"
+        fi
+    fi
+    
+    # 2) Ищем в стандартных путях
+    if [[ -z "$detected_path" ]]; then
+        local search_paths=(
+            "/opt/private-remnawave-telegram-shop-bot"
+            "/opt/rwp-shop"
+            "/opt/telegram-shop"
+            "$BOT_PATH"
+        )
+        
+        for path in "${search_paths[@]}"; do
+            if [[ -d "$path" ]] && [[ -f "$path/compose.yaml" || -f "$path/docker-compose.yml" || -f "$path/.env" ]]; then
+                detected_path="$path"
+                debug_log "MIGRATE" "Found path in standard location: $detected_path"
+                break
+            fi
+        done
+    fi
+    
+    if [[ -n "$detected_path" ]]; then
+        MIGRATION_TARGET_PATH="$detected_path"
+        debug_log "MIGRATE" "Target path set to: $MIGRATION_TARGET_PATH"
+        return 0
+    fi
+    
+    debug_log "MIGRATE" "Could not detect target path"
+    return 1
+}
+
+# --- Функция: Инициализировать рабочую директорию миграции ---
+migration_init_work_dir() {
+    # Определяем базовый путь для MIGRATION/
+    local base_path=""
+    
+    # Приоритет 1: Путь к RWP-Shop (рядом с docker-compose)
+    if [[ -n "$MIGRATION_TARGET_PATH" && -d "$MIGRATION_TARGET_PATH" ]]; then
+        base_path="$MIGRATION_TARGET_PATH"
+    # Приоритет 2: BOT_PATH
+    elif [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        base_path="$BOT_PATH"
+    # Приоритет 3: BACKUP_DIR (fallback)
+    else
+        base_path="$BACKUP_DIR"
+    fi
+    
+    # Создаём структуру: MIGRATION/YYYYMMDD_HHMMSS/
+    local migration_base="$base_path/MIGRATION"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    MIGRATION_WORK_DIR="$migration_base/$timestamp"
+    
+    mkdir -p "$MIGRATION_WORK_DIR"
+    debug_log "MIGRATE" "Work directory initialized: $MIGRATION_WORK_DIR"
+    
+    return 0
 }
 
 # --- Функция: Автопоиск архива Bedolaga ---
@@ -10493,9 +10575,9 @@ migration_run_automatic() {
     read -erp "Продолжить? (y/N): " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && return 0
     
-    # Инициализация
-    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$MIGRATION_WORK_DIR"
+    # Инициализация рабочей директории
+    migration_detect_target_path
+    migration_init_work_dir
     migration_create_not_migrated_dir
     
     local start_time=$(date +%s)
@@ -10629,9 +10711,6 @@ menu_migration() {
     # Показываем disclaimer один раз
     migration_show_disclaimer
     
-    # Инициализация рабочей директории
-    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
-    
     # Автопоиск архива при первом входе
     if [[ -z "$MIGRATION_SOURCE_BACKUP" ]]; then
         local auto_archive
@@ -10652,6 +10731,12 @@ menu_migration() {
         done
         MIGRATION_TARGET_DB="${MIGRATION_TARGET_DB:-postgres}"
         MIGRATION_TARGET_USER="${MIGRATION_TARGET_USER:-postgres}"
+    fi
+    
+    # Определяем путь к RWP-Shop и инициализируем рабочую директорию
+    migration_detect_target_path
+    if [[ -z "$MIGRATION_WORK_DIR" || ! -d "$MIGRATION_WORK_DIR" ]]; then
+        migration_init_work_dir
     fi
     
     while true; do
@@ -10731,10 +10816,9 @@ menu_migration() {
                     continue
                 fi
                 # Инициализируем рабочую папку если не задана
-                if [[ -z "$MIGRATION_WORK_DIR" ]]; then
-                    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+                if [[ -z "$MIGRATION_WORK_DIR" || ! -d "$MIGRATION_WORK_DIR" ]]; then
+                    migration_init_work_dir
                 fi
-                mkdir -p "$MIGRATION_WORK_DIR"
                 
                 echo ""
                 echo -e "${CYAN}${BOLD}═══ ШАГ 1/3: ЭКСПОРТ ДАННЫХ ═══${RESET}"
@@ -10845,10 +10929,9 @@ menu_migration() {
                     continue
                 fi
                 # Инициализируем рабочую папку если не задана
-                if [[ -z "$MIGRATION_WORK_DIR" ]]; then
-                    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+                if [[ -z "$MIGRATION_WORK_DIR" || ! -d "$MIGRATION_WORK_DIR" ]]; then
+                    migration_init_work_dir
                 fi
-                mkdir -p "$MIGRATION_WORK_DIR"
                 # Распаковываем архив если ещё не распакован
                 if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
                     if [[ -z "$MIGRATION_EXTRACTED_DIR" || ! -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
