@@ -312,7 +312,7 @@ ls -la backup_*.tar.*
 ```bash
 # 1. Запустите LAZARUS
 cd /opt/lazarus-backup
-./lazarus-backup
+./lazarus
 
 # 2. Выберите: 1. Создать бэкап
 # 3. Выберите: 4. Полный бэкап (БД + файлы)
@@ -435,7 +435,7 @@ unzip -t backup_*.tar.zip
 ```bash
 # 1. Запустить LAZARUS
 cd /opt/lazarus-backup
-./lazarus-backup
+./lazarus
 
 # 2. Выбрать: 5 → Миграция
 # 3. Ввести: YES (принять дисклеймер)
@@ -459,7 +459,7 @@ cd /opt/lazarus-backup
 
 ```bash
 cd /opt/lazarus-backup
-./lazarus-backup
+./lazarus
 ```
 
 Вы увидите главное меню LAZARUS.
@@ -833,7 +833,7 @@ ls -la /путь/к/архиву.tar.gz
 stat /путь/к/архиву.tar.gz
 
 # 3. Указать полный абсолютный путь
-./lazarus-backup
+./lazarus
 # → Миграция → Выбрать архив → Ввести путь
 
 # 4. Если файл на другом сервере - скопировать в папку RWP-Shop
@@ -925,7 +925,7 @@ TRUNCATE customer, purchase, promo, referral_link CASCADE;
 \q
 
 # Затем повторить миграцию
-./lazarus-backup
+./lazarus
 ```
 
 ---
