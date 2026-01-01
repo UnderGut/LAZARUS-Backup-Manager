@@ -7919,207 +7919,876 @@ migrate_configure_target() {
     print_message "SUCCESS" "Приёмник настроен"
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  НОВЫЙ UX МИГРАЦИИ v2.0
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Глобальные переменные для миграции ---
+MIGRATION_DISCLAIMER_SHOWN=false
+MIGRATION_AUTO_BACKUP=""          # Путь к автобэкапу БД RWP-Shop
+MIGRATION_NOT_MIGRATED_DIR=""     # Папка для непереносимых данных
+MIGRATION_DATA_ANALYSIS=""        # Результат анализа данных (cached)
+
+# Настройки что мигрировать (по умолчанию всё включено)
+MIGRATE_USERS=true
+MIGRATE_REFERRALS=true
+MIGRATE_SUBSCRIPTIONS=true
+MIGRATE_TRANSACTIONS=true
+MIGRATE_PROMOCODES=true
+MIGRATE_PROMO_USAGE=true
+MIGRATE_TICKETS=true
+MIGRATE_BROADCAST=true
+MIGRATE_SETTINGS=true
+
+# Поведение при конфликтах
+MIGRATE_CONFLICT_MODE="update"    # update | skip | ask
+
+# --- Функция: Показать disclaimer (один раз за сессию) ---
+migration_show_disclaimer() {
+    if [[ "$MIGRATION_DISCLAIMER_SHOWN" == "true" ]]; then
+        return 0
+    fi
+    
+    clear_screen
+    echo -e "${RED}${BOLD}"
+    echo "┌─────────────────────────────────────────────────────────────────────────┐"
+    echo "│                                                                          │"
+    echo "│   ⚠️   ВНИМАНИЕ! ЭКСПЕРИМЕНТАЛЬНЫЙ МИГРАТОР                              │"
+    echo "│                                                                          │"
+    echo "├─────────────────────────────────────────────────────────────────────────┤"
+    echo "│                                                                          │"
+    echo "│   Этот инструмент находится в стадии ТЕСТИРОВАНИЯ.                      │"
+    echo "│                                                                          │"
+    echo "│   • Все действия выполняются НА ВАШ СТРАХ И РИСК                        │"
+    echo "│   • Автор НЕ несёт ответственности за потерю данных                     │"
+    echo "│   • ОБЯЗАТЕЛЬНО сделайте бэкап ОБЕИХ баз данных перед миграцией        │"
+    echo "│                                                                          │"
+    echo "│   Данные которые нельзя перенести автоматически будут сохранены        │"
+    echo "│   в отдельные файлы для ручной обработки.                               │"
+    echo "│                                                                          │"
+    echo "└─────────────────────────────────────────────────────────────────────────┘"
+    echo -e "${RESET}"
+    echo ""
+    echo -e "Нажмите ${YELLOW}Enter${RESET} чтобы продолжить или ${YELLOW}Ctrl+C${RESET} для выхода..."
+    read -r
+    
+    MIGRATION_DISCLAIMER_SHOWN=true
+}
+
+# --- Функция: Автопоиск архива Bedolaga ---
+migration_auto_find_archive() {
+    debug_log "MIGRATE" "Auto-searching for Bedolaga archive..."
+    
+    local found_archive=""
+    local search_paths=()
+    
+    # 1) В папке RWP-Shop бота (если известна)
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        search_paths+=("$BOT_PATH")
+    fi
+    
+    # 2) Стандартные пути
+    search_paths+=(
+        "/opt/private-remnawave-telegram-shop-bot"
+        "/opt/rwp-shop"
+        "/root"
+        "/tmp"
+        "$HOME"
+    )
+    
+    # 3) Папка бэкапов LAZARUS
+    [[ -d "$BACKUP_DIR" ]] && search_paths+=("$BACKUP_DIR")
+    
+    local all_archives=()
+    
+    for path in "${search_paths[@]}"; do
+        [[ ! -d "$path" ]] && continue
+        
+        # Ищем архивы backup_*.tar.gz (формат Bedolaga)
+        while IFS= read -r -d '' archive; do
+            all_archives+=("$archive")
+        done < <(find "$path" -maxdepth 2 -name "backup_*.tar.gz" -type f -print0 2>/dev/null)
+    done
+    
+    if [[ ${#all_archives[@]} -eq 0 ]]; then
+        debug_log "MIGRATE" "No archives found"
+        return 1
+    fi
+    
+    # Сортируем по дате модификации (новые первыми)
+    local sorted_archives
+    sorted_archives=$(printf '%s\n' "${all_archives[@]}" | xargs -I {} stat --format='%Y %n' {} 2>/dev/null | sort -rn | head -5 | awk '{print $2}')
+    
+    # Берём самый новый
+    found_archive=$(echo "$sorted_archives" | head -1)
+    
+    if [[ -n "$found_archive" && -f "$found_archive" ]]; then
+        echo "$found_archive"
+        debug_log "MIGRATE" "Found archive: $found_archive"
+        return 0
+    fi
+    
+    return 1
+}
+
+# --- Функция: Быстрый анализ архива (без полной распаковки) ---
+migration_quick_analyze() {
+    local archive="$1"
+    
+    if [[ ! -f "$archive" ]]; then
+        return 1
+    fi
+    
+    # Создаём временную папку для анализа
+    local temp_dir=$(mktemp -d)
+    TEMP_DIRS+=("$temp_dir")
+    
+    # Распаковываем только database.json
+    if ! tar -xzf "$archive" -C "$temp_dir" "database.json" 2>/dev/null; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    local db_json="$temp_dir/database.json"
+    if [[ ! -f "$db_json" ]]; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Анализируем через Python
+    local python_cmd=""
+    if command -v python3 &>/dev/null; then python_cmd="python3"
+    elif command -v python &>/dev/null; then python_cmd="python"
+    else
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    local analysis
+    analysis=$($python_cmd - "$db_json" << 'PYEOF'
+import sys, json
+
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    tables = data.get('data', data)
+    
+    users = tables.get('users', [])
+    transactions = tables.get('transactions', [])
+    promocodes = tables.get('promocodes', [])
+    subscriptions = tables.get('subscriptions', [])
+    tickets = tables.get('tickets', [])
+    
+    # Подсчёт балансов
+    total_balance = sum(u.get('balance', u.get('balance_kopeks', 0)) or 0 for u in users)
+    users_with_balance = sum(1 for u in users if (u.get('balance', u.get('balance_kopeks', 0)) or 0) > 0)
+    
+    # Подсчёт рефералов
+    referrals = sum(1 for u in users if u.get('referred_by_id'))
+    
+    print(f"users:{len(users)}")
+    print(f"transactions:{len(transactions)}")
+    print(f"promocodes:{len(promocodes)}")
+    print(f"subscriptions:{len(subscriptions)}")
+    print(f"tickets:{len(tickets)}")
+    print(f"referrals:{referrals}")
+    print(f"total_balance_kopeks:{total_balance}")
+    print(f"users_with_balance:{users_with_balance}")
+    
+except Exception as e:
+    print(f"error:{e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+)
+    
+    rm -rf "$temp_dir"
+    echo "$analysis"
+}
+
+# --- Функция: Показать статус миграции в шапке меню ---
+migration_show_status() {
+    echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${CYAN}║${RESET}  ${BOLD}ТЕКУЩИЙ СТАТУС${RESET}                                                    ${CYAN}║${RESET}"
+    echo -e "${CYAN}╠═══════════════════════════════════════════════════════════════════╣${RESET}"
+    
+    # Источник
+    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" && -n "$MIGRATION_SOURCE_BACKUP" && -f "$MIGRATION_SOURCE_BACKUP" ]]; then
+        local archive_name=$(basename "$MIGRATION_SOURCE_BACKUP")
+        local archive_size=$(du -h "$MIGRATION_SOURCE_BACKUP" 2>/dev/null | cut -f1)
+        echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ $archive_name${RESET} ($archive_size)"
+        
+        # Показываем статистику если есть
+        if [[ -n "$MIGRATION_DATA_ANALYSIS" ]]; then
+            local users=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^users:" | cut -d: -f2)
+            local tx=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^transactions:" | cut -d: -f2)
+            local promo=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^promocodes:" | cut -d: -f2)
+            echo -e "${CYAN}║${RESET}             ${GRAY}📊 users: $users | tx: $tx | promo: $promo${RESET}"
+        fi
+    elif [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
+        echo -e "${CYAN}║${RESET}  Источник:  ${GREEN}✅ Docker: $MIGRATION_SOURCE_CONTAINER${RESET}"
+    else
+        echo -e "${CYAN}║${RESET}  Источник:  ${RED}❌ Не настроен${RESET}"
+    fi
+    
+    # Приёмник
+    if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${MIGRATION_TARGET_CONTAINER}$"; then
+            echo -e "${CYAN}║${RESET}  Приёмник:  ${GREEN}✅ Docker: $MIGRATION_TARGET_CONTAINER${RESET} (БД: $MIGRATION_TARGET_DB)"
+        else
+            echo -e "${CYAN}║${RESET}  Приёмник:  ${YELLOW}⚠️  $MIGRATION_TARGET_CONTAINER${RESET} (контейнер не запущен)"
+        fi
+    else
+        echo -e "${CYAN}║${RESET}  Приёмник:  ${RED}❌ Не настроен${RESET}"
+    fi
+    
+    echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════════╝${RESET}"
+}
+
+# --- Функция: Создать бэкап БД RWP-Shop перед миграцией ---
+migration_backup_target_db() {
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        print_message "ERROR" "Контейнер приёмника не настроен"
+        return 1
+    fi
+    
+    local backup_file="$MIGRATION_WORK_DIR/pre_migration_backup_$(date +%Y%m%d_%H%M%S).sql"
+    mkdir -p "$MIGRATION_WORK_DIR"
+    
+    print_message "INFO" "Создание бэкапа БД RWP-Shop..."
+    
+    if docker exec "$MIGRATION_TARGET_CONTAINER" pg_dump -U "$MIGRATION_TARGET_USER" "$MIGRATION_TARGET_DB" > "$backup_file" 2>/dev/null; then
+        local size=$(du -h "$backup_file" | cut -f1)
+        print_message "SUCCESS" "Бэкап создан: $backup_file ($size)"
+        MIGRATION_AUTO_BACKUP="$backup_file"
+        return 0
+    else
+        print_message "ERROR" "Не удалось создать бэкап БД"
+        return 1
+    fi
+}
+
+# --- Функция: Создать папку NOT_MIGRATED с README ---
+migration_create_not_migrated_dir() {
+    MIGRATION_NOT_MIGRATED_DIR="$MIGRATION_WORK_DIR/NOT_MIGRATED"
+    mkdir -p "$MIGRATION_NOT_MIGRATED_DIR"
+    
+    cat > "$MIGRATION_NOT_MIGRATED_DIR/README.txt" << 'EOF'
+═══════════════════════════════════════════════════════════════════════════════
+  ДАННЫЕ, КОТОРЫЕ НЕ БЫЛИ ПЕРЕНЕСЕНЫ АВТОМАТИЧЕСКИ
+  LAZARUS Migration Tool
+═══════════════════════════════════════════════════════════════════════════════
+
+Эти файлы содержат данные из Bedolaga, которые не могут быть автоматически
+перенесены в RWP-Shop из-за различий в архитектуре ботов.
+
+───────────────────────────────────────────────────────────────────────────────
+
+📄 user_balances.csv (если есть)
+   Содержит: Балансы пользователей в КОПЕЙКАХ
+   
+   Причина: В RWP-Shop баланс не хранится в рублях.
+   
+   Варианты действий:
+   • Вручную начислить дни подписки через админ-панель
+   • Связаться с пользователями для возврата/компенсации
+   • Конвертировать в дни по вашему курсу
+
+───────────────────────────────────────────────────────────────────────────────
+
+📄 referral_balances.csv (если есть)
+   Содержит: Реферальные балансы пользователей
+   
+   Причина: В RWP-Shop нет отдельного реферального баланса.
+
+───────────────────────────────────────────────────────────────────────────────
+
+📄 unknown_payments.csv (если есть)
+   Содержит: Транзакции через неподдерживаемые платёжные системы
+   Платёжки: heleket, pal24, mulenpay, cloudpayments, manual
+   
+   Причина: RWP-Shop не поддерживает эти платёжные системы.
+   
+   Информация сохранена для отчётности.
+
+───────────────────────────────────────────────────────────────────────────────
+
+📄 lost_settings.json (если есть)
+   Содержит: Настройки Bedolaga без аналога в RWP-Shop
+   
+   Примеры: PRICE_PER_DEVICE, TRAFFIC_PACKAGES_CONFIG
+
+───────────────────────────────────────────────────────────────────────────────
+
+Вопросы? Создайте issue: https://github.com/UnderGut/LAZARUS-Backup-Manager
+
+EOF
+    
+    # Добавляем дату миграции в README
+    sed -i "2a\\  Дата миграции: $(date '+%Y-%m-%d %H:%M:%S')" "$MIGRATION_NOT_MIGRATED_DIR/README.txt"
+}
+
+# --- Функция: Сохранить непереносимые данные ---
+migration_save_not_migrated_data() {
+    [[ -z "$MIGRATION_NOT_MIGRATED_DIR" ]] && migration_create_not_migrated_dir
+    
+    local export_dir="$MIGRATION_WORK_DIR/export"
+    
+    # 1) Балансы пользователей (если есть)
+    if [[ -f "$export_dir/user_balances.csv" ]]; then
+        cp "$export_dir/user_balances.csv" "$MIGRATION_NOT_MIGRATED_DIR/"
+        print_message "INFO" "Сохранены балансы пользователей → NOT_MIGRATED/"
+    fi
+    
+    # 2) Реферальные балансы
+    if [[ -f "$export_dir/referral_balances.csv" ]]; then
+        cp "$export_dir/referral_balances.csv" "$MIGRATION_NOT_MIGRATED_DIR/"
+        print_message "INFO" "Сохранены реферальные балансы → NOT_MIGRATED/"
+    fi
+    
+    # 3) Неизвестные платежи (собираем из transactions)
+    if [[ -f "$export_dir/transactions.csv" ]]; then
+        # Фильтруем транзакции с unknown payment_method
+        head -1 "$export_dir/transactions.csv" > "$MIGRATION_NOT_MIGRATED_DIR/unknown_payments.csv"
+        grep ",unknown," "$export_dir/transactions.csv" >> "$MIGRATION_NOT_MIGRATED_DIR/unknown_payments.csv" 2>/dev/null
+        
+        local unknown_count=$(wc -l < "$MIGRATION_NOT_MIGRATED_DIR/unknown_payments.csv")
+        unknown_count=$((unknown_count - 1))
+        
+        if [[ $unknown_count -gt 0 ]]; then
+            print_message "INFO" "Сохранены неизвестные платежи ($unknown_count) → NOT_MIGRATED/"
+        else
+            rm -f "$MIGRATION_NOT_MIGRATED_DIR/unknown_payments.csv"
+        fi
+    fi
+    
+    debug_log "MIGRATE" "Not migrated data saved to $MIGRATION_NOT_MIGRATED_DIR"
+}
+
+# --- Функция: Показать подробный анализ данных ---
+migration_show_detailed_analysis() {
+    if [[ -z "$MIGRATION_SOURCE_BACKUP" || ! -f "$MIGRATION_SOURCE_BACKUP" ]]; then
+        print_message "ERROR" "Архив не выбран"
+        return 1
+    fi
+    
+    clear_screen
+    echo -e "${CYAN}${BOLD}┌────────────────────────────────────────────────────────────────────┐${RESET}"
+    echo -e "${CYAN}${BOLD}│  📊 АНАЛИЗ ДАННЫХ: $(basename "$MIGRATION_SOURCE_BACKUP")${RESET}"
+    echo -e "${CYAN}${BOLD}└────────────────────────────────────────────────────────────────────┘${RESET}"
+    echo ""
+    
+    # Получаем анализ
+    if [[ -z "$MIGRATION_DATA_ANALYSIS" ]]; then
+        print_message "INFO" "Анализ архива..."
+        MIGRATION_DATA_ANALYSIS=$(migration_quick_analyze "$MIGRATION_SOURCE_BACKUP")
+    fi
+    
+    if [[ -z "$MIGRATION_DATA_ANALYSIS" ]]; then
+        print_message "ERROR" "Не удалось проанализировать архив"
+        return 1
+    fi
+    
+    # Парсим результаты
+    local users=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^users:" | cut -d: -f2)
+    local transactions=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^transactions:" | cut -d: -f2)
+    local promocodes=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^promocodes:" | cut -d: -f2)
+    local subscriptions=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^subscriptions:" | cut -d: -f2)
+    local tickets=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^tickets:" | cut -d: -f2)
+    local referrals=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^referrals:" | cut -d: -f2)
+    local total_balance=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^total_balance_kopeks:" | cut -d: -f2)
+    local users_with_balance=$(echo "$MIGRATION_DATA_ANALYSIS" | grep "^users_with_balance:" | cut -d: -f2)
+    
+    # Конвертируем копейки в рубли
+    local balance_rub=$(echo "scale=2; ${total_balance:-0} / 100" | bc 2>/dev/null || echo "0")
+    
+    echo -e "${GREEN}  БУДЕТ ПЕРЕНЕСЕНО:${RESET}"
+    echo "  ────────────────────────────────────────────────────────────────"
+    printf "  │ %-35s │ %10s │ %-15s │\n" "Данные" "Записей" "Статус"
+    echo "  ├─────────────────────────────────────┼────────────┼─────────────────┤"
+    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Пользователи → customer" "${users:-0}" "✅ Готово"
+    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Реферальные связи → referral" "${referrals:-0}" "✅ Готово"
+    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Подписки → customer.*" "${subscriptions:-0}" "✅ Активные"
+    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Транзакции → purchase" "${transactions:-0}" "✅ Готово"
+    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Промокоды → promo" "${promocodes:-0}" "✅ Готово"
+    printf "  │ %-35s │ %10s │ ${GREEN}%-15s${RESET} │\n" "Тикеты → support_ticket" "${tickets:-0}" "✅ Готово"
+    echo "  ────────────────────────────────────────────────────────────────"
+    echo ""
+    
+    if [[ "${users_with_balance:-0}" -gt 0 ]]; then
+        echo -e "${YELLOW}  ⚠️  НЕ БУДЕТ ПЕРЕНЕСЕНО (сохранится в файлы):${RESET}"
+        echo "  ────────────────────────────────────────────────────────────────"
+        printf "  │ %-35s │ %-30s │\n" "Данные" "Причина"
+        echo "  ├─────────────────────────────────────┼────────────────────────────────┤"
+        printf "  │ %-35s │ %-30s │\n" "Балансы ($users_with_balance юзеров)" "Разные единицы измерения"
+        printf "  │ %-35s │ %-30s │\n" "  Сумма: ₽$balance_rub" "→ user_balances.csv"
+        echo "  ────────────────────────────────────────────────────────────────"
+        echo ""
+    fi
+    
+    echo -e "  ${GRAY}💡 Непереносимые данные сохранятся в: NOT_MIGRATED/${RESET}"
+    echo ""
+}
+
+# --- Функция: Выбор архива из списка ---
+migration_select_archive() {
+    clear_screen
+    echo -e "${CYAN}${BOLD}═══ ВЫБОР АРХИВА BEDOLAGA ═══${RESET}"
+    echo ""
+    
+    # Собираем все архивы
+    local search_paths=(
+        "$BOT_PATH"
+        "/opt/private-remnawave-telegram-shop-bot"
+        "/opt/rwp-shop"
+        "/root"
+        "$BACKUP_DIR"
+        "$HOME"
+    )
+    
+    local all_archives=()
+    
+    for path in "${search_paths[@]}"; do
+        [[ ! -d "$path" ]] && continue
+        while IFS= read -r -d '' archive; do
+            all_archives+=("$archive")
+        done < <(find "$path" -maxdepth 2 -name "backup_*.tar.gz" -type f -print0 2>/dev/null)
+    done
+    
+    if [[ ${#all_archives[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Архивы backup_*.tar.gz не найдены автоматически${RESET}"
+        echo ""
+        echo "Где искать архив:"
+        echo "  • Скачайте бэкап из Telegram (если бот отправлял)"
+        echo "  • Скопируйте из папки Bedolaga: /opt/bedolaga/backups/"
+        echo "  • Положите в папку RWP-Shop бота"
+        echo ""
+        read -erp "Введите полный путь к архиву: " manual_path
+        
+        if [[ -f "$manual_path" ]]; then
+            MIGRATION_SOURCE_BACKUP="$manual_path"
+            MIGRATION_SOURCE_TYPE="archive"
+            MIGRATION_DATA_ANALYSIS=""  # Сбросить кэш анализа
+            print_message "SUCCESS" "Архив выбран: $manual_path"
+        else
+            print_message "ERROR" "Файл не найден: $manual_path"
+        fi
+        return
+    fi
+    
+    # Сортируем по дате и показываем список
+    echo "Найденные архивы (отсортированы по дате):"
+    echo ""
+    
+    local i=1
+    local sorted_archives=()
+    while IFS= read -r archive; do
+        sorted_archives+=("$archive")
+        local name=$(basename "$archive")
+        local size=$(du -h "$archive" 2>/dev/null | cut -f1)
+        local mtime=$(stat -c '%y' "$archive" 2>/dev/null | cut -d'.' -f1)
+        
+        if [[ $i -eq 1 ]]; then
+            echo -e "  ${GREEN}$i. $name${RESET} ($size) - $mtime ${GREEN}← РЕКОМЕНДУЕТСЯ${RESET}"
+        else
+            echo "  $i. $name ($size) - $mtime"
+        fi
+        ((i++))
+        [[ $i -gt 10 ]] && break  # Максимум 10 архивов
+    done < <(printf '%s\n' "${all_archives[@]}" | xargs -I {} stat --format='%Y %n' {} 2>/dev/null | sort -rn | awk '{print $2}')
+    
+    echo ""
+    echo "  0. Ввести путь вручную"
+    echo ""
+    read -erp "Выбор: " choice
+    
+    case "$choice" in
+        0)
+            read -erp "Путь к архиву: " manual_path
+            if [[ -f "$manual_path" ]]; then
+                MIGRATION_SOURCE_BACKUP="$manual_path"
+                MIGRATION_SOURCE_TYPE="archive"
+                MIGRATION_DATA_ANALYSIS=""
+                print_message "SUCCESS" "Архив выбран"
+            else
+                print_message "ERROR" "Файл не найден"
+            fi
+            ;;
+        [1-9]|10)
+            local idx=$((choice - 1))
+            if [[ $idx -lt ${#sorted_archives[@]} ]]; then
+                MIGRATION_SOURCE_BACKUP="${sorted_archives[$idx]}"
+                MIGRATION_SOURCE_TYPE="archive"
+                MIGRATION_DATA_ANALYSIS=""
+                print_message "SUCCESS" "Архив выбран: $(basename "${sorted_archives[$idx]}")"
+            fi
+            ;;
+    esac
+}
+
+# --- Функция: Показать предупреждение перед импортом ---
+migration_show_import_warning() {
+    echo ""
+    echo -e "${RED}${BOLD}┌────────────────────────────────────────────────────────────────────┐${RESET}"
+    echo -e "${RED}${BOLD}│  ⚠️  ВНИМАНИЕ! ИЗМЕНЕНИЕ БАЗЫ ДАННЫХ                               │${RESET}"
+    echo -e "${RED}${BOLD}├────────────────────────────────────────────────────────────────────┤${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}                                                                    ${RED}${BOLD}│${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}  Сейчас будут внесены изменения в БД RWP-Shop:                    ${RED}${BOLD}│${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}                                                                    ${RED}${BOLD}│${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}  • Контейнер: ${YELLOW}$MIGRATION_TARGET_CONTAINER${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}  • База данных: ${YELLOW}$MIGRATION_TARGET_DB${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}                                                                    ${RED}${BOLD}│${RESET}"
+    if [[ -n "$MIGRATION_AUTO_BACKUP" ]]; then
+        echo -e "${RED}${BOLD}│${RESET}  ${GREEN}🔒 Бэкап текущей БД создан:${RESET}"
+        echo -e "${RED}${BOLD}│${RESET}     ${GRAY}$MIGRATION_AUTO_BACKUP${RESET}"
+        echo -e "${RED}${BOLD}│${RESET}                                                                    ${RED}${BOLD}│${RESET}"
+    fi
+    echo -e "${RED}${BOLD}│${RESET}  Для отката выполните:                                            ${RED}${BOLD}│${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}  ${GRAY}docker exec -i $MIGRATION_TARGET_CONTAINER psql -U $MIGRATION_TARGET_USER < backup.sql${RESET}"
+    echo -e "${RED}${BOLD}│${RESET}                                                                    ${RED}${BOLD}│${RESET}"
+    echo -e "${RED}${BOLD}└────────────────────────────────────────────────────────────────────┘${RESET}"
+    echo ""
+}
+
+# --- Функция: Автоматическая миграция (пошаговая с подтверждениями) ---
+migration_run_automatic() {
+    clear_screen
+    echo -e "${GREEN}${BOLD}┌────────────────────────────────────────────────────────────────────┐${RESET}"
+    echo -e "${GREEN}${BOLD}│  🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ                                        │${RESET}"
+    echo -e "${GREEN}${BOLD}└────────────────────────────────────────────────────────────────────┘${RESET}"
+    echo ""
+    
+    # Проверки
+    if [[ -z "$MIGRATION_SOURCE_TYPE" || -z "$MIGRATION_SOURCE_BACKUP" ]]; then
+        print_message "ERROR" "Сначала выберите архив Bedolaga (пункт 2)"
+        return 1
+    fi
+    
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        print_message "ERROR" "Сначала настройте приёмник (пункт 3)"
+        return 1
+    fi
+    
+    echo "Будут выполнены следующие действия:"
+    echo ""
+    echo "  [1/8] 🔍 Анализ архива Bedolaga"
+    echo "  [2/8] 💾 Создание бэкапа БД RWP-Shop"
+    echo "  [3/8] 📤 Экспорт данных из архива"
+    echo "  [4/8] 💰 Анализ и обработка балансов"
+    echo "  [5/8] 🔄 Трансформация данных"
+    echo "  [6/8] 📥 Импорт в RWP-Shop"
+    echo "  [7/8] 📁 Сохранение непереносимых данных"
+    echo "  [8/8] 📋 Генерация отчёта"
+    echo ""
+    
+    echo -e "${YELLOW}⚠️  ВНИМАНИЕ:${RESET}"
+    echo "  • Существующие данные будут ДОПОЛНЕНЫ (не удалены)"
+    echo "  • При совпадении telegram_id данные будут ОБНОВЛЕНЫ"
+    echo "  • Балансы НЕ переносятся (сохранятся в CSV)"
+    echo ""
+    
+    read -erp "Продолжить? (y/N): " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && return 0
+    
+    # Инициализация
+    MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$MIGRATION_WORK_DIR"
+    migration_create_not_migrated_dir
+    
+    local start_time=$(date +%s)
+    
+    # [1/8] Анализ
+    echo ""
+    print_message "INFO" "[1/8] Анализ архива Bedolaga..."
+    if ! migration_quick_analyze "$MIGRATION_SOURCE_BACKUP" > /dev/null; then
+        print_message "ERROR" "Ошибка анализа архива"
+        return 1
+    fi
+    print_message "SUCCESS" "Архив валиден"
+    
+    # [2/8] Бэкап БД
+    print_message "INFO" "[2/8] Создание бэкапа БД RWP-Shop..."
+    if ! migration_backup_target_db; then
+        echo -e "${YELLOW}Продолжить без бэкапа? (y/N):${RESET} "
+        read -r skip_backup
+        [[ ! "$skip_backup" =~ ^[Yy]$ ]] && return 1
+    fi
+    
+    # [3/8] Экспорт
+    print_message "INFO" "[3/8] Экспорт данных из архива..."
+    if ! migrate_export_data; then
+        print_message "ERROR" "Ошибка экспорта!"
+        return 1
+    fi
+    
+    # [4/8] Балансы
+    print_message "INFO" "[4/8] Анализ балансов пользователей..."
+    # Автоматически выбираем export_csv для сохранения
+    BALANCE_HANDLING_MODE="export_csv"
+    if ! migrate_handle_balances; then
+        print_message "WARN" "Предупреждение при анализе балансов"
+    fi
+    
+    # [5/8] Трансформация
+    print_message "INFO" "[5/8] Трансформация данных..."
+    if ! migrate_transform_data; then
+        print_message "ERROR" "Ошибка трансформации!"
+        return 1
+    fi
+    
+    # Применяем обработку балансов
+    migrate_apply_balance_handling 2>/dev/null
+    
+    # [6/8] Импорт - требует подтверждения!
+    migration_show_import_warning
+    
+    read -erp "Введите 'IMPORT' для подтверждения импорта: " import_confirm
+    if [[ "$import_confirm" != "IMPORT" ]]; then
+        print_message "INFO" "Импорт отменён. Данные экспортированы в: $MIGRATION_WORK_DIR"
+        return 0
+    fi
+    
+    print_message "INFO" "[6/8] Импорт в RWP-Shop..."
+    if ! migrate_import_data; then
+        print_message "ERROR" "Ошибка импорта!"
+        echo ""
+        echo -e "${YELLOW}Для отката используйте бэкап:${RESET}"
+        echo "  docker exec -i $MIGRATION_TARGET_CONTAINER psql -U $MIGRATION_TARGET_USER $MIGRATION_TARGET_DB < $MIGRATION_AUTO_BACKUP"
+        return 1
+    fi
+    
+    # [7/8] Сохранение непереносимых данных
+    print_message "INFO" "[7/8] Сохранение непереносимых данных..."
+    migration_save_not_migrated_data
+    
+    # [8/8] Отчёт
+    print_message "INFO" "[8/8] Генерация отчёта..."
+    migrate_generate_report
+    
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}${BOLD}  ✅ МИГРАЦИЯ ЗАВЕРШЕНА УСПЕШНО!                                    ${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo "  Время выполнения: ${duration}с"
+    echo "  Рабочая папка: $MIGRATION_WORK_DIR"
+    [[ -d "$MIGRATION_NOT_MIGRATED_DIR" ]] && echo "  Непереносимые данные: $MIGRATION_NOT_MIGRATED_DIR"
+    echo ""
+    echo -e "${YELLOW}⚠️  Не забудьте:${RESET}"
+    echo "  • Проверить работу бота"
+    echo "  • Перезапустить бота: docker compose restart"
+    echo ""
+    
+    log_message "SUCCESS" "Migration completed in ${duration}s: Bedolaga → RWP-Shop"
+    
+    return 0
+}
+
 # --- Главное меню миграции ---
 menu_migration() {
+    # Показываем disclaimer один раз
+    migration_show_disclaimer
+    
+    # Инициализация рабочей директории
     MIGRATION_WORK_DIR="${BACKUP_DIR}/migration_$(date +%Y%m%d_%H%M%S)"
+    
+    # Автопоиск архива при первом входе
+    if [[ -z "$MIGRATION_SOURCE_BACKUP" ]]; then
+        local auto_archive
+        auto_archive=$(migration_auto_find_archive)
+        if [[ -n "$auto_archive" ]]; then
+            MIGRATION_SOURCE_BACKUP="$auto_archive"
+            MIGRATION_SOURCE_TYPE="archive"
+            # Получаем анализ
+            MIGRATION_DATA_ANALYSIS=$(migration_quick_analyze "$auto_archive" 2>/dev/null)
+        fi
+    fi
+    
+    # Автопоиск приёмника
+    if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
+        for pattern in "rwp_shop_db" "telegram-shop-db"; do
+            MIGRATION_TARGET_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE "^$pattern$" | head -1)
+            [[ -n "$MIGRATION_TARGET_CONTAINER" ]] && break
+        done
+        MIGRATION_TARGET_DB="${MIGRATION_TARGET_DB:-postgres}"
+        MIGRATION_TARGET_USER="${MIGRATION_TARGET_USER:-postgres}"
+    fi
     
     while true; do
         clear_screen
-        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
-        echo -e "${MAGENTA}${BOLD}  МИГРАЦИЯ: Bedolaga → RWP-Shop (Private)   ${RESET}"
-        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════${RESET}"
-        echo ""
-        echo -e "${YELLOW}ВНИМАНИЕ: Эта функция переносит данные между ботами!${RESET}"
-        echo -e "${YELLOW}Перед миграцией ОБЯЗАТЕЛЬНО сделайте бэкап обеих БД!${RESET}"
+        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+        echo -e "${MAGENTA}${BOLD}       🔄 МИГРАЦИЯ: Bedolaga → RWP-Shop Private                    ${RESET}"
+        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
         echo ""
         
-        # Статус настроек
-        echo -e "${CYAN}=== ТЕКУЩИЕ НАСТРОЙКИ ===${RESET}"
-        if [[ "$MIGRATION_SOURCE_TYPE" == "archive" && -n "$MIGRATION_SOURCE_BACKUP" ]]; then
-            local backup_name=$(basename "$MIGRATION_SOURCE_BACKUP")
-            echo -e "Источник: ${GREEN}Архив: $backup_name${RESET}"
-        elif [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
-            echo -e "Источник: ${GREEN}Docker: $MIGRATION_SOURCE_CONTAINER${RESET} (DB: $MIGRATION_SOURCE_DB)"
-        elif [[ -n "$MIGRATION_SOURCE_HOST" ]]; then
-            echo -e "Источник: ${GREEN}PostgreSQL: $MIGRATION_SOURCE_HOST:$MIGRATION_SOURCE_PORT${RESET} (DB: $MIGRATION_SOURCE_DB)"
-        else
-            echo -e "Источник: ${RED}Не настроен${RESET}"
-        fi
-        
-        if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
-            echo -e "Приёмник: ${GREEN}Docker: $MIGRATION_TARGET_CONTAINER${RESET} (DB: $MIGRATION_TARGET_DB)"
-        else
-            echo -e "Приёмник: ${RED}Не настроен${RESET}"
-        fi
+        # Показываем статус
+        migration_show_status
         echo ""
         
-        echo " --- НАСТРОЙКА ---"
-        echo " 1. Настроить источник (Bedolaga)"
-        echo " 2. Настроить приёмник (RWP-Shop)"
+        # Меню
+        echo -e " ${GREEN}─── БЫСТРЫЙ СТАРТ ───${RESET}"
+        echo -e " ${GREEN}${BOLD} 1. 🚀 АВТОМАТИЧЕСКАЯ МИГРАЦИЯ${RESET} (рекомендуется)"
+        echo -e "    ${GRAY}Перенесёт все данные с подтверждением на каждом этапе${RESET}"
         echo ""
-        echo " --- ДЕЙСТВИЯ ---"
-        echo " 3. Проверить подключения"
-        echo " 4. Анализ структуры источника"
+        
+        echo " ─── ПОШАГОВЫЙ РЕЖИМ ───"
+        echo " 2. 📥 Выбрать архив Bedolaga"
+        echo " 3. 🎯 Настроить приёмник (RWP-Shop)"
+        echo " 4. 📊 Анализ данных (превью миграции)"
         echo ""
-        echo " --- МИГРАЦИЯ ДАННЫХ ---"
-        echo -e " ${GREEN}5. 🚀 ЗАПУСТИТЬ ПОЛНУЮ МИГРАЦИЮ ДАННЫХ${RESET}"
+        
+        echo " ─── РУЧНОЕ УПРАВЛЕНИЕ ───"
+        echo " 5. ▶️  Только экспорт данных"
+        echo " 6. 🔄 Только трансформация"
+        echo " 7. 📥 Только импорт в БД"
+        echo " 8. 💰 Анализ балансов пользователей"
         echo ""
-        echo " --- РУЧНЫЕ ЭТАПЫ ---"
-        echo " 6. Только экспорт данных"
-        echo " 7. Только трансформация"
-        echo " 8. Только импорт"
-        echo -e " 9. ${YELLOW}Анализ балансов пользователей${RESET}"
+        
+        echo -e " ─── НАСТРОЙКИ ───"
+        echo -e " ${CYAN}9. ⚙️  Миграция настроек бота${RESET}"
         echo ""
-        echo " --- НАСТРОЙКИ ---"
-        echo -e " ${CYAN}10. 🔧 МИГРАЦИЯ НАСТРОЕК (.env → .env + DB)${RESET}"
+        
+        echo " ─── ПОСЛЕ МИГРАЦИИ ───"
+        echo " 10. 📋 Посмотреть последний отчёт"
+        echo " 11. 📁 Открыть папку NOT_MIGRATED"
         echo ""
-        echo " 0. Назад в главное меню"
+        
+        echo " 0. ← Назад в главное меню"
         echo ""
         read -erp "Выбор: " opt
         
         case "$opt" in
-            1) migrate_configure_source ;;
-            2) migrate_configure_target ;;
+            1)
+                # Автоматическая миграция
+                migration_run_automatic
+                read -erp "Нажмите Enter..." dummy
+                ;;
+            2)
+                # Выбор архива
+                migration_select_archive
+                read -erp "Нажмите Enter..." dummy
+                ;;
             3)
-                echo ""
-                if [[ -n "$MIGRATION_SOURCE_TYPE" ]]; then
-                    migrate_analyze_source && print_message "SUCCESS" "Источник доступен"
-                else
-                    print_message "ERROR" "Источник не настроен"
-                fi
-                
-                if [[ -n "$MIGRATION_TARGET_CONTAINER" ]]; then
-                    if docker ps --format '{{.Names}}' | grep -q "^${MIGRATION_TARGET_CONTAINER}$"; then
-                        print_message "SUCCESS" "Приёмник доступен"
-                    else
-                        print_message "ERROR" "Контейнер приёмника не запущен"
-                    fi
-                else
-                    print_message "ERROR" "Приёмник не настроен"
-                fi
-                read -erp "Enter..." dummy
+                # Настройка приёмника
+                migrate_configure_target
+                read -erp "Нажмите Enter..." dummy
                 ;;
             4)
-                migrate_check_compatibility
-                read -erp "Enter..." dummy
+                # Анализ данных
+                migration_show_detailed_analysis
+                read -erp "Нажмите Enter..." dummy
                 ;;
             5)
-                # Полная миграция
-                # Проверка что источник и приёмник настроены
+                # Только экспорт
                 if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
-                    print_message "ERROR" "Сначала настройте источник (пункт 1)"
+                    print_message "ERROR" "Сначала выберите архив (пункт 2)"
+                    read -erp "Enter..." dummy
+                    continue
+                fi
+                mkdir -p "$MIGRATION_WORK_DIR"
+                migrate_export_data
+                read -erp "Нажмите Enter..." dummy
+                ;;
+            6)
+                # Только трансформация
+                if [[ ! -d "$MIGRATION_WORK_DIR/export" ]]; then
+                    print_message "ERROR" "Сначала выполните экспорт (пункт 5)"
+                    read -erp "Enter..." dummy
+                    continue
+                fi
+                migrate_transform_data
+                read -erp "Нажмите Enter..." dummy
+                ;;
+            7)
+                # Только импорт
+                if [[ ! -d "$MIGRATION_WORK_DIR/import" ]]; then
+                    print_message "ERROR" "Сначала выполните трансформацию (пункт 6)"
                     read -erp "Enter..." dummy
                     continue
                 fi
                 if [[ -z "$MIGRATION_TARGET_CONTAINER" ]]; then
-                    print_message "ERROR" "Сначала настройте приёмник (пункт 2)"
+                    print_message "ERROR" "Сначала настройте приёмник (пункт 3)"
                     read -erp "Enter..." dummy
                     continue
                 fi
                 
-                echo ""
-                echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
-                echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ! ПОЛНАЯ МИГРАЦИЯ ДАННЫХ!           ${RESET}"
-                echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
-                echo ""
-                echo "Будут перенесены:"
-                echo " • Пользователи (users → customer)"
-                echo " • Транзакции (transactions → purchase)"
-                echo " • Промокоды (promocodes → promo)"
-                echo ""
-                echo -e "${YELLOW}Убедитесь что сделали бэкап обеих баз данных!${RESET}"
-                echo ""
-                read -erp "Введите 'MIGRATE' для подтверждения: " confirm
+                # Создаём бэкап перед импортом
+                migration_backup_target_db
+                migration_show_import_warning
                 
-                if [[ "$confirm" == "MIGRATE" ]]; then
-                    mkdir -p "$MIGRATION_WORK_DIR"
-                    echo ""
-                    
-                    # Этап 1: Проверка совместимости
-                    print_message "INFO" "[1/7] Проверка совместимости..."
-                    if ! migrate_check_compatibility; then
-                        print_message "ERROR" "Источник не совместим!"
-                        read -erp "Enter..." dummy
-                        continue
-                    fi
-                    
-                    # Этап 2: Анализ балансов
-                    print_message "INFO" "[2/7] Анализ балансов пользователей..."
-                    if ! migrate_handle_balances; then
-                        print_message "ERROR" "Ошибка анализа балансов!"
-                        read -erp "Enter..." dummy
-                        continue
-                    fi
-                    
-                    # Этап 3: Экспорт
-                    print_message "INFO" "[3/7] Экспорт данных..."
-                    if ! migrate_export_data; then
-                        print_message "ERROR" "Ошибка экспорта!"
-                        read -erp "Enter..." dummy
-                        continue
-                    fi
-                    
-                    # Этап 4: Трансформация
-                    print_message "INFO" "[4/7] Трансформация данных..."
-                    if ! migrate_transform_data; then
-                        print_message "ERROR" "Ошибка трансформации!"
-                        read -erp "Enter..." dummy
-                        continue
-                    fi
-                    
-                    # Этап 5: Применение обработки балансов
-                    print_message "INFO" "[5/7] Обработка балансов..."
-                    if ! migrate_apply_balance_handling; then
-                        print_message "ERROR" "Ошибка обработки балансов!"
-                        read -erp "Enter..." dummy
-                        continue
-                    fi
-                    
-                    # Этап 6: Импорт
-                    print_message "INFO" "[6/7] Импорт в RWP-Shop..."
-                    if ! migrate_import_data; then
-                        print_message "ERROR" "Ошибка импорта!"
-                        read -erp "Enter..." dummy
-                        continue
-                    fi
-                    
-                    # Этап 7: Отчёт
-                    print_message "INFO" "[7/7] Генерация отчёта..."
-                    migrate_generate_report
-                    
-                    echo ""
-                    print_message "SUCCESS" "✅ МИГРАЦИЯ ЗАВЕРШЕНА УСПЕШНО!"
-                    echo ""
-                    log_message "SUCCESS" "Migration completed: Bedolaga → RWP-Shop"
+                read -erp "Введите 'IMPORT' для подтверждения: " confirm
+                if [[ "$confirm" == "IMPORT" ]]; then
+                    migrate_import_data
                 else
-                    print_message "INFO" "Миграция отменена"
+                    print_message "INFO" "Импорт отменён"
                 fi
-                read -erp "Enter..." dummy
-                ;;
-            6)
-                mkdir -p "$MIGRATION_WORK_DIR"
-                migrate_export_data
-                read -erp "Enter..." dummy
-                ;;
-            7)
-                migrate_transform_data
-                read -erp "Enter..." dummy
+                read -erp "Нажмите Enter..." dummy
                 ;;
             8)
-                migrate_import_data
-                read -erp "Enter..." dummy
-                ;;
-            9)
+                # Анализ балансов
                 mkdir -p "$MIGRATION_WORK_DIR"
                 if [[ -z "$MIGRATION_SOURCE_TYPE" ]]; then
-                    print_message "ERROR" "Сначала настройте источник (пункт 1)"
+                    print_message "ERROR" "Сначала выберите архив (пункт 2)"
                 else
                     migrate_handle_balances
-                    [[ -n "$BALANCE_HANDLING_MODE" && "$BALANCE_HANDLING_MODE" != "none" ]] && migrate_apply_balance_handling
+                    if [[ -n "$BALANCE_HANDLING_MODE" && "$BALANCE_HANDLING_MODE" != "none" ]]; then
+                        migrate_apply_balance_handling
+                    fi
                 fi
-                read -erp "Enter..." dummy
+                read -erp "Нажмите Enter..." dummy
                 ;;
-            10) menu_migrate_settings ;;
+            9)
+                # Миграция настроек
+                menu_migrate_settings
+                ;;
+            10)
+                # Последний отчёт
+                local report_file="$MIGRATION_WORK_DIR/migration_report.txt"
+                if [[ -f "$report_file" ]]; then
+                    clear_screen
+                    cat "$report_file"
+                else
+                    # Ищем последний отчёт
+                    local latest_report=$(find "$BACKUP_DIR" -name "migration_report.txt" -type f 2>/dev/null | head -1)
+                    if [[ -n "$latest_report" ]]; then
+                        clear_screen
+                        cat "$latest_report"
+                    else
+                        print_message "WARN" "Отчёт не найден. Сначала выполните миграцию."
+                    fi
+                fi
+                read -erp "Нажмите Enter..." dummy
+                ;;
+            11)
+                # Открыть папку NOT_MIGRATED
+                local not_migrated_dir="$MIGRATION_WORK_DIR/NOT_MIGRATED"
+                if [[ -d "$not_migrated_dir" ]]; then
+                    echo ""
+                    echo "Содержимое папки NOT_MIGRATED:"
+                    echo ""
+                    ls -la "$not_migrated_dir"
+                    echo ""
+                    echo "Путь: $not_migrated_dir"
+                else
+                    # Ищем последнюю папку
+                    local latest_dir=$(find "$BACKUP_DIR" -name "NOT_MIGRATED" -type d 2>/dev/null | head -1)
+                    if [[ -n "$latest_dir" ]]; then
+                        echo ""
+                        echo "Содержимое папки NOT_MIGRATED:"
+                        echo ""
+                        ls -la "$latest_dir"
+                        echo ""
+                        echo "Путь: $latest_dir"
+                    else
+                        print_message "WARN" "Папка NOT_MIGRATED не найдена."
+                        echo "Она создаётся автоматически при миграции."
+                    fi
+                fi
+                read -erp "Нажмите Enter..." dummy
+                ;;
             0) return ;;
         esac
     done
