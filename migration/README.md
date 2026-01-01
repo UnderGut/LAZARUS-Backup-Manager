@@ -6,6 +6,8 @@
 ![Status](https://img.shields.io/badge/status-TESTING-yellow)
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
 
+**🇬🇧 [English version](README.en.md)**
+
 **Полное руководство по миграции данных из Telegram-бота Bedolaga в RWP-Shop (RemnaWave Panel Shop)**
 
 </div>
