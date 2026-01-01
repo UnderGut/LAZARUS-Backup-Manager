@@ -703,10 +703,10 @@ docker compose logs bot 2>&1 | grep -i error
 ```
 
 **Что искать в логах:**
-- ✅ `Bot started` — бот запустился
-- ✅ `Database connected` — подключение к БД
-- ❌ `Error` — ошибки (требуют внимания)
-- ❌ `Exception` — исключения
+- ✅ Сообщения об успешном запуске
+- ✅ Отсутствие ошибок
+- ❌ `Error`, `error` — ошибки (требуют внимания)
+- ❌ `Exception`, `exception` — исключения
 
 ### Шаг 3: Проверка в Telegram
 
