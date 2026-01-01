@@ -88,7 +88,7 @@ LOG_FILE="/var/log/lazarus_backup.log"
 LOCK_FILE="/var/run/lazarus_backup.lock"
 LOCK_FD=200  # File descriptor для flock
 
-# Trap для очистки при завершении (освобождение блокировки)
+# Trap для очистки при завершении (освобождение блокировки + временные файлы)
 cleanup_on_exit() {
     # Освобождаем блокировку если была получена
     # NOTE: debug_log может не работать здесь если вызывается после закрытия stdout
@@ -97,6 +97,13 @@ cleanup_on_exit() {
         eval "exec $LOCK_FD>&-" 2>/dev/null || true
     fi
     rm -f "$LOCK_FILE" 2>/dev/null || true
+    
+    # Очищаем временные директории миграции
+    if [[ ${#TEMP_DIRS[@]} -gt 0 ]]; then
+        for temp_dir in "${TEMP_DIRS[@]}"; do
+            [[ -d "$temp_dir" ]] && rm -rf "$temp_dir" 2>/dev/null || true
+        done
+    fi
 }
 trap cleanup_on_exit EXIT INT TERM
 
@@ -3904,6 +3911,9 @@ menu_settings() {
 # МИГРАЦИЯ МЕЖДУ БОТАМИ (Bedolaga → RWP-Shop (Private))
 # =============================================================================
 
+# Массив для хранения временных директорий (для очистки при выходе)
+declare -a TEMP_DIRS=()
+
 # Конфигурация миграции
 MIGRATION_SOURCE_TYPE=""        # archive | docker | postgresql
 MIGRATION_SOURCE_BACKUP=""      # Путь к архиву бэкапа (.tar.gz)
@@ -4781,8 +4791,11 @@ PYTHON_SCRIPT
         
         if (user_id in id_map) {
             telegram_id = id_map[user_id]
-            # Экранируем запятые в сообщении
-            gsub(/,/, "&#44;", message)
+            # CSV-экранирование: удваиваем кавычки внутри, оборачиваем в кавычки если есть запятые/кавычки/переносы
+            gsub(/"/, "\"\"", message)
+            if (message ~ /[,"\n\r]/) {
+                message = "\"" message "\""
+            }
             print id "," ticket_id "," sender_type "," telegram_id "," message "," created_at
         }
     }
@@ -4811,8 +4824,11 @@ PYTHON_SCRIPT
         sent = $7
         failed = $8
         
-        # Экранируем запятые в content
-        gsub(/,/, "&#44;", content)
+        # CSV-экранирование: удваиваем кавычки внутри, оборачиваем если есть спецсимволы
+        gsub(/"/, "\"\"", content)
+        if (content ~ /[,"\n\r]/) {
+            content = "\"" content "\""
+        }
         print id "," content "," type ",," created_at "," status "," total "," sent "," failed
     }' "$export_dir/broadcast_raw.csv" >> "$broadcast_file"
     
@@ -5304,6 +5320,9 @@ COPY (
 }
 
 # --- Функция: Трансформация данных ---
+# ⚠️ ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ: Если username/first_name содержат запятые,
+#    они будут неправильно разбиты IFS. Для production-данных с такими
+#    случаями рекомендуется использовать Python CSV-парсер.
 migrate_transform_data() {
     debug_log "MIGRATE" "Starting data transformation"
     print_message "INFO" "Трансформация данных для Remnawave..."
@@ -9504,9 +9523,9 @@ migration_run_automatic() {
     # Применяем обработку балансов
     migrate_apply_balance_handling 2>/dev/null
     
-    # Healthcheck трансформированных CSV
+    # Healthcheck трансформированных CSV (директория import)
     print_message "INFO" "      Проверка трансформированных данных..."
-    if ! migration_healthcheck_csv "$MIGRATION_WORK_DIR/transform" "false"; then
+    if ! migration_healthcheck_csv "$MIGRATION_WORK_DIR/import" "false"; then
         print_message "WARN" "Предупреждения при проверке трансформации"
     fi
     
@@ -9681,8 +9700,8 @@ menu_migration() {
                     continue
                 fi
                 migrate_transform_data
-                # Показываем healthcheck CSV после трансформации
-                migration_healthcheck_csv "$MIGRATION_WORK_DIR/transform" "true"
+                # Показываем healthcheck CSV после трансформации (директория import)
+                migration_healthcheck_csv "$MIGRATION_WORK_DIR/import" "true"
                 read -erp "Нажмите Enter..." dummy
                 ;;
             8)
