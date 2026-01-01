@@ -10015,15 +10015,73 @@ migration_show_detailed_analysis() {
     
     # Проверяем, требуется ли пароль
     local archive_type=$(detect_bedolaga_archive_type "$MIGRATION_SOURCE_BACKUP" 2>/dev/null)
+    local is_aes=false
+    
+    if [[ "$archive_type" == "zip" ]] && is_zip_aes_encrypted "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
+        is_aes=true
+    fi
+    
     if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$MIGRATION_SOURCE_BACKUP" 2>/dev/null; then
         if [[ -z "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
             echo -e "${YELLOW}  ⚠️  Архив защищён паролем${RESET}"
             echo ""
-            echo "  Для анализа данных необходимо ввести пароль."
-            echo "  Используйте пункт 2 в меню миграции для выбора архива"
-            echo "  и ввода пароля."
+            if [[ "$is_aes" == "true" ]]; then
+                print_message "INFO" "🔒 Шифрование: AES-256"
+            fi
+            read -ersp "  Введите пароль: " BEDOLAGA_BACKUP_PASSWORD
             echo ""
-            return 1
+            echo ""
+            
+            # Проверяем пароль
+            if [[ -n "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                local temp_dir=$(mktemp -d)
+                TEMP_DIRS+=("$temp_dir")
+                local password_ok=false
+                
+                print_message "INFO" "Проверка пароля..."
+                
+                if [[ "$is_aes" == "true" ]]; then
+                    # AES — используем 7z
+                    if ! ensure_7z_installed; then
+                        print_message "ERROR" "Для AES-зашифрованных архивов требуется 7z (p7zip)"
+                        print_message "INFO" "Установите: apt install p7zip-full"
+                        rm -rf "$temp_dir"
+                        BEDOLAGA_BACKUP_PASSWORD=""
+                        return 1
+                    fi
+                    
+                    local cmd_7z=$(get_7z_command)
+                    if $cmd_7z x -p"$BEDOLAGA_BACKUP_PASSWORD" -o"$temp_dir" "$MIGRATION_SOURCE_BACKUP" -y &>/dev/null; then
+                        if find "$temp_dir" -name "database.json" 2>/dev/null | grep -q . || \
+                           find "$temp_dir" -type f \( -name "*.tar.gz" -o -name "*.gz" \) 2>/dev/null | grep -q .; then
+                            password_ok=true
+                        fi
+                    fi
+                else
+                    # ZipCrypto — используем unzip
+                    ensure_unzip_installed 2>/dev/null
+                    if unzip -P "$BEDOLAGA_BACKUP_PASSWORD" -o -q "$MIGRATION_SOURCE_BACKUP" -d "$temp_dir" 2>/dev/null; then
+                        if find "$temp_dir" -name "database.json" 2>/dev/null | grep -q . || \
+                           find "$temp_dir" -type f \( -name "*.tar.gz" -o -name "*.gz" \) 2>/dev/null | grep -q .; then
+                            password_ok=true
+                        fi
+                    fi
+                fi
+                
+                rm -rf "$temp_dir"
+                
+                if [[ "$password_ok" == "true" ]]; then
+                    print_message "SUCCESS" "✅ Пароль верный"
+                    echo ""
+                else
+                    print_message "ERROR" "❌ Неверный пароль"
+                    BEDOLAGA_BACKUP_PASSWORD=""
+                    return 1
+                fi
+            else
+                print_message "ERROR" "Пароль не введён"
+                return 1
+            fi
         fi
     fi
     
