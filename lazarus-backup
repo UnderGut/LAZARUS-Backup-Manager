@@ -357,27 +357,6 @@ get_backup_stats() {
     STATS_LAST_AGO="$last_backup_ago"
 }
 
-# Проверка свободного места на диске
-check_disk_space() {
-    local min_space_mb="${1:-1024}"  # По умолчанию 1GB
-    local backup_path="$BACKUP_DIR"
-    
-    # Получаем свободное место в MB
-    local free_space_kb=$(df -P "$backup_path" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
-    local free_space_mb=$((free_space_kb / 1024))
-    
-    if [[ $free_space_mb -lt $min_space_mb ]]; then
-        local free_human=$(df -h "$backup_path" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
-        return 1  # Мало места
-    fi
-    return 0  # Места достаточно
-}
-
-# Получить свободное место в человекочитаемом формате
-get_free_space() {
-    df -h "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}'
-}
-
 # --- СИСТЕМА ОБНОВЛЕНИЯ ---
 
 check_for_updates() {
@@ -3975,11 +3954,44 @@ declare -A PAYMENT_METHOD_MAP=(
 # --- Функция: Анализ структуры источника ---
 migrate_analyze_source() {
     debug_log "MIGRATE" "Starting source analysis"
-    print_message "INFO" "Анализ базы данных источника..."
+    print_message "INFO" "Анализ источника данных..."
     
+    # Для режима archive — проверяем JSON-файл
+    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
+        local db_json="$MIGRATION_EXTRACTED_DIR/database.json"
+        debug_log "MIGRATE" "Archive mode: checking $db_json"
+        
+        if [[ ! -f "$db_json" ]]; then
+            print_message "ERROR" "Файл database.json не найден в архиве"
+            return 1
+        fi
+        
+        # Подсчёт таблиц в JSON через Python
+        local python_cmd=""
+        if command -v python3 &>/dev/null; then python_cmd="python3"
+        elif command -v python &>/dev/null; then python_cmd="python"
+        fi
+        
+        if [[ -n "$python_cmd" ]]; then
+            local table_count=$($python_cmd - "$db_json" << 'PYEOF'
+import sys, json
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    data = json.load(f)
+tables = data.get('data', {})
+print(len(tables))
+PYEOF
+)
+            print_message "SUCCESS" "Найдено таблиц в архиве: $table_count"
+            debug_log "MIGRATE" "Archive contains $table_count tables"
+        else
+            print_message "WARN" "Python не найден, пропускаем подсчёт таблиц"
+        fi
+        return 0
+    fi
+    
+    # Для режимов docker/postgresql — проверяем PostgreSQL
     local source_info=""
     
-    # Проверка подключения через Docker (если контейнер) или напрямую
     if [[ -n "$MIGRATION_SOURCE_CONTAINER" ]]; then
         debug_log "MIGRATE" "Using Docker container: $MIGRATION_SOURCE_CONTAINER"
         source_info=$(docker exec "$MIGRATION_SOURCE_CONTAINER" psql -U "$MIGRATION_SOURCE_USER" -d "$MIGRATION_SOURCE_DB" -t -c "
@@ -7915,11 +7927,7 @@ menu_migration() {
             3)
                 echo ""
                 if [[ -n "$MIGRATION_SOURCE_TYPE" ]]; then
-                    if [[ "$MIGRATION_SOURCE_TYPE" == "archive" ]]; then
-                        print_message "SUCCESS" "Источник: архив ${MIGRATION_SOURCE_BACKUP##*/}"
-                    else
-                        migrate_analyze_source && print_message "SUCCESS" "Источник доступен"
-                    fi
+                    migrate_analyze_source && print_message "SUCCESS" "Источник доступен"
                 else
                     print_message "ERROR" "Источник не настроен"
                 fi
