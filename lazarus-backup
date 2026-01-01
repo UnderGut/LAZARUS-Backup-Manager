@@ -7755,35 +7755,49 @@ migrate_settings_show_env_mapping() {
         echo -e "${GRAY}Источник: $(basename "$MIGRATION_SOURCE_BACKUP_FILE")${RESET}"
         echo ""
         
+        # Распаковываем архив если нужно
+        if [[ -z "$MIGRATION_EXTRACTED_DIR" || ! -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
+            if ! extract_bedolaga_backup "$MIGRATION_SOURCE_BACKUP_FILE" 2>/dev/null; then
+                print_message "ERROR" "Не удалось распаковать архив"
+                read -erp "Enter..." dummy
+                return 1
+            fi
+        fi
+        
         # Показываем настройки из архива
         if [[ -n "$MIGRATION_EXTRACTED_DIR" && -f "$MIGRATION_EXTRACTED_DIR/database.json" ]]; then
             # Читаем настройки из архива
             declare -A backup_settings
             read_all_bedolaga_settings backup_settings
             
-            echo -e "${GREEN}=== Настройки из system_settings → .env RWP-Shop ===${RESET}"
+            echo -e "${GREEN}=== Настройки из system_settings → RWP-Shop ===${RESET}"
             echo ""
             printf "%-35s │ %-30s │ %s\n" "Bedolaga (backup)" "RWP-Shop" "Значение"
             echo "────────────────────────────────────┼────────────────────────────────┼────────────────────────"
             
             local found_count=0
-            for bedolaga_key in "${!BEDOLAGA_BACKUP_TO_RWP[@]}"; do
-                local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$bedolaga_key]}"
-                local value="${backup_settings[$bedolaga_key]:-<не задано>}"
+            local mapped_count=0
+            
+            # Итерируем по реально найденным настройкам из архива
+            for bedolaga_key in "${!backup_settings[@]}"; do
+                local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$bedolaga_key]:-}"
+                local value="${backup_settings[$bedolaga_key]}"
                 
                 # Ограничиваем длину значения
                 [[ ${#value} -gt 20 ]] && value="${value:0:17}..."
                 
-                if [[ "${backup_settings[$bedolaga_key]+isset}" ]]; then
-                    printf "%-35s │ %-30s │ ${GREEN}%s${RESET}\n" "$bedolaga_key" "$rwp_key" "$value"
-                    ((found_count++))
+                ((found_count++))
+                if [[ -n "$rwp_key" ]]; then
+                    printf "%-35s │ ${GREEN}%-30s${RESET} │ %s\n" "$bedolaga_key" "$rwp_key" "$value"
+                    ((mapped_count++))
                 else
-                    printf "%-35s │ %-30s │ ${GRAY}%s${RESET}\n" "$bedolaga_key" "$rwp_key" "$value"
+                    printf "%-35s │ ${GRAY}%-30s${RESET} │ %s\n" "$bedolaga_key" "(нет маппинга)" "$value"
                 fi
             done | sort
             
             echo ""
-            echo "Найдено в архиве: $found_count из ${#BEDOLAGA_BACKUP_TO_RWP[@]}"
+            echo -e "Найдено в архиве: ${GREEN}$found_count${RESET} настроек"
+            echo -e "С маппингом в RWP-Shop: ${GREEN}$mapped_count${RESET}"
         else
             print_message "WARN" "Архив не распакован или database.json не найден"
         fi
