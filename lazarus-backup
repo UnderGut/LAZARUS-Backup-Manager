@@ -7106,21 +7106,40 @@ migrate_settings_configure_paths() {
 migrate_settings_analyze() {
     debug_log "MIGRATE" "Analyzing settings for migration"
     
-    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "ERROR" "Путь к источнику не настроен"
+    # Проверяем наличие хотя бы одного источника
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" && -z "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        print_message "ERROR" "Источник не настроен (ни .env, ни архив)"
         return 1
     fi
     
-    # Читаем исходный .env
+    # Читаем настройки из доступных источников
     declare -A source_settings
-    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+    declare -A backup_settings
+    local source_desc=""
+    
+    # 1) Из .env файла Bedolaga
+    if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+        source_desc=".env: $MIGRATION_SOURCE_ENV_FILE"
+    fi
+    
+    # 2) Из архива бэкапа (system_settings)
+    if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        if extract_bedolaga_backup "$MIGRATION_SOURCE_BACKUP_FILE" 2>/dev/null; then
+            read_all_bedolaga_settings backup_settings
+            [[ -n "$source_desc" ]] && source_desc+="\n"
+            source_desc+="Архив: $(basename "$MIGRATION_SOURCE_BACKUP_FILE") (${#backup_settings[@]} настроек из БД)"
+        fi
+    fi
     
     local total_source=${#source_settings[@]}
+    local total_backup=${#backup_settings[@]}
     local can_migrate_env=0
     local can_migrate_db=0
+    local can_migrate_from_backup=0
     local no_mapping=0
     
-    # Подсчёт переменных с маппингом
+    # Подсчёт переменных из .env с маппингом
     for key in "${!source_settings[@]}"; do
         if [[ -n "${SETTINGS_ENV_TO_ENV[$key]}" ]]; then
             ((can_migrate_env++))
@@ -7131,16 +7150,29 @@ migrate_settings_analyze() {
         fi
     done
     
+    # Подсчёт настроек из архива с маппингом
+    for key in "${!backup_settings[@]}"; do
+        if [[ -n "${BEDOLAGA_BACKUP_TO_RWP[$key]}" ]]; then
+            ((can_migrate_from_backup++))
+        fi
+    done
+    
     echo ""
     echo -e "${CYAN}${BOLD}═══ АНАЛИЗ НАСТРОЕК ═══${RESET}"
     echo ""
-    echo -e "Источник: ${GREEN}$MIGRATION_SOURCE_ENV_FILE${RESET}"
+    echo -e "Источники:\n${GREEN}$source_desc${RESET}"
     echo ""
     echo "┌─────────────────────────────────────────────────────────┐"
-    printf "│ %-43s %10s │\n" "Найдено настроек в Bedolaga:" "$total_source"
-    printf "│ %-43s %10s │\n" "Можно перенести в .env:" "$can_migrate_env"
-    printf "│ %-43s %10s │\n" "Можно перенести в settings DB:" "$can_migrate_db"
-    printf "│ %-43s %10s │\n" "Без аналога (не переносятся):" "$no_mapping"
+    if [[ $total_source -gt 0 ]]; then
+        printf "│ %-43s %10s │\n" "Найдено в .env Bedolaga:" "$total_source"
+        printf "│ %-43s %10s │\n" "  → Можно перенести в .env:" "$can_migrate_env"
+        printf "│ %-43s %10s │\n" "  → Можно перенести в settings DB:" "$can_migrate_db"
+        printf "│ %-43s %10s │\n" "  → Без аналога (не переносятся):" "$no_mapping"
+    fi
+    if [[ $total_backup -gt 0 ]]; then
+        printf "│ %-43s %10s │\n" "Найдено в архиве (system_settings):" "$total_backup"
+        printf "│ %-43s %10s │\n" "  → Можно перенести в settings DB:" "$can_migrate_from_backup"
+    fi
     echo "└─────────────────────────────────────────────────────────┘"
     echo ""
     
@@ -7150,7 +7182,11 @@ migrate_settings_analyze() {
 # --- Функция: Просмотр маппинга .env → .env ---
 migrate_settings_show_env_mapping() {
     if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "ERROR" "Путь к источнику не настроен"
+        print_message "WARN" ".env файл Bedolaga не указан"
+        echo ""
+        echo "Для просмотра маппинга .env → .env необходимо указать путь к .env файлу Bedolaga."
+        echo "Используйте пункт 1 (Настройка путей) для указания источника."
+        echo ""
         read -erp "Enter..." dummy
         return 1
     fi
@@ -7186,56 +7222,72 @@ migrate_settings_show_env_mapping() {
     read -erp "Enter..." dummy
 }
 
-# --- Функция: Просмотр маппинга .env → settings DB ---
+# --- Функция: Просмотр маппинга → settings DB ---
 migrate_settings_show_db_mapping() {
-    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "ERROR" "Путь к источнику не настроен"
+    # Проверяем наличие хотя бы одного источника
+    if [[ -z "$MIGRATION_SOURCE_ENV_FILE" && -z "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        print_message "ERROR" "Источник не настроен (ни .env, ни архив)"
         read -erp "Enter..." dummy
         return 1
     fi
     
-    declare -A source_settings
-    read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
-    
     clear_screen
-    echo -e "${CYAN}${BOLD}═══ МАППИНГ .env → settings DB ═══${RESET}"
+    echo -e "${CYAN}${BOLD}═══ МАППИНГ → settings DB ═══${RESET}"
     echo ""
     
-    # Группируем по категориям
-    local categories=("Payment" "Trial" "Referral" "UI" "URLs" "Other")
-    
-    printf "%-35s │ %-35s │ %s\n" "Bedolaga .env" "RWP-Shop settings.key" "Значение"
-    echo "────────────────────────────────────┼─────────────────────────────────────┼────────────────────────"
-    
-    local count=0
-    for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
-        local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
-        local value="${source_settings[$bedolaga_key]:-<не задано>}"
+    # 1) Настройки из архива (приоритет!)
+    if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
+        echo -e "${GREEN}=== ИЗ АРХИВА (system_settings → settings) ===${RESET}"
+        echo ""
+        printf "%-35s │ %-35s\n" "Bedolaga (backup)" "RWP-Shop settings.key"
+        echo "────────────────────────────────────┼─────────────────────────────────────"
         
-        # Маскируем чувствительные данные
-        if [[ "$bedolaga_key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
-            if [[ -n "${source_settings[$bedolaga_key]}" ]]; then
-                local masked="${value:0:6}***${value: -3}"
-                value="$masked"
+        local backup_count=0
+        for bedolaga_key in "${!BEDOLAGA_BACKUP_TO_RWP[@]}"; do
+            local rwp_key="${BEDOLAGA_BACKUP_TO_RWP[$bedolaga_key]}"
+            printf "%-35s │ %-35s\n" "$bedolaga_key" "$rwp_key"
+            ((backup_count++))
+        done | sort
+        
+        echo ""
+        echo "Всего маппингов архив→БД: $backup_count"
+        echo ""
+    fi
+    
+    # 2) Настройки из .env
+    if [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+        declare -A source_settings
+        read_env_file "$MIGRATION_SOURCE_ENV_FILE" source_settings
+        
+        echo -e "${YELLOW}=== ИЗ .ENV (SETTINGS_ENV_TO_DB) ===${RESET}"
+        echo ""
+        printf "%-35s │ %-35s │ %s\n" "Bedolaga .env" "RWP-Shop settings.key" "Значение"
+        echo "────────────────────────────────────┼─────────────────────────────────────┼────────────────────────"
+        
+        local count=0
+        for bedolaga_key in "${!SETTINGS_ENV_TO_DB[@]}"; do
+            local db_key="${SETTINGS_ENV_TO_DB[$bedolaga_key]}"
+            local value="${source_settings[$bedolaga_key]:-<не задано>}"
+            
+            # Маскируем чувствительные данные
+            if [[ "$bedolaga_key" =~ TOKEN|SECRET|PASSWORD|KEY ]]; then
+                if [[ -n "${source_settings[$bedolaga_key]}" ]]; then
+                    local masked="${value:0:6}***${value: -3}"
+                    value="$masked"
+                fi
             fi
-        fi
+            
+            # Ограничиваем длину
+            [[ ${#value} -gt 20 ]] && value="${value:0:17}..."
+            
+            printf "%-35s │ %-35s │ %s\n" "$bedolaga_key" "$db_key" "$value"
+            ((count++))
+        done
         
-        # Ограничиваем длину
-        [[ ${#value} -gt 20 ]] && value="${value:0:17}..."
-        
-        printf "%-35s │ %-35s │ %s\n" "$bedolaga_key" "$db_key" "$value"
-        
-        ((count++))
-        # Пагинация каждые 20 строк
-        if [[ $((count % 20)) -eq 0 ]]; then
-            echo ""
-            read -erp "-- Нажмите Enter для продолжения --" dummy
-            echo ""
-        fi
-    done
+        echo ""
+        echo "Всего маппингов .env→БД: $count"
+    fi
     
-    echo ""
-    echo "Всего переменных для миграции в БД: ${#SETTINGS_ENV_TO_DB[@]}"
     echo ""
     read -erp "Enter..." dummy
 }
@@ -7243,7 +7295,11 @@ migrate_settings_show_db_mapping() {
 # --- Функция: Просмотр настроек без аналога ---
 migrate_settings_show_no_mapping() {
     if [[ -z "$MIGRATION_SOURCE_ENV_FILE" || ! -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-        print_message "ERROR" "Путь к источнику не настроен"
+        print_message "WARN" ".env файл Bedolaga не указан"
+        echo ""
+        echo "Для просмотра настроек без аналога необходим .env файл Bedolaga."
+        echo "Используйте пункт 1 (Настройка путей) для указания источника."
+        echo ""
         read -erp "Enter..." dummy
         return 1
     fi
