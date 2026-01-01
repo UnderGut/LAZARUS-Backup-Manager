@@ -7728,18 +7728,18 @@ migrate_settings_analyze() {
     echo ""
     echo -e "Источники:\n${GREEN}$source_desc${RESET}"
     echo ""
-    echo "┌────────────────────────────────────────────────┐"
+    echo "┌──────────────────────────────────────────────────┐"
     if [[ $total_source -gt 0 ]]; then
-        printf "│ %-38s %7s │\n" "Найдено в .env Bedolaga:" "$total_source"
-        printf "│ %-38s %7s │\n" "  → Перенос в .env:" "$can_migrate_env"
-        printf "│ %-38s %7s │\n" "  → Перенос в settings DB:" "$can_migrate_db"
-        printf "│ %-38s %7s │\n" "  → Без аналога:" "$no_mapping"
+        printf "│  Найдено в .env Bedolaga:            %7s   │\n" "$total_source"
+        printf "│    -> Перенос в .env:                %7s   │\n" "$can_migrate_env"
+        printf "│    -> Перенос в settings DB:         %7s   │\n" "$can_migrate_db"
+        printf "│    -> Без аналога:                   %7s   │\n" "$no_mapping"
     fi
     if [[ $total_backup -gt 0 ]]; then
-        printf "│ %-38s %7s │\n" "Найдено в архиве:" "$total_backup"
-        printf "│ %-38s %7s │\n" "  → Перенос в settings DB:" "$can_migrate_from_backup"
+        printf "│  Найдено в архиве:                   %7s   │\n" "$total_backup"
+        printf "│    -> Перенос в settings DB:         %7s   │\n" "$can_migrate_from_backup"
     fi
-    echo "└────────────────────────────────────────────────┘"
+    echo "└──────────────────────────────────────────────────┘"
     echo ""
     
     return 0
@@ -7791,7 +7791,7 @@ migrate_settings_show_env_mapping() {
                     printf "%-35s │ ${GREEN}%-30s${RESET} │ %s\n" "$bedolaga_key" "$rwp_key" "$value"
                     ((mapped_count++))
                 else
-                    printf "%-35s │ ${GRAY}%-30s${RESET} │ %s\n" "$bedolaga_key" "(нет маппинга)" "$value"
+                    printf "%-35s │ ${GRAY}%-30s${RESET} │ %s\n" "$bedolaga_key" "(no mapping)" "$value"
                 fi
             done | sort
             
@@ -7883,7 +7883,7 @@ migrate_settings_show_db_mapping() {
                 lines+=("$(printf "%-35s │ ${GREEN}%-35s${RESET}" "$bedolaga_key" "$rwp_key")")
                 ((mapped_count++))
             else
-                lines+=("$(printf "%-35s │ ${GRAY}%-35s${RESET}" "$bedolaga_key" "(нет маппинга)")")
+                lines+=("$(printf "%-35s │ ${GRAY}%-35s${RESET}" "$bedolaga_key" "(no mapping)")")
                 ((unmapped_count++))
             fi
         done
