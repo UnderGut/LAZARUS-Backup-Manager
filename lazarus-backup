@@ -5641,14 +5641,22 @@ migrate_transform_data() {
             
             local uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$(date +%s)-$code")
             
-            # promo_type: subscription (даёт дни)
+            # promo_type: всегда subscription (Bedolaga даёт только дни, не скидки)
+            # RWP-Shop поддерживает: subscription (дни) и discount (скидка)
+            # В Bedolaga нет скидочных промокодов
             local promo_type="subscription"
-            [[ "$bonus_days" == "0" || -z "$bonus_days" ]] && promo_type="balance"
+            
+            # Если bonus_days=0 — пропускаем (невалидный промокод)
+            if [[ "$bonus_days" == "0" || -z "$bonus_days" ]]; then
+                debug_log "MIGRATE" "Skipping promo with 0 days: $code"
+                continue
+            fi
             
             # active: is_active (bool)
             local active="true"
             [[ "$is_active" == "false" || "$is_active" == "0" || "$is_active" == "f" ]] && active="false"
             
+            # balance_bonus=0 (RWP-Shop не использует баланс, это поле для discount type)
             echo "$uuid,$code,$promo_type,$bonus_days,0,$max_uses,${current_uses:-0},$active,$created_at,$created_at"
         done < "$export_dir/promocodes.csv" >> "$import_dir/promo.csv"
         
