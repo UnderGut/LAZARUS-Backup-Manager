@@ -7728,18 +7728,18 @@ migrate_settings_analyze() {
     echo ""
     echo -e "Источники:\n${GREEN}$source_desc${RESET}"
     echo ""
-    echo "┌──────────────────────────────────────────────────────┐"
+    echo "┌────────────────────────────────────────────────┐"
     if [[ $total_source -gt 0 ]]; then
-        printf "│ %-36s %12s │\n" "Найдено в .env Bedolaga:" "$total_source"
-        printf "│ %-36s %12s │\n" "  → Перенос в .env:" "$can_migrate_env"
-        printf "│ %-36s %12s │\n" "  → Перенос в settings DB:" "$can_migrate_db"
-        printf "│ %-36s %12s │\n" "  → Без аналога:" "$no_mapping"
+        printf "│ %-38s %7s │\n" "Найдено в .env Bedolaga:" "$total_source"
+        printf "│ %-38s %7s │\n" "  → Перенос в .env:" "$can_migrate_env"
+        printf "│ %-38s %7s │\n" "  → Перенос в settings DB:" "$can_migrate_db"
+        printf "│ %-38s %7s │\n" "  → Без аналога:" "$no_mapping"
     fi
     if [[ $total_backup -gt 0 ]]; then
-        printf "│ %-36s %12s │\n" "Найдено в архиве:" "$total_backup"
-        printf "│ %-36s %12s │\n" "  → Перенос в settings DB:" "$can_migrate_from_backup"
+        printf "│ %-38s %7s │\n" "Найдено в архиве:" "$total_backup"
+        printf "│ %-38s %7s │\n" "  → Перенос в settings DB:" "$can_migrate_from_backup"
     fi
-    echo "└──────────────────────────────────────────────────────┘"
+    echo "└────────────────────────────────────────────────┘"
     echo ""
     
     return 0
