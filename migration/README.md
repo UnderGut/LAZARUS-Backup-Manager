@@ -311,7 +311,7 @@ ls -la backup_*.tar.*
 
 ```bash
 # 1. Запустите LAZARUS
-cd /root/LAZARUS-Backup-Manager
+cd /opt/lazarus-backup
 ./lazarus-backup
 
 # 2. Выберите: 1. Создать бэкап
@@ -336,27 +336,17 @@ ls -la /root/rwp_shop_backup_*.sql
 ### Шаг 4: Установка LAZARUS Backup Manager
 
 ```bash
-# 1. Перейдите в домашнюю директорию
-cd /root
+# Установка одной командой
+curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/install.sh | bash
 
-# 2. Клонируйте репозиторий
-git clone https://github.com/UnderGut/LAZARUS-Backup-Manager.git
-
-# 3. Перейдите в папку
-cd LAZARUS-Backup-Manager
-
-# 4. Сделайте скрипт исполняемым
-chmod +x lazarus-backup
-
-# 5. Проверьте, что скрипт работает
-./lazarus-backup --help
+# LAZARUS будет установлен в /opt/lazarus-backup
 ```
 
 #### Если LAZARUS уже установлен:
 
 ```bash
 # Обновите до последней версии
-cd /root/LAZARUS-Backup-Manager
+cd /opt/lazarus-backup
 git pull origin main
 ```
 
@@ -445,7 +435,7 @@ unzip -t backup_*.tar.zip
 
 ```bash
 # 1. Запустить LAZARUS
-cd /root/LAZARUS-Backup-Manager
+cd /opt/lazarus-backup
 ./lazarus-backup
 
 # 2. Выбрать: 5 → Миграция
@@ -469,7 +459,7 @@ cd /root/LAZARUS-Backup-Manager
 ##### 1. Запуск LAZARUS
 
 ```bash
-cd /root/LAZARUS-Backup-Manager
+cd /opt/lazarus-backup
 ./lazarus-backup
 ```
 
