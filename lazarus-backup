@@ -8413,10 +8413,24 @@ menu_migrate_settings() {
         echo -e "${YELLOW}=== ТЕКУЩИЙ СТАТУС ===${RESET}"
         
         # Источник: архив (из основного меню)
+        local archive_needs_password=false
         if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]]; then
             local archive_name=$(basename "$MIGRATION_SOURCE_BACKUP_FILE")
             local archive_size=$(du -h "$MIGRATION_SOURCE_BACKUP_FILE" 2>/dev/null | cut -f1)
-            echo -e "Источник архив: ${GREEN}✅ $archive_name${RESET} ($archive_size)"
+            
+            # Проверяем, нужен ли пароль
+            local archive_type=$(detect_bedolaga_archive_type "$MIGRATION_SOURCE_BACKUP_FILE" 2>/dev/null)
+            if [[ "$archive_type" == "zip" ]] && is_archive_password_protected "$MIGRATION_SOURCE_BACKUP_FILE" 2>/dev/null; then
+                if [[ -z "$BEDOLAGA_BACKUP_PASSWORD" ]]; then
+                    archive_needs_password=true
+                    echo -e "Источник архив: ${YELLOW}🔒 $archive_name${RESET} ($archive_size)"
+                    echo -e "                ${RED}⚠️  Требуется пароль! Выберите архив заново (основное меню → пункт 2)${RESET}"
+                else
+                    echo -e "Источник архив: ${GREEN}✅ 🔑 $archive_name${RESET} ($archive_size)"
+                fi
+            else
+                echo -e "Источник архив: ${GREEN}✅ $archive_name${RESET} ($archive_size)"
+            fi
         else
             echo -e "Источник архив: ${YELLOW}⚠️  Не выбран в основном меню${RESET}"
         fi
@@ -8448,10 +8462,12 @@ menu_migrate_settings() {
         fi
         echo ""
         
-        # Показываем статистику если источник настроен
-        if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]] || \
-           [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
-            migrate_settings_analyze 2>/dev/null
+        # Показываем статистику если источник настроен И пароль не требуется
+        if [[ "$archive_needs_password" != "true" ]]; then
+            if [[ -n "$MIGRATION_SOURCE_BACKUP_FILE" && -f "$MIGRATION_SOURCE_BACKUP_FILE" ]] || \
+               [[ -n "$MIGRATION_SOURCE_ENV_FILE" && -f "$MIGRATION_SOURCE_ENV_FILE" ]]; then
+                migrate_settings_analyze 2>/dev/null
+            fi
         fi
         
         echo ""
