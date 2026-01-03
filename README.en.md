@@ -40,6 +40,20 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 
 > 💡 The script will automatically install to `/opt/lazarus-backup/` and create symlink `/usr/local/bin/lazarus`
 
+### 🔄 Force Update
+
+If automatic update check doesn't work (CDN caching), update manually:
+
+```bash
+# Update via jsDelivr CDN (faster)
+curl -sSL "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@dev/lazarus-backup?t=$(date +%s)" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+
+# Or via GitHub directly (more reliable)
+curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+```
+
+> 💡 The `?t=$(date +%s)` parameter adds a timestamp to bypass CDN cache
+
 ---
 
 ## ✨ Features

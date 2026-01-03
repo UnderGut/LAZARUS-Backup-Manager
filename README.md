@@ -40,6 +40,20 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 
 > 💡 Скрипт автоматически установится в `/opt/lazarus-backup/` и создаст symlink `/usr/local/bin/lazarus`
 
+### 🔄 Принудительное обновление
+
+Если автоматическая проверка обновлений не работает (кэширование CDN), обновите вручную:
+
+```bash
+# Обновить через jsDelivr CDN (быстрее)
+curl -sSL "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@dev/lazarus-backup?t=$(date +%s)" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+
+# Или через GitHub напрямую (надёжнее)
+curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+```
+
+> 💡 Параметр `?t=$(date +%s)` добавляет timestamp для обхода кэша CDN
+
 ---
 
 ## ✨ Возможности
