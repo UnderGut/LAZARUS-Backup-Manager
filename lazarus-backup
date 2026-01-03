@@ -12794,18 +12794,28 @@ case "$1" in
     restore) menu_restore ;;
     check_update) check_for_updates ;;
     upgrade) auto_update_bot "$2" ;;
-    bot)
+    bot|-b)
         case "$2" in
-            up)     bot_up ;;
-            down)   bot_down ;;
-            status) bot_status ;;
+            up)                 bot_up ;;
+            down)               bot_down ;;
+            status|-s)          bot_status ;;
+            upgrade|update|-u)  auto_update_bot "$3" ;;
             *)
-                echo "Использование: lazarus bot <up|down|status>"
+                echo "Использование: lazarus bot <команда>"
+                echo "           или: lazarus -b <команда>"
                 echo ""
                 echo "Команды:"
-                echo "  up      - Запустить бота (если не запущен)"
-                echo "  down    - Остановить бота"
-                echo "  status  - Статус контейнера, версия, healthcheck"
+                echo "  up              - Запустить бота (если не запущен)"
+                echo "  down            - Остановить бота"
+                echo "  status,  -s     - Статус контейнера, версия, healthcheck"
+                echo "  upgrade, -u     - Обновить бота до последней версии"
+                echo "  update          - Алиас для upgrade"
+                echo ""
+                echo "Примеры:"
+                echo "  lazarus bot status"
+                echo "  lazarus bot upgrade"
+                echo "  lazarus -b -s"
+                echo "  lazarus -b -u"
                 ;;
         esac
         ;;
