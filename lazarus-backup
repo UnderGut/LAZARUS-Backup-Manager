@@ -1768,6 +1768,272 @@ get_latest_db_backup() {
     echo "$latest"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTO UPDATE - Автоматическое обновление бота без интерактива
+# ═══════════════════════════════════════════════════════════════════════════════
+# Использование: lazarus auto_update [LICENSE_KEY]
+#   LICENSE_KEY - опционально, если не передан и нужен - будет запрошен
+#
+# Примеры:
+#   lazarus auto_update                           # Обновить, спросит ключ если нужен
+#   lazarus auto_update abc123...                 # Обновить с указанным ключом
+#   LICENSE_KEY=abc123 lazarus auto_update        # Через переменную окружения
+# ═══════════════════════════════════════════════════════════════════════════════
+auto_update_bot() {
+    local provided_key="${1:-$LICENSE_KEY}"  # Из аргумента или env
+    
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}${BOLD}  LAZARUS Auto Update v${VERSION}${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo ""
+    
+    # === 1. ПРОВЕРКА ПУТИ К БОТУ ===
+    log_message "INFO" "[AUTO] Starting auto update..."
+    
+    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+        # Пробуем найти автоматически
+        if [[ -d "$DEFAULT_BOT_PATH" && ( -f "$DEFAULT_BOT_PATH/docker-compose.yml" || -f "$DEFAULT_BOT_PATH/compose.yaml" ) ]]; then
+            BOT_PATH="$DEFAULT_BOT_PATH"
+            save_config
+        else
+            ensure_bot_path || {
+                print_message "ERROR" "Путь к боту не найден!"
+                echo "Укажите BOT_PATH в config.env или установите бота"
+                return 1
+            }
+        fi
+    fi
+    
+    print_message "INFO" "Путь к боту: $BOT_PATH"
+    
+    # === 2. ОПРЕДЕЛЯЕМ COMPOSE ФАЙЛ ===
+    local compose_file=""
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    
+    if [[ -z "$compose_file" ]]; then
+        print_message "ERROR" "Compose файл не найден в $BOT_PATH"
+        return 1
+    fi
+    
+    # === 3. ТЕКУЩАЯ ВЕРСИЯ ===
+    local current_version=$(get_current_bot_version)
+    print_message "INFO" "Текущая версия: ${current_version:-не определена}"
+    
+    # === 4. ПОИСК НОВОЙ ВЕРСИИ ===
+    # Сначала проверяем Docker images
+    local latest_docker_version=""
+    local latest_docker_image=""
+    local docker_images=$(get_loaded_bot_images)
+    
+    if [[ -n "$docker_images" ]]; then
+        while IFS='|' read -r img_name img_ver; do
+            [[ -z "$img_ver" ]] && continue
+            if [[ -z "$latest_docker_version" ]] || version_gt "$img_ver" "$latest_docker_version"; then
+                latest_docker_version="$img_ver"
+                latest_docker_image="$img_name"
+            fi
+        done <<< "$docker_images"
+    fi
+    
+    # Затем ищем .tar файлы
+    local latest_tar_version=""
+    local latest_tar_file=""
+    local tar_files=$(find_all_bot_image_files)
+    
+    if [[ -n "$tar_files" ]]; then
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local fversion=$(extract_version_from_filename "$(basename "$file")")
+            if [[ -n "$fversion" ]]; then
+                if [[ -z "$latest_tar_version" ]] || version_gt "$fversion" "$latest_tar_version"; then
+                    latest_tar_version="$fversion"
+                    latest_tar_file="$file"
+                fi
+            fi
+        done <<< "$tar_files"
+    fi
+    
+    # Определяем что использовать
+    local selected_version=""
+    local selected_file=""
+    local selected_image=""
+    local need_docker_load=false
+    
+    # Приоритет: Docker image > tar file
+    if [[ -n "$latest_docker_version" ]]; then
+        if [[ -z "$current_version" ]] || version_gt "$latest_docker_version" "$current_version"; then
+            selected_version="$latest_docker_version"
+            selected_image="$latest_docker_image"
+            print_message "SUCCESS" "Найден образ в Docker: ${selected_image}:${selected_version}"
+        fi
+    fi
+    
+    if [[ -z "$selected_version" && -n "$latest_tar_version" ]]; then
+        if [[ -z "$current_version" ]] || version_gt "$latest_tar_version" "$current_version"; then
+            # Проверяем не загружен ли уже этот tar в Docker
+            local tar_image=$(get_image_name_from_tar "$latest_tar_file")
+            if is_image_loaded_in_docker "$tar_image" "$latest_tar_version"; then
+                selected_version="$latest_tar_version"
+                selected_image="$tar_image"
+                print_message "SUCCESS" "Образ из .tar уже в Docker: ${selected_image}:${selected_version}"
+            else
+                selected_version="$latest_tar_version"
+                selected_file="$latest_tar_file"
+                need_docker_load=true
+                print_message "SUCCESS" "Найден .tar файл: $(basename "$latest_tar_file")"
+            fi
+        fi
+    fi
+    
+    if [[ -z "$selected_version" ]]; then
+        if [[ -n "$current_version" ]]; then
+            print_message "SUCCESS" "Установлена последняя версия: $current_version"
+        else
+            print_message "ERROR" "Не найдено образов для обновления"
+            echo ""
+            echo "Скачайте образ бота и положите в $BOT_PATH"
+            return 1
+        fi
+        # Даже если обновлений нет - проверяем конфигурацию
+        selected_version="$current_version"
+    fi
+    
+    # === 5. ПРОВЕРКА ТРЕБОВАНИЙ v3.25.5+ ===
+    if version_gte "$selected_version" "3.25.5"; then
+        echo ""
+        print_message "INFO" "Проверка требований для v3.25.5+..."
+        
+        # Проверяем machine-id volume
+        if ! has_machine_id_volume; then
+            print_message "WARN" "Добавляем machine-id volume в compose..."
+            
+            # Автоматическое добавление machine-id
+            if grep -A 20 "^\s*bot:" "$compose_file" | grep -q "^\s*volumes:"; then
+                cp "$compose_file" "${compose_file}.bak.auto"
+                local temp_file=$(mktemp)
+                local in_bot=false
+                local volumes_found=false
+                
+                while IFS= read -r line; do
+                    echo "$line" >> "$temp_file"
+                    if [[ "$line" =~ ^[[:space:]]*bot: ]]; then
+                        in_bot=true
+                        volumes_found=false
+                    fi
+                    if [[ "$in_bot" == true && "$line" =~ ^[[:space:]]{2}[a-z] && ! "$line" =~ ^[[:space:]]*bot: && ! "$line" =~ ^[[:space:]]{4} ]]; then
+                        in_bot=false
+                    fi
+                    if [[ "$in_bot" == true && "$volumes_found" == false && "$line" =~ ^[[:space:]]*volumes: ]]; then
+                        volumes_found=true
+                        echo "      - /etc/machine-id:/etc/machine-id:ro" >> "$temp_file"
+                    fi
+                done < "$compose_file"
+                
+                mv "$temp_file" "$compose_file"
+                print_message "SUCCESS" "machine-id volume добавлен"
+            else
+                print_message "ERROR" "Не удалось добавить machine-id автоматически"
+                echo "Добавьте вручную в секцию volumes:"
+                echo "  - /etc/machine-id:/etc/machine-id:ro"
+                return 1
+            fi
+        else
+            print_message "SUCCESS" "machine-id volume: ✓"
+        fi
+        
+        # Проверяем LICENSE_KEY
+        if ! has_license_key; then
+            if [[ -n "$provided_key" && "$provided_key" =~ ^[0-9a-f]{64}$ ]]; then
+                # Ключ передан как параметр
+                local env_file="$BOT_PATH/.env"
+                if grep -q "^LICENSE_KEY=" "$env_file" 2>/dev/null; then
+                    sed -i "s|^LICENSE_KEY=.*|LICENSE_KEY=$provided_key|" "$env_file"
+                else
+                    echo "" >> "$env_file"
+                    echo "# License key (required from v3.25.5)" >> "$env_file"
+                    echo "LICENSE_KEY=$provided_key" >> "$env_file"
+                fi
+                print_message "SUCCESS" "LICENSE_KEY добавлен"
+            else
+                print_message "WARN" "LICENSE_KEY не найден!"
+                echo ""
+                echo -e "Получите ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
+                echo ""
+                read -erp "Введите LICENSE_KEY (64 hex символа): " input_key
+                input_key=$(echo "$input_key" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+                
+                if [[ "$input_key" =~ ^[0-9a-f]{64}$ ]]; then
+                    local env_file="$BOT_PATH/.env"
+                    if grep -q "^LICENSE_KEY=" "$env_file" 2>/dev/null; then
+                        sed -i "s|^LICENSE_KEY=.*|LICENSE_KEY=$input_key|" "$env_file"
+                    else
+                        echo "" >> "$env_file"
+                        echo "# License key (required from v3.25.5)" >> "$env_file"
+                        echo "LICENSE_KEY=$input_key" >> "$env_file"
+                    fi
+                    print_message "SUCCESS" "LICENSE_KEY добавлен"
+                else
+                    print_message "ERROR" "Неверный формат LICENSE_KEY!"
+                    return 1
+                fi
+            fi
+        else
+            print_message "SUCCESS" "LICENSE_KEY: ✓"
+        fi
+    fi
+    
+    # === 6. ОБНОВЛЕНИЕ (если есть новая версия) ===
+    if [[ -n "$selected_version" && "$selected_version" != "$current_version" ]]; then
+        echo ""
+        print_message "INFO" "Обновление: $current_version → $selected_version"
+        
+        # Загружаем образ если нужно
+        if [[ "$need_docker_load" == true && -n "$selected_file" ]]; then
+            print_message "INFO" "Загрузка образа в Docker..."
+            if ! docker load -i "$selected_file"; then
+                print_message "ERROR" "Ошибка загрузки образа!"
+                return 1
+            fi
+            selected_image=$(get_image_name_from_tar "$selected_file")
+            print_message "SUCCESS" "Образ загружен: ${selected_image}:${selected_version}"
+        fi
+        
+        # Обновляем версию в compose
+        print_message "INFO" "Обновление compose файла..."
+        if ! update_compose_image_version "$compose_file" "$selected_version" "$selected_image"; then
+            print_message "ERROR" "Ошибка обновления compose файла!"
+            return 1
+        fi
+        
+        # Перезапускаем контейнер
+        print_message "INFO" "Перезапуск бота..."
+        cd "$BOT_PATH" || return 1
+        
+        docker compose down 2>/dev/null || docker-compose down 2>/dev/null
+        sleep 2
+        docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null
+        
+        sleep 3
+        
+        # Проверяем статус
+        local new_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
+        if [[ "$new_status" == *"Up"* ]]; then
+            print_message "SUCCESS" "Бот успешно обновлён до версии $selected_version"
+        else
+            print_message "WARN" "Бот запущен, но статус: $new_status"
+            echo "Проверьте логи: docker logs rwp_shop"
+        fi
+    else
+        echo ""
+        print_message "SUCCESS" "Обновление не требуется"
+    fi
+    
+    echo ""
+    log_message "INFO" "[AUTO] Auto update completed"
+    return 0
+}
+
 # Главная функция обновления бота
 update_bot() {
     debug_log "UPDATE" "=== Starting update_bot() ==="
@@ -12313,6 +12579,7 @@ case "$1" in
         cleanup_old_backups ;;
     restore) menu_restore ;;
     check_update) check_for_updates ;;
+    auto_update) auto_update_bot "$2" ;;
     *)
         # Проверка несоответствия cron при первом запуске интерактивного режима
         check_cron_mismatch
