@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.29.0-dev"
+VERSION="4.29.1-dev"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -12316,6 +12316,51 @@ case "$1" in
     *)
         # Проверка несоответствия cron при первом запуске интерактивного режима
         check_cron_mismatch
+        
+        # === ПРОВЕРКА ТРЕБОВАНИЙ ЛИЦЕНЗИИ ДЛЯ БОТА v3.25.5+ ===
+        # Проверяем конфигурацию бота при старте скрипта
+        if [[ -n "$BOT_PATH" ]]; then
+            local current_bot_version=$(get_current_bot_version 2>/dev/null)
+            if [[ -n "$current_bot_version" ]] && version_gte "$current_bot_version" "3.25.5"; then
+                local has_key=false
+                local has_mid=false
+                has_license_key && has_key=true
+                has_machine_id_volume && has_mid=true
+                
+                if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
+                    clear_screen
+                    echo -e "${RED}${BOLD}═══════════════════════════════════════════════════${RESET}"
+                    echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ: ТРЕБУЕТСЯ НАСТРОЙКА ЛИЦЕНЗИИ${RESET}"
+                    echo -e "${RED}${BOLD}═══════════════════════════════════════════════════${RESET}"
+                    echo ""
+                    echo -e "Бот версии ${CYAN}$current_bot_version${RESET} требует LICENSE_KEY и machine-id."
+                    echo ""
+                    echo -e "${YELLOW}${BOLD}Статус конфигурации:${RESET}"
+                    if [[ "$has_key" == "true" ]]; then
+                        echo -e "  LICENSE_KEY:     ${GREEN}✓ настроен${RESET}"
+                    else
+                        echo -e "  LICENSE_KEY:     ${RED}✗ отсутствует в .env${RESET}"
+                    fi
+                    if [[ "$has_mid" == "true" ]]; then
+                        echo -e "  machine-id:      ${GREEN}✓ настроен${RESET}"
+                    else
+                        echo -e "  machine-id:      ${RED}✗ отсутствует в compose${RESET}"
+                    fi
+                    echo ""
+                    echo -e "Получить ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
+                    echo ""
+                    read -erp "Настроить сейчас? [Y/n]: " setup_now
+                    if [[ ! "$setup_now" =~ ^[Nn]$ ]]; then
+                        if [[ "$has_key" == "false" ]]; then
+                            ensure_license_key
+                        fi
+                        if [[ "$has_mid" == "false" ]]; then
+                            ensure_machine_id_volume
+                        fi
+                    fi
+                fi
+            fi
+        fi
         
         while true; do
             # Получаем актуальные статусы из cron
