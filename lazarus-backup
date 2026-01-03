@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.32.0-dev"
+VERSION="4.33.0-dev"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -381,20 +381,20 @@ check_for_updates() {
     clear_screen
     echo -e "${CYAN}Проверка обновлений...${RESET}"
     
-    local REMOTE_CONTENT=""
-    local DOWNLOAD_OK=false
     local MAX_RETRIES=2
     local TIMEOUT=15
-    local USED_URL=""
-    
-    # Добавляем timestamp для обхода кэша
     local CACHE_BUSTER="?t=$(date +%s)"
     
-    # Пробуем каждый источник
+    # Собираем версии со всех источников и берём максимальную
+    local BEST_VERSION=""
+    local BEST_CONTENT=""
+    local BEST_URL=""
+    
     for url in "${REMOTE_URLS[@]}"; do
         local FETCH_URL="${url}${CACHE_BUSTER}"
-        echo -e "${GRAY}Пробую: ${url}...${RESET}"
+        echo -e "${GRAY}Проверяю: ${url}...${RESET}"
         
+        local REMOTE_CONTENT=""
         for attempt in $(seq 1 $MAX_RETRIES); do
             if command -v curl > "$SILENT_LOG" 2>&1; then
                 REMOTE_CONTENT=$(curl $CURL_SILENT -L --connect-timeout $TIMEOUT --max-time 30 "$FETCH_URL" 2> "$SILENT_LOG")
@@ -407,47 +407,61 @@ check_for_updates() {
             
             # Проверяем что получили валидный скрипт
             if [[ -n "$REMOTE_CONTENT" ]] && echo "$REMOTE_CONTENT" | head -1 | grep -q "^#!/bin/bash"; then
-                DOWNLOAD_OK=true
-                USED_URL="$url"
-                break 2  # Выходим из обоих циклов
+                break
             fi
-            
+            REMOTE_CONTENT=""
             [[ $attempt -lt $MAX_RETRIES ]] && sleep 1
         done
         
-        echo -e "${YELLOW}Источник недоступен, пробую следующий...${RESET}"
+        if [[ -z "$REMOTE_CONTENT" ]]; then
+            echo -e "${YELLOW}  ✗ Недоступен${RESET}"
+            continue
+        fi
+        
+        local THIS_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
+        if [[ -z "$THIS_VERSION" ]]; then
+            echo -e "${YELLOW}  ✗ VERSION не найден${RESET}"
+            continue
+        fi
+        
+        echo -e "${GREEN}  ✓ v${THIS_VERSION}${RESET}"
+        
+        # Сравниваем с лучшей найденной версией
+        if [[ -z "$BEST_VERSION" ]]; then
+            BEST_VERSION="$THIS_VERSION"
+            BEST_CONTENT="$REMOTE_CONTENT"
+            BEST_URL="$url"
+        else
+            # Берём максимальную версию
+            local V_BEST=$(echo "$BEST_VERSION" | cut -d'-' -f1)
+            local V_THIS=$(echo "$THIS_VERSION" | cut -d'-' -f1)
+            if [[ "$(printf '%s\n' "$V_BEST" "$V_THIS" | sort -V | tail -n1)" == "$V_THIS" && "$V_THIS" != "$V_BEST" ]]; then
+                BEST_VERSION="$THIS_VERSION"
+                BEST_CONTENT="$REMOTE_CONTENT"
+                BEST_URL="$url"
+            fi
+        fi
     done
     
-    if [[ "$DOWNLOAD_OK" != "true" ]]; then
-        print_message "ERROR" "Не удалось подключиться к серверам обновлений."
-        echo -e "${GRAY}Проверенные источники:${RESET}"
-        for url in "${REMOTE_URLS[@]}"; do
-            echo -e "${GRAY}  • $url${RESET}"
-        done
+    if [[ -z "$BEST_VERSION" ]]; then
+        print_message "ERROR" "Не удалось получить информацию о версии ни с одного источника."
         read -erp "Enter..." dummy; return
     fi
     
-    echo -e "${GREEN}✓ Подключено к: ${USED_URL}${RESET}"
     echo ""
-
-    local REMOTE_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
-
-    if [[ -z "$REMOTE_VERSION" ]]; then
-        print_message "ERROR" "Не удалось получить информацию о версии."
-        echo -e "${GRAY}Файл получен, но VERSION= не найден${RESET}"
-        read -erp "Enter..." dummy; return
-    fi
+    echo -e "${GREEN}Лучший источник: ${BEST_URL}${RESET}"
+    echo ""
 
     local V_LOCAL=$(echo "$VERSION" | cut -d'-' -f1)
-    local V_REMOTE=$(echo "$REMOTE_VERSION" | cut -d'-' -f1)
+    local V_REMOTE=$(echo "$BEST_VERSION" | cut -d'-' -f1)
     local SUFFIX_LOCAL=$(echo "$VERSION" | grep -oE '\-.*$' || echo "")
-    local SUFFIX_REMOTE=$(echo "$REMOTE_VERSION" | grep -oE '\-.*$' || echo "")
+    local SUFFIX_REMOTE=$(echo "$BEST_VERSION" | grep -oE '\-.*$' || echo "")
 
     echo -e "Текущая версия: ${BOLD}$VERSION${RESET}"
-    echo -e "Актуальная версия: ${BOLD}$REMOTE_VERSION${RESET}"
+    echo -e "Актуальная версия: ${BOLD}$BEST_VERSION${RESET}"
     echo ""
 
-    if [[ "$VERSION" == "$REMOTE_VERSION" ]]; then
+    if [[ "$VERSION" == "$BEST_VERSION" ]]; then
         print_message "SUCCESS" "У вас установлена последняя версия."
         read -erp "Enter..." dummy
         return
@@ -466,7 +480,7 @@ check_for_updates() {
         print_message "WARN" "Доступно обновление!"
         read -erp "Обновить скрипт сейчас? (y/N): " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
-            perform_update "$REMOTE_CONTENT"
+            perform_update "$BEST_CONTENT"
         else
             print_message "INFO" "Обновление отменено."
             read -erp "Enter..." dummy
@@ -475,7 +489,7 @@ check_for_updates() {
         echo -e "${YELLOW}⚠️ Внимание: Версия на сервере старее или такая же.${RESET}"
         read -erp "Все равно загрузить версию с сервера? (y/N): " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
-            perform_update "$REMOTE_CONTENT"
+            perform_update "$BEST_CONTENT"
         else
             print_message "INFO" "Отменено."
             read -erp "Enter..." dummy
@@ -483,17 +497,18 @@ check_for_updates() {
     fi
 }
 
-# Тихая проверка обновлений при старте (не блокирует, работает в фоне)
+# Тихая проверка обновлений при старте (не блокирует)
 # Результат сохраняется в UPDATE_AVAILABLE и UPDATE_REMOTE_VERSION
+# Проверяет все источники и берёт максимальную версию
 check_updates_silent() {
     UPDATE_AVAILABLE=""
     UPDATE_REMOTE_VERSION=""
     
     local TIMEOUT=5
-    local REMOTE_VERSION=""
     local CACHE_BUSTER="?t=$(date +%s)"
+    local BEST_VERSION=""
     
-    # Пробуем каждый источник по очереди
+    # Проверяем все источники и берём максимальную версию
     for url in "${REMOTE_URLS[@]}"; do
         local FETCH_URL="${url}${CACHE_BUSTER}"
         local REMOTE_CONTENT=""
@@ -503,23 +518,34 @@ check_updates_silent() {
         elif command -v wget &>/dev/null; then
             REMOTE_CONTENT=$(wget -qO- --timeout=$TIMEOUT "$FETCH_URL" 2>/dev/null | head -20)
         else
-            return 1
+            continue
         fi
         
         # Проверяем что получили валидный скрипт
         if [[ -n "$REMOTE_CONTENT" ]] && echo "$REMOTE_CONTENT" | head -1 | grep -q "^#!/bin/bash"; then
-            REMOTE_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
-            [[ -n "$REMOTE_VERSION" ]] && break
+            local THIS_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
+            if [[ -n "$THIS_VERSION" ]]; then
+                # Сравниваем с лучшей найденной версией
+                if [[ -z "$BEST_VERSION" ]]; then
+                    BEST_VERSION="$THIS_VERSION"
+                else
+                    local V_BEST=$(echo "$BEST_VERSION" | cut -d'-' -f1)
+                    local V_THIS=$(echo "$THIS_VERSION" | cut -d'-' -f1)
+                    if [[ "$(printf '%s\n' "$V_BEST" "$V_THIS" | sort -V | tail -n1)" == "$V_THIS" && "$V_THIS" != "$V_BEST" ]]; then
+                        BEST_VERSION="$THIS_VERSION"
+                    fi
+                fi
+            fi
         fi
     done
     
-    [[ -z "$REMOTE_VERSION" ]] && return 1
+    [[ -z "$BEST_VERSION" ]] && return 1
     
     # Сравниваем версии
     local V_LOCAL=$(echo "$VERSION" | cut -d'-' -f1)
-    local V_REMOTE=$(echo "$REMOTE_VERSION" | cut -d'-' -f1)
+    local V_REMOTE=$(echo "$BEST_VERSION" | cut -d'-' -f1)
     local SUFFIX_LOCAL=$(echo "$VERSION" | grep -oE '\-.*$' || echo "")
-    local SUFFIX_REMOTE=$(echo "$REMOTE_VERSION" | grep -oE '\-.*$' || echo "")
+    local SUFFIX_REMOTE=$(echo "$BEST_VERSION" | grep -oE '\-.*$' || echo "")
     
     # Проверяем есть ли обновление
     local IS_UPGRADE=false
@@ -532,7 +558,7 @@ check_updates_silent() {
     
     if [[ "$IS_UPGRADE" == "true" ]]; then
         UPDATE_AVAILABLE="true"
-        UPDATE_REMOTE_VERSION="$REMOTE_VERSION"
+        UPDATE_REMOTE_VERSION="$BEST_VERSION"
     fi
     
     return 0
