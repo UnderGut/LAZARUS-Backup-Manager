@@ -1982,6 +1982,48 @@ update_bot() {
                 echo ""
                 echo -e "Текущая версия в Docker: ${CYAN}${latest_docker_image}:${latest_docker_version}${RESET}"
                 echo -e "Установленная версия:    ${CYAN}${current_version}${RESET}"
+                
+                # Проверка требований для версий 3.25.5+ (даже если обновлений нет)
+                if version_gte "$current_version" "3.25.5"; then
+                    echo ""
+                    local has_key=false
+                    local has_mid=false
+                    has_license_key && has_key=true
+                    has_machine_id_volume && has_mid=true
+                    
+                    if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
+                        echo -e "${YELLOW}${BOLD}Проверка конфигурации (v3.25.5+):${RESET}"
+                        if [[ "$has_key" == "true" ]]; then
+                            echo -e "  LICENSE_KEY:     ${GREEN}✓ настроен${RESET}"
+                        else
+                            echo -e "  LICENSE_KEY:     ${RED}✗ отсутствует${RESET}"
+                        fi
+                        if [[ "$has_mid" == "true" ]]; then
+                            echo -e "  machine-id:      ${GREEN}✓ настроен${RESET}"
+                        else
+                            echo -e "  machine-id:      ${RED}✗ отсутствует в compose${RESET}"
+                        fi
+                        
+                        if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
+                            echo ""
+                            echo -e "${YELLOW}Для работы бота требуется LICENSE_KEY и machine-id volume.${RESET}"
+                            echo -e "Получить ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
+                            echo ""
+                            read -erp "Настроить сейчас? [y/N]: " setup_now
+                            if [[ "$setup_now" =~ ^[Yy]$ ]]; then
+                                if [[ "$has_key" == "false" ]]; then
+                                    ensure_license_key
+                                fi
+                                if [[ "$has_mid" == "false" ]]; then
+                                    ensure_machine_id_volume
+                                fi
+                            fi
+                        fi
+                    else
+                        echo ""
+                        echo -e "${GREEN}✓ LICENSE_KEY и machine-id настроены${RESET}"
+                    fi
+                fi
             else
                 print_message "WARN" "Файлы образа не найдены"
                 echo ""
@@ -2026,6 +2068,49 @@ update_bot() {
                 echo -e "Версия в Docker: ${CYAN}${latest_docker_version}${RESET}"
                 echo -e "Текущая версия:  ${CYAN}${current_version}${RESET}"
             fi
+            
+            # Проверка требований для версий 3.25.5+ (даже если обновлений нет)
+            if version_gte "$current_version" "3.25.5"; then
+                echo ""
+                local has_key=false
+                local has_mid=false
+                has_license_key && has_key=true
+                has_machine_id_volume && has_mid=true
+                
+                if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
+                    echo -e "${YELLOW}${BOLD}Проверка конфигурации (v3.25.5+):${RESET}"
+                    if [[ "$has_key" == "true" ]]; then
+                        echo -e "  LICENSE_KEY:     ${GREEN}✓ настроен${RESET}"
+                    else
+                        echo -e "  LICENSE_KEY:     ${RED}✗ отсутствует${RESET}"
+                    fi
+                    if [[ "$has_mid" == "true" ]]; then
+                        echo -e "  machine-id:      ${GREEN}✓ настроен${RESET}"
+                    else
+                        echo -e "  machine-id:      ${RED}✗ отсутствует в compose${RESET}"
+                    fi
+                    
+                    if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
+                        echo ""
+                        echo -e "${YELLOW}Для работы бота требуется LICENSE_KEY и machine-id volume.${RESET}"
+                        echo -e "Получить ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
+                        echo ""
+                        read -erp "Настроить сейчас? [y/N]: " setup_now
+                        if [[ "$setup_now" =~ ^[Yy]$ ]]; then
+                            if [[ "$has_key" == "false" ]]; then
+                                ensure_license_key
+                            fi
+                            if [[ "$has_mid" == "false" ]]; then
+                                ensure_machine_id_volume
+                            fi
+                        fi
+                    fi
+                else
+                    echo ""
+                    echo -e "${GREEN}✓ LICENSE_KEY и machine-id настроены${RESET}"
+                fi
+            fi
+            
             echo ""
             read -erp "Нажмите Enter..." dummy
             return 0
