@@ -7,7 +7,7 @@
 [![English](https://img.shields.io/badge/🇬🇧_English-blue?style=for-the-badge)](README.en.md)
 [![Русский](https://img.shields.io/badge/🇷🇺_Русский-green?style=for-the-badge)](README.md)
 
-![Version](https://img.shields.io/badge/LAZARUS-4.30.0--dev-orange)
+![Version](https://img.shields.io/badge/LAZARUS-4.35.0-green)
 ![Bot](https://img.shields.io/badge/RWP--Shop-3.25.5+-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-blue)
 
