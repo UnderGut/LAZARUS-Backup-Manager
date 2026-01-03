@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" viewBox="0 0 600 380">
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
   <style>
     .bg { fill: #1e1e1e; }
     .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
@@ -16,7 +16,7 @@
   </style>
 
   <!-- Window Frame -->
-  <rect x="0" y="0" width="600" height="380" rx="10" ry="10" class="bg"/>
+  <rect x="0" y="0" width="600" height="400" rx="10" ry="10" class="bg"/>
   <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
   
   <!-- Window Controls -->
@@ -27,7 +27,7 @@
   <!-- Header Lines -->
   <path d="M20 60 L580 60 M20 63 L580 63" class="line-stroke" shape-rendering="crispEdges"/>
   
-  <text x="300" y="85" text-anchor="middle" class="text green bold">Статус контейнеров</text>
+  <text x="300" y="85" text-anchor="middle" class="text green bold">Статус бота</text>
   
   <path d="M20 97 L580 97 M20 100 L580 100" class="line-stroke" shape-rendering="crispEdges"/>
   
@@ -36,14 +36,17 @@
     <tspan class="bold">lazarus bot status</tspan>
     
     <tspan x="20" dy="35" class="gray">═══════════════════════════════════════════════════</tspan>
-    <tspan x="20" dy="25" class="bold">  СТАТУС КОНТЕЙНЕРОВ</tspan>
-    <tspan x="20" dy="20" class="gray">═══════════════════════════════════════════════════</tspan>
+    <tspan x="20" dy="22" class="bold">  Статус бота</tspan>
+    <tspan x="20" dy="18" class="gray">═══════════════════════════════════════════════════</tspan>
     
-    <tspan x="20" dy="30">📦 rwp_shop:        <tspan class="green">✅ Running</tspan> <tspan class="gray">(Up 2 hours)</tspan></tspan>
-    <tspan x="20" dy="25">🗄️ rwp_shop_db:     <tspan class="green">✅ Running</tspan> <tspan class="gray">(Up 2 hours)</tspan></tspan>
-    <tspan x="20" dy="25">🌐 rwp_shop_redis:  <tspan class="green">✅ Running</tspan> <tspan class="gray">(Up 2 hours)</tspan></tspan>
+    <tspan x="20" dy="28">Версия бота:     <tspan class="cyan">3.27.2</tspan></tspan>
+    <tspan x="20" dy="22">Контейнер бота:  <tspan class="green">● Running</tspan></tspan>
     
-    <tspan x="20" dy="35">Версия бота: <tspan class="cyan">3.25.5</tspan></tspan>
-    <tspan x="20" dy="25">Путь: <tspan class="gray">/opt/private-remnawave-telegram-shop-bot</tspan></tspan>
+    <tspan x="20" dy="26">Контейнер БД:    <tspan class="green">● Running</tspan></tspan>
+    <tspan x="20" dy="22">Health (БД):     <tspan class="green">✓ healthy</tspan></tspan>
+    
+    <tspan x="20" dy="28" class="gray">Лицензия (v3.25.5+):</tspan>
+    <tspan x="20" dy="22">  LICENSE_KEY:   <tspan class="green">✓ настроен</tspan></tspan>
+    <tspan x="20" dy="22">  machine-id:    <tspan class="green">✓ настроен</tspan></tspan>
   </text>
 </svg>

@@ -227,6 +227,17 @@ Delete these files to free space? [Y/n]:
 | `lazarus bot update` | Same |
 | `lazarus -b -u` | Short form |
 
+### Backup Commands
+
+| Command | Description |
+|---------|-------------|
+| `lazarus backup create` | Full backup (DB + files) |
+| `lazarus backup db` | Database only |
+| `lazarus backup files` | Files only |
+| `lazarus backup list` | List backups |
+| `lazarus -B -c` | Short form for create |
+| `lazarus -B -d` | Short form for db |
+
 ### Container Management
 
 | Command | Description |
@@ -239,6 +250,9 @@ Delete these files to free space? [Y/n]:
 ### Examples
 
 ```bash
+# Create full backup
+lazarus backup create
+
 # Check container status
 lazarus bot status
 
@@ -423,6 +437,6 @@ Log categories:
 
 <div align="center">
 
-**LAZARUS Backup Manager v4.30.0-dev**
+**LAZARUS Backup Manager v4.31.0-dev**
 
 </div>

@@ -227,6 +227,17 @@ LAZARUS ищет tar-файлы в следующих директориях:
 | `lazarus bot update` | То же самое |
 | `lazarus -b -u` | Короткая форма |
 
+### Резервное копирование
+
+| Команда | Описание |
+|---------|----------|
+| `lazarus backup create` | Полный бэкап (БД + файлы) |
+| `lazarus backup db` | Только база данных |
+| `lazarus backup files` | Только файлы |
+| `lazarus backup list` | Список бэкапов |
+| `lazarus -B -c` | Короткая форма create |
+| `lazarus -B -d` | Короткая форма db |
+
 ### Управление контейнерами
 
 | Команда | Описание |
@@ -239,6 +250,9 @@ LAZARUS ищет tar-файлы в следующих директориях:
 ### Примеры
 
 ```bash
+# Создать полный бэкап
+lazarus backup create
+
 # Проверить статус контейнеров
 lazarus bot status
 
@@ -423,6 +437,6 @@ lazarus --debug bot upgrade
 
 <div align="center">
 
-**LAZARUS Backup Manager v4.30.0-dev**
+**LAZARUS Backup Manager v4.31.0-dev**
 
 </div>

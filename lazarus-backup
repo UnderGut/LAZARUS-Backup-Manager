@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.30.0-dev"
+VERSION="4.31.0-dev"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -12790,6 +12790,31 @@ case "$1" in
     backup_full) create_backup "full" ;;
     backup_db)   create_backup "db_only" ;;
     backup_files) create_backup "files_only" ;;
+    backup|-B)
+        case "$2" in
+            create|full|-c)     create_backup "full" ;;
+            db|-d)              create_backup "db_only" ;;
+            files|-f)           create_backup "files_only" ;;
+            list|-l)            menu_list_backups ;;
+            *)
+                echo "Использование: lazarus backup <команда>"
+                echo "           или: lazarus -B <команда>"
+                echo ""
+                echo "Команды:"
+                echo "  create, -c      - Создать полный бэкап (БД + файлы)"
+                echo "  full            - Алиас для create"
+                echo "  db,     -d      - Создать бэкап только БД"
+                echo "  files,  -f      - Создать бэкап только файлов"
+                echo "  list,   -l      - Список бэкапов"
+                echo ""
+                echo "Примеры:"
+                echo "  lazarus backup create"
+                echo "  lazarus backup db"
+                echo "  lazarus -B -c"
+                echo "  lazarus -B -d"
+                ;;
+        esac
+        ;;
     cleanup|cleanup_old_backups)
         cleanup_old_backups ;;
     restore) menu_restore ;;

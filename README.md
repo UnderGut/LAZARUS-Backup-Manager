@@ -172,13 +172,29 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 
 ```bash
 lazarus                  # Интерактивное меню
-lazarus backup_full      # Полный бэкап (БД + файлы)
-lazarus backup_db        # Только база данных
-lazarus backup_files     # Только файлы
-lazarus cleanup          # Очистка старых бэкапов
 lazarus restore          # Меню восстановления
 lazarus migrate          # 🆕 Миграция с Bedolaga (BETA)
+lazarus cleanup          # Очистка старых бэкапов
 lazarus check_update     # Проверка обновлений скрипта
+```
+
+### 🆕 Резервное копирование (v4.30.0+)
+
+```bash
+lazarus backup create    # Полный бэкап (БД + файлы)
+lazarus backup db        # Только база данных
+lazarus backup files     # Только файлы
+lazarus backup list      # Список бэкапов
+
+# Короткие флаги
+lazarus -B -c            # = lazarus backup create
+lazarus -B -d            # = lazarus backup db
+lazarus -B -f            # = lazarus backup files
+
+# Legacy команды (совместимость)
+lazarus backup_full      # = lazarus backup create
+lazarus backup_db        # = lazarus backup db
+lazarus backup_files     # = lazarus backup files
 ```
 
 ### 🆕 Управление ботом (v4.30.0+)
