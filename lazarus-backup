@@ -1088,6 +1088,51 @@ get_loaded_image_version() {
     return 1
 }
 
+# Получение текущей версии бота из compose файла или запущенного контейнера
+# Возвращает: версию (например "3.27.0") или пустую строку
+get_current_bot_version() {
+    # Сначала пробуем из запущенного контейнера
+    local ver=$(get_raw_bot_version)
+    if [[ -n "$ver" && "$ver" != "Unknown" ]]; then
+        echo "$ver"
+        return 0
+    fi
+    
+    # Затем из compose файла
+    local compose_file=""
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    
+    if [[ -n "$compose_file" ]]; then
+        local compose_ver=$(get_compose_image_version "$compose_file")
+        if [[ -n "$compose_ver" ]]; then
+            # Извлекаем версию из "image:version"
+            echo "${compose_ver##*:}"
+            return 0
+        fi
+    fi
+    
+    echo ""
+    return 1
+}
+
+# Получение списка загруженных образов бота в Docker
+# Возвращает: строки "image_name|version" (например "rwp_shop|3.27.0")
+get_loaded_bot_images() {
+    local result=""
+    local image_names=("rwp_shop" "private-remnawave-telegram-shop-bot")
+    
+    for img in "${image_names[@]}"; do
+        local versions=$(docker images --format "{{.Tag}}" "$img" 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+")
+        while IFS= read -r ver; do
+            [[ -z "$ver" ]] && continue
+            result+="${img}|${ver}"$'\n'
+        done <<< "$versions"
+    done
+    
+    echo -n "$result" | sed '/^$/d'
+}
+
 # Проверка соответствия версии в compose и загруженного image
 # Возвращает: 0 если совпадают, 1 если не совпадают, 2 если ошибка
 check_image_version_match() {
