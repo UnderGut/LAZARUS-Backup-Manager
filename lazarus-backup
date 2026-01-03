@@ -12587,28 +12587,28 @@ case "$1" in
         # === ПРОВЕРКА ТРЕБОВАНИЙ ЛИЦЕНЗИИ ДЛЯ БОТА v3.25.5+ ===
         # Проверяем конфигурацию бота при старте скрипта
         if [[ -n "$BOT_PATH" ]]; then
-            local current_bot_version=$(get_current_bot_version 2>/dev/null)
-            if [[ -n "$current_bot_version" ]] && version_gte "$current_bot_version" "3.25.5"; then
-                local has_key=false
-                local has_mid=false
-                has_license_key && has_key=true
-                has_machine_id_volume && has_mid=true
+            _current_bot_version=$(get_current_bot_version 2>/dev/null)
+            if [[ -n "$_current_bot_version" ]] && version_gte "$_current_bot_version" "3.25.5"; then
+                _has_key=false
+                _has_mid=false
+                has_license_key && _has_key=true
+                has_machine_id_volume && _has_mid=true
                 
-                if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
+                if [[ "$_has_key" == "false" || "$_has_mid" == "false" ]]; then
                     clear_screen
                     echo -e "${RED}${BOLD}═══════════════════════════════════════════════════${RESET}"
                     echo -e "${RED}${BOLD}  ⚠️  ВНИМАНИЕ: ТРЕБУЕТСЯ НАСТРОЙКА ЛИЦЕНЗИИ${RESET}"
                     echo -e "${RED}${BOLD}═══════════════════════════════════════════════════${RESET}"
                     echo ""
-                    echo -e "Бот версии ${CYAN}$current_bot_version${RESET} требует LICENSE_KEY и machine-id."
+                    echo -e "Бот версии ${CYAN}$_current_bot_version${RESET} требует LICENSE_KEY и machine-id."
                     echo ""
                     echo -e "${YELLOW}${BOLD}Статус конфигурации:${RESET}"
-                    if [[ "$has_key" == "true" ]]; then
+                    if [[ "$_has_key" == "true" ]]; then
                         echo -e "  LICENSE_KEY:     ${GREEN}✓ настроен${RESET}"
                     else
                         echo -e "  LICENSE_KEY:     ${RED}✗ отсутствует в .env${RESET}"
                     fi
-                    if [[ "$has_mid" == "true" ]]; then
+                    if [[ "$_has_mid" == "true" ]]; then
                         echo -e "  machine-id:      ${GREEN}✓ настроен${RESET}"
                     else
                         echo -e "  machine-id:      ${RED}✗ отсутствует в compose${RESET}"
@@ -12618,11 +12618,12 @@ case "$1" in
                     echo ""
                     read -erp "Настроить сейчас? [Y/n]: " setup_now
                     if [[ ! "$setup_now" =~ ^[Nn]$ ]]; then
-                        if [[ "$has_key" == "false" ]]; then
-                            ensure_license_key
+                        if [[ "$_has_key" == "false" ]]; then
+                            ensure_license_key_in_env
                         fi
-                        if [[ "$has_mid" == "false" ]]; then
-                            ensure_machine_id_volume
+                        if [[ "$_has_mid" == "false" ]]; then
+                            ensure_machine_id_volume "$BOT_PATH/compose.yaml"
+                            [[ ! -f "$BOT_PATH/compose.yaml" ]] && ensure_machine_id_volume "$BOT_PATH/docker-compose.yml"
                         fi
                     fi
                 fi
