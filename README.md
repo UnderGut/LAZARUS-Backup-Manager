@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.27.0--dev-orange?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-4.29.0-orange?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -267,16 +267,25 @@ lazarus migrate
 
 LAZARUS включает функцию обновления Remnawave Telegram Shop Bot:
 
-1. Поиск tar-файлов образов в `/opt/`, `/root/`, папке бота
-2. Отображение доступных версий с подсветкой новых
-3. Автоматический бэкап перед обновлением (Full + DB)
-4. Загрузка образа и обновление `docker-compose.yml`
-5. Health-check контейнеров после обновления
+### Умное обновление (v4.29.0+)
+- **Проверка Docker images** — если образ уже загружен в Docker, предлагает обновиться сразу без поиска tar-файлов
+- **Проверка требований** — для версий 3.25.5+ показывает статус LICENSE_KEY и machine-id volume
+- **Предупреждения** — красные уведомления если LICENSE_KEY или machine-id отсутствуют
+
+### Процесс обновления
+1. Проверка загруженных образов в Docker
+2. Поиск tar-файлов в `/opt/`, `/root/`, `/home/`, `/tmp/`, папке бота
+3. Отображение доступных версий с подсветкой новых
+4. Автоматический бэкап перед обновлением (Full + DB)
+5. Загрузка образа (если не загружен) и обновление `compose.yaml`
+6. Проверка и добавление LICENSE_KEY / machine-id volume
+7. Health-check контейнеров после обновления
+8. Предложение удалить установочные tar-файлы
 
 **Поддерживаемые форматы образов:**
-- `rwp_shop-X.Y.Z-amd64.tar` (рекомендуемый)
+- `rwp_shop_X.Y.Z.tar` (рекомендуемый)
+- `rwp_shop-X.Y.Z-amd64.tar` 
 - `private-remnawave-telegram-shop-bot-X.Y.Z.tar`
-- `telegram-shop-X.Y.Z.tar`
 
 ---
 
