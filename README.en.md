@@ -172,13 +172,29 @@ Config file: `/opt/lazarus-backup/config.env` (chmod 600)
 
 ```bash
 lazarus                  # Interactive menu
-lazarus backup_full      # Full backup (DB + files)
-lazarus backup_db        # Database only
-lazarus backup_files     # Files only
-lazarus cleanup          # Old backup cleanup
 lazarus restore          # Restore menu
 lazarus migrate          # 🆕 Bedolaga migration (BETA)
+lazarus cleanup          # Old backup cleanup
 lazarus check_update     # Check script updates
+```
+
+### 🆕 Backup Commands (v4.30.0+)
+
+```bash
+lazarus backup create    # Full backup (DB + files)
+lazarus backup db        # Database only
+lazarus backup files     # Files only
+lazarus backup list      # List backups
+
+# Short flags
+lazarus -B -c            # = lazarus backup create
+lazarus -B -d            # = lazarus backup db
+lazarus -B -f            # = lazarus backup files
+
+# Legacy commands (compatibility)
+lazarus backup_full      # = lazarus backup create
+lazarus backup_db        # = lazarus backup db
+lazarus backup_files     # = lazarus backup files
 ```
 
 ### 🆕 Bot Management (v4.30.0+)
