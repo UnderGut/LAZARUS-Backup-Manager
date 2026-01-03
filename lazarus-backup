@@ -12764,7 +12764,19 @@ case "$1" in
         
         # === ПРОВЕРКА ТРЕБОВАНИЙ ЛИЦЕНЗИИ ДЛЯ БОТА v3.25.5+ ===
         # Проверяем конфигурацию бота при старте скрипта
-        if [[ -n "$BOT_PATH" ]]; then
+        
+        # Если BOT_PATH пуст — пробуем найти автоматически
+        if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+            # Пробуем стандартные пути
+            for _try_path in "$DEFAULT_BOT_PATH" "/opt/rwp_shop" "/opt/remnawave-telegram-shop"; do
+                if [[ -d "$_try_path" && ( -f "$_try_path/docker-compose.yml" || -f "$_try_path/compose.yaml" ) ]]; then
+                    BOT_PATH="$_try_path"
+                    break
+                fi
+            done
+        fi
+        
+        if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
             _current_bot_version=$(get_current_bot_version 2>/dev/null)
             if [[ -n "$_current_bot_version" ]] && version_gte "$_current_bot_version" "3.25.5"; then
                 _has_key=false
@@ -12800,8 +12812,10 @@ case "$1" in
                             ensure_license_key_in_env
                         fi
                         if [[ "$_has_mid" == "false" ]]; then
-                            ensure_machine_id_volume "$BOT_PATH/compose.yaml"
-                            [[ ! -f "$BOT_PATH/compose.yaml" ]] && ensure_machine_id_volume "$BOT_PATH/docker-compose.yml"
+                            _compose_file=""
+                            [[ -f "$BOT_PATH/compose.yaml" ]] && _compose_file="$BOT_PATH/compose.yaml"
+                            [[ -f "$BOT_PATH/docker-compose.yml" ]] && _compose_file="$BOT_PATH/docker-compose.yml"
+                            [[ -n "$_compose_file" ]] && ensure_machine_id_volume "$_compose_file"
                         fi
                     fi
                 fi
