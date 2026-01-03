@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.27.0-dev"
+VERSION="4.29.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -859,6 +859,17 @@ version_gt() {
     return 1
 }
 
+# Сравнение версий (возвращает 0 если $1 >= $2)
+version_gte() {
+    local v1="$1" v2="$2"
+    
+    # Если версии равны - true
+    [[ "$v1" == "$v2" ]] && return 0
+    
+    # Иначе проверяем >
+    version_gt "$v1" "$v2"
+}
+
 # Поиск файлов образа бота в конкретной папке (без рекурсии)
 # Поддерживает все форматы именования: новые и старые
 find_bot_image_files() {
@@ -983,6 +994,649 @@ get_image_name_from_tar() {
         echo "telegram-shop"
     else
         echo "rwp_shop"  # По умолчанию новый формат
+    fi
+}
+
+# Проверка, загружен ли образ с указанной версией в Docker
+# Возвращает: 0 если загружен, 1 если нет
+is_image_loaded_in_docker() {
+    local image_name="$1"
+    local version="$2"
+    
+    [[ -z "$image_name" || -z "$version" ]] && return 1
+    
+    # Проверяем наличие образа в docker images
+    if docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep -qE "^${image_name}:${version}$"; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Быстрая проверка наличия LICENSE_KEY в .env (без интерактива)
+# Возвращает: 0 если ключ есть и не пустой, 1 если нет
+has_license_key() {
+    local env_file="${BOT_PATH}/.env"
+    [[ ! -f "$env_file" ]] && return 1
+    
+    local key=$(grep "^LICENSE_KEY=" "$env_file" 2>/dev/null | cut -d'=' -f2-)
+    [[ -n "$key" && "$key" =~ ^[0-9a-f]{64}$ ]] && return 0
+    return 1
+}
+
+# Быстрая проверка наличия machine-id volume в compose (без интерактива)
+# Возвращает: 0 если volume есть, 1 если нет
+has_machine_id_volume() {
+    local compose_file=""
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    [[ -z "$compose_file" ]] && return 1
+    
+    grep -q "/etc/machine-id" "$compose_file" 2>/dev/null && return 0
+    return 1
+}
+
+# Получение версии image из docker-compose файла
+# Возвращает: "image_name:version" или пустую строку
+get_compose_image_version() {
+    local compose_file="$1"
+    
+    if [[ ! -f "$compose_file" ]]; then
+        echo ""
+        return 1
+    fi
+    
+    # Ищем image бота в compose файле
+    local image_patterns=("rwp_shop" "private-remnawave-telegram-shop-bot" "telegram-shop" "shopbot")
+    
+    for pattern in "${image_patterns[@]}"; do
+        local match=$(grep -oE "image:\s*['\"]?${pattern}:[0-9]+\.[0-9]+\.[0-9]+" "$compose_file" | head -1)
+        if [[ -n "$match" ]]; then
+            # Извлекаем image:version (убираем "image:" и пробелы/кавычки)
+            local image_ver=$(echo "$match" | sed -E "s/image:\s*['\"]?//g" | tr -d "'" | tr -d '"')
+            echo "$image_ver"
+            return 0
+        fi
+    done
+    
+    echo ""
+    return 1
+}
+
+# Получение версии загруженного Docker image
+# Возвращает: версию (например "3.27.0") или пустую строку
+get_loaded_image_version() {
+    local image_name="$1"
+    
+    [[ -z "$image_name" ]] && image_name="rwp_shop"
+    
+    # Получаем последнюю версию image из docker images
+    local version=$(docker images --format "{{.Tag}}" "$image_name" 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | sort -V | tail -1)
+    
+    if [[ -n "$version" ]]; then
+        echo "$version"
+        return 0
+    fi
+    
+    echo ""
+    return 1
+}
+
+# Проверка соответствия версии в compose и загруженного image
+# Возвращает: 0 если совпадают, 1 если не совпадают, 2 если ошибка
+check_image_version_match() {
+    debug_log "VERSION" "=== check_image_version_match() ==="
+    
+    # Определяем compose файл
+    local compose_file=""
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+        [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    fi
+    
+    if [[ -z "$compose_file" ]]; then
+        debug_log "VERSION" "Compose file not found"
+        return 2
+    fi
+    
+    debug_log "VERSION" "Compose file: $compose_file"
+    
+    # Получаем версию из compose
+    local compose_image=$(get_compose_image_version "$compose_file")
+    debug_log "VERSION" "Compose image: $compose_image"
+    
+    if [[ -z "$compose_image" ]]; then
+        debug_log "VERSION" "Could not get image from compose"
+        return 2
+    fi
+    
+    # Разделяем на имя и версию
+    local compose_name="${compose_image%%:*}"
+    local compose_version="${compose_image##*:}"
+    debug_log "VERSION" "Compose: name=$compose_name version=$compose_version"
+    
+    # Получаем загруженную версию image
+    local loaded_version=$(get_loaded_image_version "$compose_name")
+    debug_log "VERSION" "Loaded image version: $loaded_version"
+    
+    if [[ -z "$loaded_version" ]]; then
+        debug_log "VERSION" "No loaded image found for $compose_name"
+        # Image не загружен вообще - это критическая ошибка
+        echo "NOT_FOUND"
+        return 1
+    fi
+    
+    # Сравниваем версии
+    if [[ "$compose_version" == "$loaded_version" ]]; then
+        debug_log "VERSION" "Versions match: $compose_version"
+        echo "MATCH:$compose_version"
+        return 0
+    else
+        debug_log "VERSION" "Version MISMATCH: compose=$compose_version loaded=$loaded_version"
+        
+        # Определяем какая версия выше
+        if version_gt "$loaded_version" "$compose_version"; then
+            echo "UPGRADE:$compose_version:$loaded_version:$compose_name"
+        else
+            echo "DOWNGRADE:$compose_version:$loaded_version:$compose_name"
+        fi
+        return 1
+    fi
+}
+
+# Отображение предупреждения о несоответствии версий и предложение обновить
+show_version_mismatch_warning() {
+    local compose_version="$1"
+    local loaded_version="$2"
+    local is_upgrade="$3"  # "true" если загруженная версия выше
+    local image_name="$4"
+    
+    # Короткие алиасы для цветов
+    local R="${RESET}"
+    local C="${CYAN}"
+    local G="${GREEN}"
+    local Y="${YELLOW}"
+    
+    # Паддинг версии до 8 символов (версии типа 3.26.0 = 6, 3.100.10 = 8)
+    local cv_pad=$(printf "%-8s" "$compose_version")
+    local lv_pad=$(printf "%-8s" "$loaded_version")
+    
+    echo ""
+    if [[ "$is_upgrade" == "true" ]]; then
+        local B="${YELLOW}${BOLD}"
+        echo -e "${B}╔══════════════════════════════════════════════════════════════╗${R}"
+        echo -e "${B}║${R}          [!] ОБНАРУЖЕНА НОВАЯ ВЕРСИЯ IMAGE                   ${B}║${R}"
+        echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+        echo -e "${B}║${R}                                                              ${B}║${R}"
+        echo -e "${B}║${R}  В docker-compose указана версия: ${C}${cv_pad}${R}                   ${B}║${R}"
+        echo -e "${B}║${R}  Загруженный Docker image:        ${G}${lv_pad}${R} (новее)           ${B}║${R}"
+        echo -e "${B}║${R}                                                              ${B}║${R}"
+        echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+        echo -e "${B}║${R}  Контейнер сейчас работает на старой версии.                 ${B}║${R}"
+        echo -e "${B}║${R}  Для применения новой версии нужно обновить compose файл.    ${B}║${R}"
+        echo -e "${B}╚══════════════════════════════════════════════════════════════╝${R}"
+    else
+        local B="${RED}${BOLD}"
+        echo -e "${B}╔══════════════════════════════════════════════════════════════╗${R}"
+        echo -e "${B}║${R}            [!] НЕСООТВЕТСТВИЕ ВЕРСИЙ IMAGE                   ${B}║${R}"
+        echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+        echo -e "${B}║${R}                                                              ${B}║${R}"
+        echo -e "${B}║${R}  В docker-compose указана версия: ${C}${cv_pad}${R}                   ${B}║${R}"
+        echo -e "${B}║${R}  Загруженный Docker image:        ${Y}${lv_pad}${R} (старше)          ${B}║${R}"
+        echo -e "${B}║${R}                                                              ${B}║${R}"
+        echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+        echo -e "${B}║${R}  ${Y}Требуемая версия image не найдена!${R}                         ${B}║${R}"
+        echo -e "${B}║${R}                                                              ${B}║${R}"
+        echo -e "${B}║${R}  Загрузите нужную версию: curl + docker load                 ${B}║${R}"
+        echo -e "${B}╚══════════════════════════════════════════════════════════════╝${R}"
+    fi
+    echo ""
+}
+
+# Очистка установочных .tar файлов после загрузки image
+cleanup_tar_files() {
+    # Стандартные директории куда пользователь попадает по SSH
+    local search_dirs=(
+        "/root"
+        "/tmp"
+        "/opt"
+        "$BOT_PATH"
+        "$(pwd)"
+    )
+    
+    # Добавляем домашние директории пользователей
+    if [[ -d "/home" ]]; then
+        for user_home in /home/*; do
+            [[ -d "$user_home" ]] && search_dirs+=("$user_home")
+        done
+    fi
+    
+    # Собираем уникальные tar файлы
+    local -A found_files  # ассоциативный массив для уникальности
+    
+    for dir in "${search_dirs[@]}"; do
+        [[ ! -d "$dir" ]] && continue
+        
+        while IFS= read -r -d '' file; do
+            # Используем realpath для уникальности
+            local real_path=$(realpath "$file" 2>/dev/null || echo "$file")
+            found_files["$real_path"]=1
+        done < <(find "$dir" -maxdepth 1 -name "rwp_shop*.tar" -type f -print0 2>/dev/null)
+    done
+    
+    # Преобразуем в массив
+    local tar_files=("${!found_files[@]}")
+    
+    # Если файлов нет - выходим
+    [[ ${#tar_files[@]} -eq 0 ]] && return 0
+    
+    echo ""
+    print_message "INFO" "Найдены установочные файлы Docker image:"
+    echo ""
+    
+    local total_size=0
+    for file in "${tar_files[@]}"; do
+        local size=$(du -h "$file" 2>/dev/null | cut -f1)
+        local size_bytes=$(stat -c %s "$file" 2>/dev/null || echo 0)
+        total_size=$((total_size + size_bytes))
+        echo -e "  ${CYAN}${file}${RESET}"
+        echo -e "    Размер: ${YELLOW}${size}${RESET}"
+    done
+    
+    echo ""
+    local total_human=$(numfmt --to=iec $total_size 2>/dev/null || echo "${total_size} bytes")
+    echo -e "  ${WHITE}${BOLD}Всего: ${total_human}${RESET}"
+    echo ""
+    
+    print_message "INFO" "Эти файлы больше не нужны - image уже загружен в Docker"
+    echo ""
+    
+    local confirm=""
+    while [[ ! "$confirm" =~ ^[YyNn]$ ]]; do
+        read -erp "Удалить установочные файлы? (y/n): " confirm
+        if [[ ! "$confirm" =~ ^[YyNn]$ ]]; then
+            echo -e "${YELLOW}Введите 'y' для да или 'n' для нет${RESET}"
+        fi
+    done
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        local deleted=0
+        for file in "${tar_files[@]}"; do
+            local filename=$(basename "$file")
+            if rm -f "$file" 2>/dev/null; then
+                ((deleted++))
+                print_message "OK" "Удалён: ${file}"
+                debug_log "CLEANUP" "Deleted: $file"
+            else
+                print_message "WARN" "Не удалось удалить: ${file}"
+            fi
+        done
+        echo ""
+        print_message "SUCCESS" "Удалено файлов: $deleted"
+    else
+        print_message "INFO" "Файлы оставлены"
+    fi
+}
+
+# Предложить обновить compose файл
+offer_compose_update() {
+    local compose_version="$1"
+    local loaded_version="$2"
+    local image_name="$3"
+    
+    # Определяем compose файл
+    local compose_file=""
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    
+    if [[ -z "$compose_file" ]]; then
+        print_message "ERROR" "Compose файл не найден"
+        return 1
+    fi
+    
+    echo -e "${CYAN}Обновить версию в compose файле? ${compose_version} → ${loaded_version}${RESET}"
+    echo -e "  [1] Да, обновить и перезапустить контейнеры"
+    echo -e "  [2] Да, только обновить файл (без перезапуска)"
+    echo -e "  [3] Нет, оставить как есть"
+    echo ""
+    read -erp "Выберите действие [1-3]: " choice
+    
+    # Определяем текущую версию в compose для проверки лицензии
+    # Проверяем LICENSE_KEY если ТЕКУЩАЯ версия в compose >= 3.25.5
+    # (независимо от того, обновляет пользователь или нет)
+    local current_needs_license=false
+    if version_gte "$compose_version" "3.25.5"; then
+        current_needs_license=true
+    fi
+    
+    # Проверяем нужен ли LICENSE_KEY для НОВОЙ версии
+    local new_needs_license=false
+    if version_gte "$loaded_version" "3.25.5"; then
+        new_needs_license=true
+    fi
+    
+    case "$choice" in
+        1)
+            print_message "INFO" "Обновление compose файла..."
+            if update_compose_image_version "$compose_file" "$loaded_version" "$image_name"; then
+                print_message "SUCCESS" "Compose файл обновлён"
+                
+                # Проверяем LICENSE_KEY и machine-id volume для новой версии
+                if [[ "$new_needs_license" == true ]]; then
+                    ensure_machine_id_volume "$compose_file"
+                    ensure_license_key_in_env
+                fi
+                
+                echo ""
+                print_message "INFO" "Перезапуск контейнеров..."
+                cd "$BOT_PATH" || return 1
+                docker compose down 2>/dev/null
+                sleep 2
+                docker compose up -d 2>/dev/null
+                sleep 3
+                
+                # Проверяем статус
+                if docker ps | grep -q "$BOT_CONTAINER_NAME"; then
+                    print_message "SUCCESS" "Контейнеры запущены с версией ${loaded_version}"
+                else
+                    print_message "ERROR" "Ошибка запуска контейнеров!"
+                    print_message "INFO" "Проверьте логи: docker compose logs"
+                fi
+                
+                # Очистка временных tar файлов
+                cleanup_tar_files
+            else
+                print_message "ERROR" "Ошибка обновления compose файла"
+            fi
+            ;;
+        2)
+            print_message "INFO" "Обновление compose файла..."
+            if update_compose_image_version "$compose_file" "$loaded_version" "$image_name"; then
+                print_message "SUCCESS" "Compose файл обновлён"
+                
+                # Проверяем LICENSE_KEY и machine-id volume для новой версии
+                if [[ "$new_needs_license" == true ]]; then
+                    ensure_machine_id_volume "$compose_file"
+                    ensure_license_key_in_env
+                fi
+                
+                # Очистка временных tar файлов
+                cleanup_tar_files
+                
+                print_message "INFO" "Для применения выполните: docker compose down && docker compose up -d"
+            else
+                print_message "ERROR" "Ошибка обновления compose файла"
+            fi
+            ;;
+        3|*)
+            print_message "INFO" "Compose файл не изменён"
+            
+            # ВАЖНО: Даже если пользователь отказался от обновления версии,
+            # проверяем LICENSE_KEY и machine-id для ТЕКУЩЕЙ версии в compose
+            if [[ "$current_needs_license" == true ]]; then
+                echo ""
+                print_message "INFO" "Проверка требований лицензии для текущей версии ${compose_version}..."
+                ensure_machine_id_volume "$compose_file"
+                ensure_license_key_in_env
+            fi
+            ;;
+    esac
+}
+
+# Проверка и добавление LICENSE_KEY в .env файл (требуется с версии 3.25.5+)
+ensure_license_key_in_env() {
+    local env_file="$BOT_PATH/.env"
+    local compose_file=""
+    
+    # Определяем compose файл для проверки конфигурации
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    
+    if [[ ! -f "$env_file" ]]; then
+        debug_log "LICENSE" ".env file not found: $env_file"
+        return 1
+    fi
+    
+    # Определяем тип конфигурации: env_file или environment
+    # Если в compose есть "env_file:" для сервиса bot — переменные читаются напрямую из .env
+    # Если используется "environment:" — нужна явная ссылка LICENSE_KEY=${LICENSE_KEY:-}
+    local uses_env_file=false
+    if [[ -n "$compose_file" ]]; then
+        # Проверяем есть ли env_file в секции bot
+        if grep -A 30 "^\s*bot:" "$compose_file" | grep -q "env_file:"; then
+            uses_env_file=true
+            debug_log "LICENSE" "Compose uses env_file: direct .env reading"
+        else
+            debug_log "LICENSE" "Compose uses environment: variables via \${VAR}"
+        fi
+    fi
+    
+    # Проверяем есть ли уже LICENSE_KEY в .env
+    if grep -q "^LICENSE_KEY=" "$env_file"; then
+        local existing_key=$(grep "^LICENSE_KEY=" "$env_file" | cut -d'=' -f2-)
+        if [[ -n "$existing_key" && "$existing_key" != '""' && "$existing_key" != "''" ]]; then
+            debug_log "LICENSE" "LICENSE_KEY already exists in .env (value set)"
+            return 0
+        fi
+        debug_log "LICENSE" "LICENSE_KEY exists but is empty"
+    fi
+    
+    # Очищаем экран чтобы рамка была вверху (в debug режиме показывает разделитель)
+    clear_screen
+    
+    # Рамка LICENSE_KEY (64 символа внутри = 62 контент + 2 границы)
+    local B="${RED}${BOLD}"  # Border color
+    local R="${RESET}"
+    local C="${CYAN}"
+    local Y="${YELLOW}"
+    
+    echo -e "${B}╔══════════════════════════════════════════════════════════════╗${R}"
+    echo -e "${B}║${R}            [!] ТРЕБУЕТСЯ LICENSE_KEY                         ${B}║${R}"
+    echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}║${R}  Начиная с версии ${C}3.25.5${R} для работы бота требуется           ${B}║${R}"
+    echo -e "${B}║${R}  лицензионный ключ (LICENSE_KEY).                            ${B}║${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}║${R}  ${Y}LICENSE_KEY не найден или пустой в .env файле!${R}              ${B}║${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+    echo -e "${B}║${R}  Получите ключ в боте: ${C}https://t.me/rwp_shop_bot${R}             ${B}║${R}"
+    echo -e "${B}║${R}  Формат ключа: 64 символа (hex)                              ${B}║${R}"
+    echo -e "${B}╚══════════════════════════════════════════════════════════════╝${R}"
+    echo ""
+    
+    # Цикл ввода с валидацией
+    local license_key=""
+    while true; do
+        read -erp "Введите LICENSE_KEY (или Enter чтобы пропустить): " license_key
+        
+        # Пустой ввод — пропустить
+        if [[ -z "$license_key" ]]; then
+            break
+        fi
+        
+        # Убираем пробелы по краям
+        license_key=$(echo "$license_key" | tr -d '[:space:]')
+        
+        # Приводим к нижнему регистру
+        license_key=$(echo "$license_key" | tr '[:upper:]' '[:lower:]')
+        
+        # Валидация: точно 64 символа hex (0-9, a-f)
+        if [[ "$license_key" =~ ^[0-9a-f]{64}$ ]]; then
+            break
+        else
+            echo ""
+            print_message "ERROR" "Неверный формат LICENSE_KEY!"
+            echo -e "  Ожидается: ${CYAN}64 символа (0-9, a-f)${RESET}"
+            echo -e "  Получено:  ${YELLOW}${#license_key} символов${RESET}"
+            echo ""
+        fi
+    done
+    
+    if [[ -n "$license_key" ]]; then
+        # Проверяем есть ли уже строка LICENSE_KEY= (пустая)
+        if grep -q "^LICENSE_KEY=" "$env_file"; then
+            # Заменяем существующую пустую строку
+            sed -i "s|^LICENSE_KEY=.*|LICENSE_KEY=$license_key|" "$env_file"
+        else
+            # Добавляем LICENSE_KEY в конец .env файла
+            echo "" >> "$env_file"
+            echo "# License key (required from v3.25.5)" >> "$env_file"
+            echo "LICENSE_KEY=$license_key" >> "$env_file"
+        fi
+        print_message "SUCCESS" "LICENSE_KEY добавлен в .env"
+        
+        # Предупреждаем только если используется environment (не env_file)
+        # При env_file переменные читаются напрямую из .env — всё ОК
+        if [[ "$uses_env_file" == false && -n "$compose_file" ]]; then
+            if ! grep -q "LICENSE_KEY" "$compose_file"; then
+                echo ""
+                print_message "WARN" "В compose файле отсутствует переменная LICENSE_KEY в environment!"
+                echo -e "${YELLOW}Ваш compose использует секцию environment (не env_file).${RESET}"
+                echo -e "${YELLOW}Рекомендуется добавить в секцию environment сервиса bot:${RESET}"
+                echo -e "${CYAN}      - LICENSE_KEY=\${LICENSE_KEY:-}${RESET}"
+                echo ""
+                echo -e "Или перейдите на формат с env_file — тогда все переменные"
+                echo -e "из .env будут доступны автоматически."
+                echo ""
+                print_message "INFO" "Скачайте актуальный compose файл из документации"
+                read -erp "Нажмите Enter для продолжения..." dummy
+            fi
+        fi
+        return 0
+    else
+        echo ""
+        # Рамка предупреждения (62 символа контента)
+        local B="${RED}${BOLD}"
+        local R="${RESET}"
+        local Y="${YELLOW}${BOLD}"
+        local C="${CYAN}"
+        local W="${WHITE}${BOLD}"
+        
+        echo -e "${B}┌──────────────────────────────────────────────────────────────┐${R}"
+        echo -e "${B}│${R}   ${Y}[!] LICENSE_KEY не добавлен. Бот может не запуститься!${R}     ${B}│${R}"
+        echo -e "${B}├──────────────────────────────────────────────────────────────┤${R}"
+        echo -e "${B}│${R}                                                              ${B}│${R}"
+        echo -e "${B}│${R}  Добавьте вручную в .env:                                    ${B}│${R}"
+        echo -e "${B}│${R}     ${C}LICENSE_KEY=ваш_ключ_64_символа${R}                          ${B}│${R}"
+        echo -e "${B}│${R}                                                              ${B}│${R}"
+        echo -e "${B}│${R}   ${W}Получить ключ:${R} ${C}https://t.me/rwp_shop_bot${R}                   ${B}│${R}"
+        echo -e "${B}│${R}                                                              ${B}│${R}"
+        echo -e "${B}└──────────────────────────────────────────────────────────────┘${R}"
+        echo ""
+        read -erp "Нажмите Enter для продолжения..." dummy
+        return 1
+    fi
+}
+
+# Проверка и добавление machine-id volume в compose файл (требуется с версии 3.25.5+ для лицензии)
+ensure_machine_id_volume() {
+    local compose_file="$1"
+    
+    if [[ ! -f "$compose_file" ]]; then
+        debug_log "MACHINE_ID" "Compose file not found: $compose_file"
+        return 1
+    fi
+    
+    # Проверяем есть ли уже machine-id volume
+    if grep -q "/etc/machine-id" "$compose_file"; then
+        debug_log "MACHINE_ID" "machine-id volume already exists in compose"
+        return 0
+    fi
+    
+    # Очищаем экран чтобы рамка была вверху (в debug режиме показывает разделитель)
+    clear_screen
+    
+    # Короткие алиасы
+    local B="${RED}${BOLD}"
+    local R="${RESET}"
+    local C="${CYAN}"
+    local Y="${YELLOW}"
+    
+    echo -e "${B}╔══════════════════════════════════════════════════════════════╗${R}"
+    echo -e "${B}║${R}          [!] ОТСУТСТВУЕТ VOLUME ДЛЯ ЛИЦЕНЗИИ                 ${B}║${R}"
+    echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}║${R}  В compose файле не найден обязательный volume:              ${B}║${R}"
+    echo -e "${B}║${R}  ${C}/etc/machine-id:/etc/machine-id:ro${R}                          ${B}║${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}║${R}  Этот volume необходим для привязки лицензии к серверу.      ${B}║${R}"
+    echo -e "${B}║${R}  ${Y}Без него бот не сможет проверить лицензию!${R}                  ${B}║${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+    echo -e "${B}║${R}  Нужно добавить в секцию volumes сервиса bot:                ${B}║${R}"
+    echo -e "${B}║${R}  ${C}volumes:${R}                                                    ${B}║${R}"
+    echo -e "${B}║${R}  ${C}  - /etc/machine-id:/etc/machine-id:ro${R}                      ${B}║${R}"
+    echo -e "${B}╚══════════════════════════════════════════════════════════════╝${R}"
+    echo ""
+    
+    local confirm=""
+    while [[ ! "$confirm" =~ ^[YyNn]$ ]]; do
+        read -erp "Добавить автоматически? (y/n): " confirm
+        if [[ ! "$confirm" =~ ^[YyNn]$ ]]; then
+            echo -e "${YELLOW}Введите 'y' для да или 'n' для нет${RESET}"
+        fi
+    done
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # Создаём бэкап
+        cp "$compose_file" "${compose_file}.bak.machine-id"
+        
+        # Ищем секцию volumes в сервисе bot и добавляем machine-id
+        # Используем sed для добавления после строки с volumes: в секции bot
+        
+        # Сначала проверяем есть ли уже секция volumes у bot
+        if grep -A 20 "^\s*bot:" "$compose_file" | grep -q "^\s*volumes:"; then
+            # Есть секция volumes - добавляем после неё
+            # Ищем первую строку volumes: после bot: и добавляем после неё
+            local in_bot=false
+            local volumes_found=false
+            local temp_file=$(mktemp)
+            
+            while IFS= read -r line; do
+                echo "$line" >> "$temp_file"
+                
+                # Определяем что мы в секции bot
+                if [[ "$line" =~ ^[[:space:]]*bot: ]]; then
+                    in_bot=true
+                    volumes_found=false
+                fi
+                
+                # Выходим из секции bot если встретили другой сервис
+                if [[ "$in_bot" == true && "$line" =~ ^[[:space:]]{2}[a-z] && ! "$line" =~ ^[[:space:]]*bot: && ! "$line" =~ ^[[:space:]]{4} ]]; then
+                    in_bot=false
+                fi
+                
+                # Если мы в bot и нашли volumes: - добавляем machine-id
+                if [[ "$in_bot" == true && "$volumes_found" == false && "$line" =~ ^[[:space:]]*volumes: ]]; then
+                    volumes_found=true
+                    echo "      - /etc/machine-id:/etc/machine-id:ro" >> "$temp_file"
+                fi
+            done < "$compose_file"
+            
+            mv "$temp_file" "$compose_file"
+            print_message "SUCCESS" "Volume /etc/machine-id добавлен в compose файл"
+            print_message "INFO" "Бэкап сохранён: ${compose_file}.bak.machine-id"
+            echo ""
+            read -erp "Нажмите Enter для продолжения..." dummy
+        else
+            # Нет секции volumes - нужно добавить вручную
+            print_message "ERROR" "Секция volumes не найдена в сервисе bot"
+            print_message "INFO" "Добавьте вручную в docker-compose.yml:"
+            echo ""
+            echo -e "${CYAN}services:"
+            echo -e "  bot:"
+            echo -e "    volumes:"
+            echo -e "      - /etc/machine-id:/etc/machine-id:ro${RESET}"
+            read -erp "Нажмите Enter для продолжения..." dummy
+            return 1
+        fi
+        return 0
+    else
+        print_message "WARN" "Volume не добавлен. Лицензия может не работать!"
+        print_message "INFO" "Добавьте вручную: /etc/machine-id:/etc/machine-id:ro"
+        read -erp "Нажмите Enter для продолжения..." dummy
+        return 1
     fi
 }
 
@@ -1209,128 +1863,306 @@ update_bot() {
     echo -e "Статус:          ${CYAN}$container_status${RESET}"
     echo ""
     
-    # === ЭТАП 3: ПОИСК ФАЙЛОВ ОБРАЗОВ ===
-    debug_log "UPDATE" "[STAGE 3] Searching for image files..."
-    print_message "INFO" "Поиск файлов образа в /opt/, /root/, $BOT_PATH..."
-    local image_files=$(find_all_bot_image_files)
-    debug_log "UPDATE" "Image files found: $(echo "$image_files" | wc -l) files"
+    # === ЭТАП 3: ПРОВЕРКА ОБРАЗОВ В DOCKER ===
+    debug_log "UPDATE" "[STAGE 3] Checking loaded Docker images..."
+    print_message "INFO" "Проверка загруженных образов Docker..."
     
-    if [[ -z "$image_files" ]]; then
-        debug_log "UPDATE" "No image files found, aborting"
-        echo ""
-        print_message "WARN" "Файлы образа не найдены"
-        echo ""
-        echo -e "${BOLD}Пути поиска:${RESET}"
-        echo -e "  ${CYAN}/opt/${RESET} (с подпапками)"
-        echo -e "  ${CYAN}/root/${RESET} (с подпапками)"
-        [[ -n "$BOT_PATH" ]] && echo -e "  ${CYAN}$BOT_PATH/${RESET}"
-        echo ""
-        echo -e "${BOLD}Поддерживаемые форматы файлов:${RESET}"
-        echo -e "  ${CYAN}rwp_shop-X.Y.Z-amd64.tar${RESET}  (новый, рекомендуемый)"
-        echo -e "  ${GRAY}private-remnawave-telegram-shop-bot-X.Y.Z-amd64.tar${RESET}  (старый)"
-        echo ""
-        echo -e "Скачайте файл из приватного канала и положите в:"
-        echo -e "  ${BOLD}$BOT_PATH/${RESET}"
-        echo ""
-        read -erp "Нажмите Enter..." dummy
-        return 1
+    # Получаем все версии rwp_shop из docker images
+    local docker_versions=$(docker images --format "{{.Tag}}" "rwp_shop" 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | sort -rV)
+    
+    # Также проверяем старые форматы образов
+    local old_versions=$(docker images --format "{{.Tag}}" "private-remnawave-telegram-shop-bot" 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | sort -rV)
+    
+    # Находим самую новую версию в Docker
+    local latest_docker_version=""
+    local latest_docker_image=""
+    
+    if [[ -n "$docker_versions" ]]; then
+        latest_docker_version=$(echo "$docker_versions" | head -1)
+        latest_docker_image="rwp_shop"
     fi
     
-    # Считаем количество найденных файлов
-    local files_count=$(echo "$image_files" | wc -l)
-    debug_log "UPDATE" "Files count: $files_count"
-    print_message "SUCCESS" "Найдено файлов: $files_count"
+    if [[ -n "$old_versions" ]]; then
+        local old_latest=$(echo "$old_versions" | head -1)
+        if [[ -z "$latest_docker_version" ]] || version_gt "$old_latest" "$latest_docker_version"; then
+            latest_docker_version="$old_latest"
+            latest_docker_image="private-remnawave-telegram-shop-bot"
+        fi
+    fi
     
-    # === ЭТАП 4: ОТОБРАЖЕНИЕ НАЙДЕННЫХ ФАЙЛОВ ===
-    debug_log "UPDATE" "[STAGE 4] Displaying found files..."
-    echo ""
-    echo -e "${BOLD}Найденные файлы образов (новые первыми):${RESET}"
-    local i=1
-    local files_array=()
-    while IFS= read -r file; do
-        [[ -z "$file" ]] && continue
-        local fname=$(basename "$file")
-        local fdir=$(dirname "$file")
-        local fversion=$(extract_version_from_filename "$fname")
-        local fsize=$(du -h "$file" 2>/dev/null | cut -f1)
-        local fimage=$(get_image_name_from_tar "$file")
-        files_array+=("$file")
-        debug_log "UPDATE" "  [$i] $fname (v$fversion, size=$fsize, image=$fimage)"
+    debug_log "UPDATE" "Latest Docker image: $latest_docker_image:$latest_docker_version"
+    
+    # Если в Docker есть версия новее текущей — предлагаем обновиться сразу
+    if [[ -n "$latest_docker_version" ]] && version_gt "$latest_docker_version" "$current_version"; then
+        debug_log "UPDATE" "Docker has newer version: $latest_docker_version > $current_version"
+        print_message "SUCCESS" "Найден образ в Docker: ${latest_docker_image}:${latest_docker_version}"
+        echo ""
+        echo -e "${YELLOW}${BOLD}Доступно обновление: $current_version → $latest_docker_version${RESET}"
+        echo ""
+        echo -e "${GREEN}Образ уже загружен в Docker — загрузка из файла не требуется${RESET}"
         
-        # Определяем тип файла
-        local type_label=""
-        if [[ "$fname" == rwp_shop* ]]; then
-            type_label="${GREEN}[новый]${RESET}"
-        elif [[ "$fname" == private-remnawave* ]]; then
-            type_label="${GRAY}[старый]${RESET}"
+        # Проверка требований для версий 3.25.5+
+        if version_gte "$latest_docker_version" "3.25.5"; then
+            local has_key=false
+            local has_volume=false
+            has_license_key && has_key=true
+            has_machine_id_volume && has_volume=true
+            
+            echo ""
+            # Сначала выводим критические предупреждения (красные) если чего-то нет
+            if [[ "$has_key" == false ]]; then
+                echo -e "${RED}${BOLD}⚠️  LICENSE_KEY отсутствует или пустой!${RESET}"
+                echo -e "${RED}   Получите ключ в боте: https://t.me/rwp_shop_bot${RESET}"
+                echo ""
+            fi
+            
+            if [[ "$has_volume" == false ]]; then
+                echo -e "${RED}${BOLD}⚠️  machine-id volume отсутствует в compose!${RESET}"
+                echo -e "${RED}   Будет предложено добавить при обновлении${RESET}"
+                echo ""
+            fi
+            
+            # Затем выводим статус требований
+            echo -e "${YELLOW}${BOLD}Требования для версии $latest_docker_version:${RESET}"
+            echo ""
+            
+            # Проверяем LICENSE_KEY
+            if [[ "$has_key" == true ]]; then
+                echo -e "   ${GREEN}✓${RESET} LICENSE_KEY: ${GREEN}настроен${RESET}"
+            else
+                echo -e "   ${RED}✗${RESET} LICENSE_KEY: ${RED}не настроен${RESET}"
+            fi
+            
+            # Проверяем machine-id volume
+            if [[ "$has_volume" == true ]]; then
+                echo -e "   ${GREEN}✓${RESET} machine-id volume: ${GREEN}настроен${RESET}"
+            else
+                echo -e "   ${RED}✗${RESET} machine-id volume: ${RED}не настроен${RESET}"
+            fi
+            echo ""
         fi
         
-        # Подсветка если версия новее
-        if version_gt "$fversion" "$current_version"; then
-            echo -e " ${GREEN}$i. $fname${RESET}"
-            echo -e "    v$fversion | $fsize | $type_label ${GREEN}← ОБНОВЛЕНИЕ${RESET}"
-            echo -e "    ${GRAY}$fdir${RESET}"
-        elif [[ "$fversion" == "$current_version" ]]; then
-            echo -e " ${YELLOW}$i. $fname${RESET}"
-            echo -e "    v$fversion | $fsize | $type_label ${YELLOW}(текущая)${RESET}"
-            echo -e "    ${GRAY}$fdir${RESET}"
+        local confirm=""
+        while [[ ! "$confirm" =~ ^[YyNn]$ ]]; do
+            read -erp "Обновить до версии $latest_docker_version? (y/n): " confirm
+            if [[ ! "$confirm" =~ ^[YyNn]$ ]]; then
+                echo -e "${YELLOW}Введите 'y' для да или 'n' для нет${RESET}"
+            fi
+        done
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            # Устанавливаем переменные для дальнейшего обновления
+            local selected_version="$latest_docker_version"
+            local selected_image_name="$latest_docker_image"
+            local selected_file=""  # Файл не нужен
+            local skip_docker_load=true
+            
+            # Переходим к этапу подтверждения и обновления
+            # (код будет ниже)
         else
-            echo -e " ${GRAY}$i. $fname${RESET}"
-            echo -e "    v$fversion | $fsize | $type_label"
-            echo -e "    ${GRAY}$fdir${RESET}"
+            print_message "INFO" "Отменено"
+            read -erp "Нажмите Enter..." dummy
+            return 0
         fi
-        ((i++))
-    done <<< "$image_files"
-    
-    echo ""
-    echo " 0. Назад"
-    echo ""
-    
-    # === ЭТАП 5: ВЫБОР ФАЙЛА ===
-    debug_log "UPDATE" "[STAGE 5] File selection..."
-    # Первый файл в списке = самая новая версия (после сортировки)
-    local latest_file="${files_array[0]}"
-    local latest_version=$(extract_version_from_filename "$(basename "$latest_file")")
-    debug_log "UPDATE" "Latest file: $(basename "$latest_file"), version: $latest_version"
-    
-    local choice=""
-    if ! version_gt "$latest_version" "$current_version"; then
-        debug_log "UPDATE" "Current version is latest ($current_version >= $latest_version)"
-        print_message "INFO" "Установлена последняя версия ($current_version)"
-        echo ""
-        read -erp "Выберите файл для переустановки (или Enter - назад): " choice
-        [[ -z "$choice" || "$choice" == "0" ]] && return 0
     else
-        debug_log "UPDATE" "Update available: $current_version -> $latest_version"
-        echo -e "${YELLOW}${BOLD}Доступно обновление: $current_version → $latest_version${RESET}"
+        # В Docker нет новых версий — ищем .tar файлы
+        debug_log "UPDATE" "No newer version in Docker, searching for tar files..."
+        
+        # === ЭТАП 3b: ПОИСК ФАЙЛОВ ОБРАЗОВ ===
+        print_message "INFO" "Поиск файлов образа в /opt/, /root/, $BOT_PATH..."
+        local image_files=$(find_all_bot_image_files)
+        debug_log "UPDATE" "Image files found: $(echo "$image_files" | wc -l) files"
+        
+        if [[ -z "$image_files" ]]; then
+            debug_log "UPDATE" "No image files found"
+            echo ""
+            if [[ -n "$latest_docker_version" ]]; then
+                # В Docker есть текущая или старая версия
+                print_message "INFO" "Новых версий не найдено"
+                echo ""
+                echo -e "Текущая версия в Docker: ${CYAN}${latest_docker_image}:${latest_docker_version}${RESET}"
+                echo -e "Установленная версия:    ${CYAN}${current_version}${RESET}"
+            else
+                print_message "WARN" "Файлы образа не найдены"
+                echo ""
+                echo -e "${BOLD}Пути поиска:${RESET}"
+                echo -e "  ${CYAN}/opt/${RESET} (с подпапками)"
+                echo -e "  ${CYAN}/root/${RESET} (с подпапками)"
+                [[ -n "$BOT_PATH" ]] && echo -e "  ${CYAN}$BOT_PATH/${RESET}"
+                echo ""
+                echo -e "${BOLD}Поддерживаемые форматы файлов:${RESET}"
+                echo -e "  ${CYAN}rwp_shop-X.Y.Z-amd64.tar${RESET}  (новый, рекомендуемый)"
+                echo -e "  ${GRAY}private-remnawave-telegram-shop-bot-X.Y.Z-amd64.tar${RESET}  (старый)"
+                echo ""
+                echo -e "Скачайте файл из приватного канала и положите в:"
+                echo -e "  ${BOLD}$BOT_PATH/${RESET}"
+            fi
+            echo ""
+            read -erp "Нажмите Enter..." dummy
+            return 1
+        fi
+        
+        # Фильтруем: показываем только файлы, которых НЕТ в Docker
+        local files_to_show=""
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local fname=$(basename "$file")
+            local fversion=$(extract_version_from_filename "$fname")
+            local fimage=$(get_image_name_from_tar "$file")
+            
+            if ! is_image_loaded_in_docker "$fimage" "$fversion"; then
+                files_to_show+="$file"$'\n'
+            fi
+        done <<< "$image_files"
+        files_to_show=$(echo -n "$files_to_show" | sed '/^$/d')
+        
+        if [[ -z "$files_to_show" ]]; then
+            debug_log "UPDATE" "All tar files already loaded in Docker"
+            print_message "INFO" "Все найденные образы уже загружены в Docker"
+            echo ""
+            if [[ -n "$latest_docker_version" ]] && [[ "$latest_docker_version" == "$current_version" ]]; then
+                print_message "SUCCESS" "Установлена последняя версия ($current_version)"
+            elif [[ -n "$latest_docker_version" ]]; then
+                echo -e "Версия в Docker: ${CYAN}${latest_docker_version}${RESET}"
+                echo -e "Текущая версия:  ${CYAN}${current_version}${RESET}"
+            fi
+            echo ""
+            read -erp "Нажмите Enter..." dummy
+            return 0
+        fi
+        
+        # Показываем только файлы, которые ещё не загружены
+        local files_count=$(echo "$files_to_show" | wc -l)
+        debug_log "UPDATE" "Files to show (not in Docker): $files_count"
+        print_message "SUCCESS" "Найдено новых файлов: $files_count"
+        
+        # === ЭТАП 4: ОТОБРАЖЕНИЕ НАЙДЕННЫХ ФАЙЛОВ ===
+        debug_log "UPDATE" "[STAGE 4] Displaying found files..."
         echo ""
-        read -erp "Выберите файл (Enter - последний v$latest_version): " choice
-        [[ -z "$choice" ]] && choice=1
+        echo -e "${BOLD}Найденные файлы образов (ещё не загружены в Docker):${RESET}"
+        local i=1
+        local files_array=()
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local fname=$(basename "$file")
+            local fdir=$(dirname "$file")
+            local fversion=$(extract_version_from_filename "$fname")
+            local fsize=$(du -h "$file" 2>/dev/null | cut -f1)
+            files_array+=("$file")
+            debug_log "UPDATE" "  [$i] $fname (v$fversion, size=$fsize)"
+            
+            # Подсветка если версия новее
+            if version_gt "$fversion" "$current_version"; then
+                echo -e " ${GREEN}$i. $fname${RESET}"
+                echo -e "    v$fversion | $fsize ${GREEN}← ОБНОВЛЕНИЕ${RESET}"
+                echo -e "    ${GRAY}$fdir${RESET}"
+            elif [[ "$fversion" == "$current_version" ]]; then
+                echo -e " ${YELLOW}$i. $fname${RESET}"
+                echo -e "    v$fversion | $fsize ${YELLOW}(текущая)${RESET}"
+                echo -e "    ${GRAY}$fdir${RESET}"
+            else
+                echo -e " ${GRAY}$i. $fname${RESET}"
+                echo -e "    v$fversion | $fsize"
+                echo -e "    ${GRAY}$fdir${RESET}"
+            fi
+            ((i++))
+        done <<< "$files_to_show"
+        
+        echo ""
+        echo " 0. Назад"
+        echo ""
+        
+        # === ЭТАП 5: ВЫБОР ФАЙЛА ===
+        debug_log "UPDATE" "[STAGE 5] File selection..."
+        local latest_file="${files_array[0]}"
+        local latest_version=$(extract_version_from_filename "$(basename "$latest_file")")
+        debug_log "UPDATE" "Latest file: $(basename "$latest_file"), version: $latest_version"
+        
+        # Проверка требований для версий 3.25.5+
+        if version_gte "$latest_version" "3.25.5"; then
+            local has_key=false
+            local has_volume=false
+            has_license_key && has_key=true
+            has_machine_id_volume && has_volume=true
+            
+            # Сначала выводим критические предупреждения (красные) если чего-то нет
+            if [[ "$has_key" == false ]]; then
+                echo -e "${RED}${BOLD}⚠️  LICENSE_KEY отсутствует или пустой!${RESET}"
+                echo -e "${RED}   Получите ключ в боте: https://t.me/rwp_shop_bot${RESET}"
+                echo ""
+            fi
+            
+            if [[ "$has_volume" == false ]]; then
+                echo -e "${RED}${BOLD}⚠️  machine-id volume отсутствует в compose!${RESET}"
+                echo -e "${RED}   Будет предложено добавить при обновлении${RESET}"
+                echo ""
+            fi
+            
+            # Затем выводим статус требований
+            echo -e "${YELLOW}${BOLD}Требования для версий 3.25.5+:${RESET}"
+            echo ""
+            
+            # Проверяем LICENSE_KEY
+            if [[ "$has_key" == true ]]; then
+                echo -e "   ${GREEN}✓${RESET} LICENSE_KEY: ${GREEN}настроен${RESET}"
+            else
+                echo -e "   ${RED}✗${RESET} LICENSE_KEY: ${RED}не настроен${RESET}"
+            fi
+            
+            # Проверяем machine-id volume
+            if [[ "$has_volume" == true ]]; then
+                echo -e "   ${GREEN}✓${RESET} machine-id volume: ${GREEN}настроен${RESET}"
+            else
+                echo -e "   ${RED}✗${RESET} machine-id volume: ${RED}не настроен${RESET}"
+            fi
+            echo ""
+        fi
+        
+        local choice=""
+        if ! version_gt "$latest_version" "$current_version"; then
+            debug_log "UPDATE" "Current version is latest ($current_version >= $latest_version)"
+            print_message "INFO" "Установлена последняя версия ($current_version)"
+            echo ""
+            read -erp "Выберите файл для переустановки (или Enter - назад): " choice
+            [[ -z "$choice" || "$choice" == "0" ]] && return 0
+        else
+            debug_log "UPDATE" "Update available: $current_version -> $latest_version"
+            echo -e "${YELLOW}${BOLD}Доступно обновление: $current_version → $latest_version${RESET}"
+            echo ""
+            read -erp "Выберите файл (Enter - последний v$latest_version): " choice
+            [[ -z "$choice" ]] && choice=1
+        fi
+        
+        debug_log "UPDATE" "User choice: $choice"
+        
+        # Валидация выбора
+        if [[ "$choice" == "0" ]]; then return 0; fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "${#files_array[@]}" ]]; then
+            debug_log "UPDATE" "Invalid choice: $choice (valid: 1-${#files_array[@]})"
+            print_message "ERROR" "Неверный выбор"
+            sleep 1
+            return 1
+        fi
+        
+        local selected_file="${files_array[$((choice-1))]}"
+        local selected_version=$(extract_version_from_filename "$(basename "$selected_file")")
+        local selected_image_name=$(get_image_name_from_tar "$selected_file")
+        local skip_docker_load=false
+        debug_log "UPDATE" "Selected: file=$selected_file, version=$selected_version, image=$selected_image_name"
     fi
-    
-    debug_log "UPDATE" "User choice: $choice"
-    
-    # Валидация выбора
-    if [[ "$choice" == "0" ]]; then return 0; fi
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "${#files_array[@]}" ]]; then
-        debug_log "UPDATE" "Invalid choice: $choice (valid: 1-${#files_array[@]})"
-        print_message "ERROR" "Неверный выбор"
-        sleep 1
-        return 1
-    fi
-    
-    local selected_file="${files_array[$((choice-1))]}"
-    local selected_version=$(extract_version_from_filename "$(basename "$selected_file")")
-    local selected_image_name=$(get_image_name_from_tar "$selected_file")
-    debug_log "UPDATE" "Selected: file=$selected_file, version=$selected_version, image=$selected_image_name"
     
     # === ЭТАП 6: ПОДТВЕРЖДЕНИЕ ===
     debug_log "UPDATE" "[STAGE 6] User confirmation..."
     echo ""
     echo -e "${BOLD}════════════════════════════════════════${RESET}"
-    echo -e "${BOLD}Выбран файл:${RESET} $(basename "$selected_file")"
-    echo -e "${BOLD}Версия:${RESET}      $selected_version"
-    echo -e "${BOLD}Image:${RESET}       $selected_image_name"
+    if [[ -n "$selected_file" ]]; then
+        echo -e "${BOLD}Файл:${RESET}    $(basename "$selected_file")"
+    fi
+    echo -e "${BOLD}Версия:${RESET}  $selected_version"
+    echo -e "${BOLD}Image:${RESET}   $selected_image_name"
+    if [[ "$skip_docker_load" == true ]]; then
+        echo -e "${BOLD}Статус:${RESET}  ${GREEN}Уже в Docker${RESET}"
+    fi
     echo -e "${BOLD}════════════════════════════════════════${RESET}"
     echo ""
     
@@ -1395,47 +2227,55 @@ update_bot() {
     debug_log "UPDATE" "[STAGE 8] Loading Docker image..."
     echo ""
     echo -e "${CYAN}${BOLD}═══ ЗАГРУЗКА IMAGE ═══${RESET}"
-    print_message "INFO" "[3/7] Загрузка Docker image..."
-    debug_log "DOCKER" "Running: docker load -i $selected_file"
     
-    local load_output
-    load_output=$(docker load -i "$selected_file" 2>&1)
-    local load_result=$?
-    debug_log "DOCKER" "docker load result: $load_result"
-    debug_log "DOCKER" "docker load output: $load_output"
-    
-    if [[ $load_result -ne 0 ]]; then
-        debug_log "DOCKER" "docker load FAILED"
-        print_message "ERROR" "Ошибка загрузки image!"
-        echo "$load_output"
-        log_message "ERROR" "Bot update failed: docker load error"
-        echo ""
-        print_message "INFO" "Бэкапы созданы. Данные не потеряны."
-        read -erp "Нажмите Enter..." dummy
-        return 1
-    fi
-    
-    # Извлекаем реальное имя загруженного image
-    local loaded_image=$(echo "$load_output" | grep -oE "Loaded image: [^ ]+" | cut -d' ' -f3)
-    debug_log "DOCKER" "Loaded image from output: $loaded_image"
-    if [[ -n "$loaded_image" ]]; then
-        print_message "SUCCESS" "Image загружен: $loaded_image"
-        # Извлекаем имя image без версии
-        selected_image_name="${loaded_image%%:*}"
-        debug_log "DOCKER" "Image name extracted: $selected_image_name"
+    # Проверяем флаг skip_docker_load или наличие образа в Docker
+    if [[ "$skip_docker_load" == true ]] || is_image_loaded_in_docker "$selected_image_name" "$selected_version"; then
+        debug_log "DOCKER" "Image $selected_image_name:$selected_version already loaded in Docker (skip_docker_load=$skip_docker_load)"
+        print_message "INFO" "[3/7] Image уже загружен в Docker"
+        print_message "SUCCESS" "Пропускаем docker load: ${selected_image_name}:${selected_version}"
     else
-        print_message "SUCCESS" "Image загружен"
-        echo "$load_output" | grep -i "loaded" | head -1
-    fi
-    
-    # Проверяем что image появился
-    debug_log "DOCKER" "Verifying image in docker images..."
-    if ! docker images | grep -q "$selected_image_name.*$selected_version"; then
-        debug_log "DOCKER" "Image not found in list, showing available:"
-        print_message "WARN" "Image загружен, но не найден в списке"
-        docker images | grep -E "(rwp_shop|telegram-shop|private-remnawave)" | head -5
-    else
-        debug_log "DOCKER" "Image verified in docker images list"
+        print_message "INFO" "[3/7] Загрузка Docker image..."
+        debug_log "DOCKER" "Running: docker load -i $selected_file"
+        
+        local load_output
+        load_output=$(docker load -i "$selected_file" 2>&1)
+        local load_result=$?
+        debug_log "DOCKER" "docker load result: $load_result"
+        debug_log "DOCKER" "docker load output: $load_output"
+        
+        if [[ $load_result -ne 0 ]]; then
+            debug_log "DOCKER" "docker load FAILED"
+            print_message "ERROR" "Ошибка загрузки image!"
+            echo "$load_output"
+            log_message "ERROR" "Bot update failed: docker load error"
+            echo ""
+            print_message "INFO" "Бэкапы созданы. Данные не потеряны."
+            read -erp "Нажмите Enter..." dummy
+            return 1
+        fi
+        
+        # Извлекаем реальное имя загруженного image
+        local loaded_image=$(echo "$load_output" | grep -oE "Loaded image: [^ ]+" | cut -d' ' -f3)
+        debug_log "DOCKER" "Loaded image from output: $loaded_image"
+        if [[ -n "$loaded_image" ]]; then
+            print_message "SUCCESS" "Image загружен: $loaded_image"
+            # Извлекаем имя image без версии
+            selected_image_name="${loaded_image%%:*}"
+            debug_log "DOCKER" "Image name extracted: $selected_image_name"
+        else
+            print_message "SUCCESS" "Image загружен"
+            echo "$load_output" | grep -i "loaded" | head -1
+        fi
+        
+        # Проверяем что image появился
+        debug_log "DOCKER" "Verifying image in docker images..."
+        if ! docker images | grep -q "$selected_image_name.*$selected_version"; then
+            debug_log "DOCKER" "Image not found in list, showing available:"
+            print_message "WARN" "Image загружен, но не найден в списке"
+            docker images | grep -E "(rwp_shop|telegram-shop|private-remnawave)" | head -5
+        else
+            debug_log "DOCKER" "Image verified in docker images list"
+        fi
     fi
     
     # === ЭТАП 9: ОБНОВЛЕНИЕ COMPOSE ФАЙЛА ===
@@ -1472,6 +2312,18 @@ update_bot() {
         print_message "INFO" "Compose файл восстановлен из бэкапа."
         read -erp "Нажмите Enter..." dummy
         return 1
+    fi
+    
+    # === ЭТАП 9.5: ПРОВЕРКА ТРЕБОВАНИЙ ЛИЦЕНЗИИ (v3.25.5+) ===
+    if version_gte "$selected_version" "3.25.5"; then
+        debug_log "UPDATE" "[STAGE 9.5] Checking license requirements for v$selected_version..."
+        print_message "INFO" "Проверка требований лицензии для v$selected_version..."
+        
+        # Проверяем и добавляем machine-id volume
+        ensure_machine_id_volume "$compose_file"
+        
+        # Проверяем и добавляем LICENSE_KEY в .env
+        ensure_license_key_in_env
     fi
     
     # === ЭТАП 10: ОСТАНОВКА КОНТЕЙНЕРОВ ===
@@ -11199,6 +12051,62 @@ check_dependencies
 install_script
 load_or_create_config
 check_config_mismatch # Проверка при запуске
+
+# Проверка соответствия версий Docker image
+check_and_warn_version_mismatch() {
+    local result=$(check_image_version_match 2>/dev/null)
+    local status=$?
+    
+    debug_log "VERSION" "Version check result: $result (status=$status)"
+    
+    case "$result" in
+        MATCH:*)
+            # Версии совпадают - всё ок
+            debug_log "VERSION" "Versions match"
+            ;;
+        UPGRADE:*)
+            # Загруженная версия ВЫШЕ чем в compose - предложить обновить
+            local compose_ver=$(echo "$result" | cut -d: -f2)
+            local loaded_ver=$(echo "$result" | cut -d: -f3)
+            local image_name=$(echo "$result" | cut -d: -f4)
+            # Очищаем экран чтобы предупреждение было вверху
+            clear_screen
+            show_version_mismatch_warning "$compose_ver" "$loaded_ver" "true" "$image_name"
+            if [[ "$IS_INTERACTIVE" == true ]]; then
+                offer_compose_update "$compose_ver" "$loaded_ver" "$image_name"
+            fi
+            ;;
+        DOWNGRADE:*)
+            # Загруженная версия НИЖЕ чем в compose - предупреждение
+            local compose_ver=$(echo "$result" | cut -d: -f2)
+            local loaded_ver=$(echo "$result" | cut -d: -f3)
+            local image_name=$(echo "$result" | cut -d: -f4)
+            # Очищаем экран чтобы предупреждение было вверху
+            clear_screen
+            show_version_mismatch_warning "$compose_ver" "$loaded_ver" "false" "$image_name"
+            if [[ "$IS_INTERACTIVE" == true ]]; then
+                read -erp "Нажмите Enter для продолжения..." dummy
+            fi
+            ;;
+        NOT_FOUND)
+            # Image не найден - критическая ошибка
+            echo ""
+            print_message "ERROR" "Docker image бота не найден!"
+            print_message "INFO" "Загрузите image командой: curl + docker load"
+            echo ""
+            ;;
+        *)
+            # Не удалось определить - игнорируем (возможно бот не настроен)
+            debug_log "VERSION" "Could not determine version match (bot not configured?)"
+            ;;
+    esac
+}
+
+# Запускаем проверку только если бот настроен
+if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+    check_and_warn_version_mismatch
+fi
+
 # --- Global CLI flags parsing ---
 # Support calling like: lazarus --yes --dry-run cleanup
 DRY_RUN="false"
