@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.35.0"
+VERSION="4.36.1"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -53,11 +53,19 @@ RETENTION_DAYS="7"
 MAX_BACKUP_SIZE_MB="0"
 
 # Настройки удаленного хранилища
-REMOTE_STORAGE_TYPE="off" # off, ftp, webdav
+REMOTE_STORAGE_TYPE="off" # off, ftp, webdav, rclone, s3
 REMOTE_STORAGE_URL=""
 REMOTE_STORAGE_USER=""
 REMOTE_STORAGE_PASS=""
 REMOTE_UPLOAD_STATUS_TEXT=""
+
+# Настройки S3 (AWS, MinIO, RustFS, Yandex Cloud, etc.)
+S3_ENDPOINT=""           # https://s3.amazonaws.com или кастомный endpoint
+S3_BUCKET=""             # Имя bucket
+S3_PATH=""               # Путь внутри bucket (lazarus-backups/)
+S3_ACCESS_KEY=""         # Access Key ID
+S3_SECRET_KEY=""         # Secret Access Key
+S3_REGION="us-east-1"    # Регион (для AWS) или любой для S3-совместимых
 
 # Настройки шифрования
 BACKUP_PASSWORD=""
@@ -2113,7 +2121,7 @@ auto_update_bot() {
                     echo "LICENSE_KEY=$provided_key" >> "$env_file"
                 fi
                 print_message "SUCCESS" "LICENSE_KEY добавлен"
-            else
+            elif [[ "$IS_INTERACTIVE" == true ]]; then
                 print_message "WARN" "LICENSE_KEY не найден!"
                 echo ""
                 echo -e "Получите ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
@@ -2135,6 +2143,11 @@ auto_update_bot() {
                     print_message "ERROR" "Неверный формат LICENSE_KEY!"
                     return 1
                 fi
+            else
+                # Неинтерактивный режим - пропускаем без ключа
+                print_message "WARN" "LICENSE_KEY не найден! Передайте ключ через параметр:"
+                print_message "INFO" "  lazarus -b -u YOUR_LICENSE_KEY"
+                print_message "INFO" "  или: LICENSE_KEY=... lazarus -b -u"
             fi
         else
             print_message "SUCCESS" "LICENSE_KEY: ✓"
@@ -3284,6 +3297,12 @@ SEND_TO_REMOTE="$SEND_TO_REMOTE"
 DELETE_MODE="$DELETE_MODE"
 RETENTION_DAYS="$RETENTION_DAYS"
 MAX_BACKUP_SIZE_MB="$MAX_BACKUP_SIZE_MB"
+S3_ENDPOINT="$S3_ENDPOINT"
+S3_BUCKET="$S3_BUCKET"
+S3_PATH="$S3_PATH"
+S3_ACCESS_KEY="$S3_ACCESS_KEY"
+S3_SECRET_KEY="$S3_SECRET_KEY"
+S3_REGION="$S3_REGION"
 EOF
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
@@ -3317,6 +3336,7 @@ load_or_create_config() {
     if [[ -z "$DELETE_MODE" ]]; then DELETE_MODE="time"; fi
     if [[ -z "$RETENTION_DAYS" ]]; then RETENTION_DAYS="7"; fi
     if [[ -z "$MAX_BACKUP_SIZE_MB" ]]; then MAX_BACKUP_SIZE_MB="0"; fi
+    if [[ -z "$S3_REGION" ]]; then S3_REGION="us-east-1"; fi
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -3626,6 +3646,84 @@ upload_to_remote() {
         fi
     fi
 
+    # === S3 (AWS, MinIO, RustFS, Yandex Cloud, etc.) ===
+    if [[ "$REMOTE_STORAGE_TYPE" == "s3" ]]; then
+        debug_log "REMOTE" "Using S3..."
+        
+        # Проверяем AWS CLI
+        if ! command -v aws > "$SILENT_LOG" 2>&1; then
+            print_message "ERROR" "AWS CLI не установлен!" >&2
+            echo -e "Установка: ${GRAY}curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o awscliv2.zip && unzip awscliv2.zip && sudo ./aws/install${RESET}" >&2
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: AWS CLI не установлен'
+            return 1
+        fi
+        
+        # Проверяем настройки
+        if [[ -z "$S3_BUCKET" ]]; then
+            print_message "ERROR" "S3 bucket не настроен!" >&2
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: Bucket не настроен'
+            return 1
+        fi
+        
+        # Формируем путь в bucket
+        local s3_path="${S3_PATH%/}"
+        [[ -n "$s3_path" ]] && s3_path="${s3_path}/"
+        local s3_dest="s3://${S3_BUCKET}/${s3_path}${filename}"
+        
+        debug_log "REMOTE" "S3 Endpoint: $S3_ENDPOINT"
+        debug_log "REMOTE" "S3 Bucket: $S3_BUCKET"
+        debug_log "REMOTE" "S3 Region: $S3_REGION"
+        debug_log "REMOTE" "S3 Destination: $s3_dest"
+        
+        # Формируем команду
+        local aws_opts=()
+        [[ -n "$S3_ENDPOINT" ]] && aws_opts+=(--endpoint-url "$S3_ENDPOINT")
+        [[ -n "$S3_REGION" ]] && aws_opts+=(--region "$S3_REGION")
+        
+        # Экспортируем credentials (если заданы в конфиге)
+        local old_aws_access=""
+        local old_aws_secret=""
+        if [[ -n "$S3_ACCESS_KEY" && -n "$S3_SECRET_KEY" ]]; then
+            old_aws_access="$AWS_ACCESS_KEY_ID"
+            old_aws_secret="$AWS_SECRET_ACCESS_KEY"
+            export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+            export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+            debug_log "REMOTE" "Using S3 credentials from config"
+        fi
+        
+        # Загружаем файл
+        debug_log "REMOTE" "Running: aws s3 cp $file_path $s3_dest ${aws_opts[*]}"
+        local s3_output
+        if [[ "$IS_INTERACTIVE" == "true" ]]; then
+            s3_output=$(aws s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --only-show-errors 2>&1)
+        else
+            s3_output=$(aws s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --quiet 2>&1)
+        fi
+        local s3_result=$?
+        
+        # Восстанавливаем старые credentials
+        if [[ -n "$old_aws_access" ]]; then
+            export AWS_ACCESS_KEY_ID="$old_aws_access"
+            export AWS_SECRET_ACCESS_KEY="$old_aws_secret"
+        elif [[ -n "$S3_ACCESS_KEY" ]]; then
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+        fi
+        
+        if [[ $s3_result -eq 0 ]]; then
+            print_message "SUCCESS" "Файл загружен в S3." >&2
+            debug_log "REMOTE" "S3 upload SUCCESS"
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: OK'
+            log_message "SUCCESS" "Uploaded $filename to S3 ($s3_dest)"
+            return 0
+        else
+            print_message "ERROR" "Ошибка загрузки в S3: $s3_output" >&2
+            debug_log "REMOTE" "S3 upload FAILED: $s3_output"
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: Ошибка'
+            log_message "ERROR" "Failed upload $filename to S3: $s3_output"
+            return 1
+        fi
+    fi
+
     # === FTP / WEBDAV ===
     local upload_url="${REMOTE_STORAGE_URL%/}/$filename"
     local max_retries=3
@@ -3746,7 +3844,14 @@ configure_remote_storage() {
         echo ""
         
         # Показываем текущий статус
-        if [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
+        if [[ "$REMOTE_STORAGE_TYPE" == "s3" && -n "$S3_BUCKET" ]]; then
+            echo -e "Текущие настройки:"
+            echo -e "  Тип: ${YELLOW}S3${RESET}"
+            echo -e "  Bucket: ${CYAN}${S3_BUCKET}${RESET}"
+            [[ -n "$S3_PATH" ]] && echo -e "  Путь: ${GRAY}${S3_PATH}${RESET}"
+            [[ -n "$S3_ENDPOINT" ]] && echo -e "  Endpoint: ${GRAY}${S3_ENDPOINT}${RESET}"
+            echo ""
+        elif [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
             echo -e "Текущие настройки:"
             echo -e "  Тип: ${YELLOW}${REMOTE_STORAGE_TYPE^^}${RESET}"
             echo -e "  URL: ${CYAN}${REMOTE_STORAGE_URL}${RESET}"
@@ -3756,7 +3861,8 @@ configure_remote_storage() {
         
         echo " 1. FTP / FTPS"
         echo " 2. WebDAV (Яндекс.Диск, Nextcloud, и др.)"
-        echo " 3. Rclone (Google Drive, S3, Dropbox, и др.)"
+        echo -e " 3. ${CYAN}S3 Storage${RESET} (AWS, MinIO, RustFS, Yandex Cloud)"
+        echo " 4. Rclone (Google Drive, Dropbox, и др.)"
         echo ""
         echo -e " ${RED}0. Отключить${RESET}"
         echo ""
@@ -3770,7 +3876,8 @@ configure_remote_storage() {
         case $r_type in
             1) new_type="ftp" ;;
             2) new_type="webdav" ;;
-            3) new_type="rclone" ;;
+            3) new_type="s3" ;;
+            4) new_type="rclone" ;;
             0) 
                 REMOTE_STORAGE_TYPE="off"
                 REMOTE_STORAGE_URL=""
@@ -3869,6 +3976,176 @@ configure_remote_storage() {
             read -erp "Пользователь: " input_user
             read -s -erp "Пароль (или токен приложения): " input_pass
             echo ""
+        
+        elif [[ "$new_type" == "s3" ]]; then
+            echo -e "${CYAN}${BOLD}Настройка S3 Storage${RESET}"
+            echo ""
+            
+            # Проверяем AWS CLI
+            if ! command -v aws > "$SILENT_LOG" 2>&1; then
+                print_message "WARN" "AWS CLI не установлен!"
+                echo ""
+                echo -e "Установить автоматически? (требуется ~100MB)"
+                read -erp "(Y/n): " install_aws
+                if [[ ! "$install_aws" =~ ^[Nn]$ ]]; then
+                    print_message "INFO" "Устанавливаю AWS CLI..."
+                    if curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && \
+                       unzip -q /tmp/awscliv2.zip -d /tmp && \
+                       sudo /tmp/aws/install --update 2> "$SILENT_LOG"; then
+                        rm -rf /tmp/awscliv2.zip /tmp/aws
+                        print_message "SUCCESS" "AWS CLI установлен!"
+                    else
+                        rm -rf /tmp/awscliv2.zip /tmp/aws
+                        print_message "ERROR" "Ошибка установки AWS CLI"
+                        echo -e "Установите вручную: ${GRAY}https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${RESET}"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                else
+                    continue
+                fi
+            fi
+            
+            echo -e "${GRAY}Шаг 1/5: Выберите провайдер${RESET}"
+            echo ""
+            echo " 1. AWS S3"
+            echo " 2. MinIO"
+            echo " 3. RustFS"
+            echo " 4. Yandex Cloud Object Storage"
+            echo " 5. Selectel Cloud Storage"
+            echo " 6. Другой S3-совместимый"
+            echo ""
+            read -erp "Выбор (Enter - назад): " s3_provider
+            [[ -z "$s3_provider" ]] && continue
+            
+            local default_endpoint="" default_region=""
+            case $s3_provider in
+                1) # AWS
+                    default_endpoint=""  # AWS CLI использует дефолтный endpoint
+                    default_region="us-east-1"
+                    ;;
+                2) # MinIO
+                    default_endpoint="http://localhost:9000"
+                    default_region="us-east-1"
+                    ;;
+                3) # RustFS
+                    default_endpoint="http://localhost:8333"
+                    default_region="us-east-1"
+                    ;;
+                4) # Yandex Cloud
+                    default_endpoint="https://storage.yandexcloud.net"
+                    default_region="ru-central1"
+                    ;;
+                5) # Selectel
+                    default_endpoint="https://s3.storage.selcloud.ru"
+                    default_region="ru-1"
+                    ;;
+                6) # Custom
+                    default_endpoint=""
+                    default_region="us-east-1"
+                    ;;
+                *) continue ;;
+            esac
+            
+            echo ""
+            echo -e "${GRAY}Шаг 2/5: Endpoint URL${RESET}"
+            if [[ -n "$default_endpoint" ]]; then
+                echo -e "По умолчанию: ${CYAN}${default_endpoint}${RESET}"
+                echo "(Оставьте пустым для значения по умолчанию)"
+            elif [[ "$s3_provider" == "1" ]]; then
+                echo -e "${GRAY}Для AWS оставьте пустым (используется стандартный endpoint)${RESET}"
+            else
+                echo -e "Пример: ${GRAY}https://s3.example.com${RESET}"
+            fi
+            read -erp "Endpoint URL: " input_endpoint
+            [[ -z "$input_endpoint" ]] && input_endpoint="$default_endpoint"
+            
+            echo ""
+            echo -e "${GRAY}Шаг 3/5: Bucket и путь${RESET}"
+            read -erp "Имя bucket: " input_bucket
+            [[ -z "$input_bucket" ]] && { print_message "ERROR" "Bucket обязателен!"; sleep 1; continue; }
+            
+            echo ""
+            echo -e "Путь внутри bucket (опционально):"
+            echo -e "  ${GRAY}backups${RESET}         → s3://${input_bucket}/backups/"
+            echo -e "  ${GRAY}lazarus/prod${RESET}    → s3://${input_bucket}/lazarus/prod/"
+            echo -e "  ${GRAY}(пусто)${RESET}         → s3://${input_bucket}/"
+            read -erp "Путь: " input_path
+            input_path="${input_path#/}"
+            input_path="${input_path%/}"
+            
+            echo ""
+            echo -e "${GRAY}Шаг 4/5: Регион${RESET}"
+            echo -e "По умолчанию: ${CYAN}${default_region}${RESET}"
+            read -erp "Регион: " input_region
+            [[ -z "$input_region" ]] && input_region="$default_region"
+            
+            echo ""
+            echo -e "${GRAY}Шаг 5/5: Credentials${RESET}"
+            read -erp "Access Key ID: " input_access_key
+            read -s -erp "Secret Access Key: " input_secret_key
+            echo ""
+            
+            [[ -z "$input_access_key" || -z "$input_secret_key" ]] && { 
+                print_message "ERROR" "Credentials обязательны!"
+                sleep 1
+                continue 
+            }
+            
+            # Тестируем подключение
+            echo ""
+            print_message "INFO" "Проверка подключения к S3..."
+            
+            local test_opts=()
+            [[ -n "$input_endpoint" ]] && test_opts+=(--endpoint-url "$input_endpoint")
+            test_opts+=(--region "$input_region")
+            
+            export AWS_ACCESS_KEY_ID="$input_access_key"
+            export AWS_SECRET_ACCESS_KEY="$input_secret_key"
+            
+            if aws s3 ls "s3://${input_bucket}/" "${test_opts[@]}" --max-items 1 > "$SILENT_LOG" 2>&1; then
+                print_message "SUCCESS" "Подключение успешно!"
+                
+                # Сохраняем настройки
+                REMOTE_STORAGE_TYPE="s3"
+                REMOTE_STORAGE_URL=""  # Не используется для S3
+                REMOTE_STORAGE_USER=""
+                REMOTE_STORAGE_PASS=""
+                S3_ENDPOINT="$input_endpoint"
+                S3_BUCKET="$input_bucket"
+                S3_PATH="$input_path"
+                S3_REGION="$input_region"
+                S3_ACCESS_KEY="$input_access_key"
+                S3_SECRET_KEY="$input_secret_key"
+                
+                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+                save_config
+                print_message "SUCCESS" "Настройки S3 сохранены."
+                sleep 1.5
+                return
+            else
+                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+                print_message "ERROR" "Не удалось подключиться к S3!"
+                echo ""
+                read -erp "Сохранить настройки несмотря на ошибку? (y/N): " force_save
+                if [[ "$force_save" =~ ^[Yy]$ ]]; then
+                    REMOTE_STORAGE_TYPE="s3"
+                    REMOTE_STORAGE_URL=""
+                    REMOTE_STORAGE_USER=""
+                    REMOTE_STORAGE_PASS=""
+                    S3_ENDPOINT="$input_endpoint"
+                    S3_BUCKET="$input_bucket"
+                    S3_PATH="$input_path"
+                    S3_REGION="$input_region"
+                    S3_ACCESS_KEY="$input_access_key"
+                    S3_SECRET_KEY="$input_secret_key"
+                    save_config
+                    print_message "WARN" "Настройки сохранены (соединение не проверено)."
+                    sleep 1.5
+                    return
+                fi
+            fi
+            continue
             
         elif [[ "$new_type" == "rclone" ]]; then
             echo -e "${CYAN}${BOLD}Настройка Rclone${RESET}"
@@ -12775,9 +13052,18 @@ check_and_warn_version_mismatch() {
 }
 
 # Запускаем проверку только если бот настроен
-if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+# НО пропускаем если вызывается auto_update (lazarus -b -u / bot update / upgrade)
+_SKIP_VERSION_CHECK=false
+for _arg in "$@"; do
+    case "$_arg" in
+        upgrade|update|-u|auto_update) _SKIP_VERSION_CHECK=true; break ;;
+    esac
+done
+
+if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && "$_SKIP_VERSION_CHECK" == false ]]; then
     check_and_warn_version_mismatch
 fi
+unset _SKIP_VERSION_CHECK
 
 # --- Global CLI flags parsing ---
 # Support calling like: lazarus --yes --dry-run cleanup
@@ -12948,6 +13234,81 @@ case "$1" in
                 echo "  lazarus bot upgrade"
                 echo "  lazarus -b -s"
                 echo "  lazarus -b -u"
+                ;;
+        esac
+        ;;
+    s3|-S)
+        case "$2" in
+            test|-t)
+                # Тест подключения к S3
+                if [[ "$REMOTE_STORAGE_TYPE" != "s3" ]]; then
+                    echo -e "${RED}S3 не настроен!${RESET} Используйте: lazarus → Настройки → Удалённое хранилище"
+                    exit 1
+                fi
+                echo "Проверка подключения к S3..."
+                _s3_test_opts=()
+                [[ -n "$S3_ENDPOINT" ]] && _s3_test_opts+=(--endpoint-url "$S3_ENDPOINT")
+                [[ -n "$S3_REGION" ]] && _s3_test_opts+=(--region "$S3_REGION")
+                export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+                export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+                if aws s3 ls "s3://${S3_BUCKET}/" "${_s3_test_opts[@]}" --max-items 1 > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓${RESET} Подключение успешно!"
+                    echo "  Bucket: $S3_BUCKET"
+                    [[ -n "$S3_PATH" ]] && echo "  Path: $S3_PATH"
+                else
+                    echo -e "${RED}✗${RESET} Ошибка подключения!"
+                fi
+                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+                ;;
+            list|-l)
+                # Список файлов в S3
+                if [[ "$REMOTE_STORAGE_TYPE" != "s3" ]]; then
+                    echo -e "${RED}S3 не настроен!${RESET}"
+                    exit 1
+                fi
+                _s3_list_opts=()
+                [[ -n "$S3_ENDPOINT" ]] && _s3_list_opts+=(--endpoint-url "$S3_ENDPOINT")
+                [[ -n "$S3_REGION" ]] && _s3_list_opts+=(--region "$S3_REGION")
+                _s3_list_path="${S3_PATH%/}"
+                [[ -n "$_s3_list_path" ]] && _s3_list_path="${_s3_list_path}/"
+                export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+                export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+                echo "Файлы в s3://${S3_BUCKET}/${_s3_list_path}:"
+                aws s3 ls "s3://${S3_BUCKET}/${_s3_list_path}" "${_s3_list_opts[@]}" --human-readable
+                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+                ;;
+            upload|-u)
+                # Загрузить файл в S3
+                if [[ "$REMOTE_STORAGE_TYPE" != "s3" ]]; then
+                    echo -e "${RED}S3 не настроен!${RESET}"
+                    exit 1
+                fi
+                _s3_file_to_upload="$3"
+                if [[ -z "$_s3_file_to_upload" ]]; then
+                    echo "Использование: lazarus s3 upload <файл>"
+                    exit 1
+                fi
+                if [[ ! -f "$_s3_file_to_upload" ]]; then
+                    echo -e "${RED}Файл не найден: $_s3_file_to_upload${RESET}"
+                    exit 1
+                fi
+                SEND_TO_REMOTE="true"
+                upload_to_remote "$_s3_file_to_upload"
+                ;;
+            *)
+                echo "Использование: lazarus s3 <команда>"
+                echo "           или: lazarus -S <команда>"
+                echo ""
+                echo "Команды:"
+                echo "  test,   -t      - Проверить подключение к S3"
+                echo "  list,   -l      - Список файлов в bucket"
+                echo "  upload, -u      - Загрузить файл в S3"
+                echo ""
+                echo "Примеры:"
+                echo "  lazarus s3 test"
+                echo "  lazarus s3 list"
+                echo "  lazarus s3 upload backup.tar.gz"
+                echo "  lazarus -S -t"
                 ;;
         esac
         ;;
