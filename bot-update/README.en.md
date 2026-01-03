@@ -38,6 +38,13 @@ lazarus
 # Select: 6. Update bot
 ```
 
+<details>
+<summary>📸 Bot Update Menu</summary>
+
+![Update Menu](assets/bot_update_menu.svg)
+
+</details>
+
 ### Automatic Update (CLI)
 ```bash
 lazarus upgrade
@@ -81,6 +88,13 @@ volumes:
 ### Check on Script Startup
 
 LAZARUS automatically checks these requirements on startup:
+
+<details>
+<summary>📸 LICENSE_KEY Warning</summary>
+
+![LICENSE_KEY Required](assets/license_required.svg)
+
+</details>
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -129,6 +143,13 @@ LAZARUS searches for tar files in following directories:
 
 ### Step 1: Version Selection
 
+<details>
+<summary>📸 Version Selection</summary>
+
+![Version Select](assets/version_select.svg)
+
+</details>
+
 ```
 ═══════════════════════════════════════════════════
   BOT UPDATE — Remnawave Telegram Shop Bot
@@ -168,6 +189,13 @@ Before update creates:
 - **DB backup** — separate database copy
 
 ### Step 4: Update
+
+<details>
+<summary>📸 Update Process</summary>
+
+![Update Process](assets/update_process.svg)
+
+</details>
 
 1. Load image (if from tar)
 2. Update version in `compose.yaml`
@@ -226,6 +254,13 @@ lazarus --yes upgrade
 ## 🐳 Container Management
 
 ### Container Status
+
+<details>
+<summary>📸 Container Status</summary>
+
+![Container Status](assets/container_status.svg)
+
+</details>
 
 ```bash
 lazarus bot status

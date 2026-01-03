@@ -38,6 +38,13 @@ lazarus
 # Выбрать: 6. Обновить бота
 ```
 
+<details>
+<summary>📸 Меню обновления бота</summary>
+
+![Меню обновления](assets/bot_update_menu.svg)
+
+</details>
+
 ### Автоматическое обновление (CLI)
 ```bash
 lazarus upgrade
@@ -81,6 +88,13 @@ volumes:
 ### Проверка при запуске скрипта
 
 LAZARUS автоматически проверяет эти требования при старте:
+
+<details>
+<summary>📸 Предупреждение о LICENSE_KEY</summary>
+
+![LICENSE_KEY Required](assets/license_required.svg)
+
+</details>
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -129,6 +143,13 @@ LAZARUS ищет tar-файлы в следующих директориях:
 
 ### Шаг 1: Выбор версии
 
+<details>
+<summary>📸 Выбор версии для обновления</summary>
+
+![Выбор версии](assets/version_select.svg)
+
+</details>
+
 ```
 ═══════════════════════════════════════════════════
   ОБНОВЛЕНИЕ БОТА — Remnawave Telegram Shop Bot
@@ -168,6 +189,13 @@ LAZARUS ищет tar-файлы в следующих директориях:
 - **DB backup** — отдельная копия базы данных
 
 ### Шаг 4: Обновление
+
+<details>
+<summary>📸 Процесс обновления</summary>
+
+![Процесс обновления](assets/update_process.svg)
+
+</details>
 
 1. Загрузка образа (если из tar)
 2. Обновление версии в `compose.yaml`
@@ -226,6 +254,13 @@ lazarus --yes upgrade
 ## 🐳 Управление контейнерами
 
 ### Статус контейнеров
+
+<details>
+<summary>📸 Статус контейнеров</summary>
+
+![Статус контейнеров](assets/container_status.svg)
+
+</details>
 
 ```bash
 lazarus bot status

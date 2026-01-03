@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="540" viewBox="0 0 600 540">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .yellow { fill: #f1c40f; }
+    .red { fill: #e74c3c; }
+    .gray { fill: #7f8c8d; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+    .line-stroke { stroke: #2ecc71; stroke-width: 1; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="600" height="540" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Header Lines -->
+  <path d="M20 60 L580 60 M20 63 L580 63" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <text x="300" y="85" text-anchor="middle" class="text green bold">Выбор версии для обновления</text>
+  
+  <path d="M20 97 L580 97 M20 100 L580 100" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <!-- Body Content -->
+  <text x="20" y="130" class="text">
+    <tspan>Путь к боту:     <tspan class="cyan">/opt/private-remnawave-telegram-shop-bot</tspan></tspan>
+    <tspan x="20" dy="20">Текущая версия:  <tspan class="cyan">3.24.0</tspan></tspan>
+    <tspan x="20" dy="20">Статус:          <tspan class="green">Online</tspan></tspan>
+    
+    <tspan x="20" dy="35" class="bold">📦 Загруженные Docker образы:</tspan>
+    <tspan x="20" dy="20">  1. <tspan class="yellow">[NEW]</tspan> rwp_shop:3.26.0</tspan>
+    <tspan x="20" dy="20">  2. <tspan class="yellow">[NEW]</tspan> rwp_shop:3.25.5</tspan>
+    <tspan x="20" dy="20">  3. <tspan class="gray">     </tspan> rwp_shop:3.24.0 <tspan class="gray">(текущая)</tspan></tspan>
+    
+    <tspan x="20" dy="35" class="bold">📄 Найденные tar-файлы:</tspan>
+    <tspan x="20" dy="20">  4. <tspan class="yellow">[NEW]</tspan> rwp_shop_3.27.0.tar <tspan class="gray">(/root/)</tspan></tspan>
+    <tspan x="20" dy="20">  5. <tspan class="gray">     </tspan> rwp_shop_3.24.0.tar <tspan class="gray">(/opt/)</tspan></tspan>
+    
+    <tspan x="20" dy="35" class="gray">──────────────────────────────────────────────────────</tspan>
+    <tspan x="20" dy="20">  0. Назад (отмена)</tspan>
+    
+    <tspan x="20" dy="35">Введите номер версии: <tspan class="green">_</tspan></tspan>
+  </text>
+</svg>

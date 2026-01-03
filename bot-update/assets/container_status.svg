@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" viewBox="0 0 600 380">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .yellow { fill: #f1c40f; }
+    .red { fill: #e74c3c; }
+    .gray { fill: #7f8c8d; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+    .line-stroke { stroke: #2ecc71; stroke-width: 1; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="600" height="380" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Header Lines -->
+  <path d="M20 60 L580 60 M20 63 L580 63" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <text x="300" y="85" text-anchor="middle" class="text green bold">Статус контейнеров</text>
+  
+  <path d="M20 97 L580 97 M20 100 L580 100" class="line-stroke" shape-rendering="crispEdges"/>
+  
+  <!-- Body Content -->
+  <text x="20" y="130" class="text">
+    <tspan class="bold">lazarus bot status</tspan>
+    
+    <tspan x="20" dy="35" class="gray">═══════════════════════════════════════════════════</tspan>
+    <tspan x="20" dy="25" class="bold">  СТАТУС КОНТЕЙНЕРОВ</tspan>
+    <tspan x="20" dy="20" class="gray">═══════════════════════════════════════════════════</tspan>
+    
+    <tspan x="20" dy="30">📦 rwp_shop:        <tspan class="green">✅ Running</tspan> <tspan class="gray">(Up 2 hours)</tspan></tspan>
+    <tspan x="20" dy="25">🗄️ rwp_shop_db:     <tspan class="green">✅ Running</tspan> <tspan class="gray">(Up 2 hours)</tspan></tspan>
+    <tspan x="20" dy="25">🌐 rwp_shop_redis:  <tspan class="green">✅ Running</tspan> <tspan class="gray">(Up 2 hours)</tspan></tspan>
+    
+    <tspan x="20" dy="35">Версия бота: <tspan class="cyan">3.25.5</tspan></tspan>
+    <tspan x="20" dy="25">Путь: <tspan class="gray">/opt/private-remnawave-telegram-shop-bot</tspan></tspan>
+  </text>
+</svg>
