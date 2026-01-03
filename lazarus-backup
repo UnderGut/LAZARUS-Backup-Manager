@@ -2438,13 +2438,16 @@ update_bot() {
                             echo -e "${YELLOW}Для работы бота требуется LICENSE_KEY и machine-id volume.${RESET}"
                             echo -e "Получить ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
                             echo ""
-                            read -erp "Настроить сейчас? [y/N]: " setup_now
-                            if [[ "$setup_now" =~ ^[Yy]$ ]]; then
+                            read -erp "Настроить сейчас? [Y/n]: " setup_now
+                            if [[ ! "$setup_now" =~ ^[Nn]$ ]]; then
                                 if [[ "$has_key" == "false" ]]; then
-                                    ensure_license_key
+                                    ensure_license_key_in_env
                                 fi
                                 if [[ "$has_mid" == "false" ]]; then
-                                    ensure_machine_id_volume
+                                    local _cf=""
+                                    [[ -f "$BOT_PATH/compose.yaml" ]] && _cf="$BOT_PATH/compose.yaml"
+                                    [[ -f "$BOT_PATH/docker-compose.yml" ]] && _cf="$BOT_PATH/docker-compose.yml"
+                                    [[ -n "$_cf" ]] && ensure_machine_id_volume "$_cf"
                                 fi
                             fi
                         fi
@@ -2524,13 +2527,16 @@ update_bot() {
                         echo -e "${YELLOW}Для работы бота требуется LICENSE_KEY и machine-id volume.${RESET}"
                         echo -e "Получить ключ: ${CYAN}https://t.me/rwp_shop_bot${RESET}"
                         echo ""
-                        read -erp "Настроить сейчас? [y/N]: " setup_now
-                        if [[ "$setup_now" =~ ^[Yy]$ ]]; then
+                        read -erp "Настроить сейчас? [Y/n]: " setup_now
+                        if [[ ! "$setup_now" =~ ^[Nn]$ ]]; then
                             if [[ "$has_key" == "false" ]]; then
-                                ensure_license_key
+                                ensure_license_key_in_env
                             fi
                             if [[ "$has_mid" == "false" ]]; then
-                                ensure_machine_id_volume
+                                local _cf=""
+                                [[ -f "$BOT_PATH/compose.yaml" ]] && _cf="$BOT_PATH/compose.yaml"
+                                [[ -f "$BOT_PATH/docker-compose.yml" ]] && _cf="$BOT_PATH/docker-compose.yml"
+                                [[ -n "$_cf" ]] && ensure_machine_id_volume "$_cf"
                             fi
                         fi
                     fi
