@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.30.0--dev-orange?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-4.35.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -24,18 +24,16 @@
 
 ## 🚀 Быстрый старт
 
-> ⚠️ **DEV-версия!** Эта ветка содержит тестовый функционал. Для стабильной версии используйте ветку `main`.
-
 Одна команда — установка и запуск:
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup)
+bash <(curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup)
 ```
 
 Или установить в систему:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus && lazarus
+curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus && lazarus
 ```
 
 > 💡 Скрипт автоматически установится в `/opt/lazarus-backup/` и создаст symlink `/usr/local/bin/lazarus`
@@ -46,10 +44,10 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 
 ```bash
 # Обновить через jsDelivr CDN (быстрее)
-curl -sSL "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@dev/lazarus-backup?t=$(date +%s)" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+curl -sSL "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@main/lazarus-backup?t=$(date +%s)" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
 
 # Или через GitHub напрямую (надёжнее)
-curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
 ```
 
 > 💡 Параметр `?t=$(date +%s)` добавляет timestamp для обхода кэша CDN
