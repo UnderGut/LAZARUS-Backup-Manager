@@ -1,14 +1,24 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.31.0-dev"
+VERSION="4.32.0-dev"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
+
+# --- ИСТОЧНИКИ ОБНОВЛЕНИЙ (проверяются по порядку) ---
 # jsDelivr CDN - быстрее обновляется чем raw.githubusercontent.com
-REMOTE_URL="https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@dev/lazarus-backup"
+REMOTE_URLS=(
+    "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@dev/lazarus-backup"
+    "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/lazarus-backup"
+)
+REMOTE_URL="${REMOTE_URLS[0]}"  # Основной URL для обратной совместимости
+
+# Глобальные переменные для проверки обновлений
+UPDATE_AVAILABLE=""       # Если не пусто — доступна новая версия
+UPDATE_REMOTE_VERSION=""  # Версия на сервере
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА БОТА (НЕ ПАНЕЛИ!) ---
 # Согласно документации: rwp_shop, rwp_shop_db
@@ -373,37 +383,52 @@ check_for_updates() {
     
     local REMOTE_CONTENT=""
     local DOWNLOAD_OK=false
-    local MAX_RETRIES=3
+    local MAX_RETRIES=2
     local TIMEOUT=15
+    local USED_URL=""
     
-    # Добавляем timestamp для обхода кэша GitHub
+    # Добавляем timestamp для обхода кэша
     local CACHE_BUSTER="?t=$(date +%s)"
-    local FETCH_URL="${REMOTE_URL}${CACHE_BUSTER}"
     
-    for attempt in $(seq 1 $MAX_RETRIES); do
-        if command -v curl > "$SILENT_LOG" 2>&1; then
-            REMOTE_CONTENT=$(curl $CURL_SILENT -L --connect-timeout $TIMEOUT --max-time 30 "$FETCH_URL" 2> "$SILENT_LOG")
-        elif command -v wget > "$SILENT_LOG" 2>&1; then
-            REMOTE_CONTENT=$(wget $WGET_SILENT -O- --timeout=$TIMEOUT "$FETCH_URL" 2> "$SILENT_LOG")
-        else
-            print_message "ERROR" "Нет curl или wget для проверки обновлений."
-            read -erp "Enter..." dummy; return
-        fi
+    # Пробуем каждый источник
+    for url in "${REMOTE_URLS[@]}"; do
+        local FETCH_URL="${url}${CACHE_BUSTER}"
+        echo -e "${GRAY}Пробую: ${url}...${RESET}"
         
-        # Проверяем что получили валидный скрипт
-        if [[ -n "$REMOTE_CONTENT" ]] && echo "$REMOTE_CONTENT" | head -1 | grep -q "^#!/bin/bash"; then
-            DOWNLOAD_OK=true
-            break
-        fi
+        for attempt in $(seq 1 $MAX_RETRIES); do
+            if command -v curl > "$SILENT_LOG" 2>&1; then
+                REMOTE_CONTENT=$(curl $CURL_SILENT -L --connect-timeout $TIMEOUT --max-time 30 "$FETCH_URL" 2> "$SILENT_LOG")
+            elif command -v wget > "$SILENT_LOG" 2>&1; then
+                REMOTE_CONTENT=$(wget $WGET_SILENT -O- --timeout=$TIMEOUT "$FETCH_URL" 2> "$SILENT_LOG")
+            else
+                print_message "ERROR" "Нет curl или wget для проверки обновлений."
+                read -erp "Enter..." dummy; return
+            fi
+            
+            # Проверяем что получили валидный скрипт
+            if [[ -n "$REMOTE_CONTENT" ]] && echo "$REMOTE_CONTENT" | head -1 | grep -q "^#!/bin/bash"; then
+                DOWNLOAD_OK=true
+                USED_URL="$url"
+                break 2  # Выходим из обоих циклов
+            fi
+            
+            [[ $attempt -lt $MAX_RETRIES ]] && sleep 1
+        done
         
-        [[ $attempt -lt $MAX_RETRIES ]] && echo -e "${YELLOW}Попытка $attempt/$MAX_RETRIES не удалась, повтор...${RESET}" && sleep 2
+        echo -e "${YELLOW}Источник недоступен, пробую следующий...${RESET}"
     done
     
     if [[ "$DOWNLOAD_OK" != "true" ]]; then
-        print_message "ERROR" "Не удалось подключиться к серверу обновлений."
-        echo -e "${GRAY}URL: $REMOTE_URL${RESET}"
+        print_message "ERROR" "Не удалось подключиться к серверам обновлений."
+        echo -e "${GRAY}Проверенные источники:${RESET}"
+        for url in "${REMOTE_URLS[@]}"; do
+            echo -e "${GRAY}  • $url${RESET}"
+        done
         read -erp "Enter..." dummy; return
     fi
+    
+    echo -e "${GREEN}✓ Подключено к: ${USED_URL}${RESET}"
+    echo ""
 
     local REMOTE_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
 
@@ -456,6 +481,61 @@ check_for_updates() {
             read -erp "Enter..." dummy
         fi
     fi
+}
+
+# Тихая проверка обновлений при старте (не блокирует, работает в фоне)
+# Результат сохраняется в UPDATE_AVAILABLE и UPDATE_REMOTE_VERSION
+check_updates_silent() {
+    UPDATE_AVAILABLE=""
+    UPDATE_REMOTE_VERSION=""
+    
+    local TIMEOUT=5
+    local REMOTE_VERSION=""
+    local CACHE_BUSTER="?t=$(date +%s)"
+    
+    # Пробуем каждый источник по очереди
+    for url in "${REMOTE_URLS[@]}"; do
+        local FETCH_URL="${url}${CACHE_BUSTER}"
+        local REMOTE_CONTENT=""
+        
+        if command -v curl &>/dev/null; then
+            REMOTE_CONTENT=$(curl -sL --connect-timeout $TIMEOUT --max-time 10 "$FETCH_URL" 2>/dev/null | head -20)
+        elif command -v wget &>/dev/null; then
+            REMOTE_CONTENT=$(wget -qO- --timeout=$TIMEOUT "$FETCH_URL" 2>/dev/null | head -20)
+        else
+            return 1
+        fi
+        
+        # Проверяем что получили валидный скрипт
+        if [[ -n "$REMOTE_CONTENT" ]] && echo "$REMOTE_CONTENT" | head -1 | grep -q "^#!/bin/bash"; then
+            REMOTE_VERSION=$(echo "$REMOTE_CONTENT" | grep '^VERSION=' | head -1 | cut -d'"' -f2)
+            [[ -n "$REMOTE_VERSION" ]] && break
+        fi
+    done
+    
+    [[ -z "$REMOTE_VERSION" ]] && return 1
+    
+    # Сравниваем версии
+    local V_LOCAL=$(echo "$VERSION" | cut -d'-' -f1)
+    local V_REMOTE=$(echo "$REMOTE_VERSION" | cut -d'-' -f1)
+    local SUFFIX_LOCAL=$(echo "$VERSION" | grep -oE '\-.*$' || echo "")
+    local SUFFIX_REMOTE=$(echo "$REMOTE_VERSION" | grep -oE '\-.*$' || echo "")
+    
+    # Проверяем есть ли обновление
+    local IS_UPGRADE=false
+    if [[ "$(printf '%s\n' "$V_LOCAL" "$V_REMOTE" | sort -V | head -n1)" == "$V_LOCAL" && "$V_LOCAL" != "$V_REMOTE" ]]; then
+        IS_UPGRADE=true
+    elif [[ "$V_LOCAL" == "$V_REMOTE" && "$SUFFIX_LOCAL" != "$SUFFIX_REMOTE" && -n "$SUFFIX_LOCAL" && -z "$SUFFIX_REMOTE" ]]; then
+        # dev -> stable это тоже обновление
+        IS_UPGRADE=true
+    fi
+    
+    if [[ "$IS_UPGRADE" == "true" ]]; then
+        UPDATE_AVAILABLE="true"
+        UPDATE_REMOTE_VERSION="$REMOTE_VERSION"
+    fi
+    
+    return 0
 }
 
 perform_update() {
@@ -12909,6 +12989,9 @@ case "$1" in
             fi
         fi
         
+        # Тихая проверка обновлений скрипта при первом запуске меню
+        check_updates_silent 2>/dev/null
+        
         while true; do
             # Получаем актуальные статусы из cron
             CRON_STATUS_FULL=$(get_cron_status "full")
@@ -12940,6 +13023,13 @@ case "$1" in
             echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
             echo -e "Бот: ${CYAN}${BOT_VERSION}${RESET} | Контейнер: ${STATUS_COLOR}${CONTAINER_STATUS}${RESET}"
             echo ""
+            
+            # Уведомление о доступном обновлении скрипта
+            if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
+                echo -e "${CYAN}${BOLD}🆕 Доступно обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION}${RESET}"
+                echo -e "${GRAY}   Выберите пункт 8 для обновления${RESET}"
+                echo ""
+            fi
             
             # Статистика бэкапов
             echo -e "Бэкапы: ${STATS_FULL} Full | ${STATS_DB} DB | ${STATS_FILES} Files | ${BOLD}${STATS_SIZE}${RESET} всего"
@@ -12982,7 +13072,13 @@ case "$1" in
             echo -e " 6. ${CYAN}Обновить бота${RESET}"
             echo -e " 7. ${MAGENTA}Миграция между ботами${RESET}"
             echo ""
-            echo -e " 8. Проверить обновления скрипта"
+            
+            # Подсветка пункта обновления если доступно
+            if [[ -n "$UPDATE_AVAILABLE" ]]; then
+                echo -e " ${CYAN}${BOLD}8. Проверить обновления скрипта [NEW!]${RESET}"
+            else
+                echo -e " 8. Проверить обновления скрипта"
+            fi
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
             echo " 0. Выход"
             echo ""
