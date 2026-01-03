@@ -375,11 +375,15 @@ check_for_updates() {
     local MAX_RETRIES=3
     local TIMEOUT=15
     
+    # Добавляем timestamp для обхода кэша GitHub
+    local CACHE_BUSTER="?t=$(date +%s)"
+    local FETCH_URL="${REMOTE_URL}${CACHE_BUSTER}"
+    
     for attempt in $(seq 1 $MAX_RETRIES); do
         if command -v curl > "$SILENT_LOG" 2>&1; then
-            REMOTE_CONTENT=$(curl $CURL_SILENT -L --connect-timeout $TIMEOUT --max-time 30 "$REMOTE_URL" 2> "$SILENT_LOG")
+            REMOTE_CONTENT=$(curl $CURL_SILENT -L --connect-timeout $TIMEOUT --max-time 30 "$FETCH_URL" 2> "$SILENT_LOG")
         elif command -v wget > "$SILENT_LOG" 2>&1; then
-            REMOTE_CONTENT=$(wget $WGET_SILENT -O- --timeout=$TIMEOUT "$REMOTE_URL" 2> "$SILENT_LOG")
+            REMOTE_CONTENT=$(wget $WGET_SILENT -O- --timeout=$TIMEOUT "$FETCH_URL" 2> "$SILENT_LOG")
         else
             print_message "ERROR" "Нет curl или wget для проверки обновлений."
             read -erp "Enter..." dummy; return
@@ -530,10 +534,12 @@ install_script() {
         DOWNLOAD_SUCCESS=true
     else
         print_message "INFO" "Загрузка последней версии..."
+        # Добавляем timestamp для обхода кэша GitHub
+        local FETCH_URL="${REMOTE_URL}?t=$(date +%s)"
         if command -v curl > "$SILENT_LOG" 2>&1; then
-            curl $CURL_SILENT -L --connect-timeout 15 --max-time 60 "$REMOTE_URL" -o "$TEMP_FILE"
+            curl $CURL_SILENT -L --connect-timeout 15 --max-time 60 "$FETCH_URL" -o "$TEMP_FILE"
         elif command -v wget > "$SILENT_LOG" 2>&1; then
-            wget $WGET_SILENT -O "$TEMP_FILE" --timeout=15 "$REMOTE_URL"
+            wget $WGET_SILENT -O "$TEMP_FILE" --timeout=15 "$FETCH_URL"
         else
             print_message "ERROR" "Для установки нужен curl или wget!"
             exit 1
