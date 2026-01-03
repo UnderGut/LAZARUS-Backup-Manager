@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.27.0--dev-orange?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-4.30.0--dev-orange?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — an advanced backup system for **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** with encryption, cloud storage support, and smart automation.
@@ -105,7 +105,9 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/dev/
 
 Config file: `/opt/lazarus-backup/config.env` (chmod 600)
 
-### Telegram
+### Telegram (optional)
+
+> 💡 **Telegram settings are optional.** If not configured, the script will show a notification in the menu but will work without sending notifications.
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
@@ -177,6 +179,20 @@ lazarus cleanup          # Old backup cleanup
 lazarus restore          # Restore menu
 lazarus migrate          # 🆕 Bedolaga migration (BETA)
 lazarus check_update     # Check script updates
+```
+
+### 🆕 Bot Management (v4.30.0+)
+
+```bash
+lazarus upgrade          # Auto-update bot (non-interactive)
+lazarus bot up           # Start bot containers
+lazarus bot down         # Stop bot containers  
+lazarus bot status       # Container status
+lazarus bot upgrade      # Auto-update bot
+
+# Short flags
+lazarus -b -u            # = lazarus bot upgrade
+lazarus -b -s            # = lazarus bot status
 ```
 
 ### Global Flags
@@ -267,16 +283,40 @@ lazarus migrate
 
 LAZARUS includes Remnawave Telegram Shop Bot update functionality:
 
-1. Search for image tar files in `/opt/`, `/root/`, bot folder
-2. Display available versions with new ones highlighted
-3. Automatic backup before update (Full + DB)
-4. Image loading and `docker-compose.yml` update
-5. Container health-check after update
+### Smart Update (v4.29.0+)
+- **Docker images check** — if image is already loaded in Docker, offers to update immediately without searching for tar files
+- **Requirements check** — for versions 3.25.5+ shows LICENSE_KEY and machine-id volume status
+- **Warnings** — red notifications if LICENSE_KEY or machine-id are missing
+
+### CLI Update Commands (v4.30.0+)
+```bash
+lazarus upgrade          # Auto-update bot without interactive menu
+lazarus bot upgrade      # Same
+lazarus -b -u            # Short form
+```
+
+### Script Update
+The script uses **jsDelivr CDN** for update checks (faster than raw.githubusercontent.com).
+```bash
+lazarus check_update     # Check and update script
+```
+
+### Update Process
+1. Check loaded images in Docker
+2. Search tar files in `/opt/`, `/root/`, `/home/`, `/tmp/`, bot folder
+3. Display available versions with new ones highlighted
+4. Automatic backup before update (Full + DB)
+5. Load image (if not loaded) and update `compose.yaml`
+6. Check and add LICENSE_KEY / machine-id volume
+7. Container health-check after update
+8. Offer to delete installation tar files
+
+📖 **Full documentation:** [bot-update/README.en.md](bot-update/README.en.md)
 
 **Supported image formats:**
-- `rwp_shop-X.Y.Z-amd64.tar` (recommended)
+- `rwp_shop_X.Y.Z.tar` (recommended)
+- `rwp_shop-X.Y.Z-amd64.tar` 
 - `private-remnawave-telegram-shop-bot-X.Y.Z.tar`
-- `telegram-shop-X.Y.Z.tar`
 
 ---
 
