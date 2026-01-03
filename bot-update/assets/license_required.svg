@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="420" viewBox="0 0 600 420">
+  <style>
+    .bg { fill: #1e1e1e; }
+    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
+    .green { fill: #2ecc71; font-weight: bold; }
+    .cyan { fill: #3498db; }
+    .yellow { fill: #f1c40f; }
+    .red { fill: #e74c3c; }
+    .gray { fill: #7f8c8d; }
+    .bold { font-weight: bold; }
+    .window-header { fill: #2d2d2d; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+    .line-stroke { stroke: #f1c40f; stroke-width: 1; }
+    .box-stroke { stroke: #f1c40f; stroke-width: 2; fill: none; }
+  </style>
+
+  <!-- Window Frame -->
+  <rect x="0" y="0" width="600" height="420" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
+  
+  <!-- Window Controls -->
+  <circle cx="20" cy="15" r="6" class="dot-red"/>
+  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
+  <circle cx="60" cy="15" r="6" class="dot-green"/>
+  
+  <!-- Warning Box -->
+  <rect x="20" y="50" width="560" height="200" rx="5" ry="5" class="box-stroke"/>
+  
+  <text x="300" y="80" text-anchor="middle" class="text yellow bold">[!] ТРЕБУЕТСЯ LICENSE_KEY</text>
+  
+  <text x="300" y="110" text-anchor="middle" class="text gray">────────────────────────────────────────────────</text>
+  
+  <text x="40" y="140" class="text">
+    <tspan>Для бота версии 3.25.5+ требуется лицензионный ключ.</tspan>
+    
+    <tspan x="40" dy="35">Текущий статус:</tspan>
+    <tspan x="40" dy="25">  • LICENSE_KEY:    <tspan class="red">❌ НЕ НАСТРОЕН</tspan></tspan>
+    <tspan x="40" dy="20">  • machine-id:     <tspan class="green">✅ Volume настроен</tspan></tspan>
+  </text>
+  
+  <!-- Body Content -->
+  <text x="20" y="280" class="text">
+    <tspan class="yellow">Для получения LICENSE_KEY:</tspan>
+    <tspan x="20" dy="20">  1. Перейдите в бот: <tspan class="cyan">https://t.me/rwp_shop_bot</tspan></tspan>
+    <tspan x="20" dy="20">  2. Получите ключ лицензии</tspan>
+    <tspan x="20" dy="20">  3. Добавьте в .env файл бота</tspan>
+    
+    <tspan x="20" dy="35">Настроить LICENSE_KEY сейчас? [Y/n]: <tspan class="green">_</tspan></tspan>
+  </text>
+</svg>
