@@ -3216,18 +3216,10 @@ load_or_create_config() {
 
     local updated=false
     
-    # Запрашиваем Telegram настройки только если конфиг уже существует, но они пустые
-    # При первой установке (конфиг не существует) - не требуем
-    if [[ "$config_existed" == "true" ]] && [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
-        debug_log "CONFIG" "Telegram settings missing in existing config, prompting user"
-        echo ""; print_message "WARN" "Настройки Telegram не найдены."
-        [[ -z "$BOT_TOKEN" ]] && read -erp " Введите Bot Token: " BOT_TOKEN
-        [[ -z "$CHAT_ID" ]] && read -erp " Введите Chat ID: " CHAT_ID
-        [[ -z "$TG_MESSAGE_THREAD_ID" ]] && read -erp " Введите ID топика (или Enter): " TG_MESSAGE_THREAD_ID
-        updated=true
-        debug_log "CONFIG" "Telegram settings received from user"
-    elif [[ "$config_existed" == "false" ]]; then
-        debug_log "CONFIG" "First run, Telegram settings will be configured later"
+    # Telegram настройки опциональны - НЕ требуем их ввода при старте
+    # Уведомление об отсутствии настроек будет показано в главном меню
+    if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+        debug_log "CONFIG" "Telegram settings not configured (optional)"
     fi
     
     if [[ -z "$BOT_PATH" || -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then 
@@ -12934,6 +12926,12 @@ case "$1" in
             if [[ "$NO_CRITICAL_BACKUP" == true ]]; then
                 echo -e "${RED}${BOLD}⚠️  ВНИМАНИЕ: Авто-бэкап не настроен!${RESET}"
                 echo -e "${RED}   Рекомендуется включить Full или DB бэкап${RESET}"
+                echo ""
+            fi
+            
+            # Предупреждение если Telegram не настроен
+            if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+                echo -e "${YELLOW}ℹ️  Telegram не настроен (уведомления отключены)${RESET}"
                 echo ""
             fi
             
