@@ -2034,6 +2034,163 @@ auto_update_bot() {
     return 0
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOT COMMANDS - Управление контейнером бота из командной строки
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# lazarus bot up - Запустить контейнер бота (если не запущен)
+bot_up() {
+    echo -e "${GREEN}${BOLD}[BOT UP]${RESET} Проверка контейнера бота..."
+    
+    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+        ensure_bot_path || {
+            print_message "ERROR" "Путь к боту не найден"
+            return 1
+        }
+    fi
+    
+    cd "$BOT_PATH" || return 1
+    
+    # Проверяем статус контейнера
+    local bot_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
+    
+    if [[ "$bot_status" == *"Up"* ]]; then
+        local bot_ver=$(get_current_bot_version 2>/dev/null)
+        print_message "SUCCESS" "Бот уже запущен (v${bot_ver:-?})"
+        echo -e "Статус: ${GREEN}$bot_status${RESET}"
+        return 0
+    fi
+    
+    print_message "INFO" "Запуск контейнера..."
+    if docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null; then
+        sleep 2
+        bot_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
+        if [[ "$bot_status" == *"Up"* ]]; then
+            print_message "SUCCESS" "Бот запущен"
+        else
+            print_message "WARN" "Контейнер запущен, статус: $bot_status"
+        fi
+    else
+        print_message "ERROR" "Ошибка запуска контейнера"
+        return 1
+    fi
+}
+
+# lazarus bot down - Остановить контейнер бота
+bot_down() {
+    echo -e "${YELLOW}${BOLD}[BOT DOWN]${RESET} Остановка контейнера бота..."
+    
+    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+        ensure_bot_path || {
+            print_message "ERROR" "Путь к боту не найден"
+            return 1
+        }
+    fi
+    
+    cd "$BOT_PATH" || return 1
+    
+    # Проверяем запущен ли
+    local bot_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
+    
+    if [[ -z "$bot_status" || "$bot_status" != *"Up"* ]]; then
+        print_message "INFO" "Бот уже остановлен"
+        return 0
+    fi
+    
+    print_message "INFO" "Остановка..."
+    if docker compose down 2>/dev/null || docker-compose down 2>/dev/null; then
+        print_message "SUCCESS" "Бот остановлен"
+    else
+        print_message "ERROR" "Ошибка остановки"
+        return 1
+    fi
+}
+
+# lazarus bot status - Статус бота, версия, БД healthcheck
+bot_status() {
+    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${CYAN}${BOLD}  Статус бота${RESET}"
+    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo ""
+    
+    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+        ensure_bot_path || {
+            print_message "ERROR" "Путь к боту не найден"
+            return 1
+        }
+    fi
+    
+    cd "$BOT_PATH" || return 1
+    
+    # Версия бота
+    local bot_ver=$(get_current_bot_version 2>/dev/null)
+    echo -e "Версия бота:     ${CYAN}${bot_ver:-не определена}${RESET}"
+    
+    # Статус контейнера бота
+    local bot_container=$(docker compose ps --format "{{.Name}}" 2>/dev/null | grep -E "bot|shop" | head -1)
+    local bot_status=$(docker inspect --format='{{.State.Status}}' "$bot_container" 2>/dev/null)
+    local bot_health=$(docker inspect --format='{{.State.Health.Status}}' "$bot_container" 2>/dev/null)
+    
+    if [[ "$bot_status" == "running" ]]; then
+        echo -e "Контейнер бота:  ${GREEN}● Running${RESET}"
+    elif [[ -n "$bot_status" ]]; then
+        echo -e "Контейнер бота:  ${RED}○ $bot_status${RESET}"
+    else
+        echo -e "Контейнер бота:  ${RED}○ не найден${RESET}"
+    fi
+    
+    if [[ -n "$bot_health" && "$bot_health" != "none" ]]; then
+        if [[ "$bot_health" == "healthy" ]]; then
+            echo -e "Health (бот):    ${GREEN}✓ healthy${RESET}"
+        else
+            echo -e "Health (бот):    ${YELLOW}$bot_health${RESET}"
+        fi
+    fi
+    
+    # Статус БД
+    local db_container=$(docker compose ps --format "{{.Name}}" 2>/dev/null | grep -E "db|postgres" | head -1)
+    local db_status=$(docker inspect --format='{{.State.Status}}' "$db_container" 2>/dev/null)
+    local db_health=$(docker inspect --format='{{.State.Health.Status}}' "$db_container" 2>/dev/null)
+    
+    echo ""
+    if [[ "$db_status" == "running" ]]; then
+        echo -e "Контейнер БД:    ${GREEN}● Running${RESET}"
+    elif [[ -n "$db_status" ]]; then
+        echo -e "Контейнер БД:    ${RED}○ $db_status${RESET}"
+    else
+        echo -e "Контейнер БД:    ${GRAY}○ не найден${RESET}"
+    fi
+    
+    if [[ -n "$db_health" && "$db_health" != "none" ]]; then
+        if [[ "$db_health" == "healthy" ]]; then
+            echo -e "Health (БД):     ${GREEN}✓ healthy${RESET}"
+        else
+            echo -e "Health (БД):     ${YELLOW}$db_health${RESET}"
+        fi
+    fi
+    
+    # Проверка LICENSE_KEY и machine-id (для v3.25.5+)
+    if [[ -n "$bot_ver" ]] && version_gte "$bot_ver" "3.25.5"; then
+        echo ""
+        echo -e "${BOLD}Лицензия (v3.25.5+):${RESET}"
+        if has_license_key; then
+            echo -e "  LICENSE_KEY:   ${GREEN}✓ настроен${RESET}"
+        else
+            echo -e "  LICENSE_KEY:   ${RED}✗ отсутствует${RESET}"
+        fi
+        if has_machine_id_volume; then
+            echo -e "  machine-id:    ${GREEN}✓ настроен${RESET}"
+        else
+            echo -e "  machine-id:    ${RED}✗ отсутствует${RESET}"
+        fi
+    fi
+    
+    # Путь
+    echo ""
+    echo -e "Путь:            ${GRAY}$BOT_PATH${RESET}"
+    echo ""
+}
+
 # Главная функция обновления бота
 update_bot() {
     debug_log "UPDATE" "=== Starting update_bot() ==="
@@ -12579,7 +12736,22 @@ case "$1" in
         cleanup_old_backups ;;
     restore) menu_restore ;;
     check_update) check_for_updates ;;
-    auto_update) auto_update_bot "$2" ;;
+    upgrade) auto_update_bot "$2" ;;
+    bot)
+        case "$2" in
+            up)     bot_up ;;
+            down)   bot_down ;;
+            status) bot_status ;;
+            *)
+                echo "Использование: lazarus bot <up|down|status>"
+                echo ""
+                echo "Команды:"
+                echo "  up      - Запустить бота (если не запущен)"
+                echo "  down    - Остановить бота"
+                echo "  status  - Статус контейнера, версия, healthcheck"
+                ;;
+        esac
+        ;;
     *)
         # Проверка несоответствия cron при первом запуске интерактивного режима
         check_cron_mismatch
