@@ -803,18 +803,25 @@ scan_system_for_bot() {
                 candidate_bot=$(grep -E "container_name:" "$file" | grep -E "($(IFS="|"; echo "${KEYWORDS[*]}"))" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
                 
                 # Если container_name не найден, используем docker compose для получения имени контейнера
+                # subshell: cd локален и не оставляет побочных эффектов в вызывающем shell
                 if [[ -z "$candidate_bot" && -d "$candidate_path" ]]; then
-                    cd "$candidate_path" 2> "$SILENT_LOG"
-                    # Ищем service который использует наш image
-                    for key in "${KEYWORDS[@]}"; do
-                        local services=$(grep -B 2 "image:.*$key" "$file" | grep "^[a-z]" | head -1 | awk '{print $1}' | tr -d ':')
-                        if [[ -n "$services" ]]; then
-                            # Получаем реальное имя контейнера через docker compose
-                            candidate_bot=$(docker compose ps -a --format '{{.Name}}' "$services" 2> "$SILENT_LOG" | head -1)
-                            [[ -n "$candidate_bot" ]] && break
-                        fi
-                    done
-                    cd - > "$SILENT_LOG"
+                    candidate_bot=$(
+                        cd "$candidate_path" 2> "$SILENT_LOG" || exit 0
+                        # Ищем service который использует наш image
+                        for key in "${KEYWORDS[@]}"; do
+                            local _svc
+                            _svc=$(grep -B 2 "image:.*$key" "$file" | grep "^[a-z]" | head -1 | awk '{print $1}' | tr -d ':')
+                            if [[ -n "$_svc" ]]; then
+                                # Получаем реальное имя контейнера через docker compose
+                                local _name
+                                _name=$(docker compose ps -a --format '{{.Name}}' "$_svc" 2> "$SILENT_LOG" | head -1)
+                                if [[ -n "$_name" ]]; then
+                                    echo "$_name"
+                                    break
+                                fi
+                            fi
+                        done
+                    )
                 fi
                 add_candidate "$candidate_path" "$candidate_bot"
             fi
@@ -822,19 +829,23 @@ scan_system_for_bot() {
     fi
 
     # Поиск контейнера БД
+    # subshell: cd локален, результат передаётся через stdout
     if [[ -n "$FOUND_PATH" ]]; then
-        if cd "$FOUND_PATH" 2> "$SILENT_LOG"; then
+        local _found_db
+        _found_db=$(
+            cd "$FOUND_PATH" 2> "$SILENT_LOG" || exit 0
             local db_services=("db" "postgres" "database" "postgresql")
             for svc in "${db_services[@]}"; do
-                local db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
+                local db_c
+                db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
                 # Исключаем БД панели
-                if [[ -n "$db_c" && "$db_c" != "remnawave-db" && "$db_c" != *"remnawave_"* ]]; then 
-                    FOUND_DB="$db_c"
+                if [[ -n "$db_c" && "$db_c" != "remnawave-db" && "$db_c" != *"remnawave_"* ]]; then
+                    echo "$db_c"
                     break
                 fi
             done
-            cd - > "$SILENT_LOG"
-        fi
+        )
+        [[ -n "$_found_db" ]] && FOUND_DB="$_found_db"
     fi
 }
 
