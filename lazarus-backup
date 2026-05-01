@@ -6840,6 +6840,386 @@ set -- "${_NEWARGS[@]}"
         echo ""
     fi
 
+# =============================================================================
+# RECOVER-HISTORICAL: восстановление исторических данных из старого дампа
+# =============================================================================
+# Контекст: 2025-11-01 при восстановлении из бэкапа ~700 пользователей получили
+# одинаковую created_at='2025-11-01 22:38:50.539351+00', а платежи и рефералы
+# до этой даты потерялись. См. .github/RECOVERY_ANALYSIS.md
+#
+# Стратегия:
+#   1) Поднять старый дамп во временную БД lazarus_recover_<ts> в том же
+#      Postgres-контейнере.
+#   2) Через TSV-pipeline (COPY TO STDOUT → COPY FROM STDIN во временные
+#      таблицы основной БД) выполнить три операции:
+#        Step 1: UPDATE customer.created_at для записей с фейковой датой,
+#                сопоставление по telegram_id (уникальный ключ).
+#        Step 2: INSERT старых purchase (id назначается SERIAL, customer_id
+#                перепривязывается через telegram_id).
+#        Step 3: INSERT старых referral (referrer_id/referee_id — это
+#                telegram_id, не меняются; дубли отсеиваются NOT EXISTS).
+#   3) Удалить временную БД.
+#
+# Безопасность:
+#   - Перед любыми изменениями делается полный safety snapshot текущей БД.
+#   - Каждый шаг идёт в собственной транзакции; перед EXECUTE — dry-run счётчик
+#     и подтверждение (или флаг --yes для неинтерактивного запуска).
+#   - Без --yes интерактивно запрашивается подтверждение перед каждым шагом.
+# =============================================================================
+
+# Helper: psql в указанной БД через docker exec, на stdout — результат tAc
+_rh_psql_q() {
+    # $1 = db name, $2 = SQL
+    docker exec -i "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d "$1" -tAc "$2" 2> "$SILENT_LOG"
+}
+
+# Helper: psql -f stdin (для многострочных запросов с транзакциями), возвращает exit code
+_rh_psql_run() {
+    # $1 = db name; SQL читается из stdin
+    docker exec -i "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d "$1" -v ON_ERROR_STOP=1 2> "$SILENT_LOG"
+}
+
+recover_historical_data() {
+    local old_dump="$1"
+    local auto_yes="false"
+    [[ "$2" == "--yes" || "$2" == "-y" || "$AUTO_CONFIRM" == "true" ]] && auto_yes="true"
+
+    clear_screen
+    echo -e "${RED}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${RED}${BOLD}  🩺  ВОССТАНОВЛЕНИЕ ИСТОРИЧЕСКИХ ДАННЫХ (recover-historical)      ${RESET}"
+    echo -e "${RED}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+
+    # === 1. Валидация аргумента ===
+    if [[ -z "$old_dump" ]]; then
+        print_message "ERROR" "Не указан путь к старому SQL-дампу."
+        echo ""
+        echo "Использование: lazarus recover-historical <old_dump.sql[.gz]> [--yes]"
+        echo ""
+        echo "Дамп должен быть plain-SQL pg_dump (НЕ custom-формат)."
+        return 1
+    fi
+    if [[ ! -f "$old_dump" ]]; then
+        print_message "ERROR" "Файл не найден: $old_dump"
+        return 1
+    fi
+
+    local dump_size; dump_size=$(du -h "$old_dump" 2>/dev/null | cut -f1)
+
+    # === 2. Детекция БД ===
+    detect_bot_installation > "$SILENT_LOG" 2>&1 || true
+    if [[ -z "$DB_CONTAINER_NAME" ]]; then
+        print_message "ERROR" "Не удалось определить контейнер БД (DB_CONTAINER_NAME пуст)."
+        return 1
+    fi
+    if ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Контейнер $DB_CONTAINER_NAME не найден."
+        return 1
+    fi
+    local _RH_DB_USER; _RH_DB_USER=$(get_db_user)
+    local _RH_DB_NAME; _RH_DB_NAME=$(get_db_name)
+    if [[ -z "$_RH_DB_USER" || -z "$_RH_DB_NAME" ]]; then
+        print_message "ERROR" "Не удалось определить DB_USER/DB_NAME."
+        return 1
+    fi
+
+    if ! docker exec "$DB_CONTAINER_NAME" pg_isready -U "$_RH_DB_USER" -d "$_RH_DB_NAME" > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "БД не готова (pg_isready failed)."
+        return 1
+    fi
+
+    # === 3. Печать плана ===
+    local CORRUPT_DATE="2025-11-01 22:38:50.539351+00"
+    local CUTOFF_DATE="2025-11-02"
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    local temp_db="lazarus_recover_${ts}"
+    local snapshot_file="${BACKUP_DIR}/pre_recover_snapshot_${ts}.sql.gz"
+
+    echo -e "${CYAN}Параметры:${RESET}"
+    echo "  Старый дамп:        $old_dump ($dump_size)"
+    echo "  Контейнер БД:       $DB_CONTAINER_NAME"
+    echo "  Текущая БД:         $_RH_DB_NAME (user=$_RH_DB_USER)"
+    echo "  Временная БД:       $temp_db"
+    echo "  Safety snapshot:    $snapshot_file"
+    echo "  Метка фейк-даты:    $CORRUPT_DATE"
+    echo "  Граница импорта:    created_at < $CUTOFF_DATE"
+    echo ""
+    echo -e "${YELLOW}Будут выполнены 3 шага в отдельных транзакциях:${RESET}"
+    echo "  1) UPDATE customer.created_at для записей с фейковой датой"
+    echo "  2) INSERT старых purchase (с пере-маппингом customer_id через telegram_id)"
+    echo "  3) INSERT старых referral (NOT EXISTS защита от дублей)"
+    echo ""
+
+    if [[ "$auto_yes" != "true" ]]; then
+        local _ans=""
+        read -erp "Продолжить? [y/N]: " _ans
+        if [[ ! "$_ans" =~ ^[YyДд]$ ]]; then
+            print_message "INFO" "Отменено пользователем."
+            return 0
+        fi
+    fi
+
+    # === 4. Safety snapshot ===
+    echo ""
+    print_message "INFO" "Создание safety snapshot..."
+    mkdir -p "$BACKUP_DIR" 2> "$SILENT_LOG"
+    if ! docker exec "$DB_CONTAINER_NAME" pg_dump -U "$_RH_DB_USER" "$_RH_DB_NAME" 2> "$SILENT_LOG" \
+            | gzip > "$snapshot_file"; then
+        print_message "ERROR" "Не удалось создать safety snapshot. Восстановление прервано."
+        rm -f "$snapshot_file"
+        return 1
+    fi
+    local snap_size; snap_size=$(du -h "$snapshot_file" 2>/dev/null | cut -f1)
+    print_message "SUCCESS" "Snapshot: $snapshot_file ($snap_size)"
+
+    # === 5. Создание временной БД и заливка старого дампа ===
+    echo ""
+    print_message "INFO" "Создание временной БД '$temp_db'..."
+    if ! docker exec "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d postgres \
+            -c "CREATE DATABASE \"$temp_db\"" > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "CREATE DATABASE $temp_db не удалось."
+        return 1
+    fi
+
+    print_message "INFO" "Загрузка старого дампа в $temp_db (это может занять время)..."
+    local load_rc=0
+    if [[ "$old_dump" =~ \.gz$ ]]; then
+        zcat "$old_dump" | docker exec -i "$DB_CONTAINER_NAME" \
+            psql -U "$_RH_DB_USER" -d "$temp_db" -v ON_ERROR_STOP=0 > "$SILENT_LOG" 2>&1 || load_rc=$?
+    else
+        docker exec -i "$DB_CONTAINER_NAME" \
+            psql -U "$_RH_DB_USER" -d "$temp_db" -v ON_ERROR_STOP=0 < "$old_dump" > "$SILENT_LOG" 2>&1 || load_rc=$?
+    fi
+
+    # Проверяем что таблицы customer/purchase/referral реально появились
+    local _check
+    _check=$(_rh_psql_q "$temp_db" "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('customer','purchase','referral')")
+    if [[ "$_check" != "3" ]]; then
+        print_message "ERROR" "После загрузки дампа в $temp_db найдено таблиц customer/purchase/referral: ${_check:-0}/3."
+        print_message "ERROR" "Дамп либо повреждён, либо это не дамп бота."
+        docker exec "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d postgres \
+            -c "DROP DATABASE \"$temp_db\"" > "$SILENT_LOG" 2>&1
+        return 1
+    fi
+    print_message "SUCCESS" "Старый дамп загружен (rc=$load_rc, customer/purchase/referral присутствуют)"
+
+    local total_failures=0
+
+    # === STEP 1: Исправление created_at ===
+    echo ""
+    echo -e "${BOLD}━━━ Шаг 1/3: customer.created_at ━━━${RESET}"
+    local n_corrupt
+    n_corrupt=$(_rh_psql_q "$_RH_DB_NAME" "SELECT count(*) FROM customer WHERE created_at = '$CORRUPT_DATE'")
+    n_corrupt=${n_corrupt:-0}
+    local n_old_customers
+    n_old_customers=$(_rh_psql_q "$temp_db" "SELECT count(*) FROM customer")
+    n_old_customers=${n_old_customers:-0}
+    echo "  В текущей БД с фейковой датой: $n_corrupt"
+    echo "  В старом дампе (источник):     $n_old_customers"
+
+    if [[ "$n_corrupt" -gt 0 && "$n_old_customers" -gt 0 ]]; then
+        local proceed1="y"
+        if [[ "$auto_yes" != "true" ]]; then
+            read -erp "Выполнить Шаг 1? [Y/n]: " proceed1
+            proceed1="${proceed1:-y}"
+        fi
+        if [[ "$proceed1" =~ ^[YyДд]$ ]]; then
+            print_message "INFO" "Перенос (telegram_id, created_at) и UPDATE..."
+            local rc1=0
+            {
+                printf '%s\n' \
+                    'BEGIN;' \
+                    'CREATE TEMP TABLE _ohist (telegram_id BIGINT, created_at TIMESTAMPTZ);' \
+                    'COPY _ohist FROM STDIN;'
+                docker exec "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d "$temp_db" \
+                    -tAc "COPY (SELECT telegram_id, created_at FROM customer WHERE telegram_id IS NOT NULL) TO STDOUT" 2> "$SILENT_LOG"
+                printf '\\.\n'
+                printf '%s\n' \
+                    'UPDATE customer c' \
+                    '   SET created_at = h.created_at' \
+                    '  FROM _ohist h' \
+                    ' WHERE c.telegram_id = h.telegram_id' \
+                    "   AND c.created_at = '$CORRUPT_DATE';" \
+                    'COMMIT;'
+            } | _rh_psql_run "$_RH_DB_NAME" || rc1=$?
+            if [[ $rc1 -eq 0 ]]; then
+                local n_after
+                n_after=$(_rh_psql_q "$_RH_DB_NAME" "SELECT count(*) FROM customer WHERE created_at = '$CORRUPT_DATE'")
+                local fixed=$(( n_corrupt - ${n_after:-0} ))
+                print_message "SUCCESS" "Шаг 1: исправлено $fixed записей (осталось с фейк-датой: ${n_after:-?})"
+            else
+                print_message "ERROR" "Шаг 1: psql вернул rc=$rc1"
+                total_failures=$((total_failures + 1))
+            fi
+        else
+            print_message "INFO" "Шаг 1 пропущен."
+        fi
+    else
+        print_message "INFO" "Нет данных для Шага 1 (n_corrupt=$n_corrupt, n_old=$n_old_customers)."
+    fi
+
+    # === STEP 2: Восстановление purchase ===
+    echo ""
+    echo -e "${BOLD}━━━ Шаг 2/3: purchase (старые платежи) ━━━${RESET}"
+    local n_old_purch
+    n_old_purch=$(_rh_psql_q "$temp_db" "SELECT count(*) FROM purchase WHERE created_at < '$CUTOFF_DATE'")
+    n_old_purch=${n_old_purch:-0}
+    echo "  Старых платежей до $CUTOFF_DATE: $n_old_purch"
+
+    if [[ "$n_old_purch" -gt 0 ]]; then
+        local proceed2="y"
+        if [[ "$auto_yes" != "true" ]]; then
+            read -erp "Выполнить Шаг 2? [Y/n]: " proceed2
+            proceed2="${proceed2:-y}"
+        fi
+        if [[ "$proceed2" =~ ^[YyДд]$ ]]; then
+            print_message "INFO" "Перенос старых purchase через telegram_id..."
+            local rc2=0
+            local _s2_pre _s2_post
+            _s2_pre=$(cat <<'SQL_S2_PRE'
+BEGIN;
+CREATE TEMP TABLE _opurch (
+    telegram_id        BIGINT,
+    amount             NUMERIC,
+    created_at         TIMESTAMPTZ,
+    month              INTEGER,
+    paid_at            TIMESTAMPTZ,
+    currency           TEXT,
+    expire_at          TIMESTAMPTZ,
+    status             TEXT,
+    invoice_type       TEXT,
+    crypto_invoice_id  TEXT,
+    crypto_invoice_url TEXT,
+    yookasa_url        TEXT,
+    yookasa_id         TEXT
+);
+COPY _opurch FROM STDIN;
+SQL_S2_PRE
+)
+            _s2_post=$(cat <<'SQL_S2_POST'
+INSERT INTO purchase (
+    amount, customer_id, created_at, month, paid_at,
+    currency, expire_at, status, invoice_type,
+    crypto_invoice_id, crypto_invoice_url, yookasa_url, yookasa_id
+)
+SELECT
+    p.amount, c.id, p.created_at, p.month, p.paid_at,
+    p.currency, p.expire_at, p.status, p.invoice_type,
+    p.crypto_invoice_id, p.crypto_invoice_url, p.yookasa_url, p.yookasa_id
+  FROM _opurch p
+  JOIN customer c ON c.telegram_id = p.telegram_id;
+COMMIT;
+SQL_S2_POST
+)
+            {
+                printf '%s\n' "$_s2_pre"
+                docker exec "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d "$temp_db" \
+                    -tAc "COPY (SELECT oc.telegram_id, p.amount, p.created_at, p.month, p.paid_at, p.currency, p.expire_at, p.status, p.invoice_type, p.crypto_invoice_id, p.crypto_invoice_url, p.yookasa_url, p.yookasa_id FROM purchase p JOIN customer oc ON oc.id = p.customer_id WHERE p.created_at < '$CUTOFF_DATE') TO STDOUT" 2> "$SILENT_LOG"
+                printf '\\.\n'
+                printf '%s\n' "$_s2_post"
+            } | _rh_psql_run "$_RH_DB_NAME" || rc2=$?
+            if [[ $rc2 -eq 0 ]]; then
+                local n_purch_after
+                n_purch_after=$(_rh_psql_q "$_RH_DB_NAME" "SELECT count(*) FROM purchase WHERE created_at < '$CUTOFF_DATE'")
+                print_message "SUCCESS" "Шаг 2: в текущей БД старых платежей теперь: ${n_purch_after:-?}"
+            else
+                print_message "ERROR" "Шаг 2: psql вернул rc=$rc2"
+                print_message "WARN" "Возможно отсутствуют какие-то поля purchase в текущей схеме. См. snapshot для отката."
+                total_failures=$((total_failures + 1))
+            fi
+        else
+            print_message "INFO" "Шаг 2 пропущен."
+        fi
+    else
+        print_message "INFO" "Нет старых платежей в дампе."
+    fi
+
+    # === STEP 3: Восстановление referral ===
+    echo ""
+    echo -e "${BOLD}━━━ Шаг 3/3: referral (старые рефералы) ━━━${RESET}"
+    local n_old_ref
+    n_old_ref=$(_rh_psql_q "$temp_db" "SELECT count(*) FROM referral WHERE used_at < '$CUTOFF_DATE'")
+    n_old_ref=${n_old_ref:-0}
+    echo "  Старых рефералов до $CUTOFF_DATE: $n_old_ref"
+
+    if [[ "$n_old_ref" -gt 0 ]]; then
+        local proceed3="y"
+        if [[ "$auto_yes" != "true" ]]; then
+            read -erp "Выполнить Шаг 3? [Y/n]: " proceed3
+            proceed3="${proceed3:-y}"
+        fi
+        if [[ "$proceed3" =~ ^[YyДд]$ ]]; then
+            print_message "INFO" "Перенос старых referral..."
+            local rc3=0
+            local _s3_pre _s3_post
+            _s3_pre=$(cat <<'SQL_S3_PRE'
+BEGIN;
+CREATE TEMP TABLE _oref (
+    referrer_id    BIGINT,
+    referee_id     BIGINT,
+    used_at        TIMESTAMPTZ,
+    bonus_granted  BOOLEAN
+);
+COPY _oref FROM STDIN;
+SQL_S3_PRE
+)
+            _s3_post=$(cat <<'SQL_S3_POST'
+INSERT INTO referral (referrer_id, referee_id, used_at, bonus_granted)
+SELECT o.referrer_id, o.referee_id, o.used_at, o.bonus_granted
+  FROM _oref o
+ WHERE NOT EXISTS (
+       SELECT 1 FROM referral r
+        WHERE r.referrer_id = o.referrer_id
+          AND r.referee_id  = o.referee_id
+ );
+COMMIT;
+SQL_S3_POST
+)
+            {
+                printf '%s\n' "$_s3_pre"
+                docker exec "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d "$temp_db" \
+                    -tAc "COPY (SELECT referrer_id, referee_id, used_at, bonus_granted FROM referral WHERE used_at < '$CUTOFF_DATE') TO STDOUT" 2> "$SILENT_LOG"
+                printf '\\.\n'
+                printf '%s\n' "$_s3_post"
+            } | _rh_psql_run "$_RH_DB_NAME" || rc3=$?
+            if [[ $rc3 -eq 0 ]]; then
+                local n_ref_after
+                n_ref_after=$(_rh_psql_q "$_RH_DB_NAME" "SELECT count(*) FROM referral WHERE used_at < '$CUTOFF_DATE'")
+                print_message "SUCCESS" "Шаг 3: в текущей БД старых рефералов теперь: ${n_ref_after:-?}"
+            else
+                print_message "ERROR" "Шаг 3: psql вернул rc=$rc3"
+                total_failures=$((total_failures + 1))
+            fi
+        else
+            print_message "INFO" "Шаг 3 пропущен."
+        fi
+    else
+        print_message "INFO" "Нет старых рефералов в дампе."
+    fi
+
+    # === 6. Cleanup временной БД ===
+    echo ""
+    print_message "INFO" "Удаление временной БД '$temp_db'..."
+    docker exec "$DB_CONTAINER_NAME" psql -U "$_RH_DB_USER" -d postgres \
+        -c "DROP DATABASE \"$temp_db\"" > "$SILENT_LOG" 2>&1 || \
+        print_message "WARN" "Не удалось удалить $temp_db автоматически."
+
+    # === 7. Итог ===
+    echo ""
+    if [[ $total_failures -eq 0 ]]; then
+        echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+        echo -e "${GREEN}${BOLD}  ✓ recover-historical завершён без ошибок                         ${RESET}"
+        echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+    else
+        echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+        echo -e "${YELLOW}${BOLD}  ⚠  recover-historical: $total_failures шаг(а) завершилось с ошибкой${RESET}"
+        echo -e "${YELLOW}${BOLD}  Откат: zcat $snapshot_file | docker exec -i $DB_CONTAINER_NAME \\${RESET}"
+        echo -e "${YELLOW}${BOLD}    psql -U $_RH_DB_USER -d $_RH_DB_NAME                            ${RESET}"
+        echo -e "${YELLOW}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
+    fi
+    return $total_failures
+}
+
 case "$1" in
     backup_full) create_backup "full" ;;
     backup_db)   create_backup "db_only" ;;
@@ -6874,6 +7254,7 @@ case "$1" in
     restore) menu_restore ;;
     check_update) check_for_updates ;;
     install-migrator) install_migrator ;;
+    recover-historical) recover_historical_data "$2" "$3" ;;
     upgrade) auto_update_bot "$2" ;;
     bot|-b)
         case "$2" in
