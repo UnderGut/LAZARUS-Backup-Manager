@@ -6380,6 +6380,116 @@ menu_settings() {
 LAZARUS_MIGRATOR_PATH="${LAZARUS_MIGRATOR_PATH:-/opt/lazarus-backup/lazarus-migrator}"
 LAZARUS_MIGRATOR_LOADED=0
 
+# install_migrator: скачивает плагин миграции с GitHub, проверяет валидность,
+# сохраняет в $LAZARUS_MIGRATOR_PATH с правами 644. Использует те же зеркала,
+# что и check_for_updates (REMOTE_URLS) — берёт первое доступное.
+install_migrator() {
+    local target="$LAZARUS_MIGRATOR_PATH"
+    local target_dir; target_dir="$(dirname "$target")"
+    local cache_buster="?t=$(date +%s)"
+    local timeout=20
+
+    # Список зеркал для плагина (соответствует REMOTE_URLS, но для lazarus-migrator)
+    local mirrors=(
+        "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator"
+        "https://raw.githack.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator"
+        "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@main/lazarus-migrator"
+    )
+
+    clear_screen
+    echo -e "${CYAN}${BOLD}Установка плагина миграции (lazarus-migrator)${RESET}"
+    echo ""
+
+    # Проверка прав записи
+    if [[ ! -d "$target_dir" ]]; then
+        if ! mkdir -p "$target_dir" 2> "$SILENT_LOG"; then
+            print_message "ERROR" "Не удалось создать каталог: $target_dir"
+            return 1
+        fi
+    fi
+    if [[ ! -w "$target_dir" ]]; then
+        print_message "ERROR" "Нет прав записи в $target_dir (запустите от root)."
+        return 1
+    fi
+
+    # Проверка наличия curl/wget
+    local fetcher=""
+    if command -v curl > "$SILENT_LOG" 2>&1; then
+        fetcher="curl"
+    elif command -v wget > "$SILENT_LOG" 2>&1; then
+        fetcher="wget"
+    else
+        print_message "ERROR" "Нет curl или wget — установка невозможна."
+        return 1
+    fi
+
+    local tmp; tmp=$(mktemp 2> "$SILENT_LOG") || {
+        print_message "ERROR" "Не удалось создать временный файл."
+        return 1
+    }
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
+
+    local downloaded=0
+    local source_url=""
+    for url in "${mirrors[@]}"; do
+        local fetch_url="${url}${cache_buster}"
+        echo -e "${GRAY}Загружаю: ${url}...${RESET}"
+        : > "$tmp"
+        if [[ "$fetcher" == "curl" ]]; then
+            curl $CURL_SILENT -L --connect-timeout "$timeout" --max-time 60 -o "$tmp" "$fetch_url" 2> "$SILENT_LOG" || true
+        else
+            wget $WGET_SILENT -O "$tmp" --timeout="$timeout" "$fetch_url" 2> "$SILENT_LOG" || true
+        fi
+
+        # Валидация: shebang + plugin guard + версия
+        if [[ -s "$tmp" ]] \
+            && head -1 "$tmp" | grep -q '^#!/bin/bash' \
+            && grep -q 'LAZARUS_MIGRATOR_VERSION=' "$tmp" \
+            && grep -q 'BASH_SOURCE\[0\]' "$tmp"; then
+            downloaded=1
+            source_url="$url"
+            echo -e "${GREEN}  ✓ OK${RESET}"
+            break
+        fi
+        echo -e "${YELLOW}  ✗ Невалидный или недоступен${RESET}"
+    done
+
+    if [[ "$downloaded" != "1" ]]; then
+        print_message "ERROR" "Не удалось скачать плагин ни с одного зеркала."
+        return 1
+    fi
+
+    # Синтакс-проверка перед установкой
+    if ! bash -n "$tmp" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Скачанный плагин не прошёл проверку синтаксиса (bash -n)."
+        return 1
+    fi
+
+    # Извлекаем версию плагина для отчёта
+    local plugin_version
+    plugin_version=$(grep '^LAZARUS_MIGRATOR_VERSION=' "$tmp" | head -1 | cut -d'"' -f2)
+    [[ -z "$plugin_version" ]] && plugin_version="(unknown)"
+
+    # Атомарная установка
+    if ! install -m 0644 "$tmp" "$target" 2> "$SILENT_LOG"; then
+        # fallback на cp+chmod если install отсутствует
+        cp "$tmp" "$target" 2> "$SILENT_LOG" || {
+            print_message "ERROR" "Не удалось записать плагин в $target."
+            return 1
+        }
+        chmod 0644 "$target" 2> "$SILENT_LOG" || true
+    fi
+
+    echo ""
+    print_message "OK" "Плагин установлен: $target"
+    echo -e "  Версия: ${GREEN}${plugin_version}${RESET}"
+    echo -e "  Источник: ${GRAY}${source_url}${RESET}"
+    echo ""
+    echo -e "${CYAN}Перезапустите ${SCRIPT_NAME}, чтобы плагин загрузился.${RESET}"
+    return 0
+}
+
 if [[ -f "$LAZARUS_MIGRATOR_PATH" && -r "$LAZARUS_MIGRATOR_PATH" ]]; then
     # shellcheck source=/dev/null
     if source "$LAZARUS_MIGRATOR_PATH" 2> "$SILENT_LOG"; then
@@ -6410,10 +6520,18 @@ if [[ "$LAZARUS_MIGRATOR_LOADED" != "1" ]]; then
         echo ""
         echo -e "${CYAN}Установка:${RESET}"
         echo ""
-        echo "  curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator \\"
-        echo "    -o $LAZARUS_MIGRATOR_PATH && chmod +x $LAZARUS_MIGRATOR_PATH"
+        echo -e "  ${BOLD}Вариант 1${RESET} (рекомендуется):"
+        echo "    lazarus install-migrator"
         echo ""
-        echo "После установки перезапустите скрипт и снова откройте этот пункт меню."
+        echo -e "  ${BOLD}Вариант 2${RESET} (вручную):"
+        echo "    curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator \\"
+        echo "      -o $LAZARUS_MIGRATOR_PATH && chmod 644 $LAZARUS_MIGRATOR_PATH"
+        echo ""
+        local _ans=""
+        read -erp "Установить плагин сейчас? [y/N]: " _ans
+        if [[ "$_ans" =~ ^[YyДд]$ ]]; then
+            install_migrator
+        fi
         echo ""
         read -erp "Нажмите Enter для возврата в главное меню..." _dummy
         return 0
@@ -6755,6 +6873,7 @@ case "$1" in
         cleanup_old_backups ;;
     restore) menu_restore ;;
     check_update) check_for_updates ;;
+    install-migrator) install_migrator ;;
     upgrade) auto_update_bot "$2" ;;
     bot|-b)
         case "$2" in
