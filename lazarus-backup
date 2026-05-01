@@ -3806,10 +3806,80 @@ validate_remote_connection() {
         fi
         debug_log "REMOTE" "Rclone connection FAILED"
         return 1
+
+    elif [[ "$type" == "s3" ]]; then
+        debug_log "REMOTE" "Testing S3 connection..."
+        if ! command -v aws > "$SILENT_LOG" 2>&1; then
+            print_message "ERROR" "AWS CLI не установлен!"
+            return 1
+        fi
+        if [[ -z "$S3_BUCKET" ]]; then
+            print_message "ERROR" "S3_BUCKET не задан в конфиге."
+            return 1
+        fi
+        local _s3_validate_opts=()
+        [[ -n "$S3_ENDPOINT" ]] && _s3_validate_opts+=(--endpoint-url "$S3_ENDPOINT")
+        [[ -n "$S3_REGION"   ]] && _s3_validate_opts+=(--region "$S3_REGION")
+        if _s3_aws_run s3 ls "s3://${S3_BUCKET}/" "${_s3_validate_opts[@]}" --max-items 1 > "$SILENT_LOG" 2>&1; then
+            debug_log "REMOTE" "S3 connection SUCCESS"
+            return 0
+        fi
+        debug_log "REMOTE" "S3 connection FAILED"
+        return 1
     fi
     
     debug_log "REMOTE" "Unknown storage type: $type"
     return 1
+}
+
+# =============================================================================
+# _s3_aws_run: вызов aws CLI с приватным credentials-файлом
+# =============================================================================
+# Записывает временный файл ~/aws/credentials с правами 0600 и подключает его
+# через AWS_SHARED_CREDENTIALS_FILE + AWS_PROFILE=lazarus, а не через
+# `export AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` в окружение текущего
+# shell-процесса. После завершения файл затирается (shred / rm).
+#
+# Преимущества:
+#   - переменные не утекают в дочерние процессы, не запущенные через aws;
+#   - нет race-window между export и unset, в котором креды видны другим;
+#   - повторные параллельные вызовы не конфликтуют между собой.
+#
+# Использование:
+#   _s3_aws_run s3 cp file.tgz s3://bucket/path/
+#   _s3_aws_run s3 ls "s3://bucket/" --max-items 1
+# Override (для wizard-режима, когда S3_* ещё не сохранены):
+#   _S3_AWS_KEY_OVERRIDE="<key>" _S3_AWS_SECRET_OVERRIDE="<secret>" \
+#       _s3_aws_run s3 ls ...
+# =============================================================================
+_s3_aws_run() {
+    local _ak="${_S3_AWS_KEY_OVERRIDE:-$S3_ACCESS_KEY}"
+    local _sk="${_S3_AWS_SECRET_OVERRIDE:-$S3_SECRET_KEY}"
+    if [[ -z "$_ak" || -z "$_sk" ]]; then
+        debug_log "S3" "_s3_aws_run: пустые credentials, fallback на default chain"
+        aws "$@"
+        return $?
+    fi
+    local _creds_file
+    _creds_file=$(mktemp 2> "$SILENT_LOG") || {
+        print_message "ERROR" "_s3_aws_run: mktemp failed, выполняем aws без приватного файла" >&2
+        aws "$@"
+        return $?
+    }
+    chmod 600 "$_creds_file" 2> "$SILENT_LOG" || true
+    {
+        printf '[lazarus]\n'
+        printf 'aws_access_key_id = %s\n' "$_ak"
+        printf 'aws_secret_access_key = %s\n' "$_sk"
+    } > "$_creds_file"
+    AWS_SHARED_CREDENTIALS_FILE="$_creds_file" AWS_PROFILE="lazarus" aws "$@"
+    local _rc=$?
+    if command -v shred > "$SILENT_LOG" 2>&1; then
+        shred -u "$_creds_file" 2> "$SILENT_LOG" || rm -f "$_creds_file"
+    else
+        rm -f "$_creds_file"
+    fi
+    return $_rc
 }
 
 upload_to_remote() {
@@ -3902,36 +3972,17 @@ upload_to_remote() {
         local aws_opts=()
         [[ -n "$S3_ENDPOINT" ]] && aws_opts+=(--endpoint-url "$S3_ENDPOINT")
         [[ -n "$S3_REGION" ]] && aws_opts+=(--region "$S3_REGION")
-        
-        # Экспортируем credentials (если заданы в конфиге)
-        local old_aws_access=""
-        local old_aws_secret=""
-        if [[ -n "$S3_ACCESS_KEY" && -n "$S3_SECRET_KEY" ]]; then
-            old_aws_access="$AWS_ACCESS_KEY_ID"
-            old_aws_secret="$AWS_SECRET_ACCESS_KEY"
-            export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
-            export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
-            debug_log "REMOTE" "Using S3 credentials from config"
-        fi
-        
-        # Загружаем файл
-        debug_log "REMOTE" "Running: aws s3 cp $file_path $s3_dest ${aws_opts[*]}"
+
+        # Credentials передаются через _s3_aws_run без export
+        debug_log "REMOTE" "Running: _s3_aws_run s3 cp $file_path $s3_dest ${aws_opts[*]}"
         local s3_output
         if [[ "$IS_INTERACTIVE" == "true" ]]; then
-            s3_output=$(aws s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --only-show-errors 2>&1)
+            s3_output=$(_s3_aws_run s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --only-show-errors 2>&1)
         else
-            s3_output=$(aws s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --quiet 2>&1)
+            s3_output=$(_s3_aws_run s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --quiet 2>&1)
         fi
         local s3_result=$?
-        
-        # Восстанавливаем старые credentials
-        if [[ -n "$old_aws_access" ]]; then
-            export AWS_ACCESS_KEY_ID="$old_aws_access"
-            export AWS_SECRET_ACCESS_KEY="$old_aws_secret"
-        elif [[ -n "$S3_ACCESS_KEY" ]]; then
-            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-        fi
-        
+
         if [[ $s3_result -eq 0 ]]; then
             print_message "SUCCESS" "Файл загружен в S3." >&2
             debug_log "REMOTE" "S3 upload SUCCESS"
@@ -4322,11 +4373,9 @@ configure_remote_storage() {
             local test_opts=()
             [[ -n "$input_endpoint" ]] && test_opts+=(--endpoint-url "$input_endpoint")
             test_opts+=(--region "$input_region")
-            
-            export AWS_ACCESS_KEY_ID="$input_access_key"
-            export AWS_SECRET_ACCESS_KEY="$input_secret_key"
-            
-            if aws s3 ls "s3://${input_bucket}/" "${test_opts[@]}" --max-items 1 > "$SILENT_LOG" 2>&1; then
+
+            if _S3_AWS_KEY_OVERRIDE="$input_access_key" _S3_AWS_SECRET_OVERRIDE="$input_secret_key" \
+                    _s3_aws_run s3 ls "s3://${input_bucket}/" "${test_opts[@]}" --max-items 1 > "$SILENT_LOG" 2>&1; then
                 print_message "SUCCESS" "Подключение успешно!"
                 
                 # Сохраняем настройки
@@ -4341,13 +4390,11 @@ configure_remote_storage() {
                 S3_ACCESS_KEY="$input_access_key"
                 S3_SECRET_KEY="$input_secret_key"
                 
-                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
                 save_config
                 print_message "SUCCESS" "Настройки S3 сохранены."
                 sleep 1.5
                 return
             else
-                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
                 print_message "ERROR" "Не удалось подключиться к S3!"
                 echo ""
                 read -erp "Сохранить настройки несмотря на ошибку? (y/N): " force_save
@@ -7293,16 +7340,13 @@ case "$1" in
                 _s3_test_opts=()
                 [[ -n "$S3_ENDPOINT" ]] && _s3_test_opts+=(--endpoint-url "$S3_ENDPOINT")
                 [[ -n "$S3_REGION" ]] && _s3_test_opts+=(--region "$S3_REGION")
-                export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
-                export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
-                if aws s3 ls "s3://${S3_BUCKET}/" "${_s3_test_opts[@]}" --max-items 1 > /dev/null 2>&1; then
+                if _s3_aws_run s3 ls "s3://${S3_BUCKET}/" "${_s3_test_opts[@]}" --max-items 1 > /dev/null 2>&1; then
                     echo -e "${GREEN}✓${RESET} Подключение успешно!"
                     echo "  Bucket: $S3_BUCKET"
                     [[ -n "$S3_PATH" ]] && echo "  Path: $S3_PATH"
                 else
                     echo -e "${RED}✗${RESET} Ошибка подключения!"
                 fi
-                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
                 ;;
             list|-l)
                 # Список файлов в S3
@@ -7315,11 +7359,8 @@ case "$1" in
                 [[ -n "$S3_REGION" ]] && _s3_list_opts+=(--region "$S3_REGION")
                 _s3_list_path="${S3_PATH%/}"
                 [[ -n "$_s3_list_path" ]] && _s3_list_path="${_s3_list_path}/"
-                export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
-                export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
                 echo "Файлы в s3://${S3_BUCKET}/${_s3_list_path}:"
-                aws s3 ls "s3://${S3_BUCKET}/${_s3_list_path}" "${_s3_list_opts[@]}" --human-readable
-                unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+                _s3_aws_run s3 ls "s3://${S3_BUCKET}/${_s3_list_path}" "${_s3_list_opts[@]}" --human-readable
                 ;;
             upload|-u)
                 # Загрузить файл в S3
