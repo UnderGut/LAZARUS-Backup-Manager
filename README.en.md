@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.35.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-4.37.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — an advanced backup system for **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** with encryption, cloud storage support, and smart automation.
@@ -173,8 +173,11 @@ Config file: `/opt/lazarus-backup/config.env` (chmod 600)
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `BACKUP_PASSWORD` | AES-256 encryption password | `MySecretPass123` or empty |
+| `BACKUP_PASSWORD_FILE` | File with encryption password (chmod 600) | `/opt/lazarus-backup/.password` |
 | `MAX_FILE_SIZE_MB` | Max file size in archive (MB) | `1` (skip larger) |
 | `EXCLUDE_DIRS` | Exclude folders (space-separated) | `node_modules .git cache` |
+
+> ⚠️ Password is stored in `BACKUP_PASSWORD_FILE` for safety and correct handling of special characters.
 
 ---
 
@@ -189,6 +192,11 @@ lazarus migrate          # 🆕 Bedolaga migration (BETA)
 lazarus cleanup          # Old backup cleanup
 lazarus check_update     # Check script updates
 ```
+
+> ⚠️ **IMPORTANT (Restore):** restore now requires strict path validation and a typed confirmation
+> `RESTORE_TO:/path/to/bot`. For non-interactive mode you must pass **both** flags:
+> `--yes --i-know-what-i-am-doing`. By default `.env` is preserved (not overwritten).
+> DB volume deletion is opt-in only; use `--restore-drop-volume` if you need to recreate it.
 
 ### 🆕 Backup Commands (v4.30.0+)
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="4.36.1"
+VERSION="4.37.0"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -69,6 +69,13 @@ S3_REGION="us-east-1"    # Регион (для AWS) или любой для S3
 
 # Настройки шифрования
 BACKUP_PASSWORD=""
+BACKUP_PASSWORD_FILE="$INSTALL_DIR/.password"
+
+# Restore safety flags
+RESTORE_FORCE="false"
+RESTORE_INCLUDE_ENV="false"
+RESTORE_DROP_VOLUME="false"
+RESTORE_DROP_SCHEMA="false"
 
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
@@ -297,7 +304,7 @@ check_lock_owner() {
 }
 
 check_dependencies() {
-    local deps=("tar" "gzip" "openssl" "docker" "find" "du" "date")
+    local deps=("tar" "gzip" "openssl" "docker" "find" "du" "date" "rsync")
     local missing=()
     
     # Check for curl OR wget
@@ -697,8 +704,20 @@ install_script() {
 
 # --- ЯДРО ИНТЕЛЛЕКТУАЛЬНОГО ПОИСКА ---
 
+add_candidate() {
+    local path="$1"
+    local bot="$2"
+    [[ -z "$path" ]] && return
+    for p in "${FOUND_PATHS[@]}"; do
+        [[ "$p" == "$path" ]] && return
+    done
+    FOUND_PATHS+=("$path")
+    FOUND_BOTS+=("$bot")
+}
+
 scan_system_for_bot() {
     FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
+    FOUND_PATHS=(); FOUND_BOTS=(); FOUND_DBS=()
     debug_log "SCAN" "=== scan_system_for_bot ==="
     local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
     debug_log "SCAN" "Running containers: $(echo "$running_containers" | wc -l)"
@@ -748,15 +767,20 @@ scan_system_for_bot() {
         for key in "${KEYWORDS[@]}"; do
             if [[ "$c_image" == *"$key"* || "$c_name" == *"$key"* ]]; then
                 debug_log "SCAN" "  -> MATCH! keyword=$key"
-                FOUND_BOT="$c_name"
                 local work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name")
                 debug_log "SCAN" "  -> working_dir=$work_dir"
-                if [[ -n "$work_dir" && -d "$work_dir" ]]; then FOUND_PATH="$work_dir"; fi
-                break 2
+                if [[ -n "$work_dir" && -d "$work_dir" && "$work_dir" != "/opt" ]]; then
+                    add_candidate "$work_dir" "$c_name"
+                fi
+                break
             fi
         done
     done
     
+    if [[ ${#FOUND_PATHS[@]} -gt 0 ]]; then
+        FOUND_PATH="${FOUND_PATHS[0]}"
+        FOUND_BOT="${FOUND_BOTS[0]}"
+    fi
     debug_log "SCAN" "After container scan: FOUND_BOT=$FOUND_BOT, FOUND_PATH=$FOUND_PATH"
 
     # Если не нашли через контейнеры — ищем по файлам docker-compose
@@ -771,25 +795,28 @@ scan_system_for_bot() {
             
             # Ищем по ключевым словам БОТА
             if grep -qE "image:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file" || grep -qE "container_name:.*($(IFS="|"; echo "${KEYWORDS[*]}"))" "$file"; then
-                FOUND_PATH=$(dirname "$file")
+                local candidate_path
+                candidate_path=$(dirname "$file")
+                [[ "$candidate_path" == "/opt" ]] && continue
                 # Сначала пытаемся найти container_name
-                FOUND_BOT=$(grep -E "container_name:" "$file" | grep -E "($(IFS="|"; echo "${KEYWORDS[*]}"))" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                local candidate_bot
+                candidate_bot=$(grep -E "container_name:" "$file" | grep -E "($(IFS="|"; echo "${KEYWORDS[*]}"))" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
                 
                 # Если container_name не найден, используем docker compose для получения имени контейнера
-                if [[ -z "$FOUND_BOT" && -d "$FOUND_PATH" ]]; then
-                    cd "$FOUND_PATH" 2> "$SILENT_LOG"
+                if [[ -z "$candidate_bot" && -d "$candidate_path" ]]; then
+                    cd "$candidate_path" 2> "$SILENT_LOG"
                     # Ищем service который использует наш image
                     for key in "${KEYWORDS[@]}"; do
                         local services=$(grep -B 2 "image:.*$key" "$file" | grep "^[a-z]" | head -1 | awk '{print $1}' | tr -d ':')
                         if [[ -n "$services" ]]; then
                             # Получаем реальное имя контейнера через docker compose
-                            FOUND_BOT=$(docker compose ps -a --format '{{.Name}}' "$services" 2> "$SILENT_LOG" | head -1)
-                            [[ -n "$FOUND_BOT" ]] && break
+                            candidate_bot=$(docker compose ps -a --format '{{.Name}}' "$services" 2> "$SILENT_LOG" | head -1)
+                            [[ -n "$candidate_bot" ]] && break
                         fi
                     done
                     cd - > "$SILENT_LOG"
                 fi
-                break
+                add_candidate "$candidate_path" "$candidate_bot"
             fi
         done
     fi
@@ -3137,11 +3164,48 @@ update_bot() {
     return 0
 }
 
+find_db_container_for_path() {
+    local path="$1"
+    [[ -z "$path" || ! -d "$path" ]] && return 1
+    local db_services=("db" "postgres" "database" "postgresql")
+    local db_name=""
+    if cd "$path" 2> "$SILENT_LOG"; then
+        for svc in "${db_services[@]}"; do
+            db_name=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
+            if [[ -n "$db_name" && "$db_name" != "remnawave-db" && "$db_name" != *"remnawave_"* ]]; then
+                cd - > "$SILENT_LOG"
+                echo "$db_name"
+                return 0
+            fi
+        done
+        cd - > "$SILENT_LOG"
+    fi
+    return 1
+}
+
 detect_bot_installation() {
     debug_log "SCAN" "=== detect_bot_installation ==="
     print_message "INFO" "Запуск интеллектуального поиска..."
     scan_system_for_bot 
-    if [[ -n "$FOUND_PATH" ]]; then
+    if [[ ${#FOUND_PATHS[@]} -gt 1 ]]; then
+        echo ""; print_message "WARN" "Найдено несколько установок. Выберите нужную:"
+        local idx=1
+        for path in "${FOUND_PATHS[@]}"; do
+            local bot="${FOUND_BOTS[$((idx-1))]}"
+            echo -e "  $idx. ${BOLD}$path${RESET} ${bot:+(bot: $bot)}"
+            idx=$((idx + 1))
+        done
+        echo "  0. Отмена"
+        read -erp "Ваш выбор: " sel
+        if [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le ${#FOUND_PATHS[@]} ]]; then
+            local selected_path="${FOUND_PATHS[$((sel-1))]}"
+            local selected_bot="${FOUND_BOTS[$((sel-1))]}"
+            BOT_PATH="$selected_path"
+            [[ -n "$selected_bot" ]] && BOT_CONTAINER_NAME="$selected_bot"
+            DB_CONTAINER_NAME=$(find_db_container_for_path "$BOT_PATH")
+            save_config; print_message "SUCCESS" "Настройки сохранены."; return 0
+        fi
+    elif [[ -n "$FOUND_PATH" ]]; then
         debug_log "SCAN" "Found installation: PATH=$FOUND_PATH, BOT=$FOUND_BOT, DB=$FOUND_DB"
         echo ""; print_message "SUCCESS" "Обнаружена установка!"
         echo -e "   Путь:      ${BOLD}$FOUND_PATH${RESET}"
@@ -3266,43 +3330,178 @@ ensure_bot_path() {
     return 0
 }
 
+trim_ws() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    echo "$s"
+}
+
+parse_env_value() {
+    local val
+    val=$(trim_ws "$1")
+    if [[ $val == "\""*"\"" && $val == *"\"" ]]; then
+        val="${val:1:${#val}-2}"
+        val="${val//\\\\/\\}"
+        val="${val//\\\"/\"}"
+    elif [[ $val == "'"*"'" && $val == *"'" ]]; then
+        val="${val:1:${#val}-2}"
+        val=$(printf '%s' "$val" | sed "s/'\\''/'/g")
+    fi
+    echo "$val"
+}
+
+load_config_file() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" != *"="* ]] && continue
+        local key="${line%%=*}"
+        key=$(trim_ws "$key")
+        local raw_val="${line#*=}"
+        local val
+        val=$(parse_env_value "$raw_val")
+
+        case "$key" in
+            BOT_TOKEN) BOT_TOKEN="$val" ;;
+            CHAT_ID) CHAT_ID="$val" ;;
+            TG_MESSAGE_THREAD_ID) TG_MESSAGE_THREAD_ID="$val" ;;
+            BOT_PATH) BOT_PATH="$val" ;;
+            BOT_CONTAINER_NAME) BOT_CONTAINER_NAME="$val" ;;
+            DB_CONTAINER_NAME) DB_CONTAINER_NAME="$val" ;;
+            DB_USER) DB_USER="$val" ;;
+            IGNORE_MISMATCH) IGNORE_MISMATCH="$val" ;;
+            EXCLUDE_DIRS) EXCLUDE_DIRS="$val" ;;
+            MAX_FILE_SIZE_MB) MAX_FILE_SIZE_MB="$val" ;;
+            REMOTE_STORAGE_TYPE) REMOTE_STORAGE_TYPE="$val" ;;
+            REMOTE_STORAGE_URL) REMOTE_STORAGE_URL="$val" ;;
+            REMOTE_STORAGE_USER) REMOTE_STORAGE_USER="$val" ;;
+            REMOTE_STORAGE_PASS) REMOTE_STORAGE_PASS="$val" ;;
+            SEND_TO_TELEGRAM) SEND_TO_TELEGRAM="$val" ;;
+            TG_SEND_FILE) TG_SEND_FILE="$val" ;;
+            SEND_TO_REMOTE) SEND_TO_REMOTE="$val" ;;
+            DELETE_MODE) DELETE_MODE="$val" ;;
+            RETENTION_DAYS) RETENTION_DAYS="$val" ;;
+            MAX_BACKUPS_COUNT) MAX_BACKUPS_COUNT="$val" ;;
+            MAX_BACKUP_SIZE_MB) MAX_BACKUP_SIZE_MB="$val" ;;
+            SCHEDULE_FULL) SCHEDULE_FULL="$val" ;;
+            SCHEDULE_DB) SCHEDULE_DB="$val" ;;
+            SCHEDULE_FILES) SCHEDULE_FILES="$val" ;;
+            S3_ENDPOINT) S3_ENDPOINT="$val" ;;
+            S3_BUCKET) S3_BUCKET="$val" ;;
+            S3_PATH) S3_PATH="$val" ;;
+            S3_ACCESS_KEY) S3_ACCESS_KEY="$val" ;;
+            S3_SECRET_KEY) S3_SECRET_KEY="$val" ;;
+            S3_REGION) S3_REGION="$val" ;;
+            BACKUP_PASSWORD) BACKUP_PASSWORD="$val" ;;
+            BACKUP_PASSWORD_FILE) BACKUP_PASSWORD_FILE="$val" ;;
+        esac
+    done < "$file"
+}
+
+env_escape() {
+    local val="$1"
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    echo "$val"
+}
+
+write_password_file() {
+    local file="$BACKUP_PASSWORD_FILE"
+    mkdir -p "$(dirname "$file")"
+    printf '%s' "$1" > "$file"
+    chmod 600 "$file" 2> "$SILENT_LOG" || true
+}
+
+read_password_file() {
+    local file="$BACKUP_PASSWORD_FILE"
+    if [[ -n "$file" && -f "$file" ]]; then
+        IFS= read -r BACKUP_PASSWORD < "$file" || true
+        return 0
+    fi
+    return 1
+}
+
 save_config() {
     debug_log "CONFIG" "=== save_config ==="
     debug_log "CONFIG" "Creating config dir: $INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
     debug_log "CONFIG" "Writing config to: $CONFIG_FILE"
+    local BOT_TOKEN_ESC CHAT_ID_ESC TG_MESSAGE_THREAD_ID_ESC BOT_PATH_ESC DB_USER_ESC
+    local SCHEDULE_FULL_ESC SCHEDULE_DB_ESC SCHEDULE_FILES_ESC MAX_BACKUPS_COUNT_ESC
+    local BOT_CONTAINER_NAME_ESC DB_CONTAINER_NAME_ESC IGNORE_MISMATCH_ESC EXCLUDE_DIRS_ESC
+    local MAX_FILE_SIZE_MB_ESC REMOTE_STORAGE_TYPE_ESC REMOTE_STORAGE_URL_ESC REMOTE_STORAGE_USER_ESC
+    local REMOTE_STORAGE_PASS_ESC SEND_TO_TELEGRAM_ESC TG_SEND_FILE_ESC SEND_TO_REMOTE_ESC
+    local DELETE_MODE_ESC RETENTION_DAYS_ESC MAX_BACKUP_SIZE_MB_ESC S3_ENDPOINT_ESC S3_BUCKET_ESC
+    local S3_PATH_ESC S3_ACCESS_KEY_ESC S3_SECRET_KEY_ESC S3_REGION_ESC BACKUP_PASSWORD_FILE_ESC
+
+    BOT_TOKEN_ESC=$(env_escape "$BOT_TOKEN")
+    CHAT_ID_ESC=$(env_escape "$CHAT_ID")
+    TG_MESSAGE_THREAD_ID_ESC=$(env_escape "$TG_MESSAGE_THREAD_ID")
+    BOT_PATH_ESC=$(env_escape "$BOT_PATH")
+    DB_USER_ESC=$(env_escape "$DB_USER")
+    SCHEDULE_FULL_ESC=$(env_escape "$SCHEDULE_FULL")
+    SCHEDULE_DB_ESC=$(env_escape "$SCHEDULE_DB")
+    SCHEDULE_FILES_ESC=$(env_escape "$SCHEDULE_FILES")
+    MAX_BACKUPS_COUNT_ESC=$(env_escape "$MAX_BACKUPS_COUNT")
+    BOT_CONTAINER_NAME_ESC=$(env_escape "$BOT_CONTAINER_NAME")
+    DB_CONTAINER_NAME_ESC=$(env_escape "$DB_CONTAINER_NAME")
+    IGNORE_MISMATCH_ESC=$(env_escape "$IGNORE_MISMATCH")
+    EXCLUDE_DIRS_ESC=$(env_escape "$EXCLUDE_DIRS")
+    MAX_FILE_SIZE_MB_ESC=$(env_escape "$MAX_FILE_SIZE_MB")
+    REMOTE_STORAGE_TYPE_ESC=$(env_escape "$REMOTE_STORAGE_TYPE")
+    REMOTE_STORAGE_URL_ESC=$(env_escape "$REMOTE_STORAGE_URL")
+    REMOTE_STORAGE_USER_ESC=$(env_escape "$REMOTE_STORAGE_USER")
+    REMOTE_STORAGE_PASS_ESC=$(env_escape "$REMOTE_STORAGE_PASS")
+    SEND_TO_TELEGRAM_ESC=$(env_escape "$SEND_TO_TELEGRAM")
+    TG_SEND_FILE_ESC=$(env_escape "$TG_SEND_FILE")
+    SEND_TO_REMOTE_ESC=$(env_escape "$SEND_TO_REMOTE")
+    DELETE_MODE_ESC=$(env_escape "$DELETE_MODE")
+    RETENTION_DAYS_ESC=$(env_escape "$RETENTION_DAYS")
+    MAX_BACKUP_SIZE_MB_ESC=$(env_escape "$MAX_BACKUP_SIZE_MB")
+    S3_ENDPOINT_ESC=$(env_escape "$S3_ENDPOINT")
+    S3_BUCKET_ESC=$(env_escape "$S3_BUCKET")
+    S3_PATH_ESC=$(env_escape "$S3_PATH")
+    S3_ACCESS_KEY_ESC=$(env_escape "$S3_ACCESS_KEY")
+    S3_SECRET_KEY_ESC=$(env_escape "$S3_SECRET_KEY")
+    S3_REGION_ESC=$(env_escape "$S3_REGION")
+    BACKUP_PASSWORD_FILE_ESC=$(env_escape "$BACKUP_PASSWORD_FILE")
+
     cat > "$CONFIG_FILE" <<EOF
-BOT_TOKEN="$BOT_TOKEN"
-CHAT_ID="$CHAT_ID"
-TG_MESSAGE_THREAD_ID="$TG_MESSAGE_THREAD_ID"
-BOT_PATH="$BOT_PATH"
-DB_USER="$DB_USER"
-SCHEDULE_FULL="$SCHEDULE_FULL"
-SCHEDULE_DB="$SCHEDULE_DB"
-SCHEDULE_FILES="$SCHEDULE_FILES"
-MAX_BACKUPS_COUNT="$MAX_BACKUPS_COUNT"
-BOT_CONTAINER_NAME="$BOT_CONTAINER_NAME"
-DB_CONTAINER_NAME="$DB_CONTAINER_NAME"
-IGNORE_MISMATCH="$IGNORE_MISMATCH"
-EXCLUDE_DIRS="$EXCLUDE_DIRS"
-MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB"
-REMOTE_STORAGE_TYPE="$REMOTE_STORAGE_TYPE"
-REMOTE_STORAGE_URL="$REMOTE_STORAGE_URL"
-REMOTE_STORAGE_USER="$REMOTE_STORAGE_USER"
-REMOTE_STORAGE_PASS="$REMOTE_STORAGE_PASS"
-BACKUP_PASSWORD="$BACKUP_PASSWORD"
-SEND_TO_TELEGRAM="$SEND_TO_TELEGRAM"
-TG_SEND_FILE="$TG_SEND_FILE"
-SEND_TO_REMOTE="$SEND_TO_REMOTE"
-DELETE_MODE="$DELETE_MODE"
-RETENTION_DAYS="$RETENTION_DAYS"
-MAX_BACKUP_SIZE_MB="$MAX_BACKUP_SIZE_MB"
-S3_ENDPOINT="$S3_ENDPOINT"
-S3_BUCKET="$S3_BUCKET"
-S3_PATH="$S3_PATH"
-S3_ACCESS_KEY="$S3_ACCESS_KEY"
-S3_SECRET_KEY="$S3_SECRET_KEY"
-S3_REGION="$S3_REGION"
+BOT_TOKEN="$BOT_TOKEN_ESC"
+CHAT_ID="$CHAT_ID_ESC"
+TG_MESSAGE_THREAD_ID="$TG_MESSAGE_THREAD_ID_ESC"
+BOT_PATH="$BOT_PATH_ESC"
+DB_USER="$DB_USER_ESC"
+SCHEDULE_FULL="$SCHEDULE_FULL_ESC"
+SCHEDULE_DB="$SCHEDULE_DB_ESC"
+SCHEDULE_FILES="$SCHEDULE_FILES_ESC"
+MAX_BACKUPS_COUNT="$MAX_BACKUPS_COUNT_ESC"
+BOT_CONTAINER_NAME="$BOT_CONTAINER_NAME_ESC"
+DB_CONTAINER_NAME="$DB_CONTAINER_NAME_ESC"
+IGNORE_MISMATCH="$IGNORE_MISMATCH_ESC"
+EXCLUDE_DIRS="$EXCLUDE_DIRS_ESC"
+MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB_ESC"
+REMOTE_STORAGE_TYPE="$REMOTE_STORAGE_TYPE_ESC"
+REMOTE_STORAGE_URL="$REMOTE_STORAGE_URL_ESC"
+REMOTE_STORAGE_USER="$REMOTE_STORAGE_USER_ESC"
+REMOTE_STORAGE_PASS="$REMOTE_STORAGE_PASS_ESC"
+BACKUP_PASSWORD=""
+BACKUP_PASSWORD_FILE="$BACKUP_PASSWORD_FILE_ESC"
+SEND_TO_TELEGRAM="$SEND_TO_TELEGRAM_ESC"
+TG_SEND_FILE="$TG_SEND_FILE_ESC"
+SEND_TO_REMOTE="$SEND_TO_REMOTE_ESC"
+DELETE_MODE="$DELETE_MODE_ESC"
+RETENTION_DAYS="$RETENTION_DAYS_ESC"
+MAX_BACKUP_SIZE_MB="$MAX_BACKUP_SIZE_MB_ESC"
+S3_ENDPOINT="$S3_ENDPOINT_ESC"
+S3_BUCKET="$S3_BUCKET_ESC"
+S3_PATH="$S3_PATH_ESC"
+S3_ACCESS_KEY="$S3_ACCESS_KEY_ESC"
+S3_SECRET_KEY="$S3_SECRET_KEY_ESC"
+S3_REGION="$S3_REGION_ESC"
 EOF
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
@@ -3320,8 +3519,8 @@ load_or_create_config() {
     local config_existed=false
     if [[ -f "$CONFIG_FILE" ]]; then 
         config_existed=true
-        debug_log "CONFIG" "Config exists, sourcing..."
-        source "$CONFIG_FILE"
+        debug_log "CONFIG" "Config exists, loading safely..."
+        load_config_file "$CONFIG_FILE"
         debug_log "CONFIG" "Config loaded successfully"
     else
         debug_log "CONFIG" "Config file not found, using defaults"
@@ -3337,6 +3536,7 @@ load_or_create_config() {
     if [[ -z "$RETENTION_DAYS" ]]; then RETENTION_DAYS="7"; fi
     if [[ -z "$MAX_BACKUP_SIZE_MB" ]]; then MAX_BACKUP_SIZE_MB="0"; fi
     if [[ -z "$S3_REGION" ]]; then S3_REGION="us-east-1"; fi
+    if [[ -z "$BACKUP_PASSWORD_FILE" ]]; then BACKUP_PASSWORD_FILE="$INSTALL_DIR/.password"; fi
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -3352,6 +3552,18 @@ load_or_create_config() {
     if [[ -z "$BOT_PATH" || -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then 
         debug_log "CONFIG" "Bot installation not configured, starting detection"
         detect_bot_installation
+    fi
+
+    # Миграция пароля в файл (безопасный вариант)
+    if [[ -n "$BACKUP_PASSWORD" ]]; then
+        debug_log "CONFIG" "Migrating BACKUP_PASSWORD to file"
+        write_password_file "$BACKUP_PASSWORD"
+        BACKUP_PASSWORD=""
+        updated=true
+    fi
+    # Загружаем пароль из файла (если есть)
+    if [[ -z "$BACKUP_PASSWORD" ]]; then
+        read_password_file || true
     fi
     
     if $updated; then 
@@ -4811,8 +5023,8 @@ create_backup() {
         read -erp "Ваш выбор: " enc_choice
         case $enc_choice in
             1) ;; 
-            2) read -s -erp "Введите пароль шифрования: " np
-               echo ""; if [[ -n "$np" ]]; then BACKUP_PASSWORD="$np"; save_config; print_message "SUCCESS" "Пароль установлен."; else print_message "ERROR" "Пустой пароль. Отмена."; return; fi ;;
+                2) read -s -erp "Введите пароль шифрования: " np
+                    echo ""; if [[ -n "$np" ]]; then write_password_file "$np"; BACKUP_PASSWORD="$np"; save_config; print_message "SUCCESS" "Пароль установлен."; else print_message "ERROR" "Пустой пароль. Отмена."; return; fi ;;
             *) print_message "INFO" "Бэкап отменен."; return ;;
         esac
     fi
@@ -4893,18 +5105,28 @@ create_backup() {
         : > "$SKIP_FILE"
         local BOT_DIRNAME=$(basename "$BOT_PATH")
         debug_log "TAR" "BOT_DIRNAME=$BOT_DIRNAME, MAX_FILE_SIZE_MB=$MAX_FILE_SIZE_MB"
-        local FIND_CMD="find ."
-        for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then FIND_CMD+=" -path './$ex' -prune -o"; fi; done
-        FIND_CMD+=" -type f -size +${MAX_FILE_SIZE_MB}M -print"
-        debug_log "TAR" "Find command: $FIND_CMD"
-        cd "$BOT_PATH"; eval "$FIND_CMD" | while read -r f; do
+        # Построение массива аргументов find без eval (защита от инъекций через EXCLUDE_DIRS)
+        local FIND_ARGS=(".")
+        for ex in "${EXCLUDE_ARRAY[@]}"; do
+            if [[ -n "$ex" ]]; then
+                # Валидация: допускаем только безопасные имена путей
+                if [[ "$ex" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+                    FIND_ARGS+=("-path" "./$ex" "-prune" "-o")
+                else
+                    debug_log "TAR" "SKIP unsafe exclude pattern: $ex"
+                fi
+            fi
+        done
+        FIND_ARGS+=("-type" "f" "-size" "+${MAX_FILE_SIZE_MB}M" "-print")
+        debug_log "TAR" "Find args: ${FIND_ARGS[*]}"
+        cd "$BOT_PATH"; find "${FIND_ARGS[@]}" | while read -r f; do
             # Преобразуем ./path/file в BOT_DIRNAME/path/file для корректной работы --exclude-from
             echo "${BOT_DIRNAME}${f#.}"
         done > "$SKIP_FILE"
         local SKIP_COUNT=$(wc -l < "$SKIP_FILE")
         debug_log "TAR" "Large files to skip: $SKIP_COUNT"
         if [[ "$SKIP_COUNT" -gt 0 ]]; then
-            local SKIP_SIZE=$(cd "$BOT_PATH" && eval "$FIND_CMD" | tr '\n' '\0' | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
+            local SKIP_SIZE=$(cd "$BOT_PATH" && find "${FIND_ARGS[@]}" | tr '\n' '\0' | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
             print_message "WARN" "Пропущено больших файлов (>${MAX_FILE_SIZE_MB}MB): $SKIP_COUNT (общий вес: $SKIP_SIZE)"
             debug_log "TAR" "Skipped files content:"
             if [[ "$DEBUG_MODE" == true ]]; then cat "$SKIP_FILE"; fi
@@ -5147,24 +5369,385 @@ select_backup_file() {
     done
 }
 
+normalize_path() {
+    local path="$1"
+    if command -v realpath > "$SILENT_LOG" 2>&1; then
+        realpath -m "$path"
+    else
+        readlink -f "$path"
+    fi
+}
+
+get_compose_file() {
+    local compose_file=""
+    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
+    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    echo "$compose_file"
+}
+
+is_forbidden_bot_path() {
+    local path="$1"
+    case "$path" in
+        "/"|"/opt"|"/root"|"/home"|"/usr"|"/var"|"/etc"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/boot"|"/srv"|"/run"|"/proc"|"/sys")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+assert_safe_bot_path() {
+    local raw_path="$1"
+    if [[ -z "$raw_path" ]]; then
+        print_message "ERROR" "BOT_PATH не задан. Укажите путь вручную в config.env"
+        return 1
+    fi
+
+    local real_path
+    real_path=$(normalize_path "$raw_path")
+
+    if [[ "$real_path" != /* ]]; then
+        print_message "ERROR" "BOT_PATH должен быть абсолютным путем: '$raw_path'"
+        return 1
+    fi
+    if is_forbidden_bot_path "$real_path"; then
+        print_message "ERROR" "BOT_PATH слишком высокий уровень: '$real_path'"
+        return 1
+    fi
+    if [[ "$real_path" == "$(dirname "$real_path")" ]]; then
+        print_message "ERROR" "BOT_PATH указывает на корень файловой системы: '$real_path'"
+        return 1
+    fi
+    if [[ ! -d "$real_path" ]]; then
+        print_message "ERROR" "BOT_PATH не существует: '$real_path'"
+        return 1
+    fi
+
+    BOT_PATH="$real_path"
+
+    local compose_file
+    compose_file=$(get_compose_file)
+    if [[ -z "$compose_file" ]]; then
+        print_message "ERROR" "В BOT_PATH не найден compose.yaml или docker-compose.yml"
+        return 1
+    fi
+
+    local services
+    services=$(docker compose -f "$compose_file" config --services 2> "$SILENT_LOG")
+    if [[ -z "$services" ]]; then
+        print_message "ERROR" "Не удалось определить сервисы compose для BOT_PATH=$BOT_PATH"
+        return 1
+    fi
+
+    local bot_ok=false
+    for key in "${KEYWORDS[@]}"; do
+        if echo "$services" | grep -qx "$key"; then
+            bot_ok=true
+            break
+        fi
+    done
+    if [[ "$bot_ok" == false && -n "$BOT_CONTAINER_NAME" ]]; then
+        if echo "$services" | grep -q "$BOT_CONTAINER_NAME"; then
+            bot_ok=true
+        fi
+    fi
+    if [[ "$bot_ok" == false ]]; then
+        print_message "ERROR" "Compose в BOT_PATH не похож на бота (services: $services)"
+        return 1
+    fi
+
+    local db_ok=false
+    if [[ -n "$DB_SERVICE_NAME" ]] && echo "$services" | grep -qx "$DB_SERVICE_NAME"; then
+        db_ok=true
+    else
+        for svc in db postgres database postgresql; do
+            if echo "$services" | grep -qx "$svc"; then
+                DB_SERVICE_NAME="$svc"
+                db_ok=true
+                break
+            fi
+        done
+    fi
+    if [[ "$db_ok" == false ]]; then
+        print_message "ERROR" "Compose не содержит сервис БД (ожидался '$DB_SERVICE_NAME')"
+        return 1
+    fi
+
+    return 0
+}
+
+confirm_restore_target() {
+    if [[ "$IS_INTERACTIVE" == true ]]; then
+        echo ""
+        print_message "WARN" "Введите точную строку подтверждения для продолжения:"
+        local expected="RESTORE_TO:$BOT_PATH"
+        echo -e "${CYAN}$expected${RESET}"
+        read -r confirm
+        if [[ "$confirm" != "$expected" ]]; then
+            print_message "INFO" "Отменено пользователем."
+            return 1
+        fi
+        return 0
+    fi
+
+    if [[ "$AUTO_CONFIRM" == "true" && "$RESTORE_FORCE" == "true" ]]; then
+        return 0
+    fi
+
+    print_message "ERROR" "Restore требует подтверждения. Используйте --i-know-what-i-am-doing вместе с --yes"
+    return 1
+}
+
+confirm_drop_volume() {
+    local volume_name="$1"
+    if [[ "$RESTORE_DROP_VOLUME" != "true" ]]; then
+        print_message "INFO" "Удаление volume отключено. Используйте --restore-drop-volume при необходимости."
+        return 1
+    fi
+
+    if [[ "$IS_INTERACTIVE" == true ]]; then
+        echo ""
+        print_message "WARN" "Будет удален volume БД. Это полностью удалит данные в volume."
+        local expected="DROP_VOLUME:$volume_name"
+        echo -e "${CYAN}$expected${RESET}"
+        read -r confirm
+        if [[ "$confirm" != "$expected" ]]; then
+            print_message "INFO" "Удаление volume отменено пользователем."
+            return 1
+        fi
+        return 0
+    fi
+
+    if [[ "$AUTO_CONFIRM" == "true" && "$RESTORE_FORCE" == "true" ]]; then
+        return 0
+    fi
+
+    print_message "ERROR" "Удаление volume требует --restore-drop-volume вместе с --yes и --i-know-what-i-am-doing"
+    return 1
+}
+
+validate_tar_safety() {
+    local archive="$1"
+    local list_file="$2"
+
+    if ! tar -tzf "$archive" > "$list_file" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Архив поврежден или не tar.gz: $archive"
+        return 1
+    fi
+
+    if grep -Eq '(^/|^[A-Za-z]:|(^|/)\.\.(|/))' "$list_file"; then
+        print_message "ERROR" "Архив содержит небезопасные пути: $archive"
+        return 1
+    fi
+
+    if tar -tvf "$archive" 2> "$SILENT_LOG" | awk '{print substr($1,1,1)}' | grep -Eq '^[lh]'; then
+        print_message "ERROR" "Архив содержит ссылки (symlink/hardlink), восстановление запрещено"
+        return 1
+    fi
+
+    return 0
+}
+
+get_restore_stage_root() {
+    local stage_dir="$1"
+    local entries=("$stage_dir"/*)
+    local count=0
+    local root=""
+    for entry in "${entries[@]}"; do
+        [[ ! -e "$entry" ]] && continue
+        count=$((count + 1))
+        root="$entry"
+    done
+    if [[ $count -ne 1 || ! -d "$root" ]]; then
+        print_message "ERROR" "Ожидалась одна корневая папка в архиве (найдено: $count)"
+        return 1
+    fi
+    echo "$root"
+}
+
+restore_rsync_preview() {
+    local src="$1"
+    local dst="$2"
+    local extra_excludes=()
+    if [[ "$RESTORE_INCLUDE_ENV" != "true" ]]; then
+        extra_excludes+=("--exclude" ".env")
+        extra_excludes+=("--exclude" ".env.*")
+    fi
+
+    rsync -a --delete --safe-links --itemize-changes --dry-run "${extra_excludes[@]}" "$src/" "$dst/"
+}
+
+restore_rsync_apply() {
+    local src="$1"
+    local dst="$2"
+    local extra_excludes=()
+    if [[ "$RESTORE_INCLUDE_ENV" != "true" ]]; then
+        extra_excludes+=("--exclude" ".env")
+        extra_excludes+=("--exclude" ".env.*")
+    fi
+
+    rsync -a --delete --safe-links "${extra_excludes[@]}" "$src/" "$dst/"
+}
+
+assert_db_container_matches_bot() {
+    if [[ -z "$DB_CONTAINER_NAME" ]]; then
+        print_message "ERROR" "DB_CONTAINER_NAME не задан"
+        return 1
+    fi
+    local work_dir
+    work_dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$DB_CONTAINER_NAME" 2> "$SILENT_LOG")
+    if [[ -z "$work_dir" ]]; then
+        print_message "ERROR" "Не удалось определить working_dir контейнера БД"
+        return 1
+    fi
+    local real_work
+    local real_bot
+    real_work=$(normalize_path "$work_dir")
+    real_bot=$(normalize_path "$BOT_PATH")
+    if [[ "$real_work" != "$real_bot" ]]; then
+        print_message "ERROR" "Контейнер БД не принадлежит BOT_PATH (ожидался $real_bot, найден $real_work)"
+        return 1
+    fi
+    return 0
+}
+
+# --- assert_safe_db_target: проверяет что БД контейнер соответствует целевому проекту ---
+# Выполняет: 1) belongs to working_dir, 2) psql current_database() check, 3) показывает инфо
+assert_safe_db_target() {
+    local container="$1"
+    local expected_user="$2"
+    local expected_db="$3"
+
+    if [[ -z "$container" ]]; then
+        print_message "ERROR" "assert_safe_db_target: контейнер не задан"
+        return 1
+    fi
+
+    # 1) Контейнер запущен
+    if ! docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+        print_message "ERROR" "Контейнер БД не запущен: $container"
+        return 1
+    fi
+
+    # 2) Контейнер принадлежит BOT_PATH (уже проверено assert_db_container_matches_bot, но проверим ещё раз)
+    local work_dir
+    work_dir=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$container" 2> "$SILENT_LOG")
+    if [[ -n "$work_dir" && -n "$BOT_PATH" ]]; then
+        local real_work real_bot
+        real_work=$(normalize_path "$work_dir")
+        real_bot=$(normalize_path "$BOT_PATH")
+        if [[ "$real_work" != "$real_bot" ]]; then
+            print_message "ERROR" "Контейнер БД '$container' принадлежит проекту '$real_work', а не '$real_bot'"
+            return 1
+        fi
+    fi
+
+    # 3) PostgreSQL доступен и current_database совпадает
+    local actual_db
+    actual_db=$(docker exec "$container" psql -U "$expected_user" -tAc "SELECT current_database()" 2> "$SILENT_LOG")
+    if [[ -z "$actual_db" ]]; then
+        print_message "ERROR" "Не удалось подключиться к PostgreSQL в контейнере '$container'"
+        return 1
+    fi
+
+    if [[ "$actual_db" != "$expected_db" ]]; then
+        print_message "ERROR" "current_database()='$actual_db', ожидалось '$expected_db'"
+        return 1
+    fi
+
+    debug_log "RESTORE" "assert_safe_db_target OK: container=$container, db=$actual_db, user=$expected_user"
+    return 0
+}
+
+# --- confirm_drop_schema: подтверждение DROP SCHEMA с safety snapshot ---
+# Безопасное по умолчанию: без флага --restore-drop-schema DROP SCHEMA не выполняется
+confirm_drop_schema() {
+    local db_container="$1"
+    local db_user="$2"
+    local db_name="$3"
+    local backup_dir="$4"
+
+    # === БЕЗОПАСНЫЙ СНАПШОТ ПЕРЕД DROP ===
+    local snapshot_file="${backup_dir}/pre_restore_snapshot_$(date +%Y%m%d_%H%M%S).sql.gz"
+    print_message "INFO" "Создание safety snapshot БД перед DROP SCHEMA..."
+    if docker exec "$db_container" pg_dump -U "$db_user" "$db_name" 2> "$SILENT_LOG" | gzip > "$snapshot_file"; then
+        local snap_size
+        snap_size=$(du -h "$snapshot_file" 2>/dev/null | cut -f1)
+        print_message "SUCCESS" "Safety snapshot: $snapshot_file ($snap_size)"
+    else
+        print_message "ERROR" "Не удалось создать safety snapshot! Восстановление прервано."
+        rm -f "$snapshot_file"
+        return 1
+    fi
+
+    # === ИНТЕРАКТИВНЫЙ РЕЖИМ ===
+    if [[ "$IS_INTERACTIVE" == true ]]; then
+        if [[ "$AUTO_CONFIRM" == "true" && "$RESTORE_FORCE" == "true" ]]; then
+            print_message "WARN" "AUTO_CONFIRM+FORCE: DROP SCHEMA пропущен в интерактивном режиме без --restore-drop-schema"
+            if [[ "$RESTORE_DROP_SCHEMA" != "true" ]]; then
+                return 1
+            fi
+            return 0
+        fi
+
+        echo ""
+        echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
+        echo -e "${RED}${BOLD}  ⚠️  ОЧИСТКА СХЕМЫ БАЗЫ ДАННЫХ!                 ${RESET}"
+        echo -e "${RED}${BOLD}══════════════════════════════════════════════════${RESET}"
+        echo ""
+        echo "Контейнер:  $db_container"
+        echo "База данных: $db_name"
+        echo "Пользователь: $db_user"
+        echo ""
+        echo "Будет выполнено: DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+        echo "Это УНИЧТОЖИТ все таблицы, данные и индексы в схеме public."
+        echo ""
+        echo -e "Safety snapshot сохранён: ${GREEN}$snapshot_file${RESET}"
+        echo ""
+        local expected="DROP_SCHEMA_IN:${db_name}"
+        echo -n "Введите для подтверждения: "
+        echo -e "${CYAN}$expected${RESET}"
+        read -r confirm
+        if [[ "$confirm" != "$expected" ]]; then
+            print_message "INFO" "DROP SCHEMA отменён пользователем."
+            return 1
+        fi
+        return 0
+    fi
+
+    # === НЕ-ИНТЕРАКТИВНЫЙ РЕЖИМ ===
+    if [[ "$RESTORE_DROP_SCHEMA" != "true" ]]; then
+        print_message "ERROR" "DROP SCHEMA требует --restore-drop-schema в не-интерактивном режиме"
+        return 1
+    fi
+
+    if [[ "$AUTO_CONFIRM" == "true" && "$RESTORE_FORCE" == "true" ]]; then
+        return 0
+    fi
+
+    print_message "ERROR" "DROP SCHEMA требует --restore-drop-schema вместе с --yes и --i-know-what-i-am-doing"
+    return 1
+}
+
 execute_restore() {
     local MODE="$1"; local FILE="$2"
     debug_log "RESTORE" "=== execute_restore ==="
     debug_log "RESTORE" "Mode: $MODE, File: $FILE"
     echo ""; print_message "WARN" "ВНИМАНИЕ: Текущие данные будут перезаписаны!"
-    read -erp "Продолжить? (y/n): " confirm; [[ "$confirm" != "y" ]] && return
+    if [[ "$IS_INTERACTIVE" == true ]]; then
+        read -erp "Продолжить? (y/n): " confirm; [[ "$confirm" != "y" ]] && return
+    fi
 
     local TMP_DIR="$BACKUP_DIR/restore_tmp_$$"
     mkdir -p "$TMP_DIR"
     debug_log "RESTORE" "Temp dir: $TMP_DIR"
-    
+
     local WORK_FILE="$FILE"
     if [[ "$FILE" == *".enc" ]]; then
         print_message "INFO" "Файл зашифрован. Требуется пароль."
         debug_log "RESTORE" "File is encrypted, requesting password..."
         read -s -erp "Пароль: " decrypt_pass; echo ""
         local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
-        
+
         debug_log "RESTORE" "Decrypting to: $DECRYPTED_FILE"
         export LAZARUS_DEC_PASS="$decrypt_pass"
         openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$FILE" -out "$DECRYPTED_FILE" -pass env:LAZARUS_DEC_PASS 2> "$SILENT_LOG"
@@ -5177,67 +5760,132 @@ execute_restore() {
         WORK_FILE="$DECRYPTED_FILE"
     fi
 
-    print_message "INFO" "Распаковка..."
-    debug_log "RESTORE" "Extracting: tar -xzf $WORK_FILE -C $TMP_DIR"
-    tar -xzf "$WORK_FILE" -C "$TMP_DIR"
-    debug_log "RESTORE" "Contents: $(ls -la "$TMP_DIR")"
+    local DB_DUMP=""
+    local DIR_ARC=""
 
-    local DB_DUMP=$(find "$TMP_DIR" -name "db_*.sql.gz" | head -1)
-    local DIR_ARC=$(find "$TMP_DIR" -name "dir_*.tar.gz" | head -1)
+    if [[ "$MODE" == "files_only" ]]; then
+        DIR_ARC="$WORK_FILE"
+    else
+        local OUTER_LIST="$TMP_DIR/outer_list.txt"
+        if ! validate_tar_safety "$WORK_FILE" "$OUTER_LIST"; then rm -rf "$TMP_DIR"; return; fi
+
+        print_message "INFO" "Распаковка..."
+        debug_log "RESTORE" "Extracting: tar -xzf $WORK_FILE -C $TMP_DIR"
+        tar -xzf "$WORK_FILE" -C "$TMP_DIR" --no-same-owner --no-same-permissions
+        debug_log "RESTORE" "Contents: $(ls -la "$TMP_DIR")"
+
+        DB_DUMP=$(find "$TMP_DIR" -name "db_*.sql.gz" | head -1)
+        DIR_ARC=$(find "$TMP_DIR" -name "dir_*.tar.gz" | head -1)
+    fi
+
     debug_log "RESTORE" "DB_DUMP: $DB_DUMP"
     debug_log "RESTORE" "DIR_ARC: $DIR_ARC"
 
-    if [[ "$MODE" == "full" && -n "$DIR_ARC" ]]; then
+    if [[ "$MODE" == "full" || "$MODE" == "files_only" ]]; then
         if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi
+        if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return; fi
+        if [[ -z "$DIR_ARC" || ! -f "$DIR_ARC" ]]; then
+            print_message "ERROR" "Архив с файлами не найден."
+            rm -rf "$TMP_DIR"
+            return
+        fi
+
+        local DIR_LIST="$TMP_DIR/dir_list.txt"
+        if ! validate_tar_safety "$DIR_ARC" "$DIR_LIST"; then rm -rf "$TMP_DIR"; return; fi
+
+        local STAGE_DIR="$TMP_DIR/restore_stage"
+        mkdir -p "$STAGE_DIR"
+        tar -xzf "$DIR_ARC" -C "$STAGE_DIR" --no-same-owner --no-same-permissions
+
+        local ROOT_DIR
+        ROOT_DIR=$(get_restore_stage_root "$STAGE_DIR") || { rm -rf "$TMP_DIR"; return; }
+
+        print_message "INFO" "План синхронизации (dry-run):"
+        local PLAN_FILE="$TMP_DIR/restore_plan.txt"
+        restore_rsync_preview "$ROOT_DIR" "$BOT_PATH" > "$PLAN_FILE" 2>&1 || true
+        if [[ -s "$PLAN_FILE" ]]; then
+            head -n 25 "$PLAN_FILE"
+            if [[ $(wc -l < "$PLAN_FILE") -gt 25 ]]; then
+                echo "..."
+            fi
+        else
+            echo "(Изменений не обнаружено)"
+        fi
+
+        if ! confirm_restore_target; then rm -rf "$TMP_DIR"; return; fi
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            print_message "INFO" "DRY-RUN: восстановление пропущено"
+            rm -rf "$TMP_DIR"
+            return
+        fi
+
         print_message "INFO" "Остановка контейнеров..."
         debug_log "RESTORE" "Stopping containers in $BOT_PATH"
         cd "$BOT_PATH" && docker compose down 2> "$SILENT_LOG"
-        print_message "INFO" "Очистка папки..."
-        debug_log "RESTORE" "Cleaning $BOT_PATH/*"
-        rm -rf "$BOT_PATH"/*
-        print_message "INFO" "Извлечение файлов..."
-        debug_log "RESTORE" "Extracting: tar -xzf $DIR_ARC -C $(dirname "$BOT_PATH")"
-        tar -xzf "$DIR_ARC" -C "$(dirname "$BOT_PATH")"
-        
-        # Определяем имя volume автоматически
-        local volume_name=$(get_db_volume_name)
-        debug_log "RESTORE" "DB Volume: $volume_name"
-        if [[ -n "$volume_name" ]]; then
-            print_message "INFO" "Удаление старого volume: $volume_name"
-            debug_log "RESTORE" "Running: docker volume rm $volume_name"
-            docker volume rm "$volume_name" 2> "$SILENT_LOG" || true
-        else
-            print_message "WARN" "Volume БД не определён, пропускаем удаление."
+
+        print_message "INFO" "Синхронизация файлов..."
+        restore_rsync_apply "$ROOT_DIR" "$BOT_PATH"
+
+        if [[ "$MODE" == "full" ]]; then
+            if ! assert_db_container_matches_bot; then rm -rf "$TMP_DIR"; return; fi
+            local volume_name
+            volume_name=$(get_db_volume_name)
+            debug_log "RESTORE" "DB Volume: $volume_name"
+            if [[ -n "$volume_name" ]]; then
+                if confirm_drop_volume "$volume_name"; then
+                    print_message "INFO" "Удаление старого volume: $volume_name"
+                    debug_log "RESTORE" "Running: docker volume rm $volume_name"
+                    docker volume rm "$volume_name" 2> "$SILENT_LOG" || true
+                else
+                    print_message "INFO" "Пропускаем удаление volume БД."
+                fi
+            else
+                print_message "WARN" "Volume БД не определён, пропускаем удаление."
+            fi
+
+            print_message "INFO" "Запуск БД..."
+            debug_log "RESTORE" "Running: docker compose up -d $DB_SERVICE_NAME"
+            docker compose up -d "$DB_SERVICE_NAME"
+            sleep 5
         fi
-        
-        print_message "INFO" "Запуск БД..."
-        debug_log "RESTORE" "Running: docker compose up -d $DB_SERVICE_NAME"
-        docker compose up -d "$DB_SERVICE_NAME"
-        sleep 5
     fi
 
     if [[ -n "$DB_DUMP" ]]; then
         print_message "INFO" "Импорт базы данных..."
         if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi
-        
-        # Получаем параметры БД из .env бота
-        local ACTUAL_DB_USER=$(get_db_user)
-        local ACTUAL_DB_NAME=$(get_db_name)
+        if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return; fi
+        if ! assert_db_container_matches_bot; then rm -rf "$TMP_DIR"; return; fi
+
+        local ACTUAL_DB_USER
+        local ACTUAL_DB_NAME
+        ACTUAL_DB_USER=$(get_db_user)
+        ACTUAL_DB_NAME=$(get_db_name)
         debug_log "RESTORE" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
-        
-        # Согласно официальной документации: очищаем схему перед импортом
-        # https://docs.remnawave.shop/ru/private/backup/
-        print_message "INFO" "Очистка схемы БД (DROP SCHEMA public CASCADE)..."
-        debug_log "RESTORE" "Running: docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER -c 'DROP SCHEMA...'"
-        docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
-        
+
+        # Проверяем что целевая БД валидна
+        if ! assert_safe_db_target "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME"; then
+            print_message "ERROR" "Целевая БД не прошла проверку безопасности. Восстановление прервано."
+            rm -rf "$TMP_DIR"
+            return
+        fi
+
+        # DROP SCHEMA требует явного подтверждения — safe by default
+        if confirm_drop_schema "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$BACKUP_DIR"; then
+            print_message "INFO" "Очистка схемы БД (DROP SCHEMA public CASCADE)..."
+            debug_log "RESTORE" "Running: docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER -c 'DROP SCHEMA...'"
+            docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+        else
+            print_message "WARN" "DROP SCHEMA пропущен. Импорт может завершиться с ошибками из-за существующих таблиц."
+        fi
+
         print_message "INFO" "Импорт данных (user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME)..."
         debug_log "RESTORE" "Running: zcat $DB_DUMP | docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER $ACTUAL_DB_NAME"
         zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" > "$SILENT_LOG" 2>&1
         debug_log "RESTORE" "DB import complete"
     fi
 
-    if [[ "$MODE" == "full" ]]; then
+    if [[ "$MODE" == "full" || "$MODE" == "files_only" ]]; then
         print_message "INFO" "Запуск всех контейнеров..."
         debug_log "RESTORE" "Running: docker compose up -d"
         cd "$BOT_PATH" && docker compose up -d
@@ -5247,7 +5895,9 @@ execute_restore() {
     debug_log "RESTORE" "Temp dir cleaned up"
     print_message "SUCCESS" "Восстановление успешно завершено."
     log_message "SUCCESS" "Restore completed (mode=$MODE, file=$FILE)"
-    read -erp "Нажмите Enter..." dummy
+    if [[ "$IS_INTERACTIVE" == true ]]; then
+        read -erp "Нажмите Enter..." dummy
+    fi
 }
 
 # --- МЕНЮШКИ ---
@@ -5295,12 +5945,8 @@ menu_restore() {
         case $r_choice in
             1) if select_backup_file "lazarus_full" "Полные бэкапы"; then execute_restore "full" "$SELECTED_FILE"; fi ;;
             2) if select_backup_file "lazarus_db" "Бэкапы БД"; then execute_restore "db_only" "$SELECTED_FILE"; fi ;;
-            3) if select_backup_file "lazarus_files" "Бэкапы Файлов"; then 
-                   echo ""; print_message "WARN" "Будут перезаписаны файлы в папке бота!"
-                   read -erp "Продолжить? (y/n): " cf
-                   if [[ "$cf" == "y" ]]; then 
-                       if ensure_bot_path; then tar -xzf "$SELECTED_FILE" -C "$(dirname "$BOT_PATH")"; print_message "SUCCESS" "Файлы распакованы."; read -erp "Enter..." dummy; fi
-                   fi
+            3) if select_backup_file "lazarus_files" "Бэкапы Файлов"; then
+                   execute_restore "files_only" "$SELECTED_FILE"
                fi ;;
             0) return ;;
         esac
@@ -12995,11 +13641,12 @@ cleanup_old_backups() {
 }
 
 # --- MAIN LOOP ---
-rotate_internal_log
-check_dependencies
-install_script
-load_or_create_config
-check_config_mismatch # Проверка при запуске
+if [[ "${LAZARUS_LIB}" != "true" ]]; then
+    rotate_internal_log
+    check_dependencies
+    install_script
+    load_or_create_config
+    check_config_mismatch # Проверка при запуске
 
 # Проверка соответствия версий Docker image
 check_and_warn_version_mismatch() {
@@ -13060,10 +13707,10 @@ for _arg in "$@"; do
     esac
 done
 
-if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && "$_SKIP_VERSION_CHECK" == false ]]; then
-    check_and_warn_version_mismatch
-fi
-unset _SKIP_VERSION_CHECK
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && "$_SKIP_VERSION_CHECK" == false ]]; then
+        check_and_warn_version_mismatch
+    fi
+    unset _SKIP_VERSION_CHECK
 
 # --- Global CLI flags parsing ---
 # Support calling like: lazarus --yes --dry-run cleanup
@@ -13078,105 +13725,115 @@ for _a in "$@"; do
         --dry-run|-n) DRY_RUN="true" ;;
         --report-tg) REPORT_TO_TG="true" ;;
         --debug|-d) DEBUG_MODE=true ;;
+        --i-know-what-i-am-doing) RESTORE_FORCE="true" ;;
+        --restore-include-env) RESTORE_INCLUDE_ENV="true" ;;
+        --restore-drop-volume) RESTORE_DROP_VOLUME="true" ;;
+        --restore-drop-schema) RESTORE_DROP_SCHEMA="true" ;;
         *) _NEWARGS+=("$_a") ;;
     esac
 done
 set -- "${_NEWARGS[@]}"
 
 # Debug mode banner
-if [[ "$DEBUG_MODE" == true ]]; then
-    SILENT_LOG="/dev/stderr"
-    CURL_SILENT="-v"
-    WGET_SILENT=""
-    echo -e "${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${MAGENTA}${BOLD}║                    DEBUG MODE ENABLED                          ║${RESET}"
-    echo -e "${MAGENTA}${BOLD}║  All operations will be logged in detail to console           ║${RESET}"
-    echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
-    echo ""
-    echo -e "${CYAN}=== SYSTEM INFO ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} LAZARUS Version: $VERSION"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Bash Version: $BASH_VERSION"
-    echo -e "${MAGENTA}[DEBUG]${RESET} User: $(whoami) (UID: $EUID)"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Hostname: $(hostname)"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo ""
-    echo -e "${CYAN}=== CONFIG ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Config file: $CONFIG_FILE"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Install dir: $INSTALL_DIR"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Backup dir: $BACKUP_DIR"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Log file: $LOG_FILE"
-    echo ""
-    echo -e "${CYAN}=== BOT CONFIG ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Bot path: ${BOT_PATH:-<not set>}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Bot container: ${BOT_CONTAINER_NAME:-<not set>}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} DB container: ${DB_CONTAINER_NAME:-<not set>}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} DB user: ${DB_USER:-postgres}"
-    echo ""
-    echo -e "${CYAN}=== TELEGRAM ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Notifications: $SEND_TO_TELEGRAM"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Send file: $TG_SEND_FILE"
-    # Маскируем токен: показываем только первые 4 и последние 4 символа
-    _masked_token="<not set>"
-    if [[ -n "$BOT_TOKEN" ]]; then
-        if [[ ${#BOT_TOKEN} -gt 10 ]]; then
-            _masked_token="${BOT_TOKEN:0:4}****${BOT_TOKEN: -4}"
-        else
-            _masked_token="<set>"
+    if [[ "$DEBUG_MODE" == true ]]; then
+        SILENT_LOG="/dev/stderr"
+        CURL_SILENT="-v"
+        WGET_SILENT=""
+        echo -e "${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
+        echo -e "${MAGENTA}${BOLD}║                    DEBUG MODE ENABLED                          ║${RESET}"
+        echo -e "${MAGENTA}${BOLD}║  All operations will be logged in detail to console           ║${RESET}"
+        echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════════════╝${RESET}"
+        echo ""
+        echo -e "${CYAN}=== SYSTEM INFO ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} LAZARUS Version: $VERSION"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Bash Version: $BASH_VERSION"
+        echo -e "${MAGENTA}[DEBUG]${RESET} User: $(whoami) (UID: $EUID)"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Hostname: $(hostname)"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo ""
+        echo -e "${CYAN}=== CONFIG ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Config file: $CONFIG_FILE"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Install dir: $INSTALL_DIR"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Backup dir: $BACKUP_DIR"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Log file: $LOG_FILE"
+        echo ""
+        echo -e "${CYAN}=== BOT CONFIG ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Bot path: ${BOT_PATH:-<not set>}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Bot container: ${BOT_CONTAINER_NAME:-<not set>}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} DB container: ${DB_CONTAINER_NAME:-<not set>}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} DB user: ${DB_USER:-postgres}"
+        echo ""
+        echo -e "${CYAN}=== TELEGRAM ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Notifications: $SEND_TO_TELEGRAM"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Send file: $TG_SEND_FILE"
+        # Маскируем токен: показываем только первые 4 и последние 4 символа
+        _masked_token="<not set>"
+        if [[ -n "$BOT_TOKEN" ]]; then
+            if [[ ${#BOT_TOKEN} -gt 10 ]]; then
+                _masked_token="${BOT_TOKEN:0:4}****${BOT_TOKEN: -4}"
+            else
+                _masked_token="<set>"
+            fi
         fi
-    fi
-    echo -e "${MAGENTA}[DEBUG]${RESET} Bot token: $_masked_token"
-    # Маскируем Chat ID: показываем только первые 4 и последние 3 символа
-    _masked_chat="<not set>"
-    if [[ -n "$CHAT_ID" ]]; then
-        if [[ ${#CHAT_ID} -gt 8 ]]; then
-            _masked_chat="${CHAT_ID:0:4}***${CHAT_ID: -3}"
-        else
-            _masked_chat="<set>"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Bot token: $_masked_token"
+        # Маскируем Chat ID: показываем только первые 4 и последние 3 символа
+        _masked_chat="<not set>"
+        if [[ -n "$CHAT_ID" ]]; then
+            if [[ ${#CHAT_ID} -gt 8 ]]; then
+                _masked_chat="${CHAT_ID:0:4}***${CHAT_ID: -3}"
+            else
+                _masked_chat="<set>"
+            fi
         fi
-    fi
-    echo -e "${MAGENTA}[DEBUG]${RESET} Chat ID: $_masked_chat"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Thread ID: ${TG_MESSAGE_THREAD_ID:-<not set>}"
-    echo ""
-    echo -e "${CYAN}=== REMOTE STORAGE ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Type: $REMOTE_STORAGE_TYPE"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Enabled: $SEND_TO_REMOTE"
-    # Маскируем URL: показываем только протокол и домен
-    _masked_url="<not set>"
-    if [[ -n "$REMOTE_STORAGE_URL" ]]; then
-        # Извлекаем протокол и хост, скрываем путь и креды
-        _url_proto=$(echo "$REMOTE_STORAGE_URL" | grep -oP '^[a-z]+://' || echo "")
-        _url_host=$(echo "$REMOTE_STORAGE_URL" | sed -E 's|^[a-z]+://([^@]*@)?([^/]+).*|\2|')
-        if [[ -n "$_url_host" ]]; then
-            _masked_url="${_url_proto}${_url_host}/***"
-        else
-            _masked_url="<set>"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Chat ID: $_masked_chat"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Thread ID: ${TG_MESSAGE_THREAD_ID:-<not set>}"
+        echo ""
+        echo -e "${CYAN}=== REMOTE STORAGE ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Type: $REMOTE_STORAGE_TYPE"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Enabled: $SEND_TO_REMOTE"
+        # Маскируем URL: показываем только протокол и домен
+        _masked_url="<not set>"
+        if [[ -n "$REMOTE_STORAGE_URL" ]]; then
+            # Извлекаем протокол и хост, скрываем путь и креды
+            _url_proto=$(echo "$REMOTE_STORAGE_URL" | grep -oP '^[a-z]+://' || echo "")
+            _url_host=$(echo "$REMOTE_STORAGE_URL" | sed -E 's|^[a-z]+://([^@]*@)?([^/]+).*|\2|')
+            if [[ -n "$_url_host" ]]; then
+                _masked_url="${_url_proto}${_url_host}/***"
+            else
+                _masked_url="<set>"
+            fi
         fi
+        echo -e "${MAGENTA}[DEBUG]${RESET} URL: $_masked_url"
+        echo ""
+        echo -e "${CYAN}=== ROTATION ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Delete mode: $DELETE_MODE"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Retention days: $RETENTION_DAYS"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Max backups: $MAX_BACKUPS_COUNT"
+        echo ""
+        echo -e "${CYAN}=== ENCRYPTION ===${RESET}"
+        # Показываем только что пароль установлен, без частичного раскрытия
+        _masked_pass="<not set>"
+        [[ -n "$BACKUP_PASSWORD" ]] && _masked_pass="<set> (${#BACKUP_PASSWORD} chars)"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Password: $_masked_pass"
+        echo ""
+        echo -e "${CYAN}=== EXCLUSIONS ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Exclude dirs: ${EXCLUDE_DIRS:-<none>}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} Max file size: ${MAX_FILE_SIZE_MB} MB"
+        echo ""
+        echo -e "${CYAN}=== RESTORE FLAGS ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} RESTORE_FORCE: $RESTORE_FORCE"
+        echo -e "${MAGENTA}[DEBUG]${RESET} RESTORE_DROP_VOLUME: $RESTORE_DROP_VOLUME"
+        echo -e "${MAGENTA}[DEBUG]${RESET} RESTORE_DROP_SCHEMA: $RESTORE_DROP_SCHEMA"
+        echo -e "${MAGENTA}[DEBUG]${RESET} RESTORE_INCLUDE_ENV: $RESTORE_INCLUDE_ENV"
+        echo ""
+        echo -e "${CYAN}=== DEBUG OUTPUT SETTINGS ===${RESET}"
+        echo -e "${MAGENTA}[DEBUG]${RESET} SILENT_LOG: $SILENT_LOG"
+        echo -e "${MAGENTA}[DEBUG]${RESET} CURL_SILENT: $CURL_SILENT"
+        echo -e "${MAGENTA}[DEBUG]${RESET} IS_INTERACTIVE: $IS_INTERACTIVE"
+        echo ""
+        echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════════${RESET}"
+        echo ""
     fi
-    echo -e "${MAGENTA}[DEBUG]${RESET} URL: $_masked_url"
-    echo ""
-    echo -e "${CYAN}=== ROTATION ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Delete mode: $DELETE_MODE"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Retention days: $RETENTION_DAYS"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Max backups: $MAX_BACKUPS_COUNT"
-    echo ""
-    echo -e "${CYAN}=== ENCRYPTION ===${RESET}"
-    # Показываем только что пароль установлен, без частичного раскрытия
-    _masked_pass="<not set>"
-    [[ -n "$BACKUP_PASSWORD" ]] && _masked_pass="<set> (${#BACKUP_PASSWORD} chars)"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Password: $_masked_pass"
-    echo ""
-    echo -e "${CYAN}=== EXCLUSIONS ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Exclude dirs: ${EXCLUDE_DIRS:-<none>}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} Max file size: ${MAX_FILE_SIZE_MB} MB"
-    echo ""
-    echo -e "${CYAN}=== DEBUG OUTPUT SETTINGS ===${RESET}"
-    echo -e "${MAGENTA}[DEBUG]${RESET} SILENT_LOG: $SILENT_LOG"
-    echo -e "${MAGENTA}[DEBUG]${RESET} CURL_SILENT: $CURL_SILENT"
-    echo -e "${MAGENTA}[DEBUG]${RESET} IS_INTERACTIVE: $IS_INTERACTIVE"
-    echo ""
-    echo -e "${MAGENTA}═══════════════════════════════════════════════════════════════════${RESET}"
-    echo ""
-fi
 
 case "$1" in
     backup_full) create_backup "full" ;;
@@ -13478,3 +14135,5 @@ case "$1" in
         done
         ;;
 esac
+
+fi
