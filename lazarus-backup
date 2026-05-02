@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.2"
+VERSION="5.0.3"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -303,20 +303,31 @@ check_lock_owner() {
 }
 
 check_dependencies() {
-    local deps=("tar" "gzip" "openssl" "docker" "find" "du" "date" "rsync")
+    # Required at startup. Without these the script cannot work at all.
+    local required=("tar" "gzip" "openssl" "docker" "find" "du" "date")
+    # Optional: needed only for specific features. Missing -> warn, do not exit.
+    #   rsync -> needed only for rsync-mode restore (folder sync).
+    local optional=("rsync")
     local missing=()
-    
-    # Check for curl OR wget
+    local missing_optional=()
+
+    # Check for curl OR wget (required for self-update / network ops)
     if ! command -v curl > "$SILENT_LOG" 2>&1 && ! command -v wget > "$SILENT_LOG" 2>&1; then
         missing+=("curl (or wget)")
     fi
 
-    for cmd in "${deps[@]}"; do
+    for cmd in "${required[@]}"; do
         if ! command -v "$cmd" > "$SILENT_LOG" 2>&1; then
             missing+=("$cmd")
         fi
     done
-    
+
+    for cmd in "${optional[@]}"; do
+        if ! command -v "$cmd" > "$SILENT_LOG" 2>&1; then
+            missing_optional+=("$cmd")
+        fi
+    done
+
     # Check for docker compose (v2)
     if command -v docker > "$SILENT_LOG" 2>&1; then
         if ! docker compose version > "$SILENT_LOG" 2>&1; then
@@ -330,6 +341,11 @@ check_dependencies() {
         echo -e "${RED}[ERROR]${RESET} Missing dependencies: ${missing[*]}"
         echo -e "${CYAN}[ACTION]${RESET} Please install them (e.g., apt install ${missing[*]})"
         exit 1
+    fi
+
+    if [[ ${#missing_optional[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[WARN]${RESET} Optional tools not found: ${missing_optional[*]}"
+        echo -e "${CYAN}[HINT]${RESET} Install only if you need rsync-mode restore: apt install ${missing_optional[*]}"
     fi
 }
 
@@ -5742,9 +5758,19 @@ get_restore_stage_root() {
     echo "$root"
 }
 
+require_rsync() {
+    if ! command -v rsync > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "rsync не установлен — режим восстановления через rsync недоступен."
+        print_message "INFO" "Установите его: apt install rsync"
+        return 1
+    fi
+    return 0
+}
+
 restore_rsync_preview() {
     local src="$1"
     local dst="$2"
+    require_rsync || return 1
     local extra_excludes=()
     if [[ "$RESTORE_INCLUDE_ENV" != "true" ]]; then
         extra_excludes+=("--exclude" ".env")
@@ -5757,6 +5783,7 @@ restore_rsync_preview() {
 restore_rsync_apply() {
     local src="$1"
     local dst="$2"
+    require_rsync || return 1
     local extra_excludes=()
     if [[ "$RESTORE_INCLUDE_ENV" != "true" ]]; then
         extra_excludes+=("--exclude" ".env")
@@ -5962,6 +5989,7 @@ execute_restore() {
     if [[ "$MODE" == "full" || "$MODE" == "files_only" ]]; then
         if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return; fi
         if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return; fi
+        if ! require_rsync; then rm -rf "$TMP_DIR"; return; fi
         if [[ -z "$DIR_ARC" || ! -f "$DIR_ARC" ]]; then
             print_message "ERROR" "Архив с файлами не найден."
             rm -rf "$TMP_DIR"
