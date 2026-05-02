@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.0"
+VERSION="5.0.1"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -1322,22 +1322,65 @@ check_image_version_match() {
     # Получаем загруженную версию image
     local loaded_version=$(get_loaded_image_version "$compose_name")
     debug_log "VERSION" "Loaded image version: $loaded_version"
-    
-    if [[ -z "$loaded_version" ]]; then
-        debug_log "VERSION" "No loaded image found for $compose_name"
-        # Image не загружен вообще - это критическая ошибка
+
+    # Сканируем локальные .tar файлы (для случая, когда image ещё не выполнен docker load)
+    local latest_tar_version=""
+    local latest_tar_file=""
+    local _tar_list
+    _tar_list=$(find_all_bot_image_files 2>/dev/null)
+    if [[ -n "$_tar_list" ]]; then
+        local _tf _tv
+        while IFS= read -r _tf; do
+            [[ -z "$_tf" ]] && continue
+            _tv=$(extract_version_from_filename "$(basename "$_tf")")
+            [[ -z "$_tv" ]] && continue
+            if [[ -z "$latest_tar_version" ]] || version_gt "$_tv" "$latest_tar_version"; then
+                latest_tar_version="$_tv"
+                latest_tar_file="$_tf"
+            fi
+        done <<< "$_tar_list"
+    fi
+    debug_log "VERSION" "Latest tar: version=$latest_tar_version file=$latest_tar_file"
+
+    # Нет ни загруженного image, ни локального .tar
+    if [[ -z "$loaded_version" && -z "$latest_tar_version" ]]; then
+        debug_log "VERSION" "No loaded image and no tar found for $compose_name"
         echo "NOT_FOUND"
         return 1
     fi
-    
-    # Сравниваем версии
+
+    # Image не загружен — есть только локальный .tar
+    if [[ -z "$loaded_version" ]]; then
+        if version_gt "$latest_tar_version" "$compose_version"; then
+            debug_log "VERSION" "TAR_NEW (no loaded): tar=$latest_tar_version > compose=$compose_version"
+            echo "TAR_NEW:$compose_version:$latest_tar_version:$compose_name:$latest_tar_file"
+        elif [[ "$latest_tar_version" == "$compose_version" ]]; then
+            debug_log "VERSION" "TAR_MATCH (no loaded): tar=$latest_tar_version == compose"
+            echo "TAR_MATCH:$compose_version:$latest_tar_version:$compose_name:$latest_tar_file"
+        else
+            debug_log "VERSION" "Only older tar present, image not loaded"
+            echo "NOT_FOUND"
+        fi
+        return 1
+    fi
+
+    # Loaded image есть, но локальный .tar новее (и compose, и loaded) — это TAR_NEW с приоритетом
+    if [[ -n "$latest_tar_version" ]] \
+       && version_gt "$latest_tar_version" "$loaded_version" \
+       && version_gt "$latest_tar_version" "$compose_version"; then
+        debug_log "VERSION" "TAR_NEW (with loaded): tar=$latest_tar_version > loaded=$loaded_version, compose=$compose_version"
+        echo "TAR_NEW:$compose_version:$latest_tar_version:$compose_name:$latest_tar_file"
+        return 1
+    fi
+
+    # Сравниваем версии (compose vs загруженный image)
     if [[ "$compose_version" == "$loaded_version" ]]; then
         debug_log "VERSION" "Versions match: $compose_version"
         echo "MATCH:$compose_version"
         return 0
     else
         debug_log "VERSION" "Version MISMATCH: compose=$compose_version loaded=$loaded_version"
-        
+
         # Определяем какая версия выше
         if version_gt "$loaded_version" "$compose_version"; then
             echo "UPGRADE:$compose_version:$loaded_version:$compose_name"
@@ -1395,6 +1438,125 @@ show_version_mismatch_warning() {
         echo -e "${B}╚══════════════════════════════════════════════════════════════╝${R}"
     fi
     echo ""
+}
+
+# Предупреждение: найден локальный .tar с версией новее, чем в compose / docker
+# $1 compose_ver, $2 tar_ver, $3 image_name, $4 tar_path, $5 mode (new|match)
+show_tar_available_warning() {
+    local compose_version="$1"
+    local tar_version="$2"
+    local image_name="$3"
+    local tar_path="$4"
+    local mode="$5"  # "new" — tar > compose; "match" — tar == compose, не загружен
+
+    local R="${RESET}" C="${CYAN}" G="${GREEN}" Y="${YELLOW}"
+    local cv_pad lv_pad
+    cv_pad=$(printf "%-8s" "$compose_version")
+    lv_pad=$(printf "%-8s" "$tar_version")
+
+    local B="${YELLOW}${BOLD}"
+    echo ""
+    echo -e "${B}╔══════════════════════════════════════════════════════════════╗${R}"
+    if [[ "$mode" == "new" ]]; then
+        echo -e "${B}║${R}      [!] НАЙДЕН .TAR С НОВОЙ ВЕРСИЕЙ IMAGE                   ${B}║${R}"
+    else
+        echo -e "${B}║${R}      [!] IMAGE ЕЩЁ НЕ ЗАГРУЖЕН В DOCKER                      ${B}║${R}"
+    fi
+    echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}║${R}  Версия в docker-compose:         ${C}${cv_pad}${R}                   ${B}║${R}"
+    if [[ "$mode" == "new" ]]; then
+        echo -e "${B}║${R}  Версия в локальном .tar:         ${G}${lv_pad}${R} (новее)           ${B}║${R}"
+    else
+        echo -e "${B}║${R}  Версия в локальном .tar:         ${G}${lv_pad}${R} (та же)           ${B}║${R}"
+    fi
+    echo -e "${B}║${R}  Image (${image_name}) загружен в Docker: ${Y}нет${R}                  ${B}║${R}"
+    echo -e "${B}║${R}                                                              ${B}║${R}"
+    echo -e "${B}╠══════════════════════════════════════════════════════════════╣${R}"
+    if [[ "$mode" == "new" ]]; then
+        echo -e "${B}║${R}  Чтобы применить новую версию: docker load + bump compose.   ${B}║${R}"
+    else
+        echo -e "${B}║${R}  Контейнер не сможет стартовать пока image не загружен.      ${B}║${R}"
+    fi
+    echo -e "${B}╚══════════════════════════════════════════════════════════════╝${R}"
+    echo ""
+    echo -e "  ${C}.tar файл:${R} ${tar_path}"
+    echo ""
+}
+
+# Загрузить локальный .tar в Docker и (опционально) обновить compose
+# $1 compose_ver, $2 tar_ver, $3 image_name, $4 tar_path, $5 mode (new|match)
+offer_tar_load_and_update() {
+    local compose_version="$1"
+    local tar_version="$2"
+    local image_name="$3"
+    local tar_path="$4"
+    local mode="$5"
+
+    if [[ ! -f "$tar_path" ]]; then
+        print_message "ERROR" ".tar файл не найден: $tar_path"
+        return 1
+    fi
+
+    local prompt_text
+    if [[ "$mode" == "new" ]]; then
+        prompt_text="Загрузить ${tar_version} в Docker и обновить compose? (y/n): "
+    else
+        prompt_text="Загрузить ${tar_version} в Docker? (y/n): "
+    fi
+
+    local confirm=""
+    while [[ ! "$confirm" =~ ^[YyNn]$ ]]; do
+        read -erp "$prompt_text" confirm
+        [[ ! "$confirm" =~ ^[YyNn]$ ]] && echo -e "${YELLOW}Введите 'y' или 'n'${RESET}"
+    done
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        print_message "INFO" "Пропущено. .tar остаётся неизменным."
+        return 0
+    fi
+
+    print_message "INFO" "Загрузка image из ${tar_path}..."
+    if ! docker load -i "$tar_path"; then
+        print_message "ERROR" "docker load завершился с ошибкой"
+        return 1
+    fi
+
+    # Проверяем что image действительно появился
+    if ! is_image_loaded_in_docker "$image_name" "$tar_version"; then
+        print_message "WARN" "Image ${image_name}:${tar_version} не обнаружен после docker load"
+        print_message "INFO" "Возможно tag в .tar отличается от ожидаемого. Проверьте: docker images"
+        return 1
+    fi
+    print_message "SUCCESS" "Image ${image_name}:${tar_version} загружен"
+
+    if [[ "$mode" == "new" ]]; then
+        # Передаём управление в существующий offer_compose_update
+        offer_compose_update "$compose_version" "$tar_version" "$image_name"
+    else
+        # tar_version == compose_version: обновлять compose не нужно, но можно перезапустить
+        echo ""
+        local restart=""
+        while [[ ! "$restart" =~ ^[YyNn]$ ]]; do
+            read -erp "Перезапустить контейнеры сейчас? (y/n): " restart
+            [[ ! "$restart" =~ ^[YyNn]$ ]] && echo -e "${YELLOW}Введите 'y' или 'n'${RESET}"
+        done
+        if [[ "$restart" =~ ^[Yy]$ ]]; then
+            cd "$BOT_PATH" || return 1
+            docker compose down 2>/dev/null
+            sleep 2
+            docker compose up -d 2>/dev/null
+            sleep 3
+            if docker ps | grep -q "$BOT_CONTAINER_NAME"; then
+                print_message "SUCCESS" "Контейнеры запущены с версией ${tar_version}"
+            else
+                print_message "ERROR" "Ошибка запуска контейнеров. См. docker compose logs"
+            fi
+            cleanup_tar_files
+        else
+            print_message "INFO" "Для применения: docker compose down && docker compose up -d"
+        fi
+    fi
 }
 
 # Очистка установочных .tar файлов после загрузки image
@@ -6742,6 +6904,30 @@ check_and_warn_version_mismatch() {
             show_version_mismatch_warning "$compose_ver" "$loaded_ver" "false" "$image_name"
             if [[ "$IS_INTERACTIVE" == true ]]; then
                 read -erp "Нажмите Enter для продолжения..." dummy
+            fi
+            ;;
+        TAR_NEW:*)
+            # Найден локальный .tar с версией новее чем в compose; image ещё НЕ загружен в Docker
+            local compose_ver=$(echo "$result" | cut -d: -f2)
+            local tar_ver=$(echo "$result" | cut -d: -f3)
+            local image_name=$(echo "$result" | cut -d: -f4)
+            local tar_path=$(echo "$result" | cut -d: -f5-)
+            clear_screen
+            show_tar_available_warning "$compose_ver" "$tar_ver" "$image_name" "$tar_path" "new"
+            if [[ "$IS_INTERACTIVE" == true ]]; then
+                offer_tar_load_and_update "$compose_ver" "$tar_ver" "$image_name" "$tar_path" "new"
+            fi
+            ;;
+        TAR_MATCH:*)
+            # Локальный .tar совпадает с compose, но в Docker не загружен
+            local compose_ver=$(echo "$result" | cut -d: -f2)
+            local tar_ver=$(echo "$result" | cut -d: -f3)
+            local image_name=$(echo "$result" | cut -d: -f4)
+            local tar_path=$(echo "$result" | cut -d: -f5-)
+            clear_screen
+            show_tar_available_warning "$compose_ver" "$tar_ver" "$image_name" "$tar_path" "match"
+            if [[ "$IS_INTERACTIVE" == true ]]; then
+                offer_tar_load_and_update "$compose_ver" "$tar_ver" "$image_name" "$tar_path" "match"
             fi
             ;;
         NOT_FOUND)
