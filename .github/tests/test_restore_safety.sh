@@ -1,0 +1,1 @@
+-- mock pg_dump output
