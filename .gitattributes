@@ -1,0 +1,6 @@
+# Force LF line endings for shell scripts and YAML so they execute on Linux CI runners
+*.sh         text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+lazarus-backup   text eol=lf
+lazarus-migrator text eol=lf

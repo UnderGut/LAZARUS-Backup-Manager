@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.35.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-4.37.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -173,8 +173,11 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 | Параметр | Описание | Пример |
 |----------|----------|--------|
 | `BACKUP_PASSWORD` | Пароль AES-256 шифрования | `MySecretPass123` или пусто |
+| `BACKUP_PASSWORD_FILE` | Файл с паролем шифрования (chmod 600) | `/opt/lazarus-backup/.password` |
 | `MAX_FILE_SIZE_MB` | Макс. размер файла в архиве (MB) | `1` (пропуск больших) |
 | `EXCLUDE_DIRS` | Исключить папки (через пробел) | `node_modules .git cache` |
+
+> ⚠️ Пароль сохраняется в отдельном файле `BACKUP_PASSWORD_FILE` для безопасности и корректной работы спецсимволов.
 
 ---
 
@@ -189,6 +192,12 @@ lazarus migrate          # 🆕 Миграция с Bedolaga (BETA)
 lazarus cleanup          # Очистка старых бэкапов
 lazarus check_update     # Проверка обновлений скрипта
 ```
+
+> ⚠️ **ВАЖНО (Restore):** восстановление теперь требует строгую проверку пути и подтверждение строкой
+> `RESTORE_TO:/путь/к/боту`. Для неинтерактивного режима нужно **оба** флага:
+> `--yes --i-know-what-i-am-doing`. По умолчанию `.env` сохраняется (не перезаписывается).
+> Удаление volume БД не выполняется по умолчанию — используйте `--restore-drop-volume` при необходимости.
+> Очистка схемы БД (`DROP SCHEMA`) требует `--restore-drop-schema` — без этого флага данные не удаляются, импорт выполняется поверх существующих таблиц.
 
 ### 🆕 Резервное копирование (v4.30.0+)
 
@@ -231,6 +240,10 @@ lazarus -b -s            # = lazarus bot status
 | `--dry-run`, `-n` | Предпросмотр без выполнения |
 | `--debug`, `-d` | Режим отладки (подробное логирование) |
 | `--report-tg` | Отправить отчёт в Telegram |
+| `--i-know-what-i-am-doing` | Разрешить деструктивные операции (non-interactive) |
+| `--restore-include-env` | Восстановить .env из бэкапа (по умолчанию сохраняется) |
+| `--restore-drop-volume` | Удалить Docker volume БД при восстановлении |
+| `--restore-drop-schema` | Выполнить DROP SCHEMA перед импортом БД |
 
 ### Примеры использования
 

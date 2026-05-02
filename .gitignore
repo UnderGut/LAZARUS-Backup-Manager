@@ -2,7 +2,11 @@
 config.env
 
 # AI instructions and documentation (local only)
-.github/
+# Track only CI workflows and test fixtures; everything else under .github/
+# (RECOVERY_ANALYSIS, MIGRATION_DATA, copilot prompts, internal PS scripts) stays local.
+.github/*
+!.github/workflows/
+!.github/tests/
 
 # Migrator development (will be merged into lazarus-backup later)
 lazarus-migrator/
