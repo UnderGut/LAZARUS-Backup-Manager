@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.1"
+VERSION="5.0.2"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -86,7 +86,6 @@ DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
 DEFAULT_BOT_CONTAINER="rwp_shop"
 DEFAULT_DB_CONTAINER="rwp_shop_db"
 # Volume имена (определяются автоматически)
-DB_VOLUME_NAME=""  # Будет определено автоматически (например rwp_shop_db_data)
 DB_SERVICE_NAME="db"  # Имя сервиса в compose.yaml 
 
 # Статусы расписаний
@@ -717,7 +716,7 @@ add_candidate() {
 
 scan_system_for_bot() {
     FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
-    FOUND_PATHS=(); FOUND_BOTS=(); FOUND_DBS=()
+    FOUND_PATHS=(); FOUND_BOTS=()
     debug_log "SCAN" "=== scan_system_for_bot ==="
     local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
     debug_log "SCAN" "Running containers: $(echo "$running_containers" | wc -l)"
@@ -1029,21 +1028,6 @@ version_gte() {
     version_gt "$v1" "$v2"
 }
 
-# Поиск файлов образа бота в конкретной папке (без рекурсии)
-# Поддерживает все форматы именования: новые и старые
-find_bot_image_files() {
-    local search_path="$1"
-    # Ищем .tar файлы со всеми возможными паттернами:
-    # - rwp_shop-*.tar (новый официальный)
-    # - private-remnawave-telegram-shop-bot-*.tar (старый)
-    # - telegram-shop-*.tar (альтернативный)
-    find "$search_path" -maxdepth 1 -type f \( \
-        -name "rwp_shop*.tar" -o \
-        -name "private-remnawave-telegram-shop-bot*.tar" -o \
-        -name "telegram-shop*.tar" \
-    \) 2> "$SILENT_LOG"
-}
-
 # Поиск файлов образа во всех стандартных путях + BOT_PATH
 # Возвращает список файлов, отсортированный по версии (новые первыми)
 find_all_bot_image_files() {
@@ -1112,30 +1096,6 @@ find_all_bot_image_files() {
         local version=$(extract_version_from_filename "$(basename "$file")")
         echo "$version|$file"
     done | sort -t'|' -k1 -Vr | cut -d'|' -f2
-}
-
-# Получение последнего (самого нового) файла образа
-get_latest_bot_image_file() {
-    local search_path="$1"
-    local files=$(find_bot_image_files "$search_path")
-    
-    if [[ -z "$files" ]]; then
-        echo ""
-        return 1
-    fi
-    
-    local latest_file=""
-    local latest_version="0.0.0"
-    
-    while IFS= read -r file; do
-        local version=$(extract_version_from_filename "$(basename "$file")")
-        if [[ -n "$version" ]] && version_gt "$version" "$latest_version"; then
-            latest_version="$version"
-            latest_file="$file"
-        fi
-    done <<< "$files"
-    
-    echo "$latest_file"
 }
 
 # Определение имени image из загруженного tar файла
@@ -3076,9 +3036,6 @@ update_bot() {
     echo -e "${CYAN}${BOLD}═══ СОЗДАНИЕ БЭКАПОВ ═══${RESET}"
     log_message "INFO" "Starting bot update: $current_version -> $selected_version"
     
-    # Запоминаем время начала для поиска созданных бэкапов
-    local update_start_time=$(date +%s)
-    
     debug_log "UPDATE" "Creating full backup..."
     print_message "INFO" "[1/7] Создание полного бэкапа..."
     create_backup "full"
@@ -3693,9 +3650,7 @@ load_or_create_config() {
     debug_log "CONFIG" "=== load_or_create_config ==="
     debug_log "CONFIG" "Config file: $CONFIG_FILE"
     
-    local config_existed=false
     if [[ -f "$CONFIG_FILE" ]]; then 
-        config_existed=true
         debug_log "CONFIG" "Config exists, loading safely..."
         load_config_file "$CONFIG_FILE"
         debug_log "CONFIG" "Config loaded successfully"
@@ -4740,10 +4695,6 @@ rotate_backups_by_age() {
 
     debug_log "ROTATION" "=== rotate_backups_by_age($PREFIX, $LABEL, days=$DAYS, delete=$PERFORM_DELETE) ==="
 
-    # Ищем только архивы (включая .enc)
-    local pattern1="$BACKUP_DIR/${PREFIX}_*.tar.gz"
-    local pattern2="$BACKUP_DIR/${PREFIX}_*.tar.gz.enc"
-
     # Найдём файлы старше DAYS дней
     local files=()
     # find -mtime +N означает "строго больше N дней". Чтобы RETENTION_DAYS=N означал
@@ -4986,7 +4937,6 @@ get_cron_status() {
     local minute=$(echo "$cron_line" | awk '{print $1}')
     local hour=$(echo "$cron_line" | awk '{print $2}')
     local day_month=$(echo "$cron_line" | awk '{print $3}')
-    local month=$(echo "$cron_line" | awk '{print $4}')
     local day_week=$(echo "$cron_line" | awk '{print $5}')
     
     # Определяем тип расписания
