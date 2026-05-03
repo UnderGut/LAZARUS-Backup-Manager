@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.5"
+VERSION="5.0.6"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -1010,7 +1010,7 @@ extract_version_from_filename() {
     # - rwp_shop-3.23.0.tar
     # - private-remnawave-telegram-shop-bot-3.21.2-amd64.tar (старый)
     # - telegram-shop-2.0.0.tar
-    echo "$filename" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+    echo "$filename" | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -1
 }
 
 # Нормализация версии: оставляем только цифры и точки, берём первые 4 числовые
@@ -1203,7 +1203,7 @@ get_compose_image_version() {
     local image_patterns=("rwp_shop" "private-remnawave-telegram-shop-bot" "telegram-shop" "shopbot")
     
     for pattern in "${image_patterns[@]}"; do
-        local match=$(grep -oE "image:\s*['\"]?${pattern}:[0-9]+\.[0-9]+\.[0-9]+" "$compose_file" | head -1)
+        local match=$(grep -oE "image:\s*['\"]?${pattern}:[0-9]+(\.[0-9]+){1,3}" "$compose_file" | head -1)
         if [[ -n "$match" ]]; then
             # Извлекаем image:version (убираем "image:" и пробелы/кавычки)
             local image_ver=$(echo "$match" | sed -E "s/image:\s*['\"]?//g" | tr -d "'" | tr -d '"')
@@ -2036,7 +2036,7 @@ update_compose_image_version() {
         if grep -qE "image:\s*['\"]?${pattern}:" "$compose_file"; then
             debug_log "COMPOSE" "Pattern matched: $pattern"
             # Заменяем на новое имя и версию
-            sed -i -E "s|(image:\s*['\"]?)${pattern}:[0-9]+\.[0-9]+\.[0-9]+|\1${new_image_name}:${new_version}|g" "$compose_file"
+            sed -i -E "s|(image:\s*['\"]?)${pattern}:[0-9]+(\.[0-9]+){1,3}|\1${new_image_name}:${new_version}|g" "$compose_file"
             found=true
             debug_log "COMPOSE" "Sed replacement done: ${pattern} -> ${new_image_name}:${new_version}"
             print_message "SUCCESS" "Image обновлён: ${pattern} → ${new_image_name}:${new_version}"
