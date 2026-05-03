@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.3"
+VERSION="5.0.4"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -1013,18 +1013,32 @@ extract_version_from_filename() {
     echo "$filename" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
 
+# Нормализация версии: оставляем только цифры и точки, берём первые 3 числовые
+# компоненты. Защищает от тегов вида "6.3.1.2", "6.3.1-rc1", "v6.3.1+build".
+_normalize_version_parts() {
+    local raw="$1"
+    # Оставляем только [0-9.] — отрезаем суффиксы вроде -rc1, +build, префикс v
+    local clean="${raw//[^0-9.]/}"
+    local -a parts
+    IFS='.' read -ra parts <<< "$clean"
+    # Возвращаем три компоненты через пробел; пустые → 0
+    printf '%s %s %s' \
+        "${parts[0]:-0}" \
+        "${parts[1]:-0}" \
+        "${parts[2]:-0}"
+}
+
 # Сравнение версий (возвращает 0 если $1 > $2)
 version_gt() {
     local v1="$1" v2="$2"
-    # Разбиваем версии на части
     local v1_major v1_minor v1_patch v2_major v2_minor v2_patch
-    IFS='.' read -r v1_major v1_minor v1_patch <<< "$v1"
-    IFS='.' read -r v2_major v2_minor v2_patch <<< "$v2"
-    
+    read -r v1_major v1_minor v1_patch <<< "$(_normalize_version_parts "$v1")"
+    read -r v2_major v2_minor v2_patch <<< "$(_normalize_version_parts "$v2")"
+
     # Приводим к числам (убираем ведущие нули)
     v1_major=$((10#${v1_major:-0})); v1_minor=$((10#${v1_minor:-0})); v1_patch=$((10#${v1_patch:-0}))
     v2_major=$((10#${v2_major:-0})); v2_minor=$((10#${v2_minor:-0})); v2_patch=$((10#${v2_patch:-0}))
-    
+
     if [[ $v1_major -gt $v2_major ]]; then return 0; fi
     if [[ $v1_major -lt $v2_major ]]; then return 1; fi
     if [[ $v1_minor -gt $v2_minor ]]; then return 0; fi
