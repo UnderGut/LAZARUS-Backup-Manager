@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.4"
+VERSION="5.0.5"
 SCRIPT_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
@@ -1013,37 +1013,41 @@ extract_version_from_filename() {
     echo "$filename" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
 
-# Нормализация версии: оставляем только цифры и точки, берём первые 3 числовые
-# компоненты. Защищает от тегов вида "6.3.1.2", "6.3.1-rc1", "v6.3.1+build".
+# Нормализация версии: оставляем только цифры и точки, берём первые 4 числовые
+# компоненты (major.minor.patch.build). Защищает от тегов вида "6.3.1.2",
+# "6.3.1-rc1", "v6.3.1+build". Build (4-я) используется как tie-breaker.
 _normalize_version_parts() {
     local raw="$1"
     # Оставляем только [0-9.] — отрезаем суффиксы вроде -rc1, +build, префикс v
     local clean="${raw//[^0-9.]/}"
     local -a parts
     IFS='.' read -ra parts <<< "$clean"
-    # Возвращаем три компоненты через пробел; пустые → 0
-    printf '%s %s %s' \
+    # Возвращаем четыре компоненты через пробел; пустые → 0
+    printf '%s %s %s %s' \
         "${parts[0]:-0}" \
         "${parts[1]:-0}" \
-        "${parts[2]:-0}"
+        "${parts[2]:-0}" \
+        "${parts[3]:-0}"
 }
 
 # Сравнение версий (возвращает 0 если $1 > $2)
 version_gt() {
     local v1="$1" v2="$2"
-    local v1_major v1_minor v1_patch v2_major v2_minor v2_patch
-    read -r v1_major v1_minor v1_patch <<< "$(_normalize_version_parts "$v1")"
-    read -r v2_major v2_minor v2_patch <<< "$(_normalize_version_parts "$v2")"
+    local v1_major v1_minor v1_patch v1_build v2_major v2_minor v2_patch v2_build
+    read -r v1_major v1_minor v1_patch v1_build <<< "$(_normalize_version_parts "$v1")"
+    read -r v2_major v2_minor v2_patch v2_build <<< "$(_normalize_version_parts "$v2")"
 
     # Приводим к числам (убираем ведущие нули)
-    v1_major=$((10#${v1_major:-0})); v1_minor=$((10#${v1_minor:-0})); v1_patch=$((10#${v1_patch:-0}))
-    v2_major=$((10#${v2_major:-0})); v2_minor=$((10#${v2_minor:-0})); v2_patch=$((10#${v2_patch:-0}))
+    v1_major=$((10#${v1_major:-0})); v1_minor=$((10#${v1_minor:-0})); v1_patch=$((10#${v1_patch:-0})); v1_build=$((10#${v1_build:-0}))
+    v2_major=$((10#${v2_major:-0})); v2_minor=$((10#${v2_minor:-0})); v2_patch=$((10#${v2_patch:-0})); v2_build=$((10#${v2_build:-0}))
 
     if [[ $v1_major -gt $v2_major ]]; then return 0; fi
     if [[ $v1_major -lt $v2_major ]]; then return 1; fi
     if [[ $v1_minor -gt $v2_minor ]]; then return 0; fi
     if [[ $v1_minor -lt $v2_minor ]]; then return 1; fi
     if [[ $v1_patch -gt $v2_patch ]]; then return 0; fi
+    if [[ $v1_patch -lt $v2_patch ]]; then return 1; fi
+    if [[ $v1_build -gt $v2_build ]]; then return 0; fi
     return 1
 }
 
