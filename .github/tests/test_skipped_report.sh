@@ -23,9 +23,13 @@ log_message() { :; }
 debug_log() { :; }
 export SILENT_LOG
 
-# Extract function
+# Extract functions (build_skipped_report зависит от _split_exclude_dirs)
 FUNC_FILE="$TMP_DIR/build_skipped.sh"
-sed -n '/^build_skipped_report() {$/,/^}$/p' "$SCRIPT" > "$FUNC_FILE"
+{
+    sed -n '/^_split_exclude_dirs() {$/,/^}$/p' "$SCRIPT"
+    echo ""
+    sed -n '/^build_skipped_report() {$/,/^}$/p' "$SCRIPT"
+} > "$FUNC_FILE"
 if ! [[ -s "$FUNC_FILE" ]]; then
     echo "FAIL: could not extract build_skipped_report from $SCRIPT" >&2
     exit 1
