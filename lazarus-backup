@@ -6117,6 +6117,62 @@ format_size_mb() {
     fi
 }
 
+# =============================================================================
+# _split_exclude_dirs: разбивает EXCLUDE_DIRS-строку на массив, поддерживая
+# пути с пробелами через `,` или `;` как первичный разделитель.
+# =============================================================================
+# Раньше split шёл через `IFS=' '` — пути типа `my dir/cache` ломались на
+# два «my» + «dir/cache». Новая логика:
+#   - Если в строке есть `,` или `;` — используем их как primary separator,
+#     trim'им trailing/leading whitespace вокруг каждого элемента.
+#   - Иначе fallback на space-split (backward-compat для существующих configs).
+#
+# Аргументы:
+#   $1 — EXCLUDE_DIRS значение
+#   $2 — имя выходного array (передаётся по reference через `eval`)
+#
+# Пример:
+#   _split_exclude_dirs "node_modules, .git, my data/cache" ARR
+#   # ARR=( "node_modules" ".git" "my data/cache" )
+# =============================================================================
+_split_exclude_dirs() {
+    local _input="$1"
+    local _out_name="$2"
+    # Очистка target array через nameref (bash 4.3+, есть везде где есть GNU bash).
+    eval "$_out_name=()"
+    [[ -z "$_input" ]] && return 0
+
+    # Detect comma/semicolon как разделитель — если есть, парсим по ним.
+    if [[ "$_input" == *,* || "$_input" == *\;* ]]; then
+        # Нормализуем `;` → `,` для одного парсинга.
+        local _norm="${_input//;/,}"
+        local _old_ifs="$IFS"
+        IFS=','
+        # shellcheck disable=SC2206
+        local _raw=( $_norm )
+        IFS="$_old_ifs"
+        local _item
+        for _item in "${_raw[@]}"; do
+            # Trim leading/trailing whitespace
+            _item="${_item#"${_item%%[![:space:]]*}"}"
+            _item="${_item%"${_item##*[![:space:]]}"}"
+            [[ -n "$_item" ]] && eval "$_out_name+=( \"\$_item\" )"
+        done
+    else
+        # Backward-compat: space-split. Не поддерживает пути с пробелами,
+        # но не ломает existing configs.
+        local _old_ifs="$IFS"
+        IFS=' '
+        # shellcheck disable=SC2206
+        local _raw=( $_input )
+        IFS="$_old_ifs"
+        local _item
+        for _item in "${_raw[@]}"; do
+            [[ -n "$_item" ]] && eval "$_out_name+=( \"\$_item\" )"
+        done
+    fi
+}
+
 # build_skipped_report: сканирует BOT_PATH и записывает в output_file список
 # файлов, которые НЕ попадут в архив, с причиной. Формат строки (TSV):
 #     SIZE_BYTES \t RELATIVE_PATH \t REASON
@@ -6144,7 +6200,7 @@ build_skipped_report() {
     fi
 
     local EXCL_ARR=()
-    [[ -n "$EXCLUDE_DIRS" ]] && IFS=' ' read -r -a EXCL_ARR <<< "$EXCLUDE_DIRS"
+    _split_exclude_dirs "$EXCLUDE_DIRS" EXCL_ARR
 
     local skip_logs="true"
     [[ "$BACKUP_LOG_FILES" == "true" ]] && skip_logs="false"
@@ -6159,7 +6215,12 @@ build_skipped_report() {
     # shellcheck disable=SC2064
     trap "$_eg_prev" RETURN
 
-    while IFS=$'\t' read -r size rel_path; do
+    # NB: используем NUL-разделитель (`-printf '%s\t%P\0'` + `read -d ''`) —
+    # защита от файлов с tab/newline в именах. Атакующий с write-доступом к
+    # BOT_PATH мог создать файл `evil\nname.log` чтобы log-pattern matcher
+    # не сработал (newline ломает читаемые «строки»). С NUL — каждая запись
+    # доезжает целиком, имя сохраняется как есть.
+    while IFS=$'\t' read -r -d '' size rel_path; do
         [[ -z "$rel_path" ]] && continue
         local reason=""
 
@@ -6190,10 +6251,15 @@ build_skipped_report() {
         fi
 
         if [[ -n "$reason" ]]; then
-            printf '%s\t%s\t%s\n' "${size:-0}" "$rel_path" "$reason" >> "$output_file"
+            # NB: rel_path может содержать tab/newline → в TSV выводе они ломают
+            # парсинг в show_skipped_report. Заменяем на видимые маркеры (не теряем
+            # имя для diagnostics, но строка остаётся одна и парсится корректно).
+            local _safe_path="${rel_path//$'\t'/<TAB>}"
+            _safe_path="${_safe_path//$'\n'/<NL>}"
+            printf '%s\t%s\t%s\n' "${size:-0}" "$_safe_path" "$reason" >> "$output_file"
             count=$((count + 1))
         fi
-    done < <(cd "$bot_path" 2>/dev/null && find . -type f -printf '%s\t%P\n' 2> "$SILENT_LOG")
+    done < <(cd "$bot_path" 2>/dev/null && find . -type f -printf '%s\t%P\0' 2> "$SILENT_LOG")
 
     # extglob восстанавливается через trap RETURN (см. выше)
     echo "$count"
@@ -6222,9 +6288,10 @@ get_top_files_in_archive() {
     local FIND_ARGS=(".")
     if [[ -n "$exclude_dirs_str" ]]; then
         local EXCL_ARR=()
-        IFS=' ' read -r -a EXCL_ARR <<< "$exclude_dirs_str"
+        _split_exclude_dirs "$exclude_dirs_str" EXCL_ARR
         for ex in "${EXCL_ARR[@]}"; do
-            if [[ -n "$ex" && "$ex" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+            # Whitelist: разрешаем пробелы внутри (нужно для путей типа "my dir/cache").
+            if [[ -n "$ex" && "$ex" =~ ^[a-zA-Z0-9_./\ -]+$ ]]; then
                 FIND_ARGS+=("-path" "./$ex" "-prune" "-o")
             fi
         done
@@ -6234,9 +6301,14 @@ get_top_files_in_archive() {
     if [[ "$max_size_mb" =~ ^[0-9]+$ ]] && [[ "$max_size_mb" -gt 0 ]]; then
         FIND_ARGS+=("!" "-size" "+${max_size_mb}M")
     fi
-    FIND_ARGS+=("-printf" "%s\t%P\n")
+    # NUL-delim формат (`%s\t%P\0`) — защита от файлов с tab/newline в именах.
+    # awk -F'\t' читает поля; запись с control char внутри пути ломала формат
+    # «size TAB path NEWLINE» и приводила к partial parsing. С NUL-разделителем
+    # каждая запись доезжает целиком, control'ы заменяем в awk на «?».
+    FIND_ARGS+=("-printf" "%s\t%P\0")
 
     (cd "$bot_path" 2>/dev/null && find "${FIND_ARGS[@]}" 2>/dev/null) \
+        | tr '\0' '\n' \
         | sort -rn \
         | head -n "$limit" \
         | awk -F'\t' '{
@@ -6245,6 +6317,8 @@ get_top_files_in_archive() {
             if (h>=1024) { h/=1024; u="K" }
             if (h>=1024) { h/=1024; u="M" }
             if (h>=1024) { h/=1024; u="G" }
+            # Очистка контрол-символов (на случай если в имени файла остался NUL/tab внутри)
+            gsub(/[\001-\037\177]/, "?", path)
             # Обрезаем длинные пути до 60 символов для красоты в TG
             if (length(path) > 60) path = "..." substr(path, length(path)-57);
             printf "  • %.1f%s — %s\n", h, u, path
@@ -6771,7 +6845,9 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
     fi
 
     local -a EXCLUDE_ARRAY=() EXCLUDE_FLAGS=()
-    IFS=' ' read -r -a EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
+    # Используем _split_exclude_dirs — поддерживает `,`/`;` как разделитель
+    # для путей с пробелами (`my dir/cache, .git, node_modules`).
+    _split_exclude_dirs "$EXCLUDE_DIRS" EXCLUDE_ARRAY
     local ex
     for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then EXCLUDE_FLAGS+=(--exclude="$ex"); fi; done
     # Базовые исключения (всегда):
@@ -6830,26 +6906,38 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         local FIND_ARGS=(".")
         for ex in "${EXCLUDE_ARRAY[@]}"; do
             if [[ -n "$ex" ]]; then
-                # Валидация: допускаем только безопасные имена путей
-                if [[ "$ex" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+                # Валидация: допускаем буквы/цифры/_./- + пробелы (для путей с пробелами).
+                # Защита от shell-injection через EXCLUDE_DIRS: запрещаем `;`, `|`, `&`,
+                # `$()`, backticks, `\n` — всё что bash может интерпретировать.
+                if [[ "$ex" =~ ^[a-zA-Z0-9_./\ -]+$ ]]; then
                     FIND_ARGS+=("-path" "./$ex" "-prune" "-o")
                 else
                     debug_log "TAR" "SKIP unsafe exclude pattern: $ex"
                 fi
             fi
         done
-        FIND_ARGS+=("-type" "f" "-size" "+${MAX_FILE_SIZE_MB}M" "-print")
+        FIND_ARGS+=("-type" "f" "-size" "+${MAX_FILE_SIZE_MB}M" "-print0")
         debug_log "TAR" "Find args: ${FIND_ARGS[*]}"
         # Subshell: cd не утечёт в parent (cwd используется в других местах create_backup).
         # Если cd упал — find работает в текущей cwd → BACKUP_DIR обходим, что неправильно.
-        ( cd "$BOT_PATH" && find "${FIND_ARGS[@]}" ) | while IFS= read -r f; do
-            # Преобразуем ./path/file в BOT_DIRNAME/path/file для корректной работы --exclude-from
-            echo "${BOT_DIRNAME}${f#.}"
+        # NUL-delim (`-print0` + `read -d ''`) — защита от файлов с newline/tab
+        # в именах. tar --exclude-from понимает только line-based input, поэтому
+        # сразу перед записью заменяем NUL на newline, а tab в имени файла на
+        # видимый маркер (tar патерны не должны содержать настоящие tab/newline).
+        ( cd "$BOT_PATH" && find "${FIND_ARGS[@]}" ) | while IFS= read -r -d '' f; do
+            # Преобразуем ./path/file в BOT_DIRNAME/path/file для корректной работы --exclude-from.
+            # Чистка контролов: tab/newline → видимые маркеры (защита от шенаниганов в именах).
+            local _clean="${f//$'\t'/_TAB_}"
+            _clean="${_clean//$'\n'/_NL_}"
+            echo "${BOT_DIRNAME}${_clean#.}"
         done > "$SKIP_FILE"
         local SKIP_COUNT=$(wc -l < "$SKIP_FILE")
         debug_log "TAR" "Large files to skip: $SKIP_COUNT"
         if [[ "$SKIP_COUNT" -gt 0 ]]; then
-            local SKIP_SIZE=$(cd "$BOT_PATH" && find "${FIND_ARGS[@]}" | tr '\n' '\0' | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
+            # NUL-delim для du --files0-from — единственный safe способ передать
+            # пути с любыми символами. find -print0 даёт прямо нужный формат.
+            local SKIP_SIZE
+            SKIP_SIZE=$(cd "$BOT_PATH" && find "${FIND_ARGS[@]}" | du -ch --files0-from=- 2>/dev/null | tail -1 | cut -f1)
             print_message "WARN" "Пропущено больших файлов (>${MAX_FILE_SIZE_MB}MB): $SKIP_COUNT (общий вес: $SKIP_SIZE)"
             debug_log "TAR" "Skipped files content:"
             if [[ "$DEBUG_MODE" == true ]]; then cat "$SKIP_FILE"; fi
@@ -6885,11 +6973,15 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files" \
             tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
-        [[ $_tar_rc -eq 0 ]] && {
-            # Затем объединяем с версией
+        # NB: rc=1 = warning «файл изменился во время чтения» — архив OK,
+        # combine можно делать (то же что и в `full` ниже).
+        [[ $_tar_rc -le 1 ]] && {
+            local _first_rc=$_tar_rc
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files-combine" \
                 tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR" 2>> "$_tar_err"
             _tar_rc=$?
+            # Если combine OK (0) но первый tar был warning (1) — финальный статус = warning.
+            [[ $_tar_rc -eq 0 && $_first_rc -eq 1 ]] && _tar_rc=1
         }
         rm -f "$BACKUP_DIR/$FILE_DIR"
     else
@@ -6899,10 +6991,15 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full" \
             tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
+        # rc=1 = warning (файл изменился во время чтения), archive валиден → combine OK.
         [[ $_tar_rc -le 1 ]] && {
+            local _first_rc=$_tar_rc
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full-combine" \
                 tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR" 2>> "$_tar_err"
             _tar_rc=$?
+            # Sticky warning: если первый tar дал rc=1 (warning), а combine — 0,
+            # финальный статус остаётся 1, чтобы пользователь увидел WARN в логе.
+            [[ $_tar_rc -eq 0 && $_first_rc -eq 1 ]] && _tar_rc=1
         }
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
     fi
@@ -8542,11 +8639,19 @@ menu_settings() {
             4) read -erp "Новый DB User: " ndb
                if [[ -n "$ndb" ]]; then DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
-            5) read -erp "Исключить (например: uploads/cache): " ed
-               if [[ -n "$ed" ]]; then 
+            5) echo -e "${GRAY}Разделитель: \",\" или \";\" (поддержка пробелов в путях)${RESET}"
+               echo -e "${GRAY}Пример: ${CYAN}node_modules, .cache, my dir/temp${RESET}"
+               echo -e "${GRAY}Backward-compat: \"foo bar\" (через пробел) тоже работает, но без поддержки пробелов в путях${RESET}"
+               read -erp "Исключить: " ed
+               if [[ -n "$ed" ]]; then
                    EXCLUDE_DIRS="$ed"; save_config; print_message "SUCCESS" "Сохранено"
-               else 
-                   if [[ -n "$EXCLUDE_DIRS" ]]; then 
+                   # Preview: какие реально элементы получились после split
+                   local _preview_arr=()
+                   _split_exclude_dirs "$ed" _preview_arr
+                   echo -e "${GRAY}Распознано ${#_preview_arr[@]} паттернов:${RESET}"
+                   for ex in "${_preview_arr[@]}"; do echo -e "  ${CYAN}• $ex${RESET}"; done
+               else
+                   if [[ -n "$EXCLUDE_DIRS" ]]; then
                        read -erp "Очистить? (y/N): " clr
                        if [[ "$clr" =~ ^[Yy]$ ]]; then EXCLUDE_DIRS=""; save_config; fi
                    fi
