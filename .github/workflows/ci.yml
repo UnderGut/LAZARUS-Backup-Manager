@@ -20,5 +20,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run tests
-        run: bash .github/tests/run.sh
+      - name: System info
+        run: |
+          bash --version | head -1
+          openssl version
+          which python3 || true
+          which timeout || true
+          which gzip || true
+          uname -a
+      - name: Install test deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq openssl coreutils python3 gzip
+      - name: Run tests (verbose)
+        run: bash -x .github/tests/run.sh
+        env:
+          # Force locale (некоторые tests с unicode в bash зависят от UTF-8)
+          LC_ALL: C.UTF-8
+          LANG: C.UTF-8
