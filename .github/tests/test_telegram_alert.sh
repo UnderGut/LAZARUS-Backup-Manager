@@ -61,14 +61,22 @@ source "$FUNC_FILE"
 
 FAILS=0
 
-# --- Test 1: CRITICAL severity → 🔴🔴🔴 + CRITICAL label + #critical ---
+# --- Test 1: CRITICAL severity → 🔴 (one) + CRITICAL label + #critical ---
 : > "$CURL_LOG"
 send_telegram_alert "CRITICAL" "Test critical" "body text" ""
 LAST=$(cat "$CURL_LOG")
-grep -q "🔴🔴🔴" <<< "$LAST" || { echo "FAIL [crit emoji]: no 🔴🔴🔴 in output" >&2; FAILS=$((FAILS + 1)); }
+grep -q "🔴" <<< "$LAST" || { echo "FAIL [crit emoji]: no 🔴 in output" >&2; FAILS=$((FAILS + 1)); }
+# Должна быть ровно ОДНА 🔴 (compact format), не серия
+COUNT=$(grep -o "🔴" <<< "$LAST" | wc -l)
+if [[ $COUNT -ne 1 ]]; then
+    echo "FAIL [crit emoji count]: expected 1 🔴, got $COUNT" >&2; FAILS=$((FAILS + 1))
+fi
 grep -q "CRITICAL" <<< "$LAST" || { echo "FAIL [crit label]: no CRITICAL" >&2; FAILS=$((FAILS + 1)); }
 grep -q "#critical" <<< "$LAST" || { echo "FAIL [crit hashtag]: no #critical" >&2; FAILS=$((FAILS + 1)); }
-grep -q "━" <<< "$LAST" || { echo "FAIL [crit separator]: no ━━━ line" >&2; FAILS=$((FAILS + 1)); }
+# Никакого separator (━) в compact формате
+if grep -q "━" <<< "$LAST"; then
+    echo "FAIL [crit separator]: ━ line should be removed in compact format" >&2; FAILS=$((FAILS + 1))
+fi
 
 # --- Test 2: ERROR severity → ❌ + ERROR label + #error ---
 : > "$CURL_LOG"
@@ -82,10 +90,9 @@ grep -q "ERROR" <<< "$LAST" || { echo "FAIL [err label]" >&2; FAILS=$((FAILS + 1
 send_telegram_alert "WARN" "Test warn" "warn body" ""
 LAST=$(cat "$CURL_LOG")
 grep -q "⚠️" <<< "$LAST" || { echo "FAIL [warn emoji]" >&2; FAILS=$((FAILS + 1)); }
-grep -q "WARNING" <<< "$LAST" || { echo "FAIL [warn label]" >&2; FAILS=$((FAILS + 1)); }
+# Label now "WARN" (was "WARNING")
+grep -q '\*WARN\*' <<< "$LAST" || { echo "FAIL [warn label]: expected *WARN*" >&2; FAILS=$((FAILS + 1)); }
 grep -q "#warning" <<< "$LAST" || { echo "FAIL [warn hashtag]" >&2; FAILS=$((FAILS + 1)); }
-# WARN не должен иметь separator (только CRITICAL)
-grep -q "━" <<< "$LAST" && { echo "FAIL [warn separator]: should NOT have ━ line" >&2; FAILS=$((FAILS + 1)); }
 
 # --- Test 4: INFO ---
 : > "$CURL_LOG"
@@ -102,7 +109,7 @@ LAST=$(cat "$CURL_LOG")
 grep -q "body text here" <<< "$LAST" || { echo "FAIL [body present]" >&2; FAILS=$((FAILS + 1)); }
 grep -q "do something" <<< "$LAST" || { echo "FAIL [actions line 1]" >&2; FAILS=$((FAILS + 1)); }
 grep -q "do another" <<< "$LAST" || { echo "FAIL [actions line 2]" >&2; FAILS=$((FAILS + 1)); }
-grep -q "Что делать" <<< "$LAST" || { echo "FAIL [actions label]" >&2; FAILS=$((FAILS + 1)); }
+grep -q "Действия" <<< "$LAST" || { echo "FAIL [actions label]" >&2; FAILS=$((FAILS + 1)); }
 
 # --- Test 6: <code>X</code> → `X` после escape ---
 : > "$CURL_LOG"
@@ -137,13 +144,12 @@ if [[ -s "$CURL_LOG" ]]; then
 fi
 BOT_TOKEN="$BOT_TOKEN_BAK"
 
-# --- Test 9: hostname + timestamp в footer, hashtags в самом начале ---
+# --- Test 9: hostname в footer (compact: без 🕐 clock emoji), hashtags в начале ---
 : > "$CURL_LOG"
 send_telegram_alert "INFO" "Footer test" "" ""
 LAST=$(cat "$CURL_LOG")
 grep -q "🖥" <<< "$LAST" || { echo "FAIL [host emoji]" >&2; FAILS=$((FAILS + 1)); }
-grep -q "🕐" <<< "$LAST" || { echo "FAIL [clock emoji]" >&2; FAILS=$((FAILS + 1)); }
-# timestamp в формате DD.MM HH:MM:SS — должна быть хотя бы пара цифр-точка-цифр
+# Clock emoji в compact формате убрана — проверяем только что timestamp есть
 grep -qE "[0-9]+\\\.[0-9]+" <<< "$LAST" || { echo "FAIL [timestamp format]" >&2; FAILS=$((FAILS + 1)); }
 # Hashtag должен быть в первой строке (не в footer)
 FIRST_LINE=$(head -1 <<< "$LAST")

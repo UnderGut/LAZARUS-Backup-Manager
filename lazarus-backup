@@ -4727,31 +4727,32 @@ send_telegram_alert() {
     [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
     [[ "$SEND_TO_TELEGRAM" != "true" ]] && return 0
 
-    # Визуальные элементы по severity
-    local _emoji_band="" _label="" _hashtags=""
+    # Визуальные элементы по severity. Компактный формат для мобильных:
+    # одна emoji в начале + короткий label, без тройных баннеров.
+    local _emoji="" _label="" _hashtags=""
     case "$severity" in
         CRITICAL)
-            _emoji_band="🔴🔴🔴"
+            _emoji="🔴"
             _label="CRITICAL"
             _hashtags="#alert #critical"
             ;;
         ERROR)
-            _emoji_band="❌"
+            _emoji="❌"
             _label="ERROR"
             _hashtags="#alert #error"
             ;;
         WARN)
-            _emoji_band="⚠️"
-            _label="WARNING"
+            _emoji="⚠️"
+            _label="WARN"
             _hashtags="#warning"
             ;;
         INFO)
-            _emoji_band="ℹ️"
+            _emoji="ℹ️"
             _label="INFO"
             _hashtags="#info"
             ;;
         *)
-            _emoji_band="📌"
+            _emoji="📌"
             _label="$severity"
             _hashtags="#alert"
             ;;
@@ -4762,10 +4763,10 @@ send_telegram_alert() {
     _tags_esc=$(escape_markdown_v2 "$_hashtags")
     local _tags_line="$_tags_esc"
 
-    # Header (с big bold title)
+    # Header — компактный: одна emoji + LABEL · title (одна строка на iPhone <420px)
     local _title_esc
     _title_esc=$(escape_markdown_v2 "$title")
-    local _header="${_emoji_band} *${_label}: ${_title_esc}* ${_emoji_band}"
+    local _header="${_emoji} *${_label}* · ${_title_esc}"
 
     # Body (escape MarkdownV2, поддержка <code>X</code> для inline-code).
     # NB: escape_markdown_v2 экранирует `>` → `\>`, поэтому после escape маркеры
@@ -4779,32 +4780,28 @@ send_telegram_alert() {
         _body_section=$'\n\n'"$_body_esc"
     fi
 
-    # Actions section (выделен emoji + "Что делать:")
+    # Actions section — компактно: "💡 *Действия:*" + multi-line c командами в code.
     local _actions_section=""
     if [[ -n "$actions" ]]; then
         local _actions_esc
         _actions_esc=$(escape_markdown_v2 "$actions")
         _actions_esc=$(printf '%s' "$_actions_esc" | sed -e 's|<code\\>|`|g' -e 's|</code\\>|`|g')
-        _actions_section=$'\n\n'"💡 *Что делать:*"$'\n'"$_actions_esc"
+        _actions_section=$'\n\n'"💡 *Действия:* "$'\n'"$_actions_esc"
     fi
 
-    # Footer: hostname + timestamp (hashtags moved to top для quick-scan)
+    # Footer: hostname + short timestamp (без часов-emoji, на одной строке).
     local _host _ts
     _host=$(hostname 2>/dev/null || echo "unknown")
-    _ts=$(date '+%d.%m %H:%M:%S' 2>/dev/null || echo "")
+    _ts=$(date '+%d.%m %H:%M' 2>/dev/null || echo "")
     local _footer_esc
-    _footer_esc=$(escape_markdown_v2 "🖥 ${_host} • 🕐 ${_ts}")
+    _footer_esc=$(escape_markdown_v2 "🖥 ${_host} · ${_ts}")
     local _footer=$'\n\n'"$_footer_esc"
 
-    # Separator line (для CRITICAL — отделяем header от body для драматизма)
-    local _separator=""
-    if [[ "$severity" == "CRITICAL" ]]; then
-        _separator=$'\n'"━━━━━━━━━━━━━━━━━━━━"
-    fi
+    # Separator не используем — компактнее. Header уже выделен жирным и emoji.
 
     # Финальный текст. Hashtags на самом верху (1-я строка) — quick-scan и фильтр
     # в Telegram через #critical / #error / #warning / #info.
-    local _full_text="${_tags_line}"$'\n'"${_header}${_separator}${_body_section}${_actions_section}${_footer}"
+    local _full_text="${_tags_line}"$'\n'"${_header}${_body_section}${_actions_section}${_footer}"
 
     local thread_param=""
     [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
@@ -6709,14 +6706,12 @@ create_backup() {
     if [[ -n "$disk_used_percent" && "$disk_used_percent" -ge "$DISK_CRITICAL_PERCENT" ]]; then
         print_message "ERROR" "Диск заполнен на ${disk_used_percent}% (порог CRITICAL=${DISK_CRITICAL_PERCENT}%). Бэкап отменён."
         log_message "ERROR" "Backup aborted: disk ${disk_used_percent}% >= CRITICAL ${DISK_CRITICAL_PERCENT}% on ${disk_mount}"
-        local _crit_body="📊 Заполнение: ${disk_used_percent}% (порог CRITICAL: ${DISK_CRITICAL_PERCENT}%)
-💾 Свободно: ${free_space_human}
-📂 Точка монтирования: ${disk_mount}
-🛑 Статус: бэкап ОТМЕНЁН"
-        local _crit_actions="<code>lazarus cleanup</code> — удалить старые архивы
-<code>lazarus s3 upload <файл></code> — выгрузить в облако и удалить локально
-Или вручную освободить место на диске"
-        send_telegram_alert "CRITICAL" "Диск переполнен — бэкап остановлен" "$_crit_body" "$_crit_actions"
+        local _crit_body="📊 ${disk_used_percent}% / порог ${DISK_CRITICAL_PERCENT}%
+💾 Свободно: ${free_space_human} (${disk_mount})
+🛑 Бэкап ОТМЕНЁН"
+        local _crit_actions="<code>lazarus cleanup</code>
+<code>lazarus s3 upload <файл></code>"
+        send_telegram_alert "CRITICAL" "Диск переполнен" "$_crit_body" "$_crit_actions"
         [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
@@ -6725,12 +6720,10 @@ create_backup() {
     if [[ -n "$disk_used_percent" && "$disk_used_percent" -ge "$DISK_WARN_PERCENT" ]]; then
         print_message "WARN" "Диск заполнен на ${disk_used_percent}% (порог WARN=${DISK_WARN_PERCENT}%). Рекомендуется cleanup."
         log_message "WARN" "Disk usage ${disk_used_percent}% >= WARN ${DISK_WARN_PERCENT}% on ${disk_mount}"
-        local _warn_body="📊 Заполнение: ${disk_used_percent}% (порог WARN: ${DISK_WARN_PERCENT}%)
-💾 Свободно: ${free_space_human}
-📂 Точка монтирования: ${disk_mount}
-✅ Бэкап продолжается, но рекомендуется освободить место.
-🛑 При ${DISK_CRITICAL_PERCENT}% бэкапы будут отменяться."
-        local _warn_actions="<code>lazarus cleanup</code> — удалить старые архивы"
+        local _warn_body="📊 ${disk_used_percent}% / порог ${DISK_WARN_PERCENT}%
+💾 Свободно: ${free_space_human} (${disk_mount})
+✅ Бэкап продолжается. При ${DISK_CRITICAL_PERCENT}% — будет отменён."
+        local _warn_actions="<code>lazarus cleanup</code>"
         send_telegram_alert "WARN" "Диск заполняется" "$_warn_body" "$_warn_actions"
     fi
     
@@ -6750,13 +6743,12 @@ create_backup() {
             print_message "WARN" "Продолжаем на свой риск..."
         else
             # В non-interactive режиме (cron) отправляем уведомление и прерываем
-            send_telegram_alert "CRITICAL" "Бэкап прерван — нет места на диске" \
-                "💾 Свободно: ${free_space_human}
-📂 Точка монтирования: ${disk_mount}
-🛑 Минимум для backup: 1 GB
-🛑 Статус: бэкап ОТМЕНЁН (cron mode)" \
-                "<code>lazarus cleanup</code> — удалить старые архивы
-Проверить заполнение: <code>df -h</code>"
+            send_telegram_alert "CRITICAL" "Нет места на диске" \
+                "💾 Свободно: ${free_space_human} (${disk_mount})
+🛑 Минимум для бэкапа: 1 GB
+🛑 Бэкап ОТМЕНЁН (cron)" \
+                "<code>lazarus cleanup</code>
+<code>df -h</code>"
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
@@ -6772,13 +6764,12 @@ create_backup() {
                 print_message "ERROR" "Контейнер БД ($DB_CONTAINER_NAME) не запущен!"
                 log_message "ERROR" "Backup aborted: DB container not running ($DB_CONTAINER_NAME)"
                 if [[ "$IS_INTERACTIVE" != "true" ]]; then
-                    send_telegram_alert "CRITICAL" "Бэкап прерван — контейнер БД не запущен" \
-                        "🐳 Контейнер: <code>$DB_CONTAINER_NAME</code>
-🛑 Статус: остановлен или удалён
-📦 Тип бэкапа: $TYPE" \
-                        "Запустить контейнер: <code>docker start $DB_CONTAINER_NAME</code>
-Проверить состояние: <code>docker ps -a --filter name=$DB_CONTAINER_NAME</code>
-Если контейнер потерян — проверить compose: <code>cd \$BOT_PATH && docker compose up -d</code>"
+                    send_telegram_alert "CRITICAL" "Контейнер БД не запущен" \
+                        "🐳 <code>$DB_CONTAINER_NAME</code>
+📦 Тип: $TYPE
+🛑 Бэкап ОТМЕНЁН" \
+                        "<code>docker start $DB_CONTAINER_NAME</code>
+<code>docker ps -a</code>"
                 fi
                 [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
                 return 1
@@ -6927,14 +6918,12 @@ create_backup() {
             print_message "ERROR" "База данных не готова! (pg_isready failed 3x)"
             log_message "ERROR" "Backup aborted: pg_isready failed 3 times for $DB_CONTAINER_NAME"
             if [[ "$IS_INTERACTIVE" != "true" ]]; then
-                send_telegram_alert "CRITICAL" "Бэкап прерван — БД не отвечает" \
-                    "🐳 Контейнер: <code>$DB_CONTAINER_NAME</code>
-🔌 pg_isready: FAIL (3 попытки с retry)
-📦 Тип бэкапа: $TYPE
-🛑 Статус: бэкап ОТМЕНЁН" \
-                    "Проверить логи: <code>docker logs $DB_CONTAINER_NAME --tail 50</code>
-Проверить health: <code>docker inspect $DB_CONTAINER_NAME --format='{{.State.Health.Status}}'</code>
-Если зависание — рестарт пары bot+db (НЕ restart, а down/up)"
+                send_telegram_alert "CRITICAL" "БД не отвечает (pg_isready × 3)" \
+                    "🐳 <code>$DB_CONTAINER_NAME</code>
+📦 Тип: $TYPE
+🛑 Бэкап ОТМЕНЁН" \
+                    "<code>docker logs $DB_CONTAINER_NAME --tail 50</code>
+<code>docker inspect $DB_CONTAINER_NAME -f '{{.State.Health.Status}}'</code>"
             fi
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
@@ -7398,11 +7387,10 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
             # TG-уведомление о том что delete пропущен — только если опция была включена
             if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
                 send_telegram_alert "WARN" "Локальный бэкап сохранён" \
-                    "💾 Опция: <code>DELETE_LOCAL_AFTER_REMOTE_UPLOAD=${DELETE_LOCAL_AFTER_REMOTE_UPLOAD}</code>
-🛑 Удаление не выполнено — условие не сработало.
+                    "⚙️ Режим: <code>${DELETE_LOCAL_AFTER_REMOTE_UPLOAD}</code>
 🔍 Причина: $_delete_reason
-✅ Файл остался локально (защита от потери данных)" \
-                    "Проверить статус доставки в логах — почему канал не подтвердил."
+✅ Файл остался локально" \
+                    ""
             fi
         fi
     fi
@@ -9212,11 +9200,10 @@ cleanup_old_backups() {
         # In dry-run we never delete
         log_message "INFO" "[DRY_RUN] Cleanup preview (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, candidates=$total_del)"
         if [[ "$REPORT_TO_TG" == "true" && "$SEND_TO_TELEGRAM" == "true" ]]; then
-            send_telegram_alert "INFO" "DRY-RUN ротация (preview)" \
-                "🗑 Кандидатов на удаление: $total_del файлов
-⚙️ Режим: $DELETE_MODE
-🔍 Файлы НЕ удалены (dry-run mode)" \
-                "Запустить реальную очистку: <code>lazarus cleanup</code>"
+            send_telegram_alert "INFO" "DRY-RUN ротация" \
+                "🗑 Кандидатов: $total_del · режим $DELETE_MODE
+🔍 Файлы НЕ удалены" \
+                "<code>lazarus cleanup</code>"
         fi
         read -erp "Enter..." dummy
         return
@@ -9240,10 +9227,8 @@ cleanup_old_backups() {
         echo ""; print_message "SUCCESS" "Очистка завершена."
         log_message "INFO" "Cleanup completed (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, deleted=$total_del)"
         if [[ "$REPORT_TO_TG" == "true" && "$SEND_TO_TELEGRAM" == "true" ]]; then
-            send_telegram_alert "INFO" "Ротация бэкапов выполнена" \
-                "🗑 Удалено: $total_del файлов
-⚙️ Режим: $DELETE_MODE
-✅ Освобождено место на диске" ""
+            send_telegram_alert "INFO" "Ротация выполнена" \
+                "🗑 Удалено: $total_del · режим $DELETE_MODE" ""
         fi
     else
         echo ""; print_message "INFO" "Отменено."
