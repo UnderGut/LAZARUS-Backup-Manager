@@ -7951,11 +7951,11 @@ confirm_restore_target() {
     if [[ "$IS_INTERACTIVE" == true ]]; then
         echo ""
         print_message "WARN" "Восстановление в: ${BOT_PATH}"
-        echo -e "Введите ${CYAN}${BOLD}ВОССТАНОВИТЬ${RESET} для подтверждения:"
+        echo -e "Введите ${CYAN}${BOLD}RESTORE${RESET} для подтверждения:"
         # _typed_confirm_with_timer — auto-cancel через 60 сек если не подтвердил.
         # Защита от случая когда юзер отвлёкся и destructive операция «висит».
         # Ctrl+C по-прежнему отменяет (read -t возвращает rc!=0 → отказ).
-        local expected="ВОССТАНОВИТЬ"
+        local expected="RESTORE"
         local confirm=""
         if _typed_confirm_with_timer "$expected" 60 confirm; then
             return 0
@@ -7984,9 +7984,9 @@ confirm_drop_volume() {
         echo ""
         print_message "WARN" "Будет удалён volume БД: ${volume_name}"
         print_message "WARN" "Это полностью уничтожит данные в этом volume."
-        echo -e "Введите ${CYAN}${BOLD}УДАЛИТЬ${RESET} для подтверждения:"
+        echo -e "Введите ${CYAN}${BOLD}DELETE${RESET} для подтверждения:"
         # Auto-cancel через 60 сек — destructive, не висим зря.
-        local expected="УДАЛИТЬ"
+        local expected="DELETE"
         local confirm=""
         _typed_confirm_with_timer "$expected" 60 confirm
         if [[ "$confirm" != "$expected" ]]; then
@@ -8206,9 +8206,9 @@ confirm_drop_schema() {
         echo ""
         echo -e "Safety snapshot сохранён: ${GREEN}$snapshot_file${RESET}"
         echo ""
-        echo -e "Введите ${CYAN}${BOLD}ОЧИСТИТЬ${RESET} для подтверждения:"
+        echo -e "Введите ${CYAN}${BOLD}DROP${RESET} для подтверждения:"
         # Auto-cancel через 60 сек — DROP SCHEMA необратим.
-        local expected="ОЧИСТИТЬ"
+        local expected="DROP"
         local confirm=""
         _typed_confirm_with_timer "$expected" 60 confirm
         if [[ "$confirm" != "$expected" ]]; then
