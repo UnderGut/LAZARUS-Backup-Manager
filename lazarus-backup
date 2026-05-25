@@ -4763,10 +4763,12 @@ send_telegram_alert() {
     _tags_esc=$(escape_markdown_v2 "$_hashtags")
     local _tags_line="$_tags_esc"
 
-    # Header — компактный: одна emoji + LABEL · title (одна строка на iPhone <420px)
+    # Header — 2 строки: severity label сверху, title снизу (жирный).
+    # На iPhone это читается лучше чем «LABEL · title» в одну строку, особенно
+    # когда title длинный («Контейнер БД не запущен», «БД не отвечает»).
     local _title_esc
     _title_esc=$(escape_markdown_v2 "$title")
-    local _header="${_emoji} *${_label}* · ${_title_esc}"
+    local _header="${_emoji} *${_label}*"$'\n'"*${_title_esc}*"
 
     # Body (escape MarkdownV2, поддержка <code>X</code> для inline-code).
     # NB: escape_markdown_v2 экранирует `>` → `\>`, поэтому после escape маркеры
