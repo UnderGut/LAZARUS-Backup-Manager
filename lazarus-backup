@@ -96,6 +96,14 @@ S3_REGION="us-east-1"    # Регион (для AWS) или любой для S3
 BACKUP_PASSWORD=""
 BACKUP_PASSWORD_FILE="$INSTALL_DIR/.password"
 
+# Timeout-обёртки на критичные команды (защита от вечно висящего cron).
+# Значения по умолчанию выбраны под worst-case 1 GB БД / 5 GB файлы.
+# Disabled (=0): для пользователей с очень большими БД (>10 GB) или slow disk.
+PG_DUMP_TIMEOUT_SEC="3600"        # 60 мин — на 10 GB БД через сжатие хватает с запасом
+TAR_TIMEOUT_SEC="3600"            # 60 мин на тяжёлые файловые архивы
+ENCRYPT_TIMEOUT_SEC="1800"        # 30 мин на encrypt/HMAC для 5 GB архива
+RESTORE_TIMEOUT_SEC="3600"        # 60 мин на restore (decrypt + psql load)
+
 # Restore safety flags
 RESTORE_FORCE="false"
 RESTORE_INCLUDE_ENV="false"
@@ -345,10 +353,13 @@ _hmac_envelope_create() {
     cipher_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_enc.XXXXXX") || return 1
     register_sensitive_tmp "$cipher_tmp"
 
-    # Step 1: encrypt через openssl (как раньше)
-    if ! openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
-            -in "$infile" -out "$cipher_tmp" \
-            -pass fd:3 3<<<"$password" 2> "$SILENT_LOG"; then
+    # Step 1: encrypt через openssl (как раньше).
+    # Timeout-обёртка: PBKDF2 + AES для очень больших архивов (>5 GB) может
+    # затянуться на slow CPU/IO; ENCRYPT_TIMEOUT_SEC=0 → отключить.
+    # Используем _run_pipe_with_timeout с heredoc через FD3 — pipefail сохраняем.
+    if ! _run_pipe_with_timeout "${ENCRYPT_TIMEOUT_SEC:-1800}" "encrypt-aes" \
+            'openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$1" -out "$2" -pass fd:3 3<<<"$3" 2> "$4"' \
+            "$infile" "$cipher_tmp" "$password" "$SILENT_LOG"; then
         rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
         return 1
     fi
@@ -508,6 +519,96 @@ _hmac_envelope_decrypt() {
         [[ $drc -eq 0 ]] && return 0 || return 2
     fi
     return 1   # unknown format
+}
+
+# =============================================================================
+# _run_with_timeout: запускает команду с hard-limit таймаутом + понятным логом
+# =============================================================================
+# Защищает cron от вечно висящего pg_dump/tar/openssl при stuck-БД, медленном
+# диске, или сетевом hang на docker exec. Без таймаута процесс висит часами,
+# никто не узнаёт пока админ руками не убьёт.
+#
+# Аргументы:
+#   $1 — таймаут в секундах. 0 → запуск БЕЗ таймаута (для очень больших БД).
+#   $2 — короткий label для логов ("pg_dump", "tar-archive", "encrypt").
+#   $3+ — команда + её аргументы.
+#
+# Return:
+#   exit code команды напрямую;
+#   124 — таймаут (от GNU coreutils `timeout`), мы логируем как ERROR + TG.
+#
+# NB: не работает для pipe-цепочек (timeout даёт по SIGTERM только первому
+# процессу). Для pipe pg_dump|gzip используем отдельный subshell-wrapper
+# (см. _run_pipe_with_timeout ниже).
+# =============================================================================
+_run_with_timeout() {
+    local _timeout="$1"
+    local _label="$2"
+    shift 2
+
+    # 0 или пусто → без timeout (для очень больших БД / power-users).
+    if [[ -z "$_timeout" || "$_timeout" == "0" ]]; then
+        debug_log "TIMEOUT" "$_label: no timeout (disabled by config)"
+        "$@"
+        return $?
+    fi
+
+    # GNU timeout есть везде где есть coreutils (Debian, Ubuntu, CentOS).
+    # На BSD/macOS он может отсутствовать — fallback запускаем без timeout.
+    if ! command -v timeout > "$SILENT_LOG" 2>&1; then
+        debug_log "TIMEOUT" "$_label: 'timeout' not found, running without limit"
+        "$@"
+        return $?
+    fi
+
+    debug_log "TIMEOUT" "$_label: running with ${_timeout}s limit: $*"
+    # --kill-after 30: если SIGTERM не убил процесс за 30 сек — SIGKILL.
+    # Защищает от zombie процессов которые игнорируют TERM.
+    timeout --kill-after=30 "$_timeout" "$@"
+    local _rc=$?
+    if [[ $_rc -eq 124 || $_rc -eq 137 ]]; then
+        # 124 — SIGTERM от timeout, 137 — SIGKILL (через --kill-after).
+        print_message "ERROR" "$_label: операция прервана по таймауту (${_timeout}с)" >&2
+        log_message "ERROR" "$_label TIMEOUT (limit=${_timeout}s, rc=$_rc): $*"
+        debug_log "TIMEOUT" "$_label HARD-KILLED at ${_timeout}s"
+    fi
+    return $_rc
+}
+
+# Pipe-вариант: для конструкций вроде `pg_dump | gzip > file`.
+# Запускает всё через `timeout bash -c '...'` потому что обычный timeout
+# не передаёт SIGTERM компонентам pipe.
+# Использует переменные через -- exporting:
+#   _run_pipe_with_timeout 1800 "pg_dump+gzip" \
+#       'docker exec "$1" pg_dump -U "$2" "$3" | gzip > "$4"' \
+#       "$DB_CONTAINER" "$DB_USER" "$DB_NAME" "$OUT_FILE"
+# Внутри bash -c доступен "$1", "$2", ... — обычная positional передача.
+# Return: exit code последней команды pipe (через `set -o pipefail`).
+_run_pipe_with_timeout() {
+    local _timeout="$1"
+    local _label="$2"
+    local _pipe_cmd="$3"
+    shift 3
+
+    if [[ -z "$_timeout" || "$_timeout" == "0" ]]; then
+        debug_log "TIMEOUT" "$_label: no timeout (disabled by config)"
+        bash -c "set -o pipefail; $_pipe_cmd" _ "$@"
+        return $?
+    fi
+    if ! command -v timeout > "$SILENT_LOG" 2>&1; then
+        bash -c "set -o pipefail; $_pipe_cmd" _ "$@"
+        return $?
+    fi
+
+    debug_log "TIMEOUT" "$_label (pipe): running with ${_timeout}s limit"
+    timeout --kill-after=30 "$_timeout" bash -c "set -o pipefail; $_pipe_cmd" _ "$@"
+    local _rc=$?
+    if [[ $_rc -eq 124 || $_rc -eq 137 ]]; then
+        print_message "ERROR" "$_label: операция прервана по таймауту (${_timeout}с)" >&2
+        log_message "ERROR" "$_label TIMEOUT (limit=${_timeout}s, rc=$_rc, pipe)"
+        debug_log "TIMEOUT" "$_label HARD-KILLED at ${_timeout}s (pipe)"
+    fi
+    return $_rc
 }
 
 # =============================================================================
@@ -4142,6 +4243,10 @@ load_config_file() {
             DISK_CRITICAL_PERCENT) DISK_CRITICAL_PERCENT="$val" ;;
             DELETE_LOCAL_AFTER_REMOTE_UPLOAD) DELETE_LOCAL_AFTER_REMOTE_UPLOAD="$val" ;;
             BACKUP_LOG_FILES) BACKUP_LOG_FILES="$val" ;;
+            PG_DUMP_TIMEOUT_SEC) PG_DUMP_TIMEOUT_SEC="$val" ;;
+            TAR_TIMEOUT_SEC) TAR_TIMEOUT_SEC="$val" ;;
+            ENCRYPT_TIMEOUT_SEC) ENCRYPT_TIMEOUT_SEC="$val" ;;
+            RESTORE_TIMEOUT_SEC) RESTORE_TIMEOUT_SEC="$val" ;;
             *) debug_log "CONFIG" "Unknown key in config (ignored): $key" ;;
         esac
     done < "$file"
@@ -4282,6 +4387,11 @@ save_config() {
     DISK_CRITICAL_PERCENT_ESC=$(env_escape "$DISK_CRITICAL_PERCENT")
     DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC=$(env_escape "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD")
     BACKUP_LOG_FILES_ESC=$(env_escape "$BACKUP_LOG_FILES")
+    local PG_DUMP_TIMEOUT_SEC_ESC TAR_TIMEOUT_SEC_ESC ENCRYPT_TIMEOUT_SEC_ESC RESTORE_TIMEOUT_SEC_ESC
+    PG_DUMP_TIMEOUT_SEC_ESC=$(env_escape "$PG_DUMP_TIMEOUT_SEC")
+    TAR_TIMEOUT_SEC_ESC=$(env_escape "$TAR_TIMEOUT_SEC")
+    ENCRYPT_TIMEOUT_SEC_ESC=$(env_escape "$ENCRYPT_TIMEOUT_SEC")
+    RESTORE_TIMEOUT_SEC_ESC=$(env_escape "$RESTORE_TIMEOUT_SEC")
 
     cat > "$CONFIG_FILE" <<EOF
 BOT_TOKEN="$BOT_TOKEN_ESC"
@@ -4320,6 +4430,10 @@ DISK_WARN_PERCENT="$DISK_WARN_PERCENT_ESC"
 DISK_CRITICAL_PERCENT="$DISK_CRITICAL_PERCENT_ESC"
 DELETE_LOCAL_AFTER_REMOTE_UPLOAD="$DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC"
 BACKUP_LOG_FILES="$BACKUP_LOG_FILES_ESC"
+PG_DUMP_TIMEOUT_SEC="$PG_DUMP_TIMEOUT_SEC_ESC"
+TAR_TIMEOUT_SEC="$TAR_TIMEOUT_SEC_ESC"
+ENCRYPT_TIMEOUT_SEC="$ENCRYPT_TIMEOUT_SEC_ESC"
+RESTORE_TIMEOUT_SEC="$RESTORE_TIMEOUT_SEC_ESC"
 EOF
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
@@ -6619,13 +6733,21 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         # Используем pg_dump вместо pg_dumpall (согласно официальной документации).
         # КРИТИЧНО: проверяем PIPESTATUS обоих звеньев, иначе при падении pg_dump
         # gzip успешно создаст пустой архив и backup пройдёт как SUCCESS → silent data loss.
-        docker exec "$DB_CONTAINER_NAME" pg_dump -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" 2> "$SILENT_LOG" \
-            | gzip -9 > "$BACKUP_DIR/$FILE_DB"
-        local _pg_rc=${PIPESTATUS[0]} _gz_rc=${PIPESTATUS[1]}
-        if [[ $_pg_rc -ne 0 || $_gz_rc -ne 0 ]]; then
-            print_message "ERROR" "Ошибка дампа БД (pg_dump=$_pg_rc gzip=$_gz_rc)."
-            debug_log "DB" "pg_dump FAILED: pg_dump=$_pg_rc gzip=$_gz_rc"
-            log_message "ERROR" "pg_dump failed: pg_dump rc=$_pg_rc gzip rc=$_gz_rc"
+        # Timeout-обёртка: при stuck-БД (lock на длинной транзакции) cron мог висеть
+        # часами без сигнала. PG_DUMP_TIMEOUT_SEC=0 → отключить (для гигантских БД).
+        _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump" \
+            'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | gzip -9 > "$5"' \
+            "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$BACKUP_DIR/$FILE_DB"
+        local _pipe_rc=$?
+        # _run_pipe_with_timeout запускает pipe с set -o pipefail, поэтому
+        # rc отражает первую упавшую команду в pipe или 124/137 при timeout.
+        # Для backward-compat сохраняем legacy PIPESTATUS-style логирование:
+        # если timeout — _pg_rc=$_pipe_rc, _gz_rc=0 (логика "первая команда упала").
+        local _pg_rc=$_pipe_rc _gz_rc=0
+        if [[ $_pipe_rc -ne 0 ]]; then
+            print_message "ERROR" "Ошибка дампа БД (rc=$_pipe_rc)."
+            debug_log "DB" "pg_dump FAILED: rc=$_pipe_rc (timeout=124, killed=137)"
+            log_message "ERROR" "pg_dump failed: rc=$_pipe_rc (timeout=${PG_DUMP_TIMEOUT_SEC}s)"
             HAS_ERROR=1
         else
             local db_size=$(du -h "$BACKUP_DIR/$FILE_DB" 2>/dev/null | cut -f1)
@@ -6747,7 +6869,10 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="lazarus_db_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         debug_log "TAR" "Creating DB archive: $FILE_FINAL"
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" 2> "$_tar_err"
+        # DB archive — это просто 2 маленьких файла, timeout мизерный, но
+        # обёртка стандартизирует поведение и логирование.
+        _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-db" \
+            tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" 2> "$_tar_err"
         _tar_rc=$?
         rm -f "$BACKUP_DIR/$FILE_DB"
     elif [[ "$TYPE" == "files_only" ]]; then
@@ -6757,11 +6882,13 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         debug_log "TAR" "Creating files archive: $FILE_FINAL"
         debug_log "TAR" "Running: tar -czf $BACKUP_DIR/$FILE_DIR ${EXCLUDE_FLAGS[*]} -C $(dirname "$BOT_PATH") $(basename "$BOT_PATH")"
         # Сначала архивируем файлы бота с исключениями
-        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
+        _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files" \
+            tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
         [[ $_tar_rc -eq 0 ]] && {
             # Затем объединяем с версией
-            tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR" 2>> "$_tar_err"
+            _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files-combine" \
+                tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR" 2>> "$_tar_err"
             _tar_rc=$?
         }
         rm -f "$BACKUP_DIR/$FILE_DIR"
@@ -6769,10 +6896,12 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         FILE_FINAL="lazarus_full_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
         debug_log "TAR" "Creating full archive: $FILE_FINAL"
-        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
+        _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full" \
+            tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
         [[ $_tar_rc -le 1 ]] && {
-            tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR" 2>> "$_tar_err"
+            _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full-combine" \
+                tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR" 2>> "$_tar_err"
             _tar_rc=$?
         }
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
@@ -7479,17 +7608,23 @@ confirm_drop_schema() {
     print_message "INFO" "Создание safety snapshot БД перед DROP SCHEMA..."
     # КРИТИЧНО: PIPESTATUS обоих, иначе при падении pg_dump snapshot будет пустым
     # gzip-файлом, а DROP SCHEMA уже выполнится — rollback станет невозможен.
-    docker exec "$db_container" pg_dump -U "$db_user" "$db_name" 2> "$SILENT_LOG" | gzip > "$snapshot_file"
-    local _pg_rc=${PIPESTATUS[0]} _gz_rc=${PIPESTATUS[1]}
+    # Timeout-обёртка: snapshot перед DESTRUCTIVE операцией обязан завершиться
+    # за PG_DUMP_TIMEOUT_SEC, иначе DROP SCHEMA без rollback-точки = catastrophe.
+    _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-snapshot" \
+        'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | gzip > "$5"' \
+        "$db_container" "$db_user" "$db_name" "$SILENT_LOG" "$snapshot_file"
+    local _snap_rc=$?
+    # Для backward-compat сохраняем _pg_rc/_gz_rc для последующих логов.
+    local _pg_rc=$_snap_rc _gz_rc=0
     local snap_bytes=0
     [[ -f "$snapshot_file" ]] && snap_bytes=$(stat -c%s "$snapshot_file" 2>/dev/null || echo 0)
-    if [[ $_pg_rc -eq 0 && $_gz_rc -eq 0 && $snap_bytes -ge 100 ]]; then
+    if [[ $_snap_rc -eq 0 && $snap_bytes -ge 100 ]]; then
         local snap_size
         snap_size=$(du -h "$snapshot_file" 2>/dev/null | cut -f1)
         print_message "SUCCESS" "Safety snapshot: $snapshot_file ($snap_size)"
     else
-        print_message "ERROR" "Не удалось создать safety snapshot (pg_dump=$_pg_rc gzip=$_gz_rc size=${snap_bytes}b). Восстановление прервано."
-        log_message "ERROR" "Safety snapshot failed: pg_dump=$_pg_rc gzip=$_gz_rc size=${snap_bytes}b"
+        print_message "ERROR" "Не удалось создать safety snapshot (rc=$_snap_rc, size=${snap_bytes}b, timeout=${PG_DUMP_TIMEOUT_SEC}s). Восстановление прервано."
+        log_message "ERROR" "Safety snapshot failed: rc=$_snap_rc size=${snap_bytes}b (timeout=${PG_DUMP_TIMEOUT_SEC}s)"
         rm -f "$snapshot_file"
         return 1
     fi
@@ -7799,14 +7934,18 @@ execute_restore() {
         debug_log "RESTORE" "Running: zcat $DB_DUMP | docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER $ACTUAL_DB_NAME -v ON_ERROR_STOP=1"
         # -v ON_ERROR_STOP=1: psql останавливается на первой ошибке (FK violation,
         # syntax error, etc) — без этого silent partial restore.
-        # PIPESTATUS[1] нужен потому что psql exit code теряется в pipe.
-        zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" \
-            psql -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" -v ON_ERROR_STOP=1 > "$SILENT_LOG" 2>&1
-        local _zc_rc=${PIPESTATUS[0]} _ps_rc=${PIPESTATUS[1]}
-        debug_log "RESTORE" "DB import: zcat=$_zc_rc psql=$_ps_rc"
-        if [[ $_zc_rc -ne 0 || $_ps_rc -ne 0 ]]; then
-            print_message "ERROR" "Импорт БД провалился (zcat=$_zc_rc psql=$_ps_rc). БД в неконсистентном состоянии."
-            log_message "ERROR" "Restore psql failed: zcat=$_zc_rc psql=$_ps_rc (dump: $DB_DUMP)"
+        # Timeout-обёртка: при very large dump или slow disk restore может висеть.
+        # RESTORE_TIMEOUT_SEC=0 → отключить (для гигантских БД).
+        _run_pipe_with_timeout "$RESTORE_TIMEOUT_SEC" "psql-restore" \
+            'zcat "$1" | docker exec -i "$2" psql -U "$3" "$4" -v ON_ERROR_STOP=1 > "$5" 2>&1' \
+            "$DB_DUMP" "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG"
+        local _restore_rc=$?
+        # Сохраняем legacy log-style: _zc_rc + _ps_rc для debug.
+        local _zc_rc=$_restore_rc _ps_rc=$_restore_rc
+        debug_log "RESTORE" "DB import: rc=$_restore_rc (timeout=${RESTORE_TIMEOUT_SEC}s)"
+        if [[ $_restore_rc -ne 0 ]]; then
+            print_message "ERROR" "Импорт БД провалился (rc=$_restore_rc). БД в неконсистентном состоянии."
+            log_message "ERROR" "Restore psql failed: rc=$_restore_rc (dump: $DB_DUMP, timeout=${RESTORE_TIMEOUT_SEC}s)"
             if [[ "$IS_INTERACTIVE" == true ]]; then
                 echo -e "${RED}Для отката восстановите safety snapshot из ${BACKUP_DIR}/pre_restore_snapshot_*.sql.gz${RESET}"
             fi
