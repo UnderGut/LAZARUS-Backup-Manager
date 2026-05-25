@@ -7950,12 +7950,12 @@ _typed_confirm_with_timer() {
 confirm_restore_target() {
     if [[ "$IS_INTERACTIVE" == true ]]; then
         echo ""
-        print_message "WARN" "Введите точную строку подтверждения для продолжения:"
-        local expected="RESTORE_TO:$BOT_PATH"
-        echo -e "${CYAN}$expected${RESET}"
+        print_message "WARN" "Восстановление в: ${BOT_PATH}"
+        echo -e "Введите ${CYAN}${BOLD}ВОССТАНОВИТЬ${RESET} для подтверждения:"
         # _typed_confirm_with_timer — auto-cancel через 60 сек если не подтвердил.
         # Защита от случая когда юзер отвлёкся и destructive операция «висит».
         # Ctrl+C по-прежнему отменяет (read -t возвращает rc!=0 → отказ).
+        local expected="ВОССТАНОВИТЬ"
         local confirm=""
         if _typed_confirm_with_timer "$expected" 60 confirm; then
             return 0
@@ -7982,10 +7982,11 @@ confirm_drop_volume() {
 
     if [[ "$IS_INTERACTIVE" == true ]]; then
         echo ""
-        print_message "WARN" "Будет удален volume БД. Это полностью удалит данные в volume."
-        local expected="DROP_VOLUME:$volume_name"
-        echo -e "${CYAN}$expected${RESET}"
+        print_message "WARN" "Будет удалён volume БД: ${volume_name}"
+        print_message "WARN" "Это полностью уничтожит данные в этом volume."
+        echo -e "Введите ${CYAN}${BOLD}УДАЛИТЬ${RESET} для подтверждения:"
         # Auto-cancel через 60 сек — destructive, не висим зря.
+        local expected="УДАЛИТЬ"
         local confirm=""
         _typed_confirm_with_timer "$expected" 60 confirm
         if [[ "$confirm" != "$expected" ]]; then
@@ -8205,10 +8206,9 @@ confirm_drop_schema() {
         echo ""
         echo -e "Safety snapshot сохранён: ${GREEN}$snapshot_file${RESET}"
         echo ""
-        local expected="DROP_SCHEMA_IN:${db_name}"
-        echo -n "Введите для подтверждения: "
-        echo -e "${CYAN}$expected${RESET}"
+        echo -e "Введите ${CYAN}${BOLD}ОЧИСТИТЬ${RESET} для подтверждения:"
         # Auto-cancel через 60 сек — DROP SCHEMA необратим.
+        local expected="ОЧИСТИТЬ"
         local confirm=""
         _typed_confirm_with_timer "$expected" 60 confirm
         if [[ "$confirm" != "$expected" ]]; then
