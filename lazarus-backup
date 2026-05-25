@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.1.0"
+VERSION="5.2.0"
 # SCRIPT_NAME — имя файла внутри INSTALL_DIR, совпадает с именем в репо.
 # Раньше было "lazarus" (расхождение с именем в Git), теперь "lazarus-backup".
 # install_script автоматически мигрирует старые установки.
@@ -1018,16 +1018,71 @@ log_message() {
 }
 
 rotate_internal_log() {
-    # Rotate log if > 10MB
+    # Rotate log if > 10MB. Keep 5 archives (.1.gz через .5.gz).
+    # Если /etc/logrotate.d/lazarus установлен (через install_logrotate) — system
+    # logrotate возьмёт всё на себя, эта функция станет no-op (system делает лучше).
+    [[ -f /etc/logrotate.d/lazarus ]] && return 0
+
     local MAX_LOG_SIZE=$((10 * 1024 * 1024))
-    if [[ -f "$LOG_FILE" ]]; then
-        local size
-        size=$(stat -c%s "$LOG_FILE" 2> "$SILENT_LOG" || echo 0)
-        if [[ "$size" -gt "$MAX_LOG_SIZE" ]]; then
-            mv "$LOG_FILE" "${LOG_FILE}.old"
-            echo "Log rotated on $(date)" > "$LOG_FILE"
-        fi
+    [[ ! -f "$LOG_FILE" ]] && return 0
+    local size
+    size=$(stat -c%s "$LOG_FILE" 2> "$SILENT_LOG" || echo 0)
+    [[ "$size" -le "$MAX_LOG_SIZE" ]] && return 0
+
+    # Shift старых архивов: .4.gz → .5.gz (drop), .3.gz → .4.gz, ..., .1.gz → .2.gz
+    local i
+    for i in 5 4 3 2 1; do
+        local src="${LOG_FILE}.${i}.gz"
+        local dst="${LOG_FILE}.$((i + 1)).gz"
+        [[ -f "$src" ]] && {
+            if [[ $i -eq 5 ]]; then
+                rm -f "$src"  # самый старый дропаем
+            else
+                mv "$src" "$dst" 2> "$SILENT_LOG" || true
+            fi
+        }
+    done
+    # Current log → .1.gz (compress)
+    if command -v gzip > "$SILENT_LOG" 2>&1; then
+        gzip -c "$LOG_FILE" > "${LOG_FILE}.1.gz" 2> "$SILENT_LOG"
+        : > "$LOG_FILE"  # truncate (preserve inode + fd-handles)
+    else
+        mv "$LOG_FILE" "${LOG_FILE}.1" 2> "$SILENT_LOG"
+        : > "$LOG_FILE"
     fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log rotated (max ${MAX_LOG_SIZE} bytes exceeded)" > "$LOG_FILE"
+}
+
+# =============================================================================
+# install_logrotate: создаёт /etc/logrotate.d/lazarus при первом запуске.
+# =============================================================================
+# Используется system logrotate (надёжнее встроенного, поддерживает cron-style
+# weekly/daily, atomic rotation, копирование permissions). Вызывается из
+# install_script — один раз на установку.
+# =============================================================================
+install_logrotate() {
+    # Только если есть /etc/logrotate.d (Debian/Ubuntu/RHEL — да; alpine — нет)
+    [[ ! -d /etc/logrotate.d ]] && return 0
+    [[ "$EUID" -ne 0 ]] && return 0
+
+    local _conf=/etc/logrotate.d/lazarus
+    # Не перезаписываем если уже есть — пользователь мог изменить
+    [[ -f "$_conf" ]] && return 0
+
+    cat > "$_conf" <<EOF
+$LOG_FILE {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    su root root
+}
+EOF
+    chmod 644 "$_conf" 2> "$SILENT_LOG" || true
+    debug_log "INSTALL" "Created $_conf (system logrotate)"
 }
 
 # --- БЛОКИРОВКА ОТ ПАРАЛЛЕЛЬНОГО ЗАПУСКА ---
@@ -1529,7 +1584,11 @@ install_script() {
         chmod +x "$INSTALLED_SCRIPT_PATH"
         if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then rm -f "$SYMLINK_PATH"; fi
         ln -s "$INSTALLED_SCRIPT_PATH" "$SYMLINK_PATH"
-        
+
+        # Создаём /etc/logrotate.d/lazarus для system-level log rotation.
+        # Если /etc/logrotate.d не существует или конфиг уже есть — no-op.
+        install_logrotate
+
         print_message "SUCCESS" "Установка завершена. Запуск..."
         echo ""
         exec "$INSTALLED_SCRIPT_PATH"
@@ -4734,35 +4793,41 @@ ${escaped_caption}
     local TG_MAX_BYTES=52428800
     if [[ $file_size_bytes -ge $TG_MAX_BYTES ]]; then
         local size_mb=$((file_size_bytes / 1048576))
-        debug_log "TG" "Pre-flight: file ${size_mb}MB >= 50MB, skipping upload, sending notice"
+        debug_log "TG" "Pre-flight: file ${size_mb}MB >= 50MB"
+
+        # Auto-fallback: если S3/Rclone/FTP/WebDAV настроен — он УЖЕ загрузил
+        # файл (upload_to_remote вызывается в create_backup до send_telegram_document).
+        # Поэтому здесь шлём NICE summary вместо ERROR — пользователь видит что
+        # backup есть, просто в облаке. _UPLOAD_REMOTE_OK выставляется в caller'е.
+        local _remote_delivered="false"
+        [[ "$REMOTE_STORAGE_TYPE" != "off" && "$SEND_TO_REMOTE" == "true" && "$_UPLOAD_REMOTE_OK" == "true" ]] && _remote_delivered="true"
+
         print_message "WARN" "Файл ${size_mb}MB превышает лимит Telegram (50MB) — отправляем только уведомление"
         log_message "WARN" "TG file send skipped: ${size_mb}MB > 50MB. File kept locally: $file_path"
 
-        local escaped_caption
-        if [[ "$caption_mode" == "pre-escaped" ]]; then
-            escaped_caption="$caption"
+        if [[ "$_remote_delivered" == "true" ]]; then
+            # Compact INFO-уведомление: бэкап есть в облаке, всё ок.
+            local _storage_label="remote"
+            case "$REMOTE_STORAGE_TYPE" in
+                s3)     _storage_label="S3 (${S3_BUCKET})" ;;
+                rclone) _storage_label="Rclone" ;;
+                ftp|ftps) _storage_label="FTP" ;;
+                webdav) _storage_label="WebDAV" ;;
+            esac
+            send_telegram_alert "INFO" "Бэкап в облаке (${size_mb} MB)" \
+                "📦 Файл: ${file_size_bytes} bytes (${size_mb} MB)
+☁️ Загружено: ${_storage_label}
+ℹ️ В TG не отправляем — больше 50 MB лимита Bot API." \
+                ""
         else
-            escaped_caption=$(escape_markdown_v2 "$caption")
+            # Старое поведение: ERROR alert + инструкция настроить S3
+            send_telegram_alert "ERROR" "Бэкап не отправлен в Telegram" \
+                "📏 Размер: ${size_mb} MB
+🛑 Лимит Bot API: 50 MB
+✅ Файл сохранён локально" \
+                "Настройте удалённое хранилище: <code>lazarus</code> → Удалённое хранилище
+S3/R2/FTP/WebDAV/Rclone поддерживаются"
         fi
-
-        # Компактное уведомление: размер + одна подсказка.
-        # Пути не выводим в TG (privacy). Детали (имя файла, путь, топ-5) — в терминале.
-        local notice_text="$(tg_emoji "❌" "$EMO_ERROR") *Бэкап не отправлен в Telegram*
-
-${escaped_caption}
-
-${size_mb} MB \\> 50 MB \\(лимит Bot API\\)
-
-$(tg_emoji "💡" "$EMO_INFO") Настройте S3/FTP/WebDAV для больших бэкапов"
-
-        local thread_param=""
-        [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
-
-        curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-            -d chat_id="$CHAT_ID" \
-            -d parse_mode="MarkdownV2" \
-            --data-urlencode text="$notice_text" \
-            $thread_param > "$SILENT_LOG" 2>&1 || true
         return 2  # special code: file too big, sent notice only
     fi
 
@@ -9482,6 +9547,7 @@ if [[ "${LAZARUS_LIB}" != "true" ]]; then
     rotate_internal_log
     check_dependencies
     install_script
+    install_logrotate    # idempotent — no-op если /etc/logrotate.d/lazarus уже есть
     load_or_create_config
     check_config_mismatch # Проверка при запуске
 
@@ -9687,6 +9753,192 @@ ${_list_body}" \
 ⏱ ${_elapsed}с" ""
     fi
     return 0
+}
+
+# =============================================================================
+# diag_command: одна команда — полный snapshot состояния системы для troubleshooting.
+# =============================================================================
+# Выводит:
+#   - Version скрипта + bash + openssl
+#   - System info (uname, distribution)
+#   - Container status (rwp_shop / rwp_shop_db) + health + uptime
+#   - Disk usage + free + percent
+#   - BOT_PATH validation + version + LICENSE check
+#   - Backup stats: count, total size, last timestamp, formats (v1/v2)
+#   - Cron status (full/db/files) — schedule + last run
+#   - BACKUP_PASSWORD set/unset (без значения!)
+#   - Remote storage config (без credentials!)
+#   - TG settings status (token set yes/no, без value)
+#   - Recent 10 errors из лога
+#   - timeout config + dependencies (gzip/zstd/aws/timeout/openssl)
+#
+# Использование:
+#   lazarus diag             # вывод в stdout
+#   lazarus diag > diag.txt  # сохранить в файл для шаринга
+# =============================================================================
+diag_command() {
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "  LAZARUS DIAG — system snapshot"
+    echo "  $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+
+    echo "── VERSIONS ──"
+    echo "  Script:    v${VERSION}"
+    echo "  Bash:      $(bash --version 2>/dev/null | head -1 | awk '{print $4}')"
+    echo "  OpenSSL:   $(openssl version 2>/dev/null | awk '{print $2}')"
+    echo "  Docker:    $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
+    echo "  AWS CLI:   $(_s3_aws_version 2>/dev/null || echo 'not installed')"
+    echo "  Host:      $(hostname 2>/dev/null) · $(uname -m) · kernel $(uname -r 2>/dev/null | cut -d- -f1)"
+    [[ -f /etc/os-release ]] && echo "  OS:        $(. /etc/os-release; echo "$PRETTY_NAME")"
+    echo ""
+
+    echo "── DEPENDENCIES ──"
+    for cmd in curl wget gzip zstd tar openssl docker docker-compose aws timeout shred python3 jq; do
+        if command -v "$cmd" > /dev/null 2>&1; then
+            printf "  %-15s ✓\n" "$cmd"
+        else
+            printf "  %-15s ✗ (отсутствует)\n" "$cmd"
+        fi
+    done
+    echo ""
+
+    echo "── CONTAINER STATUS ──"
+    if [[ -n "$DB_CONTAINER_NAME" ]]; then
+        local _db_status
+        _db_status=$(docker inspect "$DB_CONTAINER_NAME" --format '{{.State.Status}} · health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}} · started={{.State.StartedAt}}' 2> /dev/null || echo "container not found")
+        echo "  DB ($DB_CONTAINER_NAME): $_db_status"
+    else
+        echo "  DB: <DB_CONTAINER_NAME не задан>"
+    fi
+    if [[ -n "$BOT_CONTAINER_NAME" ]]; then
+        local _bot_status
+        _bot_status=$(docker inspect "$BOT_CONTAINER_NAME" --format '{{.State.Status}} · started={{.State.StartedAt}}' 2> /dev/null || echo "container not found")
+        echo "  Bot ($BOT_CONTAINER_NAME): $_bot_status"
+    fi
+    echo ""
+
+    echo "── BOT CONFIG ──"
+    echo "  BOT_PATH:    ${BOT_PATH:-<не задан>}"
+    [[ -d "$BOT_PATH" ]] && echo "  exists:      ✓ ($(du -sh "$BOT_PATH" 2>/dev/null | awk '{print $1}'))" || echo "  exists:      ✗ путь не существует"
+    if [[ -d "$BOT_PATH" ]]; then
+        local _bot_ver
+        _bot_ver=$(get_raw_bot_version 2>/dev/null)
+        echo "  Bot version: ${_bot_ver:-<не определена>}"
+        [[ -f "$BOT_PATH/docker-compose.yml" ]] && echo "  compose:     docker-compose.yml ✓"
+        [[ -f "$BOT_PATH/compose.yaml" ]] && echo "  compose:     compose.yaml ✓"
+        [[ -f "$BOT_PATH/.env" ]] && echo "  .env:        ✓ ($(wc -l < "$BOT_PATH/.env" 2>/dev/null) lines)" || echo "  .env:        ✗"
+    fi
+    echo ""
+
+    echo "── BACKUPS ──"
+    if [[ -d "$BACKUP_DIR" ]]; then
+        local _b_total _b_v1=0 _b_v2=0 _b_unenc=0 _b_size
+        _b_total=$(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz*' -type f 2>/dev/null | wc -l)
+        for f in "$BACKUP_DIR"/*.enc; do
+            [[ ! -f "$f" ]] && continue
+            local _m; _m=$(head -c 4 "$f" 2>/dev/null)
+            [[ "$_m" == "LAZ2" ]] && _b_v2=$((_b_v2 + 1)) || _b_v1=$((_b_v1 + 1))
+        done
+        _b_unenc=$(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' -type f 2>/dev/null | wc -l)
+        _b_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+        echo "  Dir:         $BACKUP_DIR ($_b_size)"
+        echo "  Total:       $_b_total файлов"
+        echo "  v2 (LAZ2):   $_b_v2 (с HMAC)"
+        echo "  v1 (legacy): $_b_v1 (без HMAC)"
+        echo "  Unencrypted: $_b_unenc"
+        local _latest
+        _latest=$(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz*' -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+        if [[ -n "$_latest" ]]; then
+            local _latest_ts=$(stat -c%y "$_latest" 2>/dev/null | cut -d. -f1)
+            local _latest_size=$(stat -c%s "$_latest" 2>/dev/null | numfmt --to=iec 2>/dev/null)
+            echo "  Latest:      $(basename "$_latest") · $_latest_size · $_latest_ts"
+        fi
+    else
+        echo "  $BACKUP_DIR: не существует"
+    fi
+    echo ""
+
+    echo "── DISK ──"
+    df -h "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{printf "  Mount:       %s\n  Total:       %s\n  Used:        %s (%s)\n  Free:        %s\n", $6, $2, $3, $5, $4}'
+    echo "  Threshold:   WARN=${DISK_WARN_PERCENT}% CRITICAL=${DISK_CRITICAL_PERCENT}%"
+    echo ""
+
+    echo "── CRON ──"
+    local _cron_full _cron_db _cron_files
+    _cron_full=$(get_cron_status "full" 2>/dev/null)
+    _cron_db=$(get_cron_status "db" 2>/dev/null)
+    _cron_files=$(get_cron_status "files" 2>/dev/null)
+    echo "  Full:        ${_cron_full}"
+    echo "  DB:          ${_cron_db}"
+    echo "  Files:       ${_cron_files}"
+    echo ""
+
+    echo "── SECURITY ──"
+    [[ -n "$BACKUP_PASSWORD" ]] && echo "  Password:    ✓ set (${#BACKUP_PASSWORD} chars)" || echo "  Password:    ✗ not set (бэкапы НЕ шифруются)"
+    [[ -f "$BACKUP_PASSWORD_FILE" ]] && echo "  Pwd file:    ✓ $BACKUP_PASSWORD_FILE ($(stat -c '%a' "$BACKUP_PASSWORD_FILE" 2>/dev/null))" || echo "  Pwd file:    ✗ не существует"
+    echo ""
+
+    echo "── REMOTE STORAGE ──"
+    echo "  Type:        $REMOTE_STORAGE_TYPE"
+    echo "  Send:        $SEND_TO_REMOTE"
+    if [[ "$REMOTE_STORAGE_TYPE" == "s3" ]]; then
+        echo "  S3 bucket:   ${S3_BUCKET:-<не задан>}"
+        echo "  S3 region:   ${S3_REGION:-<не задан>}"
+        local _s3_ep_mask
+        _s3_ep_mask=$(_s3_mask_endpoint "$S3_ENDPOINT" 2>/dev/null)
+        echo "  S3 endpoint: ${_s3_ep_mask:-default}"
+        echo "  S3 path:     ${S3_PATH:-(empty)}"
+        [[ -n "$S3_ACCESS_KEY" ]] && echo "  S3 key:      ✓ set" || echo "  S3 key:      ✗ not set"
+    elif [[ "$REMOTE_STORAGE_TYPE" == "ftp" || "$REMOTE_STORAGE_TYPE" == "webdav" ]]; then
+        echo "  URL host:    $(echo "$REMOTE_STORAGE_URL" | sed -E 's|^[a-z]+://[^@/]*@?([^/]+).*|\1|')"
+    fi
+    echo ""
+
+    echo "── TELEGRAM ──"
+    [[ -n "$BOT_TOKEN" ]] && echo "  Token:       ✓ set" || echo "  Token:       ✗ not set"
+    [[ -n "$CHAT_ID" ]] && echo "  Chat ID:     ✓ set" || echo "  Chat ID:     ✗ not set"
+    echo "  Notifications: $SEND_TO_TELEGRAM · Send file: $TG_SEND_FILE"
+    echo ""
+
+    echo "── TIMEOUTS ──"
+    echo "  pg_dump:     ${PG_DUMP_TIMEOUT_SEC}s"
+    echo "  tar:         ${TAR_TIMEOUT_SEC}s"
+    echo "  encrypt:     ${ENCRYPT_TIMEOUT_SEC}s"
+    echo "  restore:     ${RESTORE_TIMEOUT_SEC}s"
+    echo ""
+
+    echo "── RECENT ERRORS (последние 10 из лога) ──"
+    if [[ -f "$LOG_FILE" ]]; then
+        grep -E "\[ERROR\]" "$LOG_FILE" 2>/dev/null | tail -10 | sed 's/^/  /'
+        local _err_24h
+        _err_24h=$(awk -v cutoff="$(date -d '24 hours ago' +%s 2>/dev/null)" '
+            match($0, /\[([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2})\]/, m) {
+                cmd="date -d \""m[1]" "m[2]"\" +%s 2>/dev/null"
+                cmd | getline ts; close(cmd)
+                if (ts && ts >= cutoff && /\[ERROR\]/) c++
+            }
+            END { print c+0 }
+        ' "$LOG_FILE" 2>/dev/null)
+        echo ""
+        echo "  Errors за 24ч: ${_err_24h:-0}"
+    else
+        echo "  $LOG_FILE: не существует"
+    fi
+    echo ""
+
+    echo "── LOG ROTATION ──"
+    if [[ -f /etc/logrotate.d/lazarus ]]; then
+        echo "  System logrotate: ✓ /etc/logrotate.d/lazarus"
+    else
+        echo "  System logrotate: ✗ используется встроенная ротация"
+    fi
+    [[ -f "$LOG_FILE" ]] && echo "  Current log: $(stat -c%s "$LOG_FILE" 2>/dev/null | numfmt --to=iec 2>/dev/null) · $LOG_FILE"
+    echo ""
+
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "  Для шаринга: lazarus diag > diag-\$(date +%Y%m%d-%H%M%S).txt"
+    echo "═══════════════════════════════════════════════════════════════════"
 }
 
 # =============================================================================
@@ -10005,6 +10257,12 @@ case "$1" in
         verify_all_backups
         exit $?
         ;;
+    diag|diagnostics)
+        # Полный snapshot состояния системы — для troubleshooting.
+        # Использование: `lazarus diag` или `lazarus diag > diag.txt`
+        diag_command
+        exit 0
+        ;;
     report)
         # Еженедельный (или другой период) отчёт в TG.
         # Использование: lazarus report [weekly|daily|month]
@@ -10063,6 +10321,7 @@ case "$1" in
         echo "  migrate-v2                  Конвертировать старые v1 backup'ы в v2 (с HMAC)"
         echo "  verify                      Проверить integrity всех архивов (MAC + gzip)"
         echo "  report [weekly|daily|month] Отчёт о backup-активности в TG"
+        echo "  diag                        System snapshot для troubleshooting"
         echo "  emoji probe <id> | scan     Premium emoji diagnostics"
         echo ""
         echo "Скрипт:"

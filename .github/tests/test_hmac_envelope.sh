@@ -26,7 +26,21 @@ unregister_sensitive_tmp() { :; }
 print_message() { :; }
 log_message() { :; }
 debug_log() { :; }
-export SILENT_LOG TMPDIR
+# Stub timeout-обёрток (используются в _hmac_envelope_create начиная с Phase 4):
+# тесты для них отдельно в test_timeout_helpers.sh; здесь просто вызываем команду напрямую.
+_run_with_timeout() {
+    local _timeout="$1"; local _label="$2"; shift 2
+    "$@"
+}
+_run_pipe_with_timeout() {
+    local _timeout="$1"; local _label="$2"; local _pipe_cmd="$3"; shift 3
+    bash -c "set -o pipefail; $_pipe_cmd" _ "$@"
+}
+PG_DUMP_TIMEOUT_SEC=0
+TAR_TIMEOUT_SEC=0
+ENCRYPT_TIMEOUT_SEC=0
+RESTORE_TIMEOUT_SEC=0
+export SILENT_LOG TMPDIR PG_DUMP_TIMEOUT_SEC TAR_TIMEOUT_SEC ENCRYPT_TIMEOUT_SEC RESTORE_TIMEOUT_SEC
 
 # Skip if openssl not available
 if ! command -v openssl >/dev/null 2>&1; then
