@@ -18,21 +18,37 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
     steps:
       - uses: actions/checkout@v4
       - name: System info
         run: |
           bash --version | head -1
           openssl version
-          which python3 || true
-          which timeout || true
-          which gzip || true
+          which python3 timeout gzip find tr
           uname -a
       - name: Install test deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq openssl coreutils python3 gzip
-      - name: Run tests (verbose)
-        run: bash -x .github/tests/run.sh
-        env:
-          # Force locale (некоторые tests с unicode в bash зависят от UTF-8)
-          LC_ALL: C.UTF-8
-          LANG: C.UTF-8
+      # Каждый тест отдельным step — увидим в Job Summary какой именно упал.
+      - name: test_restore_safety
+        run: bash .github/tests/test_restore_safety.sh
+      - name: test_password_validation
+        run: bash .github/tests/test_password_validation.sh
+      - name: test_skipped_report
+        run: bash .github/tests/test_skipped_report.sh
+      - name: test_version_compare
+        run: bash .github/tests/test_version_compare.sh
+      - name: test_hmac_envelope
+        run: bash .github/tests/test_hmac_envelope.sh
+      - name: test_s3_helpers
+        run: bash .github/tests/test_s3_helpers.sh
+      - name: test_timeout_helpers
+        run: bash .github/tests/test_timeout_helpers.sh
+      - name: test_exclude_dirs_split
+        run: bash .github/tests/test_exclude_dirs_split.sh
+      - name: test_skipped_print0
+        run: bash .github/tests/test_skipped_print0.sh
+      - name: test_telegram_alert
+        run: bash .github/tests/test_telegram_alert.sh
