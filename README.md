@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-4.37.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-5.1.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -36,7 +36,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manag
 curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus && lazarus
 ```
 
-> 💡 Скрипт автоматически установится в `/opt/lazarus-backup/` и создаст symlink `/usr/local/bin/lazarus`
+> 💡 Скрипт автоматически установится как `/opt/lazarus-backup/lazarus-backup` и создаст symlink `/usr/local/bin/lazarus` (команда `lazarus`)
 
 ### 🔄 Принудительное обновление
 
@@ -44,13 +44,15 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 
 ```bash
 # Обновить через jsDelivr CDN (быстрее)
-curl -sSL "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@main/lazarus-backup?t=$(date +%s)" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+curl -sSL "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@main/lazarus-backup?t=$(date +%s)" -o /opt/lazarus-backup/lazarus-backup && chmod +x /opt/lazarus-backup/lazarus-backup
 
 # Или через GitHub напрямую (надёжнее)
-curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o /opt/lazarus-backup/lazarus && chmod +x /opt/lazarus-backup/lazarus
+curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o /opt/lazarus-backup/lazarus-backup && chmod +x /opt/lazarus-backup/lazarus-backup
 ```
 
 > 💡 Параметр `?t=$(date +%s)` добавляет timestamp для обхода кэша CDN
+
+> ℹ️ **Имена файлов:** в репо файл называется `lazarus-backup`, на сервере устанавливается как `/opt/lazarus-backup/lazarus-backup`, команда пользователя — `lazarus` (symlink). При обновлении старых установок (`/opt/lazarus-backup/lazarus`) — `install_script` автоматически мигрирует на новое имя.
 
 ---
 
@@ -59,22 +61,16 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 ### Резервное копирование
 - **Smart Scan** — автоматически находит бота в Docker (поддержка `rwp_shop`, `telegram-shop`, `shopbot`)
 - **3 типа бэкапов** — Full (БД + файлы), DB Only, Files Only
-- **AES-256 шифрование** — защита архивов паролем (PBKDF2, 100k итераций)
+- **AES-256-CBC + HMAC-SHA256** — encrypt-then-MAC envelope (v2), защита от targeted tampering, wrong-password detect ДО decrypt
 - **Версионирование** — каждый бэкап содержит версию бота на момент создания
 - **Умная фильтрация** — исключение больших файлов и папок (logs, node_modules, .git)
-
-### 🆕 Миграция с Bedolaga (BETA)
-- **Автоматическая миграция** — полный перенос данных из Bedolaga в RWP-Shop в 10 шагов
-- **Пользователи** — telegram_id, username, реферальные коды (~95% покрытие)
-- **Подписки** — все активные подписки с датами и статусами (~90% покрытие)
-- **Транзакции** — история платежей и промокоды (~85% покрытие)
-- **Настройки** — токен бота, каналы, админы из .env
-- **Сохранение несовместимых данных** — балансы, промокоды на баланс сохраняются в NOT_MIGRATED
-- 📖 **[Полная документация миграции](migration/README.md)**
+- **v1→v2 миграция** — `lazarus migrate-v2` для конверсии старых архивов
 
 ### Хранение и доставка
-- **Telegram** — отправка файлов и уведомлений (раздельно настраивается)
+- **Telegram** — отправка файлов и уведомлений с premium emoji + retry × 3 для transient errors
 - **FTP / FTPS / WebDAV / Rclone** — облачные хранилища с retry и пошаговой настройкой
+- **S3-совместимые** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2**, **Backblaze B2**, custom
+- **Integrity verify** — `head-object` size+ETag после S3 upload, multipart orphan cleanup при fail
 - **Умная ротация** — по времени (дни) или количеству файлов
 
 ### Автоматизация
@@ -162,11 +158,26 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 
 | Параметр | Описание | Пример |
 |----------|----------|--------|
-| `REMOTE_STORAGE_TYPE` | Тип хранилища | `off` / `ftp` / `ftps` / `webdav` / `rclone` |
-| `REMOTE_STORAGE_URL` | URL сервера с папкой | `ftp://backup.server.com/backups/` |
-| `REMOTE_STORAGE_USER` | Логин | `backup_user` |
-| `REMOTE_STORAGE_PASS` | Пароль | `secret123` |
+| `REMOTE_STORAGE_TYPE` | Тип хранилища | `off` / `ftp` / `ftps` / `webdav` / `rclone` / `s3` |
+| `REMOTE_STORAGE_URL` | URL сервера (FTP/WebDAV/Rclone) | `ftp://backup.server.com/backups/` |
+| `REMOTE_STORAGE_USER` | Логин (FTP/WebDAV) | `backup_user` |
+| `REMOTE_STORAGE_PASS` | Пароль (FTP/WebDAV) | `secret123` |
 | `SEND_TO_REMOTE` | Отправлять на удалённый сервер | `true` / `false` |
+
+#### S3-совместимые провайдеры (`REMOTE_STORAGE_TYPE=s3`)
+
+Поддержка через `aws-cli`: **AWS S3, MinIO, RustFS, Yandex Cloud, Selectel, Cloudflare R2, Backblaze B2** + любой custom endpoint. Wizard настройки в `lazarus` → Удалённое хранилище → S3.
+
+| Параметр | Описание | Пример |
+|----------|----------|--------|
+| `S3_ENDPOINT` | URL endpoint | `https://<account-id>.r2.cloudflarestorage.com` (R2) |
+| `S3_BUCKET` | Имя bucket | `lazarus-backups` |
+| `S3_PATH` | Префикс внутри bucket | `prod/server1/` |
+| `S3_ACCESS_KEY` | Access Key ID | `AKIA...` |
+| `S3_SECRET_KEY` | Secret Access Key | — |
+| `S3_REGION` | Регион (для R2 **обязательно** `auto`) | `us-east-1` / `auto` |
+
+После upload — автоматический `head-object` verify (size + ETag для не-multipart). При сбое — abort висящих multipart parts (защита от billing waste у AWS).
 
 ### Шифрование и фильтрация
 
@@ -179,6 +190,23 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 
 > ⚠️ Пароль сохраняется в отдельном файле `BACKUP_PASSWORD_FILE` для безопасности и корректной работы спецсимволов.
 
+#### v2 envelope (HMAC encrypt-then-MAC)
+
+С v5.1.0 новые шифрованные backup'ы используют **v2 envelope**: `LAZ2` magic + AES-256-CBC ciphertext + HMAC-SHA256. Это даёт:
+
+- **Защита от targeted ciphertext-подмены** — атакующий с write-доступом к `.enc` файлу не может незаметно подменить байты (HMAC поймает).
+- **Wrong password detect ДО decrypt** — MAC проверяется первым, openssl не вызывается с неправильным ключом (защита от padding-oracle gadgets).
+- **Обратная совместимость** — старые v1 backup'ы (`Salted__`) расшифровываются как раньше с WARN.
+
+**Миграция старых backup'ов:**
+
+```bash
+lazarus migrate-v2               # interactive prompt
+lazarus --yes migrate-v2         # автоматически (для cron)
+```
+
+Конверсия атомарна: `decrypt v1 → encrypt v2 → verify → atomic rename`. Оригинал удаляется только после успешной верификации v2.
+
 ---
 
 ## 💻 CLI команды
@@ -186,11 +214,16 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 ### Основные команды
 
 ```bash
-lazarus                  # Интерактивное меню
-lazarus restore          # Меню восстановления
-lazarus migrate          # 🆕 Миграция с Bedolaga (BETA)
-lazarus cleanup          # Очистка старых бэкапов
-lazarus check_update     # Проверка обновлений скрипта
+lazarus                       # Интерактивное меню
+lazarus restore               # Меню восстановления
+lazarus cleanup               # Очистка старых бэкапов
+lazarus skipped               # Просмотр пропущенных файлов последнего бэкапа
+lazarus migrate-v2            # Конверсия v1 → v2 envelope (HMAC)
+lazarus --yes migrate-v2      # Автоматическая миграция (для cron)
+lazarus check_update          # Проверка обновлений скрипта
+lazarus s3 test               # Проверить подключение к S3
+lazarus s3 list               # Список файлов в S3 bucket
+lazarus s3 upload <file>      # Загрузить файл в S3
 ```
 
 > ⚠️ **ВАЖНО (Restore):** восстановление теперь требует строгую проверку пути и подтверждение строкой
@@ -286,40 +319,6 @@ dropbox:backup-folder
 
 ---
 
-## 🔄 Миграция с Bedolaga (BETA)
-
-> ⚠️ **Тестовая функция!** Используйте на свой страх и риск. Обязательно делайте бэкапы!
-
-LAZARUS включает модуль миграции данных из Telegram-бота **Bedolaga** в **RWP-Shop**:
-
-### Что мигрируется (~88% покрытие)
-
-| Данные | Покрытие | Примечание |
-|--------|:--------:|------------|
-| 👤 Пользователи | ~95% | telegram_id, username, реф. коды |
-| 📋 Подписки | ~90% | Все активные с датами |
-| 💳 Транзакции | ~85% | История платежей |
-| 🎟️ Промокоды | ~100% | Дни и скидки |
-| 👥 Рефералы | ~80% | Связи referrer → referred |
-| ⚙️ Настройки | ~85% | Токен, каналы, админы |
-
-### Что НЕ мигрируется
-
-- **Денежные балансы** — RWP-Shop не поддерживает (сохраняются в CSV)
-- **Промокоды на баланс** — только дни/скидки (сохраняются в CSV)
-- **Индивидуальные autopay** — в RWP-Shop глобальная настройка
-
-### Быстрый старт
-
-```bash
-lazarus migrate
-# или через меню: 5 → Миграция
-```
-
-📖 **Полная документация:** [migration/README.md](migration/README.md)
-
----
-
 ## 🔄 Обновление бота
 
 LAZARUS включает функцию обновления Remnawave Telegram Shop Bot:
@@ -385,19 +384,14 @@ lazarus --debug backup_full
 ```
 /opt/lazarus-backup/
 ├── config.env              # Конфигурация (chmod 600)
-├── lazarus-backup          # Основной скрипт
+├── .password               # Пароль шифрования (chmod 600, опционально)
+├── lazarus-backup          # Основной скрипт (имя совпадает с именем в репо)
+├── .last_skipped.txt       # Отчёт о пропущенных файлах последнего бэкапа
+├── .last_skipped.meta      # Метаданные отчёта (archive, count, timestamp)
 └── backup/                  # Папка с архивами
-    ├── lazarus_full_2025-01-01_04_00_00.tar.gz
-    ├── lazarus_full_2025-01-01_04_00_00.tar.gz.version
-    ├── lazarus_db_2025-01-01_12_00_00.tar.gz
-    └── lazarus_db_2025-01-01_12_00_00.tar.gz.enc  # Зашифрованный
-
-/opt/rwp-shop/MIGRATION/     # Рабочая папка миграции (создаётся в папке бота)
-├── 20250101_120000/         # Сессия миграции
-│   ├── export/              # Экспортированные данные
-│   ├── import/              # Трансформированные данные
-│   ├── NOT_MIGRATED/        # Несовместимые данные
-│   └── migration_report.txt # Отчёт о миграции
+    ├── lazarus_full_2025-01-01_04_00_00__v6.4.1.27.tar.gz       # Версия в имени
+    ├── lazarus_db_2025-01-01_12_00_00__v6.4.1.27.tar.gz
+    └── lazarus_db_2025-01-01_12_00_00__v6.4.1.27.tar.gz.enc     # Зашифрованный
 
 /usr/local/bin/lazarus      # Symlink на скрипт
 /var/log/lazarus_backup.log # Лог-файл (ротация при >10MB)
@@ -406,10 +400,10 @@ lazarus --debug backup_full
 
 ### Формат имён бэкапов
 ```
-lazarus_{full|db|files}_YYYY-MM-DD_HH_MM_SS.tar.gz      # Обычный
-lazarus_{full|db|files}_YYYY-MM-DD_HH_MM_SS.tar.gz.enc  # Зашифрованный
-*.version                                                # Кэш версии бота
+lazarus_{full|db|files}_YYYY-MM-DD_HH_MM_SS__vX.Y.Z.tar.gz       # Обычный
+lazarus_{full|db|files}_YYYY-MM-DD_HH_MM_SS__vX.Y.Z.tar.gz.enc   # Зашифрованный
 ```
+Версия бота (`__vX.Y.Z`) встроена в имя файла напрямую — никаких `.version` файлов-спутников.
 
 ---
 

@@ -3,4 +3,3 @@
 *.yml        text eol=lf
 *.yaml       text eol=lf
 lazarus-backup   text eol=lf
-lazarus-migrator text eol=lf
