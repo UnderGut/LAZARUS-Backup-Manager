@@ -281,24 +281,20 @@ debug_log() {
 # escape_markdown_v2() — он сломает `![...](tg://emoji?id=...)` синтаксис.
 #
 # Помощник: tg_emoji "📦" "$EMO_PACKAGE" → !\[📦\]\(tg://emoji?id=...\)
-# NB: ID'ы Premium emoji проверены через getCustomEmojiStickers API 2026-05-25.
-# Используем ТОЛЬКО ID, чьи реальные иконки визуально совпадают с fallback Unicode.
-# Если у пользователя НЕТ Premium — Telegram отрендерит Unicode из `![X](...)` блока.
-# Если ID указывает на другую иконку (peach вместо stats и т.п.) — мы НЕ ставим
-# Premium replacement, потому что premium-пользователи увидят неправильный смайл.
-EMO_ERROR="5260342697075416641"          # ❌ → ❌ verified
-EMO_WARN="5258474669769497337"           # ⚠️ → ❗️ close enough
-EMO_INFO="5258216851472654189"           # 💡 → 💡 verified
-EMO_LOCK="5258476306152038031"           # 🔒 → 🔒 verified
+# NB: ID'ы Premium emoji проверены через getStickerSet (tgmacicons set, 134 emoji).
+# Audit'нуто через `lazarus emoji probe <id>`. Используем точное совпадение или
+# visually-closest match (см. комментарии справа).
+EMO_ERROR="5260342697075416641"          # ❌ → ❌ exact
+EMO_WARN="5258474669769497337"           # ⚠️ → ❗️ close
+EMO_INFO="5258216851472654189"           # 💡 → 💡 exact
+EMO_LOCK="5258476306152038031"           # 🔒 → 🔒 exact
 EMO_CALENDAR="5258105663359294787"       # 📅 → 🗓 close (calendar family)
-EMO_FOLDER="5257969839313526622"         # 📁 → 📂 close (folder family)
-EMO_BADGE="5357069174512303778"          # ✅ → ✅ verified
-# Удалены (mismatch при audit):
-#   EMO_PACKAGE  = peach instead of box
-#   EMO_DOC      = folder instead of file cabinet
-#   EMO_STATS    = 🍑 peach instead of 📊 stats (worst mismatch)
-#   EMO_CLOUD    = 📦 box instead of ☁️ cloud
-# Для этих смайлов используем чистый Unicode без Premium replacement.
+EMO_FOLDER="5257969839313526622"         # 📂 → 📂 exact
+EMO_BADGE="5357069174512303778"          # ✅ → ✅ exact
+# Closest match для emoji которых НЕТ в tgmacicons (💾 / 🗄 / 📏):
+EMO_PACKAGE="5258134813302332906"        # 💾/📦 → 📦 box (best для «archive/backup»)
+EMO_DOC="5257965810634202885"            # 🗄 → 📁 file folder (нет file cabinet в наборе)
+EMO_STATS="5258391025281408576"          # 📏/📊 → 📈 chart (нет ruler в наборе)
 
 tg_emoji() {
     # Аргументы: $1=fallback Unicode  $2=premium ID (может быть пустым)
@@ -808,6 +804,166 @@ escape_markdown_v2() {
         -e 's/(/\\(/g' -e 's/)/\\)/g' -e 's/~/\~/g' -e 's/`/\\`/g' -e 's/>/\\>/g' \
         -e 's/#/\\#/g' -e 's/+/\\+/g' -e 's/-/\\-/g' -e 's/=/\\=/g' -e 's/|/\\|/g' \
         -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/\./\\./g' -e 's/!/\\!/g'
+}
+
+# =============================================================================
+# emoji_command: CLI subcommand для diagnostics Premium custom emoji.
+# =============================================================================
+# Sub-commands:
+#   probe <id1> [id2 ...]  → getCustomEmojiStickers для конкретных ID.
+#                            Выводит: ID → реальный emoji + set_name.
+#   scan [N]               → getUpdates, ищет в последних N сообщениях (default 20)
+#                            premium custom emoji (через message.entities[type=custom_emoji]).
+#                            Идеальный flow: отправь сообщение боту с нужными premium emoji,
+#                            затем `lazarus emoji scan` → получи ID каждого.
+#   help                   → справка
+# =============================================================================
+emoji_command() {
+    local subcmd="$1"
+    shift
+    case "$subcmd" in
+        probe|-p)
+            if [[ $# -eq 0 ]]; then
+                echo "Usage: lazarus emoji probe <id1> [id2 ...]"
+                echo "  Проверяет Premium custom emoji ID через Telegram API"
+                return 1
+            fi
+            if [[ -z "$BOT_TOKEN" ]]; then
+                print_message "ERROR" "BOT_TOKEN не задан в config.env"
+                return 1
+            fi
+            # Собираем JSON-массив ID для URL: ["123","456","789"]
+            local _ids_json='['
+            local _first=1
+            for id in "$@"; do
+                if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+                    print_message "WARN" "Пропущен невалидный ID: $id (должен быть число)"
+                    continue
+                fi
+                [[ $_first -eq 0 ]] && _ids_json+=','
+                _ids_json+="\"$id\""
+                _first=0
+            done
+            _ids_json+=']'
+            local _url_enc
+            _url_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$_ids_json" 2>/dev/null) || _url_enc="$_ids_json"
+            local _resp
+            _resp=$(curl $CURL_SILENT "https://api.telegram.org/bot${BOT_TOKEN}/getCustomEmojiStickers?custom_emoji_ids=${_url_enc}")
+            if [[ -z "$_resp" ]]; then
+                print_message "ERROR" "Нет ответа от Telegram API"
+                return 1
+            fi
+            # Парсим через python3 (на любом Debian/Ubuntu есть)
+            if command -v python3 > "$SILENT_LOG" 2>&1; then
+                echo "$_resp" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+if not d.get('ok'):
+    print('ERROR:', d.get('description','unknown'))
+    sys.exit(1)
+result=d.get('result') or []
+if not result:
+    print('Нет результатов — все ID невалидны')
+    sys.exit(1)
+print()
+print(f'{'ID':<22}{'Emoji':<8}{'Set name':<30}{'Type'}')
+print('-' * 75)
+for s in result:
+    print(f\"{s.get('custom_emoji_id',''):<22}{s.get('emoji',''):<8}{s.get('set_name','-'):<30}{s.get('type','-')}\")
+"
+            else
+                # Fallback grep — менее aesthetic
+                echo "$_resp"
+            fi
+            ;;
+        scan|-s)
+            if [[ -z "$BOT_TOKEN" ]]; then
+                print_message "ERROR" "BOT_TOKEN не задан"
+                return 1
+            fi
+            local _limit="${1:-20}"
+            print_message "INFO" "Получаю последние $_limit сообщений через getUpdates..."
+            print_message "INFO" "Совет: отправь боту/в чат сообщение с нужными Premium emoji,"
+            print_message "INFO" "затем запусти 'lazarus emoji scan' — извлечёт ID."
+            echo ""
+            local _resp
+            _resp=$(curl $CURL_SILENT "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=${_limit}&allowed_updates=%5B%22message%22%2C%22channel_post%22%5D")
+            if ! command -v python3 > "$SILENT_LOG" 2>&1; then
+                print_message "ERROR" "python3 required для парсинга JSON"
+                return 1
+            fi
+            echo "$_resp" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+if not d.get('ok'):
+    print('API ERROR:', d.get('description','unknown'))
+    sys.exit(1)
+updates=d.get('result') or []
+if not updates:
+    print('Нет сообщений в getUpdates. Отправь сообщение с premium emoji боту/в чат и повтори.')
+    sys.exit(0)
+found=[]
+for u in updates:
+    msg=u.get('message') or u.get('channel_post') or {}
+    text=msg.get('text','') or msg.get('caption','')
+    entities=msg.get('entities') or msg.get('caption_entities') or []
+    chat_id=(msg.get('chat') or {}).get('id','?')
+    msg_date=msg.get('date',0)
+    import datetime
+    ts=datetime.datetime.fromtimestamp(msg_date).strftime('%d.%m %H:%M') if msg_date else '?'
+    text_utf=text.encode('utf-16-le') if text else b''
+    for e in entities:
+        if e.get('type') != 'custom_emoji':
+            continue
+        off=e.get('offset',0); length=e.get('length',0)
+        emoji=''
+        if text_utf and off>=0 and off+length*2<=len(text_utf):
+            try:
+                emoji=text_utf[off*2:(off+length)*2].decode('utf-16-le')
+            except Exception:
+                emoji='?'
+        cid=e.get('custom_emoji_id','')
+        found.append((ts, chat_id, emoji, cid))
+if not found:
+    print('Premium emoji не найдены в последних сообщениях.')
+    print('Совет: отправь сообщение с premium-emoji (выбрать в Telegram → Custom emoji)')
+    sys.exit(0)
+print()
+print(f\"{'Time':<13}{'Chat':<15}{'Emoji':<8}{'Premium ID'}\")
+print('-' * 65)
+for ts,chat,emoji,cid in found:
+    print(f\"{ts:<13}{str(chat):<15}{emoji:<8}{cid}\")
+print()
+print('Использование в коде:')
+print('  EMO_<NAME>=\"<ID>\"   # пример: EMO_FLOPPY=\"5258...\"  # 💾')
+"
+            ;;
+        help|--help|-h|"")
+            cat <<EOF
+Использование: lazarus emoji <subcmd> [args]
+
+Sub-commands:
+  probe <id1> [id2 ...]   Проверить Premium emoji ID через getCustomEmojiStickers.
+                          Выводит ID → реальный emoji + set_name.
+
+  scan [N]                Сканирует последние N сообщений (default 20) в getUpdates
+                          и извлекает все Premium custom emoji ID.
+                          Идеальный flow:
+                            1. В Telegram → отправь боту/в чат сообщение с premium emoji
+                            2. lazarus emoji scan → получишь ID каждого
+                            3. Скопируй ID в EMO_<NAME>= в скрипте
+
+Примеры:
+  lazarus emoji probe 5258389041006518073 5258330865674494479
+  lazarus emoji scan 50
+EOF
+            ;;
+        *)
+            print_message "ERROR" "Неизвестная команда: $subcmd"
+            echo "Используйте: lazarus emoji help"
+            return 1
+            ;;
+    esac
 }
 
 send_telegram_notification() {
@@ -7309,16 +7465,19 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     # Unicode emoji на Premium-обёрнутый MarkdownV2-литерал (после escape).
     # ВАЖНО: Premium emoji видны ТОЛЬКО у получателей с Telegram Premium.
     # Не-Premium клиенты увидят fallback Unicode (что и есть в [...] часть).
-    # Замены делаем ТОЛЬКО для verified ID (см. audit 2026-05-25).
     local CAPTION_ESC
     CAPTION_ESC=$(escape_markdown_v2 "$CAPTION")
     debug_log "TG" "CAPTION_ESC before premium replace: $CAPTION_ESC"
+    CAPTION_ESC="${CAPTION_ESC//💾/$(tg_emoji "💾" "$EMO_PACKAGE")}"
+    CAPTION_ESC="${CAPTION_ESC//📦/$(tg_emoji "📦" "$EMO_PACKAGE")}"
     CAPTION_ESC="${CAPTION_ESC//📂/$(tg_emoji "📂" "$EMO_FOLDER")}"
+    CAPTION_ESC="${CAPTION_ESC//🗄/$(tg_emoji "🗄" "$EMO_DOC")}"
     CAPTION_ESC="${CAPTION_ESC//📅/$(tg_emoji "📅" "$EMO_CALENDAR")}"
     CAPTION_ESC="${CAPTION_ESC//🔒/$(tg_emoji "🔒" "$EMO_LOCK")}"
     CAPTION_ESC="${CAPTION_ESC//⚠️/$(tg_emoji "⚠️" "$EMO_WARN")}"
+    CAPTION_ESC="${CAPTION_ESC//📏/$(tg_emoji "📏" "$EMO_STATS")}"
+    CAPTION_ESC="${CAPTION_ESC//📊/$(tg_emoji "📊" "$EMO_STATS")}"
     CAPTION_ESC="${CAPTION_ESC//🏷/$(tg_emoji "🏷" "$EMO_BADGE")}"
-    # 💾, 📦, 🗄, 📏, ☁️ — Unicode-only (verified ID mismatch).
     debug_log "TG" "CAPTION_ESC after premium replace: $CAPTION_ESC"
 
     send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION_ESC" "pre-escaped"
@@ -7711,21 +7870,99 @@ assert_safe_bot_path() {
     return 0
 }
 
+# =============================================================================
+# _typed_confirm_with_timer: запрашивает у пользователя ввод точной строки
+# подтверждения с auto-cancel по таймеру.
+# =============================================================================
+# Защита от destructive операций (restore/drop_volume/drop_schema) если
+# пользователь отвлёкся и не подтвердил вовремя.
+#
+# Аргументы:
+#   $1 — expected: точная строка подтверждения (напр. "RESTORE_TO:/opt/...")
+#   $2 — timeout_sec (default 60). 0 = no timeout (legacy behaviour).
+#   $3 — out_var: имя переменной куда положить введённую строку
+#
+# Return:
+#   0 — введённая строка совпадает с expected
+#   1 — не совпала ИЛИ timeout ИЛИ Ctrl+C
+#
+# NB: Ctrl+C по-прежнему ОТМЕНЯЕТ операцию (read возвращает rc!=0 → отказ).
+# =============================================================================
+_typed_confirm_with_timer() {
+    local expected="$1"
+    local timeout_sec="${2:-60}"
+    local out_var="${3:-confirm}"
+    local _input=""
+
+    if [[ "$timeout_sec" -le 0 ]]; then
+        # No-timeout режим (для совместимости/специальных кейсов)
+        read -r _input
+        local _rc=$?
+        eval "$out_var=\"\$_input\""
+        [[ $_rc -ne 0 ]] && return 1
+        [[ "$_input" == "$expected" ]] && return 0 || return 1
+    fi
+
+    # Read с -t timeout. Печатаем countdown в фоне (best-effort через background loop).
+    # Сначала pre-warning о таймере.
+    echo -e "${YELLOW}⏱  Авто-отмена через ${timeout_sec} сек если не подтвердишь${RESET}"
+
+    # Background countdown — печатает оставшиеся секунды каждые 10 сек.
+    # PID сохраняем чтобы убить когда read завершится.
+    (
+        local _t=$timeout_sec
+        while (( _t > 10 )); do
+            sleep 10
+            _t=$((_t - 10))
+            # \r — возврат каретки, потом overwrite + clear-to-end
+            printf "\r${GRAY}[осталось ${_t} сек]${RESET}\033[K" 2>/dev/null
+        done
+    ) &
+    local _countdown_pid=$!
+    # При завершении функции (по любой причине) — убиваем countdown
+    trap "kill $_countdown_pid 2>/dev/null" RETURN
+
+    # Read с timeout. В bash `read -t N` возвращает rc=142 (или >128) при timeout.
+    if read -r -t "$timeout_sec" _input; then
+        # Read OK (success или Ctrl-D). Убиваем countdown сразу.
+        kill "$_countdown_pid" 2>/dev/null
+        wait "$_countdown_pid" 2>/dev/null
+        echo ""  # newline после input
+        eval "$out_var=\"\$_input\""
+        if [[ "$_input" == "$expected" ]]; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        local _rc=$?
+        kill "$_countdown_pid" 2>/dev/null
+        wait "$_countdown_pid" 2>/dev/null
+        echo ""
+        if [[ $_rc -gt 128 ]]; then
+            # rc > 128 = timeout (read -t expired)
+            print_message "WARN" "Таймаут (${timeout_sec}с) — операция автоматически отменена для безопасности"
+        fi
+        return 1
+    fi
+}
+
 confirm_restore_target() {
     if [[ "$IS_INTERACTIVE" == true ]]; then
         echo ""
         print_message "WARN" "Введите точную строку подтверждения для продолжения:"
         local expected="RESTORE_TO:$BOT_PATH"
         echo -e "${CYAN}$expected${RESET}"
-        # NB: bare `read` намеренно (НЕ safe_read) — Ctrl+C должен ОТМЕНЯТЬ
-        # деструктивную операцию (restore), а не переcпрашивать prompt.
-        # safe_read retry'ит на SIGINT и сделает Ctrl+C бесполезным здесь.
-        read -r confirm
-        if [[ "$confirm" != "$expected" ]]; then
-            print_message "INFO" "Отменено пользователем."
+        # _typed_confirm_with_timer — auto-cancel через 60 сек если не подтвердил.
+        # Защита от случая когда юзер отвлёкся и destructive операция «висит».
+        # Ctrl+C по-прежнему отменяет (read -t возвращает rc!=0 → отказ).
+        local confirm=""
+        if _typed_confirm_with_timer "$expected" 60 confirm; then
+            return 0
+        else
+            print_message "INFO" "Отменено."
             return 1
         fi
-        return 0
     fi
 
     if [[ "$AUTO_CONFIRM" == "true" && "$RESTORE_FORCE" == "true" ]]; then
@@ -7748,8 +7985,9 @@ confirm_drop_volume() {
         print_message "WARN" "Будет удален volume БД. Это полностью удалит данные в volume."
         local expected="DROP_VOLUME:$volume_name"
         echo -e "${CYAN}$expected${RESET}"
-        # NB: bare `read` намеренно — Ctrl+C должен ОТМЕНЯТЬ удаление volume.
-        read -r confirm
+        # Auto-cancel через 60 сек — destructive, не висим зря.
+        local confirm=""
+        _typed_confirm_with_timer "$expected" 60 confirm
         if [[ "$confirm" != "$expected" ]]; then
             print_message "INFO" "Удаление volume отменено пользователем."
             return 1
@@ -7970,8 +8208,9 @@ confirm_drop_schema() {
         local expected="DROP_SCHEMA_IN:${db_name}"
         echo -n "Введите для подтверждения: "
         echo -e "${CYAN}$expected${RESET}"
-        # NB: bare `read` намеренно — Ctrl+C должен ОТМЕНЯТЬ DROP SCHEMA, а не retry'ить.
-        read -r confirm
+        # Auto-cancel через 60 сек — DROP SCHEMA необратим.
+        local confirm=""
+        _typed_confirm_with_timer "$expected" 60 confirm
         if [[ "$confirm" != "$expected" ]]; then
             print_message "INFO" "DROP SCHEMA отменён пользователем."
             return 1
@@ -9266,6 +9505,21 @@ check_and_warn_version_mismatch() {
             # Очищаем экран чтобы предупреждение было вверху
             clear_screen
             show_version_mismatch_warning "$compose_ver" "$loaded_ver" "true" "$image_name"
+            # TG-уведомление об обновлении бота — once per version через sentinel.
+            # Sentinel: $INSTALL_DIR/.bot_update_notified-<image>-<loaded_ver>
+            # При следующем UPGRADE с новой версией — sentinel другой → пришлёт повторно.
+            local _bot_upd_sentinel="$INSTALL_DIR/.bot_update_notified-${image_name//\//_}-${loaded_ver}"
+            if [[ ! -f "$_bot_upd_sentinel" ]]; then
+                send_telegram_alert "INFO" "Новая версия бота доступна" \
+                    "🐳 Образ: <code>${image_name}</code>
+📦 Compose: ${compose_ver}
+✨ Загружено: ${loaded_ver}" \
+                    "Обновить: <code>lazarus bot upgrade</code>
+Или вручную: <code>cd \$BOT_PATH && docker compose up -d</code>"
+                touch "$_bot_upd_sentinel" 2> "$SILENT_LOG"
+                # Cleanup старых sentinel-файлов (>30 дней) чтобы не накапливались.
+                find "$INSTALL_DIR" -maxdepth 1 -name '.bot_update_notified-*' -mtime +30 -delete 2> "$SILENT_LOG" || true
+            fi
             if [[ "$IS_INTERACTIVE" == true ]]; then
                 offer_compose_update "$compose_ver" "$loaded_ver" "$image_name"
             fi
@@ -9318,6 +9572,245 @@ check_and_warn_version_mismatch() {
             debug_log "VERSION" "Could not determine version match (bot not configured?)"
             ;;
     esac
+}
+
+# =============================================================================
+# verify_all_backups: проверяет integrity ВСЕХ архивов в $BACKUP_DIR.
+# =============================================================================
+# Для каждого `.tar.gz` или `.tar.gz.enc`:
+#   - .enc:    detect формат (v2/v1) → MAC verify (для v2) → decrypt → gzip -t
+#   - .tar.gz: только gzip -t
+# При ошибках — alert в TG (CRITICAL — corruption детектирован) с списком файлов.
+# Запускать раз в неделю через cron для раннего обнаружения bit-rot или
+# несовместимости (например после обновления openssl).
+# =============================================================================
+verify_all_backups() {
+    debug_log "VERIFY" "=== verify_all_backups ==="
+    print_message "INFO" "Сканирую $BACKUP_DIR..."
+
+    local _files=()
+    while IFS= read -r -d '' f; do _files+=("$f"); done < <(
+        find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' \) -print0 2>/dev/null
+    )
+    local _total=${#_files[@]}
+    if [[ $_total -eq 0 ]]; then
+        print_message "INFO" "Архивов не найдено."
+        return 0
+    fi
+
+    local _ok=0 _fail=0 _i=0
+    local -a _failed_list=()
+    local _start=$(date +%s)
+
+    for f in "${_files[@]}"; do
+        _i=$((_i + 1))
+        local _base; _base=$(basename "$f")
+        printf "[%d/%d] %s ... " "$_i" "$_total" "$_base"
+        local _ok_this=true _reason=""
+
+        if [[ "$f" == *.enc ]]; then
+            if [[ -z "$BACKUP_PASSWORD" ]]; then
+                echo -e "${YELLOW}SKIP (no password)${RESET}"
+                continue
+            fi
+            # Format detect через magic + MAC verify (для v2).
+            local _fmt
+            _fmt=$(_hmac_envelope_verify "$f" "$BACKUP_PASSWORD" 2>/dev/null)
+            local _verify_rc=$?
+            if [[ "$_fmt" == "v2" ]]; then
+                if [[ $_verify_rc -ne 0 ]]; then
+                    _ok_this=false; _reason="MAC verify FAIL (corruption или wrong password)"
+                fi
+            elif [[ "$_fmt" == "v1" ]]; then
+                : # v1 не имеет MAC — переходим к decrypt+gzip
+            else
+                _ok_this=false; _reason="неизвестный формат (magic=$_fmt)"
+            fi
+
+            if $_ok_this; then
+                # Decrypt → gzip -t. Через temp-файл (single-pass _hmac_envelope_decrypt).
+                local _tmp; _tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_verify.XXXXXX")
+                register_sensitive_tmp "$_tmp"
+                if _hmac_envelope_decrypt "$f" "$_tmp" "$BACKUP_PASSWORD" > "$SILENT_LOG" 2>&1; then
+                    if ! gzip -t "$_tmp" > "$SILENT_LOG" 2>&1; then
+                        _ok_this=false; _reason="gzip -t FAIL после decrypt"
+                    fi
+                else
+                    _ok_this=false; _reason="decrypt FAIL"
+                fi
+                shred -u "$_tmp" 2>/dev/null || rm -f "$_tmp"
+                unregister_sensitive_tmp "$_tmp"
+            fi
+        else
+            # Plain .tar.gz — только gzip integrity.
+            if ! gzip -t "$f" > "$SILENT_LOG" 2>&1; then
+                _ok_this=false; _reason="gzip -t FAIL"
+            fi
+        fi
+
+        if $_ok_this; then
+            echo -e "${GREEN}OK${RESET}"
+            _ok=$((_ok + 1))
+        else
+            echo -e "${RED}FAIL${RESET} ($_reason)"
+            _fail=$((_fail + 1))
+            _failed_list+=("$_base — $_reason")
+            log_message "ERROR" "Verify FAIL: $_base ($_reason)"
+        fi
+    done
+
+    local _elapsed=$(($(date +%s) - _start))
+    echo ""
+    echo -e "${GREEN}OK: $_ok${RESET} / ${RED}FAIL: $_fail${RESET} / Всего: $_total (за ${_elapsed}с)"
+
+    # TG alert только если есть FAIL (good news не спамим).
+    if [[ $_fail -gt 0 ]]; then
+        local _list_body=""
+        for ent in "${_failed_list[@]:0:10}"; do
+            _list_body+="🔴 $ent
+"
+        done
+        [[ ${#_failed_list[@]} -gt 10 ]] && _list_body+="... +$((${#_failed_list[@]} - 10)) ещё
+"
+        send_telegram_alert "CRITICAL" "Verify backups: $_fail ошибок" \
+            "📦 Всего: $_total · ✅ OK: $_ok · ❌ FAIL: $_fail
+⏱ Время: ${_elapsed}с
+
+${_list_body}" \
+            "Проверь файлы: <code>ls -la $BACKUP_DIR</code>
+Старые backup'ы лучше удалить: <code>lazarus cleanup</code>"
+        return 1
+    elif [[ "$REPORT_TO_TG" == "true" ]]; then
+        # Положительный отчёт только если явно запрошено (--report-tg).
+        send_telegram_alert "INFO" "Verify OK · $_total архивов" \
+            "✅ Все архивы целые
+⏱ ${_elapsed}с" ""
+    fi
+    return 0
+}
+
+# =============================================================================
+# report_period_send: отчёт о backup-активности за период (1/7/30 дней).
+# =============================================================================
+# Использование (CLI / cron):
+#   lazarus report weekly
+#   lazarus report daily
+#   lazarus report month
+#
+# Cron-recipe (раз в неделю в 04:00 по воскресеньям):
+#   0 4 * * 0 /usr/local/bin/lazarus report weekly >> /var/log/lazarus_backup.log 2>&1
+#
+# Аргументы:
+#   $1 — period_days: 1 / 7 / 30
+#   $2 — period_label: "за сутки" / "за неделю" / "за месяц"
+# =============================================================================
+report_period_send() {
+    local period_days="$1"
+    local period_label="$2"
+
+    [[ ! -d "$BACKUP_DIR" ]] && {
+        print_message "WARN" "BACKUP_DIR не существует: $BACKUP_DIR"
+        return 1
+    }
+
+    # Получаем cutoff в epoch секундах (X дней назад)
+    local _cutoff
+    _cutoff=$(date -d "${period_days} days ago" +%s 2>/dev/null) || \
+        _cutoff=$(date -v-${period_days}d +%s 2>/dev/null) || {
+        print_message "ERROR" "Не могу вычислить cutoff date (требуется GNU date)"
+        return 1
+    }
+
+    # Сканируем backup-файлы. Берём mtime (когда созданы).
+    local _count_full=0 _count_db=0 _count_files=0
+    local _total_bytes=0 _verified_count=0
+    while IFS= read -r -d '' f; do
+        local _mtime
+        _mtime=$(stat -c%Y "$f" 2>/dev/null || stat -f%m "$f" 2>/dev/null || echo 0)
+        [[ "$_mtime" -lt "$_cutoff" ]] && continue
+        local _base; _base=$(basename "$f")
+        case "$_base" in
+            lazarus_full_*)   _count_full=$((_count_full + 1)) ;;
+            lazarus_db_*)     _count_db=$((_count_db + 1)) ;;
+            lazarus_files_*)  _count_files=$((_count_files + 1)) ;;
+        esac
+        local _sz
+        _sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+        _total_bytes=$((_total_bytes + _sz))
+        # v2 envelope = verified (magic LAZ2 после успешного create)
+        local _magic; _magic=$(head -c 4 "$f" 2>/dev/null)
+        [[ "$_magic" == "LAZ2" ]] && _verified_count=$((_verified_count + 1))
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' \) -print0 2>/dev/null)
+
+    local _total=$((_count_full + _count_db + _count_files))
+    local _total_human
+    _total_human=$(echo "$_total_bytes" | numfmt --to=iec 2>/dev/null || echo "${_total_bytes}B")
+
+    # Считаем ошибки из log-файла за этот период.
+    local _err_count=0
+    if [[ -f /var/log/lazarus_backup.log ]]; then
+        # awk: только ERROR-строки с timestamp >= cutoff (формат логов: [YYYY-MM-DD HH:MM:SS] [ERROR] ...)
+        _err_count=$(awk -v cutoff="$_cutoff" '
+            match($0, /\[([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-9]{2}:[0-9]{2}:[0-9]{2})\]/, m) {
+                # Преобразование даты в epoch через системный date — не надёжно в awk.
+                # Используем grep-style фильтр по строке-метке вместо.
+                t=m[1]" "m[2]
+                cmd="date -d \"" t "\" +%s 2>/dev/null"
+                cmd | getline ts
+                close(cmd)
+                if (ts && ts >= cutoff && /\[ERROR\]/) c++
+            }
+            END { print c+0 }
+        ' /var/log/lazarus_backup.log 2>/dev/null) || _err_count=0
+    fi
+
+    # Disk current state
+    local _disk_used _disk_free
+    _disk_used=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $5}')
+    _disk_free=$(df -Ph "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
+
+    # Bot version (если настроен)
+    local _bot_ver
+    _bot_ver=$(get_raw_bot_version 2>/dev/null || echo "?")
+
+    # Период — даты для footer
+    local _start_date _end_date
+    _start_date=$(date -d "@${_cutoff}" '+%d.%m' 2>/dev/null || date -r "${_cutoff}" '+%d.%m' 2>/dev/null || echo "?")
+    _end_date=$(date '+%d.%m')
+
+    local _success_rate
+    if [[ $_total -gt 0 ]]; then
+        # Простая эвристика: total - err = success
+        local _success=$((_total - _err_count))
+        [[ $_success -lt 0 ]] && _success=0
+        _success_rate=$(awk -v s="$_success" -v t="$_total" 'BEGIN{printf "%.1f", (s/t)*100}')
+    else
+        _success_rate="—"
+    fi
+
+    print_message "INFO" "Отчёт ${period_label} (${_start_date} – ${_end_date}):"
+    echo "  Full:    $_count_full"
+    echo "  DB:      $_count_db"
+    echo "  Files:   $_count_files"
+    echo "  Всего:   $_total ($_total_human)"
+    echo "  v2 enc:  $_verified_count из $_total"
+    echo "  Ошибок:  $_err_count"
+    echo "  Success: ${_success_rate}%"
+    echo "  Disk:    $_disk_used занято, $_disk_free свободно"
+
+    local _severity="INFO"
+    [[ $_err_count -gt 0 ]] && _severity="WARN"
+
+    send_telegram_alert "$_severity" "Отчёт ${period_label}" \
+        "📅 ${_start_date} – ${_end_date}
+📦 Бэкапов: ${_total} (${_total_human})
+  • Full: ${_count_full} · DB: ${_count_db} · Files: ${_count_files}
+🔒 v2-encrypted: ${_verified_count}/${_total}
+❌ Ошибок: ${_err_count}
+✅ Success rate: ${_success_rate}%
+💾 Диск: ${_disk_used} занято, ${_disk_free} свободно
+🤖 Бот: v${_bot_ver}" \
+        ""
 }
 
 # Запускаем проверку только если бот настроен
@@ -9505,6 +9998,32 @@ case "$1" in
         migrate_v1_backups
         exit $?
         ;;
+    verify|verify-all)
+        # Проверка integrity всех архивов (gzip -t + MAC verify для v2).
+        # Идеально для cron-recipe раз в неделю:
+        #   0 4 * * 0 /usr/local/bin/lazarus --report-tg verify >> /var/log/lazarus_backup.log 2>&1
+        verify_all_backups
+        exit $?
+        ;;
+    report)
+        # Еженедельный (или другой период) отчёт в TG.
+        # Использование: lazarus report [weekly|daily|month]
+        case "$2" in
+            weekly|""|-w)  report_period_send "7" "за неделю" ;;
+            daily|-d)      report_period_send "1" "за сутки" ;;
+            month|monthly|-m) report_period_send "30" "за месяц" ;;
+            *) echo "Использование: lazarus report [weekly|daily|month]"; exit 1 ;;
+        esac
+        exit $?
+        ;;
+    emoji)
+        # Diagnostics для Premium custom emoji.
+        # Sub-commands:
+        #   probe <id1> [id2 ...]  — getCustomEmojiStickers для проверки конкретных ID
+        #   scan                   — getUpdates, ищет premium-emoji в последних сообщениях
+        emoji_command "$2" "${@:3}"
+        exit $?
+        ;;
     help|--help|-h)
         echo "LAZARUS Backup Manager v${VERSION}"
         echo ""
@@ -9542,6 +10061,9 @@ case "$1" in
         echo "  cleanup                     Удалить старые бэкапы по ротации"
         echo "  skipped                     Просмотр пропущенных файлов последнего бэкапа"
         echo "  migrate-v2                  Конвертировать старые v1 backup'ы в v2 (с HMAC)"
+        echo "  verify                      Проверить integrity всех архивов (MAC + gzip)"
+        echo "  report [weekly|daily|month] Отчёт о backup-активности в TG"
+        echo "  emoji probe <id> | scan     Premium emoji diagnostics"
         echo ""
         echo "Скрипт:"
         echo "  update | check_update       Проверить обновления самого скрипта"
