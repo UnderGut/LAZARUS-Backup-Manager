@@ -1,12 +1,18 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.0.6"
-SCRIPT_NAME="lazarus"
+VERSION="5.1.0"
+# SCRIPT_NAME — имя файла внутри INSTALL_DIR, совпадает с именем в репо.
+# Раньше было "lazarus" (расхождение с именем в Git), теперь "lazarus-backup".
+# install_script автоматически мигрирует старые установки.
+SCRIPT_NAME="lazarus-backup"
+# CLI_NAME — имя команды (symlink в /usr/local/bin), которое пользователь набирает.
+# Намеренно осталось коротким "lazarus" — UX и backwards-compat с cron-задачами.
+CLI_NAME="lazarus"
 INSTALL_DIR="/opt/lazarus-backup"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
-SYMLINK_PATH="/usr/local/bin/$SCRIPT_NAME"
+SYMLINK_PATH="/usr/local/bin/$CLI_NAME"
 
 # --- ИСТОЧНИКИ ОБНОВЛЕНИЙ (проверяются все, берётся максимальная версия) ---
 REMOTE_URLS=(
@@ -51,6 +57,25 @@ RETENTION_DAYS="7"
 
 # Лимит размера всех бэкапов (в MB). 0 = без лимита
 MAX_BACKUP_SIZE_MB="0"
+
+# Пороги мониторинга диска (от объёма раздела, где лежит BACKUP_DIR)
+# WARN     — слать TG-уведомление о заполнении, бэкап продолжается
+# CRITICAL — отменять создание бэкапа + TG-уведомление с рекомендацией cleanup
+DISK_WARN_PERCENT="90"
+DISK_CRITICAL_PERCENT="95"
+
+# Удаление локального бэкапа после успешной загрузки в удалённое хранилище
+#   false       — НЕ удалять (по умолчанию, безопасно)
+#   any         — удалить если хотя бы один канал (TG или remote) подтвердил доставку
+#   all         — удалить только если ВСЕ настроенные каналы успешны
+#   remote_only — удалить если remote (S3/FTP/WebDAV/Rclone) успешен (TG не учитывается)
+DELETE_LOCAL_AFTER_REMOTE_UPLOAD="false"
+
+# Бэкапить ли логи (*.log, *.log.N, *.log.N.gz, *.log-DATE, *.log-DATE.gz)
+#   ask    — спросить при первом ручном бэкапе и запомнить выбор (default)
+#   true   — включать логи в архив
+#   false  — исключать (экономит место, обычно логи не нужны для restore)
+BACKUP_LOG_FILES="ask"
 
 # Настройки удаленного хранилища
 REMOTE_STORAGE_TYPE="off" # off, ftp, webdav, rclone, s3
@@ -113,7 +138,27 @@ LOG_FILE="/var/log/lazarus_backup.log"
 LOCK_FILE="/var/run/lazarus_backup.lock"
 LOCK_FD=200  # File descriptor для flock
 
-# Trap для очистки при завершении (освобождение блокировки + временные файлы)
+# SENSITIVE_TMP_PATHS — массив путей с sensitive данными (decrypted backups,
+# S3 credentials), которые ОБЯЗАТЕЛЬНО надо удалить при exit/SIGKILL.
+# Регистрируется через `register_sensitive_tmp`.
+declare -a SENSITIVE_TMP_PATHS=()
+
+register_sensitive_tmp() {
+    # Аргумент — путь к файлу или каталогу с sensitive данными.
+    [[ -n "$1" ]] && SENSITIVE_TMP_PATHS+=("$1")
+}
+
+unregister_sensitive_tmp() {
+    # Удалить из списка после явной успешной очистки (предотвращает double-rm).
+    local target="$1"
+    local i new=()
+    for i in "${SENSITIVE_TMP_PATHS[@]}"; do
+        [[ "$i" != "$target" ]] && new+=("$i")
+    done
+    SENSITIVE_TMP_PATHS=("${new[@]}")
+}
+
+# Trap для очистки при завершении: lock + sensitive tmp пути
 cleanup_on_exit() {
     # Освобождаем блокировку если была получена
     # NOTE: debug_log может не работать здесь если вызывается после закрытия stdout
@@ -122,21 +167,67 @@ cleanup_on_exit() {
         eval "exec $LOCK_FD>&-" 2>/dev/null || true
     fi
     rm -f "$LOCK_FILE" 2>/dev/null || true
-    
-    # Очищаем временные директории миграции
-    if [[ ${#TEMP_DIRS[@]} -gt 0 ]]; then
-        for temp_dir in "${TEMP_DIRS[@]}"; do
-            [[ -d "$temp_dir" ]] && rm -rf "$temp_dir" 2>/dev/null || true
+
+    # КРИТИЧНО: удаляем sensitive temp paths (decrypted backups, S3 creds).
+    # Если скрипт умер по SIGKILL — этот trap не сработает, но при normal exit,
+    # ctrl+C-trap exit, double-confirm exit — сработает.
+    if [[ ${#SENSITIVE_TMP_PATHS[@]} -gt 0 ]]; then
+        local p
+        for p in "${SENSITIVE_TMP_PATHS[@]}"; do
+            [[ -n "$p" && -e "$p" ]] && rm -rf "$p" 2>/dev/null || true
         done
     fi
 }
-trap cleanup_on_exit EXIT INT TERM
+# EXIT: всегда чистим (lock, temp dirs).
+# INT/TERM: double-confirm — первый Ctrl+C просит подтверждение, второй в течение
+# DOUBLE_CTRLC_WINDOW секунд завершает скрипт через exit 130 (128 + SIGINT).
+# Это спасает от случайных одиночных нажатий в меню. Внутри уже запущенных команд
+# (pg_dump/tar/curl) первый Ctrl+C всё равно убивает child process — это поведение
+# kernel/bash, наш trap не успевает защитить child. Для полной блокировки нужны
+# setsid-обёртки на каждый critical-call (отдельная задача).
+_INT_FLAG=0
+_INT_LAST_TS=0
+DOUBLE_CTRLC_WINDOW=3   # сек.
+
+_lazarus_int_handler() {
+    local _now
+    _now=$(date +%s)
+    if [[ $_INT_FLAG -eq 1 && $((_now - _INT_LAST_TS)) -le $DOUBLE_CTRLC_WINDOW ]]; then
+        # Второй Ctrl+C в окне → реально выходим
+        printf '\n\033[31m\033[1m[INFO] Повторный Ctrl+C — прерываем скрипт\033[0m\n'
+        exit 130
+    fi
+    _INT_FLAG=1
+    _INT_LAST_TS=$_now
+    printf '\n\033[33m\033[1m[WARN] Получен Ctrl+C — нажмите ещё раз в течение %s сек для выхода\033[0m\n' "$DOUBLE_CTRLC_WINDOW"
+    printf '\033[90m       (если этого не сделать, операция продолжится)\033[0m\n'
+}
+
+trap cleanup_on_exit EXIT
+trap _lazarus_int_handler INT TERM
+
+# safe_read: обёртка над builtin read. При SIGINT (rc=130) повторяет prompt —
+# полезно в меню, где Ctrl+C во время read не должен интерпретироваться
+# как пустой ответ → отмена. EOF (Ctrl+D) и прочие ошибки пропускаются дальше.
+# Использовать ВМЕСТО `read` в местах где пустой ввод имеет деструктивный смысл.
+safe_read() {
+    while true; do
+        builtin read "$@"
+        local _rc=$?
+        if [[ $_rc -eq 0 ]]; then return 0; fi
+        if [[ $_rc -eq 130 ]]; then
+            # Первый Ctrl+C — handler уже отработал WARN; перечитываем prompt
+            continue
+        fi
+        return $_rc
+    done
+}
 
 # Цвета
 if [[ -t 0 ]]; then
-    RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; GRAY=$'\e[90m'; CYAN=$'\e[36m'; MAGENTA=$'\e[35m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
+    RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; GRAY=$'\e[90m'; CYAN=$'\e[36m'; MAGENTA=$'\e[35m'; WHITE=$'\e[37m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
 else
-    RED=""; GREEN=""; YELLOW=""; GRAY=""; CYAN=""; MAGENTA=""; RESET=""; BOLD=""
+    RED=""; GREEN=""; YELLOW=""; GRAY=""; CYAN=""; MAGENTA=""; WHITE=""; RESET=""; BOLD=""
 fi
 
 # --- ФУНКЦИИ ИНТЕРФЕЙСА ---
@@ -155,15 +246,459 @@ clear_screen() {
 # Отладочное сообщение
 # Использование: debug_log "message" или debug_log "CATEGORY" "message"
 debug_log() {
+    # КРИТИЧНО: debug_log пишет в stderr (>&2), НЕ в stdout. Иначе любой вызов
+    # `result=$(some_func_with_debug_log)` захватывает debug-строку в result.
+    # Прошлый bug: get_db_user → read_bot_env → debug_log в stdout → ACTUAL_DB_USER
+    # становился многострочным "[DEBUG] ...\npostgres", pg_isready ломался.
     if [[ "$DEBUG_MODE" == true ]]; then
         local ts=$(date '+%H:%M:%S.%3N')
         if [[ $# -eq 1 ]]; then
-            echo -e "${MAGENTA}[$ts DEBUG]${RESET} $1"
+            echo -e "${MAGENTA}[$ts DEBUG]${RESET} $1" >&2
         else
             local category="$1"
             shift
-            echo -e "${MAGENTA}[$ts DEBUG]${RESET} ${CYAN}[$category]${RESET} $*"
+            echo -e "${MAGENTA}[$ts DEBUG]${RESET} ${CYAN}[$category]${RESET} $*" >&2
         fi
+    fi
+}
+
+# =============================================================================
+# PREMIUM EMOJI (Telegram Premium only)
+# =============================================================================
+# Каталог взят из UnderVPN's `!SHOP/undervpn_premium_emoji_catalog.md` (133 ID).
+# Premium emoji ID — глобальные (не привязаны к боту). У Premium-пользователей
+# показывается кастомный, у остальных — fallback Unicode.
+#
+# Использование: только в литералах MarkdownV2-шаблонов. НЕ пропускать через
+# escape_markdown_v2() — он сломает `![...](tg://emoji?id=...)` синтаксис.
+#
+# Помощник: tg_emoji "📦" "$EMO_PACKAGE" → !\[📦\]\(tg://emoji?id=...\)
+# NB: ID'ы Premium emoji проверены через getCustomEmojiStickers API 2026-05-25.
+# Используем ТОЛЬКО ID, чьи реальные иконки визуально совпадают с fallback Unicode.
+# Если у пользователя НЕТ Premium — Telegram отрендерит Unicode из `![X](...)` блока.
+# Если ID указывает на другую иконку (peach вместо stats и т.п.) — мы НЕ ставим
+# Premium replacement, потому что premium-пользователи увидят неправильный смайл.
+EMO_ERROR="5260342697075416641"          # ❌ → ❌ verified
+EMO_WARN="5258474669769497337"           # ⚠️ → ❗️ close enough
+EMO_INFO="5258216851472654189"           # 💡 → 💡 verified
+EMO_LOCK="5258476306152038031"           # 🔒 → 🔒 verified
+EMO_CALENDAR="5258105663359294787"       # 📅 → 🗓 close (calendar family)
+EMO_FOLDER="5257969839313526622"         # 📁 → 📂 close (folder family)
+EMO_BADGE="5357069174512303778"          # ✅ → ✅ verified
+# Удалены (mismatch при audit):
+#   EMO_PACKAGE  = peach instead of box
+#   EMO_DOC      = folder instead of file cabinet
+#   EMO_STATS    = 🍑 peach instead of 📊 stats (worst mismatch)
+#   EMO_CLOUD    = 📦 box instead of ☁️ cloud
+# Для этих смайлов используем чистый Unicode без Premium replacement.
+
+tg_emoji() {
+    # Аргументы: $1=fallback Unicode  $2=premium ID (может быть пустым)
+    # Возвращает MarkdownV2-safe строку.
+    local fallback="$1"
+    local id="$2"
+    if [[ -n "$id" ]]; then
+        printf '![%s](tg://emoji?id=%s)' "$fallback" "$id"
+    else
+        printf '%s' "$fallback"
+    fi
+}
+
+# =============================================================================
+# HMAC ENVELOPE для зашифрованных бэкапов (encrypt-then-MAC)
+# =============================================================================
+# AES-256-CBC сам по себе НЕ аутентифицирован — атакующий с write-доступом к .enc
+# может подменить ciphertext, decrypt пройдёт. Защита: HMAC-SHA256 над всем
+# ciphertext'ом, проверяется ПЕРЕД decrypt (constant-time compare, gadget-protected).
+#
+# Формат v2 envelope:
+#   bytes 0-3:   magic "LAZ2"
+#   bytes 4-N:   ciphertext (openssl enc -aes-256-cbc -salt -pbkdf2 output)
+#                — структура: "Salted__" + salt(8) + ciphertext
+#   bytes N-N+32: HMAC-SHA256 over bytes [4..N) (только ciphertext, без magic)
+#
+# Legacy v1 (без HMAC): просто openssl output без magic, обрабатывается как fallback.
+#
+# K_mac derivation: HMAC-SHA256(BACKUP_PASSWORD, "lazarus-hmac-key-v1").
+# Это deterministic и быстрый (без PBKDF2) — достаточно для encrypt-then-MAC:
+#   - Атакующий без BACKUP_PASSWORD не вычислит K_mac.
+#   - K_enc (PBKDF2 100k) и K_mac (fast HMAC) семантически разделены.
+#   - Подбор пароля через MAC — теоретически быстрее, чем через PBKDF2, НО
+#     attacker всё равно вынужден проверить через PBKDF2 для финального decrypt.
+
+# Hex-кодирование байт из stdin. Использует `od` (доступен везде, в отличие от `xxd`).
+_to_hex() {
+    od -An -vtx1 | tr -d ' \n'
+}
+
+# K_mac = HMAC-SHA256(password, "lazarus-hmac-key-v1") → hex 64 символа
+_derive_hmac_key() {
+    local password="$1"
+    printf '%s' "$password" | openssl dgst -sha256 -hmac "lazarus-hmac-key-v1" -binary | _to_hex
+}
+
+# Создаёт v2 envelope: openssl enc → LAZ2 + ciphertext + HMAC
+# Возвращает 0 при успехе, 1 при ошибке. Перезаписывает $2.
+_hmac_envelope_create() {
+    local infile="$1" outfile="$2" password="$3"
+    local cipher_tmp
+    cipher_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_enc.XXXXXX") || return 1
+    register_sensitive_tmp "$cipher_tmp"
+
+    # Step 1: encrypt через openssl (как раньше)
+    if ! openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+            -in "$infile" -out "$cipher_tmp" \
+            -pass fd:3 3<<<"$password" 2> "$SILENT_LOG"; then
+        rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+        return 1
+    fi
+
+    # Step 2: derive K_mac
+    local k_mac
+    k_mac=$(_derive_hmac_key "$password")
+    if [[ -z "$k_mac" ]]; then
+        rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+        return 1
+    fi
+
+    # Step 3: write LAZ2 + ciphertext + HMAC
+    {
+        printf 'LAZ2'
+        cat "$cipher_tmp"
+        openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp"
+    } > "$outfile"
+
+    rm -f "$cipher_tmp"
+    unregister_sensitive_tmp "$cipher_tmp"
+    return 0
+}
+
+# Проверка MAC v2 envelope БЕЗ decrypt.
+# Returns: 0 = MAC OK, 1 = MAC mismatch / not v2 / file too small.
+# stdout: тип формата ("v2" | "v1" | "unknown") для caller decision.
+_hmac_envelope_verify() {
+    local file="$1" password="$2"
+    local size
+    size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+
+    # Минимальный v2: 4 (LAZ2) + 16 (Salted__ + salt) + 16 (1 AES block) + 32 (MAC) = 68
+    if [[ $size -lt 68 ]]; then
+        # Проверим v1 (просто Salted__ + salt + 1 block = 24)
+        local v1_magic
+        v1_magic=$(head -c 8 "$file" 2>/dev/null)
+        if [[ "$v1_magic" == "Salted__" && $size -ge 24 ]]; then
+            echo "v1"
+            return 1   # v1 не имеет MAC — caller решает (warning)
+        fi
+        echo "unknown"
+        return 1
+    fi
+
+    local magic
+    magic=$(head -c 4 "$file" 2>/dev/null)
+    if [[ "$magic" != "LAZ2" ]]; then
+        # Legacy v1 path
+        local v1_magic
+        v1_magic=$(head -c 8 "$file" 2>/dev/null)
+        if [[ "$v1_magic" == "Salted__" ]]; then
+            echo "v1"
+            return 1
+        fi
+        echo "unknown"
+        return 1
+    fi
+
+    # v2 path: vы verify MAC
+    local k_mac
+    k_mac=$(_derive_hmac_key "$password")
+    [[ -z "$k_mac" ]] && { echo "v2"; return 1; }
+
+    local cipher_len=$((size - 4 - 32))
+    local cipher_tmp
+    cipher_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_mac.XXXXXX") || { echo "v2"; return 1; }
+    register_sensitive_tmp "$cipher_tmp"
+
+    # Извлекаем ciphertext (без LAZ2 и без последних 32 байт MAC).
+    # ВНИМАНИЕ: `dd bs=1` КАТАСТРОФИЧЕСКИ медленный (31 сек на 35 МБ → 15 мин на 1 GB).
+    # `tail -c +N | head -c M` использует buffered I/O, для 35 МБ ~ 0.1 сек.
+    # +N в `tail -c` это 1-based: пропустить 4 байта = начать с +5.
+    tail -c +5 "$file" 2>/dev/null | head -c "$cipher_len" > "$cipher_tmp" 2> "$SILENT_LOG"
+
+    local computed
+    computed=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp" | _to_hex)
+    local stored
+    stored=$(tail -c 32 "$file" | _to_hex)
+
+    rm -f "$cipher_tmp"
+    unregister_sensitive_tmp "$cipher_tmp"
+
+    # Сравнение через bash [[ == ]] — не constant-time, но для нашей threat model
+    # (атакующий без пароля не знает correct MAC) — adequate.
+    if [[ "$computed" == "$stored" && -n "$computed" ]]; then
+        echo "v2"
+        return 0
+    fi
+    echo "v2"
+    return 1
+}
+
+# Verify + decrypt v2 envelope. Принимает outfile для decrypted plaintext.
+# Returns: 0 — OK; 1 — MAC mismatch / unknown format; 2 — decrypt failed (после MAC OK).
+# umask 077 + сразу chmod 600 на outfile (для restore-сценария где outfile в /tmp).
+#
+# OPTIMIZATION: extract ciphertext ОДИН РАЗ (не вызываем _hmac_envelope_verify, который
+# делал свой extract). Single-pass = ~0.5 сек экономии на 1 GB файла.
+_hmac_envelope_decrypt() {
+    local infile="$1" outfile="$2" password="$3"
+
+    # Fast format detection через magic (4-8 байт). Без полного extract.
+    local _magic4 _magic8
+    _magic4=$(head -c 4 "$infile" 2>/dev/null)
+    _magic8=$(head -c 8 "$infile" 2>/dev/null)
+
+    if [[ "$_magic4" == "LAZ2" ]]; then
+        # === v2 path: single extract + MAC + decrypt ===
+        local size cipher_len cipher_tmp k_mac
+        size=$(stat -c%s "$infile")
+        # Минимальный v2: LAZ2(4) + Salted__(8) + salt(8) + 1 AES block(16) + MAC(32) = 68
+        if [[ $size -lt 68 ]]; then
+            debug_log "HMAC" "v2 file too small ($size bytes)"
+            return 1
+        fi
+        cipher_len=$((size - 4 - 32))
+
+        cipher_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_dec.XXXXXX") || return 2
+        register_sensitive_tmp "$cipher_tmp"
+        # Один read: ciphertext в tmp файл (тот же используется для MAC compute и openssl decrypt)
+        tail -c +5 "$infile" 2>/dev/null | head -c "$cipher_len" > "$cipher_tmp" 2> "$SILENT_LOG"
+
+        # Compute MAC over extracted ciphertext
+        k_mac=$(_derive_hmac_key "$password")
+        if [[ -z "$k_mac" ]]; then
+            rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+            return 1
+        fi
+        local computed stored
+        computed=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp" | _to_hex)
+        stored=$(tail -c 32 "$infile" | _to_hex)
+
+        if [[ "$computed" != "$stored" || -z "$computed" ]]; then
+            debug_log "HMAC" "v2 MAC mismatch"
+            rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+            return 1
+        fi
+
+        # MAC OK → decrypt тот же cipher_tmp (не extract ещё раз)
+        ( umask 077 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -in "$cipher_tmp" -out "$outfile" \
+            -pass fd:3 3<<<"$password" ) 2> "$SILENT_LOG"
+        local drc=$?
+        rm -f "$cipher_tmp"
+        unregister_sensitive_tmp "$cipher_tmp"
+        chmod 600 "$outfile" 2> "$SILENT_LOG" || true
+        [[ $drc -eq 0 ]] && return 0 || return 2
+
+    elif [[ "$_magic8" == "Salted__" ]]; then
+        # === v1 legacy path: нет MAC, decrypt напрямую ===
+        ( umask 077 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -in "$infile" -out "$outfile" \
+            -pass fd:3 3<<<"$password" ) 2> "$SILENT_LOG"
+        local drc=$?
+        chmod 600 "$outfile" 2> "$SILENT_LOG" || true
+        [[ $drc -eq 0 ]] && return 0 || return 2
+    fi
+    return 1   # unknown format
+}
+
+# =============================================================================
+# v1 → v2 envelope migration (для users которые обновились с pre-HMAC версии)
+# =============================================================================
+# v1 = openssl enc output без HMAC (magic "Salted__")
+# v2 = LAZ2 + ciphertext + HMAC-SHA256 (encrypt-then-MAC, auth)
+#
+# Конверсия: decrypt v1 → re-encrypt v2 → atomic rename → удалить v1.
+# Гарантия rollback: v1 файл удаляется ТОЛЬКО после успешного v2 verify.
+# =============================================================================
+
+# Сканирует BACKUP_DIR и возвращает (через stdout, по одному файлу на строку)
+# полный путь ко всем v1-encrypted backup'ам (`Salted__` magic).
+# Skip'ает: v2 (LAZ2), unencrypted (.tar.gz без .enc), unknown.
+_detect_v1_backups() {
+    local _dir="${1:-$BACKUP_DIR}"
+    [[ ! -d "$_dir" ]] && return 0
+    local _file _magic4 _magic8
+    while IFS= read -r -d '' _file; do
+        [[ ! -f "$_file" ]] && continue
+        _magic4=$(head -c 4 "$_file" 2>/dev/null)
+        [[ "$_magic4" == "LAZ2" ]] && continue   # уже v2
+        _magic8=$(head -c 8 "$_file" 2>/dev/null)
+        [[ "$_magic8" == "Salted__" ]] && echo "$_file"
+    done < <(find "$_dir" -maxdepth 1 -name '*.enc' -type f -print0 2>/dev/null)
+}
+
+# Конвертирует один файл v1 → v2. Атомарно: пишет в tmp, verify, replace.
+# Аргументы: $1 = path to v1 .enc, $2 = password
+# Return: 0 — OK (v1 файл заменён v2), 1 — fail (оригинал не тронут).
+_convert_v1_to_v2() {
+    local _v1file="$1"
+    local _password="$2"
+    [[ ! -f "$_v1file" ]] && return 1
+    [[ -z "$_password" ]] && {
+        debug_log "MIGRATE" "Empty password for $_v1file"
+        return 1
+    }
+
+    local _plain_tmp _v2_tmp
+    _plain_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_mig_plain.XXXXXX") || return 1
+    register_sensitive_tmp "$_plain_tmp"
+    _v2_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_mig_v2.XXXXXX") || {
+        rm -f "$_plain_tmp"; unregister_sensitive_tmp "$_plain_tmp"
+        return 1
+    }
+    register_sensitive_tmp "$_v2_tmp"
+
+    # Step 1: decrypt v1 → plain
+    if ! _hmac_envelope_decrypt "$_v1file" "$_plain_tmp" "$_password"; then
+        debug_log "MIGRATE" "decrypt FAIL for $_v1file"
+        rm -f "$_plain_tmp" "$_v2_tmp"
+        unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"
+        return 1
+    fi
+
+    # Step 2: encrypt plain → v2
+    if ! _hmac_envelope_create "$_plain_tmp" "$_v2_tmp" "$_password"; then
+        debug_log "MIGRATE" "encrypt FAIL for $_v1file"
+        rm -f "$_plain_tmp" "$_v2_tmp"
+        unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"
+        return 1
+    fi
+
+    # Step 3: verify v2 (MAC pre-check)
+    local _verify_fmt
+    _verify_fmt=$(_hmac_envelope_verify "$_v2_tmp" "$_password")
+    if [[ "$_verify_fmt" != "v2" ]]; then
+        debug_log "MIGRATE" "v2 verify FAIL for $_v1file (got format: $_verify_fmt)"
+        rm -f "$_plain_tmp" "$_v2_tmp"
+        unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"
+        return 1
+    fi
+
+    # Step 4: atomic replace (v2 → original path)
+    # mv в той же ФС атомарен; v1 файл существует до самого конца только на случай
+    # если mv упадёт из-за нехватки места.
+    if ! mv -f "$_v2_tmp" "$_v1file"; then
+        debug_log "MIGRATE" "atomic mv FAIL for $_v1file"
+        rm -f "$_plain_tmp" "$_v2_tmp"
+        unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"
+        return 1
+    fi
+    chmod 644 "$_v1file" 2> "$SILENT_LOG" || true
+
+    # Step 5: shred plain (содержит расшифрованный SQL/файлы)
+    shred -u "$_plain_tmp" 2> "$SILENT_LOG" || rm -f "$_plain_tmp"
+    unregister_sensitive_tmp "$_plain_tmp"
+    unregister_sensitive_tmp "$_v2_tmp"
+    return 0
+}
+
+# Sentinel для cron-режима: если есть v1 backup'ы и режим non-interactive,
+# создаём файл-маркер, чтобы при следующем интерактивном запуске показать prompt.
+_v2_migration_sentinel() {
+    local _sentinel="$INSTALL_DIR/.v2_migration_pending"
+    local _v1_count
+    _v1_count=$(_detect_v1_backups | wc -l)
+    if [[ $_v1_count -gt 0 ]]; then
+        echo "$_v1_count" > "$_sentinel" 2> "$SILENT_LOG" || true
+        debug_log "MIGRATE" "Sentinel created: $_v1_count v1 backup(s) pending migration"
+        log_message "WARN" "Найдено $_v1_count backup'ов в формате v1 (без HMAC). Запустите 'lazarus migrate-v2' для конверсии."
+    else
+        [[ -f "$_sentinel" ]] && rm -f "$_sentinel"
+    fi
+}
+
+# Главная функция миграции — interactive prompt + batch convert.
+# Возвращает 0 если всё OK или нет v1 файлов, 1 при ошибке любой конверсии.
+migrate_v1_backups() {
+    local _v1_files=()
+    while IFS= read -r f; do _v1_files+=("$f"); done < <(_detect_v1_backups)
+    local _v1_count=${#_v1_files[@]}
+
+    if [[ $_v1_count -eq 0 ]]; then
+        print_message "INFO" "Нет v1 backup'ов для конверсии."
+        rm -f "$INSTALL_DIR/.v2_migration_pending"
+        return 0
+    fi
+
+    if [[ -z "$BACKUP_PASSWORD" ]]; then
+        print_message "ERROR" "BACKUP_PASSWORD не задан — миграция невозможна (нужен пароль от старых архивов)."
+        return 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}  МИГРАЦИЯ v1 → v2 envelope (добавление HMAC)${RESET}"
+    echo -e "${YELLOW}═══════════════════════════════════════════════════${RESET}"
+    echo ""
+    echo -e "Найдено ${BOLD}${_v1_count}${RESET} backup'ов в формате v1 (без HMAC integrity):"
+    for f in "${_v1_files[@]:0:5}"; do
+        local _sz; _sz=$(stat -c%s "$f" 2> "$SILENT_LOG" | numfmt --to=iec 2> "$SILENT_LOG" || echo "?")
+        echo "  • $(basename "$f") (${_sz})"
+    done
+    [[ $_v1_count -gt 5 ]] && echo "  ... и ещё $((_v1_count - 5))"
+    echo ""
+    echo "v2 envelope добавляет HMAC-SHA256 проверку целостности (защита от targeted"
+    echo "ciphertext-подмены) и быструю проверку пароля ДО decrypt (gadget protection)."
+    echo ""
+    echo "Конверсия: decrypt → re-encrypt → atomic rename. Безопасна, оригинал"
+    echo "удаляется ТОЛЬКО после успешной верификации v2."
+    echo ""
+
+    # Non-interactive (cron, no auto-yes) — не спрашиваем, только sentinel.
+    # Если передан --yes (`_MIGRATE_AUTO_YES=true`) — продолжаем БЕЗ prompt.
+    if [[ "$IS_INTERACTIVE" != "true" && "${_MIGRATE_AUTO_YES:-false}" != "true" ]]; then
+        _v2_migration_sentinel
+        print_message "WARN" "Non-interactive mode — миграция отложена. Запустите 'lazarus migrate-v2 --yes' для автоматической конверсии."
+        return 0
+    fi
+
+    if [[ "${_MIGRATE_AUTO_YES:-false}" == "true" ]]; then
+        print_message "INFO" "Auto-yes — пропускаем prompt."
+    else
+        read -erp "Конвертировать в v2? [Y/n]: " _ans
+        if [[ "$_ans" =~ ^[Nn]$ ]]; then
+            print_message "INFO" "Миграция отменена. Sentinel остаётся — спросим в следующий раз."
+            _v2_migration_sentinel
+            return 0
+        fi
+    fi
+
+    echo ""
+    local _ok=0 _fail=0 _i=0
+    for f in "${_v1_files[@]}"; do
+        _i=$((_i + 1))
+        local _base; _base=$(basename "$f")
+        printf "[%d/%d] %s ... " "$_i" "$_v1_count" "$_base"
+        if _convert_v1_to_v2 "$f" "$BACKUP_PASSWORD"; then
+            echo -e "${GREEN}OK${RESET}"
+            _ok=$((_ok + 1))
+            log_message "INFO" "Migrated v1→v2: $_base"
+        else
+            echo -e "${RED}FAIL${RESET}"
+            _fail=$((_fail + 1))
+            log_message "ERROR" "Migration FAIL v1→v2: $_base"
+        fi
+    done
+
+    echo ""
+    echo -e "${GREEN}Успешно конвертировано: $_ok${RESET}"
+    [[ $_fail -gt 0 ]] && echo -e "${RED}Ошибок: $_fail${RESET}"
+
+    if [[ $_fail -eq 0 ]]; then
+        rm -f "$INSTALL_DIR/.v2_migration_pending"
+        return 0
+    else
+        _v2_migration_sentinel  # обновить counter
+        return 1
     fi
 }
 
@@ -652,6 +1187,40 @@ install_script() {
 
     local CURRENT_SCRIPT_PATH=$(realpath "$0" 2> "$SILENT_LOG")
     local INSTALLED_SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+
+    # === CLEANUP: удаляем legacy `lazarus-migrator` плагин ===
+    # Bedolaga→RWP-Shop миграция убрана из проекта (deprecated). Если у пользователя
+    # остался файл плагина от старой версии — чистим, чтобы не было путаницы.
+    if [[ -f "$INSTALL_DIR/lazarus-migrator" ]]; then
+        rm -f "$INSTALL_DIR/lazarus-migrator"
+        echo -e "${GRAY}Cleanup: удалён устаревший плагин $INSTALL_DIR/lazarus-migrator${RESET}"
+    fi
+
+    # === MIGRATION: старая установка с именем "lazarus" → "lazarus-backup" ===
+    # Раньше SCRIPT_NAME было "lazarus" → файл /opt/lazarus-backup/lazarus.
+    # Теперь SCRIPT_NAME="lazarus-backup" для согласованности с именем в репо
+    # и raw.githubusercontent URL. CLI symlink остался "lazarus" — пользователь
+    # продолжает набирать `lazarus`, cron-задачи через $SYMLINK_PATH работают.
+    local LEGACY_PATH="$INSTALL_DIR/lazarus"
+    if [[ -f "$LEGACY_PATH" && ! -L "$LEGACY_PATH" && "$LEGACY_PATH" != "$INSTALLED_SCRIPT_PATH" ]]; then
+        if [[ -f "$INSTALLED_SCRIPT_PATH" ]]; then
+            # Уже есть новый файл — удаляем legacy
+            rm -f "$LEGACY_PATH"
+            echo -e "${GRAY}Migration: удалена старая копия $LEGACY_PATH${RESET}"
+        else
+            # Переименовываем legacy → новое имя
+            mv "$LEGACY_PATH" "$INSTALLED_SCRIPT_PATH"
+            chmod +x "$INSTALLED_SCRIPT_PATH" 2> "$SILENT_LOG" || true
+            echo -e "${GREEN}Migration: $LEGACY_PATH → $INSTALLED_SCRIPT_PATH${RESET}"
+        fi
+        # Пересоздаём symlink на новый target
+        if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then rm -f "$SYMLINK_PATH"; fi
+        ln -s "$INSTALLED_SCRIPT_PATH" "$SYMLINK_PATH"
+        # CURRENT_SCRIPT_PATH мог указывать на legacy — обновим
+        if [[ "$CURRENT_SCRIPT_PATH" == "$LEGACY_PATH" ]]; then
+            CURRENT_SCRIPT_PATH="$INSTALLED_SCRIPT_PATH"
+        fi
+    fi
 
     if [[ "$CURRENT_SCRIPT_PATH" == "$INSTALLED_SCRIPT_PATH" ]]; then
         return
@@ -2261,10 +2830,10 @@ auto_update_bot() {
         selected_version="$current_version"
     fi
     
-    # === 5. ПРОВЕРКА ТРЕБОВАНИЙ v3.25.5+ ===
+    # === 5. ПРОВЕРКА ТРЕБОВАНИЙ ЛИЦЕНЗИИ (machine-id + LICENSE_KEY) ===
     if version_gte "$selected_version" "3.25.5"; then
         echo ""
-        print_message "INFO" "Проверка требований для v3.25.5+..."
+        print_message "INFO" "Проверка лицензии и machine-id..."
         
         # Проверяем machine-id volume
         if ! has_machine_id_volume; then
@@ -2539,7 +3108,7 @@ bot_status() {
     # Проверка LICENSE_KEY и machine-id (для v3.25.5+)
     if [[ -n "$bot_ver" ]] && version_gte "$bot_ver" "3.25.5"; then
         echo ""
-        echo -e "${BOLD}Лицензия (v3.25.5+):${RESET}"
+        echo -e "${BOLD}Лицензия:${RESET}"
         if has_license_key; then
             echo -e "  LICENSE_KEY:   ${GREEN}✓ настроен${RESET}"
         else
@@ -2782,7 +3351,7 @@ update_bot() {
                     has_machine_id_volume && has_mid=true
                     
                     if [[ "$has_key" == "false" || "$has_mid" == "false" ]]; then
-                        echo -e "${YELLOW}${BOLD}Проверка конфигурации (v3.25.5+):${RESET}"
+                        echo -e "${YELLOW}${BOLD}Проверка конфигурации лицензии:${RESET}"
                         if [[ "$has_key" == "true" ]]; then
                             echo -e "  LICENSE_KEY:     ${GREEN}✓ настроен${RESET}"
                         else
@@ -2980,7 +3549,7 @@ update_bot() {
             fi
             
             # Затем выводим статус требований
-            echo -e "${YELLOW}${BOLD}Требования для версий 3.25.5+:${RESET}"
+            echo -e "${YELLOW}${BOLD}Требования лицензии:${RESET}"
             echo ""
             
             # Проверяем LICENSE_KEY
@@ -3209,8 +3778,12 @@ update_bot() {
     echo ""
     echo -e "${CYAN}${BOLD}═══ ПЕРЕЗАПУСК КОНТЕЙНЕРОВ ═══${RESET}"
     print_message "INFO" "[5/7] Остановка контейнеров..."
-    
-    cd "$BOT_PATH"
+
+    if ! cd "$BOT_PATH"; then
+        print_message "ERROR" "Не удалось перейти в $BOT_PATH — обновление прервано"
+        log_message "ERROR" "cd $BOT_PATH failed in update_bot — abort"
+        return 1
+    fi
     debug_log "CONTAINER" "Running: docker compose down in $BOT_PATH"
     docker compose down 2> "$SILENT_LOG"
     local down_result=$?
@@ -3565,6 +4138,11 @@ load_config_file() {
             S3_REGION) S3_REGION="$val" ;;
             BACKUP_PASSWORD) BACKUP_PASSWORD="$val" ;;
             BACKUP_PASSWORD_FILE) BACKUP_PASSWORD_FILE="$val" ;;
+            DISK_WARN_PERCENT) DISK_WARN_PERCENT="$val" ;;
+            DISK_CRITICAL_PERCENT) DISK_CRITICAL_PERCENT="$val" ;;
+            DELETE_LOCAL_AFTER_REMOTE_UPLOAD) DELETE_LOCAL_AFTER_REMOTE_UPLOAD="$val" ;;
+            BACKUP_LOG_FILES) BACKUP_LOG_FILES="$val" ;;
+            *) debug_log "CONFIG" "Unknown key in config (ignored): $key" ;;
         esac
     done < "$file"
 }
@@ -3578,18 +4156,81 @@ env_escape() {
 
 write_password_file() {
     local file="$BACKUP_PASSWORD_FILE"
+    local pwd="$1"
+
+    # SECURITY 1: путь должен быть внутри INSTALL_DIR (защита от path injection
+    # через config.env типа BACKUP_PASSWORD_FILE="/etc/passwd").
+    case "$file" in
+        "$INSTALL_DIR"/*) ;;
+        *)
+            print_message "ERROR" "BACKUP_PASSWORD_FILE вне $INSTALL_DIR — отказ: $file"
+            log_message "ERROR" "Refusing to write password to suspicious path: $file"
+            return 1
+            ;;
+    esac
+
+    # SECURITY 2: пароль не должен содержать newline — иначе read_password_file
+    # прочитает только первую строку и silent corruption при следующем запуске.
+    if [[ "$pwd" == *$'\n'* || "$pwd" == *$'\r'* ]]; then
+        print_message "ERROR" "Пароль не должен содержать перенос строки"
+        log_message "ERROR" "Password contains newline/carriage return — refused"
+        return 1
+    fi
+
     mkdir -p "$(dirname "$file")"
-    printf '%s' "$1" > "$file"
-    chmod 600 "$file" 2> "$SILENT_LOG" || true
+    # SECURITY 3: создаём файл с правильными правами с самого начала.
+    # umask 077 + touch гарантирует chmod 600 даже если chmod ниже упадёт.
+    ( umask 077 && : > "$file" ) || {
+        print_message "ERROR" "Не удалось создать файл пароля: $file"
+        return 1
+    }
+    printf '%s' "$pwd" > "$file"
+
+    # SECURITY 4: проверяем что chmod 600 действительно применился.
+    # Если ACL или mount option блокируют — лучше удалить файл, чем оставить читаемым.
+    if ! chmod 600 "$file" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "chmod 600 на $file провалился — удаляем файл (пароль был бы доступен другим)"
+        log_message "ERROR" "chmod 600 failed for $file"
+        rm -f "$file"
+        return 1
+    fi
+    # Дополнительно проверяем фактические права (на случай ACL override)
+    local _perms
+    _perms=$(stat -c '%a' "$file" 2> "$SILENT_LOG" || echo "?")
+    if [[ "$_perms" != "600" ]]; then
+        print_message "WARN" "Права на $file: $_perms (ожидалось 600). Проверьте ACL/mount опции."
+        log_message "WARN" "Password file permissions are $_perms (expected 600): $file"
+    fi
+    return 0
 }
 
 read_password_file() {
     local file="$BACKUP_PASSWORD_FILE"
-    if [[ -n "$file" && -f "$file" ]]; then
-        IFS= read -r BACKUP_PASSWORD < "$file" || true
-        return 0
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        return 1
     fi
-    return 1
+    # Защита от path-injection и при чтении — отказ если файл вне INSTALL_DIR.
+    case "$file" in
+        "$INSTALL_DIR"/*) ;;
+        *)
+            log_message "WARN" "Refusing to read password from suspicious path: $file"
+            return 1
+            ;;
+    esac
+    # Пустой файл — не пароль, не пытаемся прочитать (silent reset).
+    if [[ ! -s "$file" ]]; then
+        BACKUP_PASSWORD=""
+        return 1
+    fi
+    # Используем `cat` вместо `read -d ''` — read обрывается на первом NUL,
+    # cat читает весь файл побайтово. Trim trailing newline через ${var%$'\n'}
+    # на случай если файл был отредактирован руками через `echo pwd >`.
+    # write_password_file использует `printf '%s'` (без newline), но защищаемся.
+    BACKUP_PASSWORD=$(cat "$file" 2>/dev/null || echo "")
+    BACKUP_PASSWORD="${BACKUP_PASSWORD%$'\n'}"
+    BACKUP_PASSWORD="${BACKUP_PASSWORD%$'\r'}"
+    [[ -z "$BACKUP_PASSWORD" ]] && return 1
+    return 0
 }
 
 save_config() {
@@ -3604,6 +4245,7 @@ save_config() {
     local REMOTE_STORAGE_PASS_ESC SEND_TO_TELEGRAM_ESC TG_SEND_FILE_ESC SEND_TO_REMOTE_ESC
     local DELETE_MODE_ESC RETENTION_DAYS_ESC MAX_BACKUP_SIZE_MB_ESC S3_ENDPOINT_ESC S3_BUCKET_ESC
     local S3_PATH_ESC S3_ACCESS_KEY_ESC S3_SECRET_KEY_ESC S3_REGION_ESC BACKUP_PASSWORD_FILE_ESC
+    local DISK_WARN_PERCENT_ESC DISK_CRITICAL_PERCENT_ESC DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC BACKUP_LOG_FILES_ESC
 
     BOT_TOKEN_ESC=$(env_escape "$BOT_TOKEN")
     CHAT_ID_ESC=$(env_escape "$CHAT_ID")
@@ -3636,6 +4278,10 @@ save_config() {
     S3_SECRET_KEY_ESC=$(env_escape "$S3_SECRET_KEY")
     S3_REGION_ESC=$(env_escape "$S3_REGION")
     BACKUP_PASSWORD_FILE_ESC=$(env_escape "$BACKUP_PASSWORD_FILE")
+    DISK_WARN_PERCENT_ESC=$(env_escape "$DISK_WARN_PERCENT")
+    DISK_CRITICAL_PERCENT_ESC=$(env_escape "$DISK_CRITICAL_PERCENT")
+    DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC=$(env_escape "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD")
+    BACKUP_LOG_FILES_ESC=$(env_escape "$BACKUP_LOG_FILES")
 
     cat > "$CONFIG_FILE" <<EOF
 BOT_TOKEN="$BOT_TOKEN_ESC"
@@ -3670,6 +4316,10 @@ S3_PATH="$S3_PATH_ESC"
 S3_ACCESS_KEY="$S3_ACCESS_KEY_ESC"
 S3_SECRET_KEY="$S3_SECRET_KEY_ESC"
 S3_REGION="$S3_REGION_ESC"
+DISK_WARN_PERCENT="$DISK_WARN_PERCENT_ESC"
+DISK_CRITICAL_PERCENT="$DISK_CRITICAL_PERCENT_ESC"
+DELETE_LOCAL_AFTER_REMOTE_UPLOAD="$DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC"
+BACKUP_LOG_FILES="$BACKUP_LOG_FILES_ESC"
 EOF
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
@@ -3703,6 +4353,10 @@ load_or_create_config() {
     if [[ -z "$MAX_BACKUP_SIZE_MB" ]]; then MAX_BACKUP_SIZE_MB="0"; fi
     if [[ -z "$S3_REGION" ]]; then S3_REGION="us-east-1"; fi
     if [[ -z "$BACKUP_PASSWORD_FILE" ]]; then BACKUP_PASSWORD_FILE="$INSTALL_DIR/.password"; fi
+    if [[ -z "$DISK_WARN_PERCENT" ]]; then DISK_WARN_PERCENT="90"; fi
+    if [[ -z "$DISK_CRITICAL_PERCENT" ]]; then DISK_CRITICAL_PERCENT="95"; fi
+    if [[ -z "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" ]]; then DELETE_LOCAL_AFTER_REMOTE_UPLOAD="false"; fi
+    if [[ -z "$BACKUP_LOG_FILES" ]]; then BACKUP_LOG_FILES="ask"; fi
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -3720,12 +4374,17 @@ load_or_create_config() {
         detect_bot_installation
     fi
 
-    # Миграция пароля в файл (безопасный вариант)
+    # Миграция пароля из старого config.env в отдельный файл (chmod 600).
+    # Если write провалится — оставляем BACKUP_PASSWORD в памяти как есть,
+    # чтобы шифрование текущей сессии работало; в следующий запуск опять попробуем.
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         debug_log "CONFIG" "Migrating BACKUP_PASSWORD to file"
-        write_password_file "$BACKUP_PASSWORD"
-        BACKUP_PASSWORD=""
-        updated=true
+        if write_password_file "$BACKUP_PASSWORD"; then
+            BACKUP_PASSWORD=""
+            updated=true
+        else
+            debug_log "CONFIG" "Migration failed — keeping BACKUP_PASSWORD in memory only"
+        fi
     fi
     # Загружаем пароль из файла (если есть)
     if [[ -z "$BACKUP_PASSWORD" ]]; then
@@ -3742,7 +4401,11 @@ load_or_create_config() {
 # --- TELEGRAM: ОТПРАВКА ФАЙЛОВ И СООБЩЕНИЙ ---
 
 send_telegram_document() {
-    local file_path="$1"; local caption="$2"
+    local file_path="$1"; local caption="$2"; local caption_mode="${3:-plain}"
+    # caption_mode: "plain" (default) — escape через escape_markdown_v2;
+    #               "pre-escaped" — caller уже подготовил MarkdownV2-safe строку
+    #               (нужно для Premium emoji литералов ![X](tg://emoji?id=N), которые
+    #               escape сломал бы).
     debug_log "TG" "=== send_telegram_document ==="
     debug_log "TG" "File: $file_path"
     debug_log "TG" "SEND_TO_TELEGRAM=$SEND_TO_TELEGRAM, TG_SEND_FILE=$TG_SEND_FILE"
@@ -3762,7 +4425,12 @@ send_telegram_document() {
         local filename=$(basename "$file_path")
         # Экранируем для MarkdownV2
         local escaped_filename=$(escape_markdown_v2 "$filename")
-        local escaped_caption=$(escape_markdown_v2 "$caption")
+        local escaped_caption
+        if [[ "$caption_mode" == "pre-escaped" ]]; then
+            escaped_caption="$caption"
+        else
+            escaped_caption=$(escape_markdown_v2 "$caption")
+        fi
         # Формируем сообщение (уже экранированное)
         local notify_text="📦 *Бэкап создан*
 
@@ -3793,47 +4461,115 @@ ${escaped_caption}
         fi
     fi
     
-    print_message "INFO" "Отправка в Telegram..."
     local file_size_bytes=$(stat -c%s "$file_path" 2> "$SILENT_LOG" || echo 0)
     debug_log "TG" "File size: $file_size_bytes bytes ($(numfmt --to=iec $file_size_bytes 2>/dev/null || echo "$file_size_bytes"))"
-    
-    local form_params=(-F chat_id="$CHAT_ID" -F document=@"$file_path" -F parse_mode="MarkdownV2" -F caption="$(escape_markdown_v2 "$caption")")
+
+    # === PRE-FLIGHT CHECK: Telegram Bot API лимит = 50 MB на sendDocument ===
+    # Не пытаемся отправлять файлы >= 50 MB — сразу шлём text-уведомление с ❌,
+    # путём и инструкцией. Это экономит ~minutes на upload + неминуемый 413.
+    local TG_MAX_BYTES=52428800
+    if [[ $file_size_bytes -ge $TG_MAX_BYTES ]]; then
+        local size_mb=$((file_size_bytes / 1048576))
+        debug_log "TG" "Pre-flight: file ${size_mb}MB >= 50MB, skipping upload, sending notice"
+        print_message "WARN" "Файл ${size_mb}MB превышает лимит Telegram (50MB) — отправляем только уведомление"
+        log_message "WARN" "TG file send skipped: ${size_mb}MB > 50MB. File kept locally: $file_path"
+
+        local escaped_caption
+        if [[ "$caption_mode" == "pre-escaped" ]]; then
+            escaped_caption="$caption"
+        else
+            escaped_caption=$(escape_markdown_v2 "$caption")
+        fi
+
+        # Компактное уведомление: размер + одна подсказка.
+        # Пути не выводим в TG (privacy). Детали (имя файла, путь, топ-5) — в терминале.
+        local notice_text="$(tg_emoji "❌" "$EMO_ERROR") *Бэкап не отправлен в Telegram*
+
+${escaped_caption}
+
+${size_mb} MB \\> 50 MB \\(лимит Bot API\\)
+
+$(tg_emoji "💡" "$EMO_INFO") Настройте S3/FTP/WebDAV для больших бэкапов"
+
+        local thread_param=""
+        [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
+
+        curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -d chat_id="$CHAT_ID" \
+            -d parse_mode="MarkdownV2" \
+            --data-urlencode text="$notice_text" \
+            $thread_param > "$SILENT_LOG" 2>&1 || true
+        return 2  # special code: file too big, sent notice only
+    fi
+
+    print_message "INFO" "Отправка в Telegram..."
+
+    local _caption_final
+    if [[ "$caption_mode" == "pre-escaped" ]]; then
+        _caption_final="$caption"
+    else
+        _caption_final=$(escape_markdown_v2 "$caption")
+    fi
+    local form_params=(-F chat_id="$CHAT_ID" -F document=@"$file_path" -F parse_mode="MarkdownV2" -F caption="$_caption_final")
     [[ -n "$TG_MESSAGE_THREAD_ID" ]] && form_params+=(-F message_thread_id="$TG_MESSAGE_THREAD_ID")
     debug_log "TG" "Sending to: https://api.telegram.org/bot<TOKEN>/sendDocument"
     debug_log "TG" "Chat ID: $CHAT_ID, Thread ID: ${TG_MESSAGE_THREAD_ID:-none}"
     
-    local http_code=$(curl $CURL_SILENT -o "$SILENT_LOG" -w "%{http_code}" -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" "${form_params[@]}")
-    debug_log "TG" "HTTP response code: $http_code"
-    
+    # Retry × 3 с exp backoff (5, 15, 45 сек). HTTP 000 = network/timeout, HTTP 5xx = TG-side issue.
+    # Retry-able: 000, 408, 429, 500, 502, 503, 504. NOT retry-able: 400, 401, 403, 413 (наши проблемы).
+    local _tg_max=3 _tg_attempt=1 _tg_delay=5
+    local http_code=""
+    while [[ $_tg_attempt -le $_tg_max ]]; do
+        [[ $_tg_attempt -gt 1 ]] && print_message "INFO" "TG retry $_tg_attempt/$_tg_max через ${_tg_delay}с..."
+        # --max-time 120 защищает от висящего соединения на конкретной попытке.
+        http_code=$(curl $CURL_SILENT --max-time 120 -o "$SILENT_LOG" -w "%{http_code}" \
+            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" "${form_params[@]}")
+        debug_log "TG" "Attempt $_tg_attempt/$_tg_max: HTTP $http_code"
+        # Success или non-retryable client error → выходим из retry-loop.
+        case "$http_code" in
+            200) break ;;
+            400|401|403|413) break ;;  # client-side errors, retry бесполезен
+            *)
+                # Retry-able: 000/timeout, 408, 429, 5xx, прочие
+                if [[ $_tg_attempt -lt $_tg_max ]]; then
+                    sleep "$_tg_delay"
+                    _tg_delay=$((_tg_delay * 3))   # 5 → 15 → 45
+                fi
+                ;;
+        esac
+        _tg_attempt=$((_tg_attempt + 1))
+    done
+
     if [[ "$http_code" == "200" ]]; then
         print_message "SUCCESS" "Успешно отправлено в Telegram."
-    else
-        local file_size=$(stat -c%s "$file_path" 2> "$SILENT_LOG" || echo 0)
-        debug_log "TG" "Send FAILED! File size: $file_size"
-        
-        if [[ $file_size -ge 52428800 ]]; then
-            print_message "ERROR" "Файл >50MB. Telegram API отклонил отправку."
-            debug_log "TG" "File exceeds 50MB limit"
-            local escaped_fname=$(escape_markdown_v2 "$(basename "$file_path")")
-            local error_msg="⚠️ *Ошибка отправки бэкапа*
-
-Файл занимает больше 50 МБ\. Telegram Bot API не позволяет загружать такие файлы напрямую\.
-
-📂 *Бэкап сохранен локально:*
-\`${escaped_fname}\`"
-            
-            local thread_param=""
-            [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
-
-            curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-                -d chat_id="$CHAT_ID" \
-                --data-urlencode text="$error_msg" \
-                -d parse_mode="MarkdownV2" \
-                $thread_param > "$SILENT_LOG"
-        else
-            print_message "ERROR" "Не удалось отправить в Telegram (HTTP код: $http_code)."
-        fi
+        return 0
     fi
+
+    # === FALLBACK (если pre-flight пропустил, например файл вырос между stat и curl) ===
+    local file_size=$(stat -c%s "$file_path" 2> "$SILENT_LOG" || echo 0)
+    debug_log "TG" "Send FAILED! File size: $file_size, HTTP=$http_code"
+
+    if [[ $file_size -ge 52428800 ]]; then
+        print_message "ERROR" "Файл >50MB. Telegram API отклонил отправку."
+        debug_log "TG" "File exceeds 50MB limit (fallback)"
+        local error_msg="⚠️ *Ошибка отправки бэкапа*
+
+Файл \\> 50 МБ \\(лимит Telegram Bot API\\)\\.
+Бэкап сохранён локально\\."
+
+        local thread_param=""
+        [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
+
+        curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -d chat_id="$CHAT_ID" \
+            --data-urlencode text="$error_msg" \
+            -d parse_mode="MarkdownV2" \
+            $thread_param > "$SILENT_LOG"
+        return 2
+    fi
+
+    print_message "ERROR" "Не удалось отправить в Telegram (HTTP код: $http_code)."
+    return 1
 }
 
 send_telegram_text() {
@@ -3967,6 +4703,10 @@ validate_remote_connection() {
         return 1
 
     elif [[ "$type" == "s3" ]]; then
+        # NB: для S3 параметры $url/$user/$pass функции НЕ используются —
+        # передавать креды через них небезопасно (попадут в process listing).
+        # Wizard temporarily set'ит S3_* глобалы или передаёт через
+        # _S3_AWS_KEY_OVERRIDE / _S3_AWS_SECRET_OVERRIDE в _s3_aws_run.
         debug_log "REMOTE" "Testing S3 connection..."
         if ! command -v aws > "$SILENT_LOG" 2>&1; then
             print_message "ERROR" "AWS CLI не установлен!"
@@ -3979,7 +4719,10 @@ validate_remote_connection() {
         local _s3_validate_opts=()
         [[ -n "$S3_ENDPOINT" ]] && _s3_validate_opts+=(--endpoint-url "$S3_ENDPOINT")
         [[ -n "$S3_REGION"   ]] && _s3_validate_opts+=(--region "$S3_REGION")
-        if _s3_aws_run s3 ls "s3://${S3_BUCKET}/" "${_s3_validate_opts[@]}" --max-items 1 > "$SILENT_LOG" 2>&1; then
+        # NB: используем s3api head-bucket (доступен в v1/v2) вместо `aws s3 ls --max-items`.
+        # `--max-items` это аргумент `aws s3api list-objects-v2`, а не `aws s3 ls` —
+        # на AWS CLI v2 даёт `Unknown options: --max-items`.
+        if _s3_aws_run s3api head-bucket --bucket "$S3_BUCKET" "${_s3_validate_opts[@]}" > "$SILENT_LOG" 2>&1; then
             debug_log "REMOTE" "S3 connection SUCCESS"
             return 0
         fi
@@ -4006,7 +4749,7 @@ validate_remote_connection() {
 #
 # Использование:
 #   _s3_aws_run s3 cp file.tgz s3://bucket/path/
-#   _s3_aws_run s3 ls "s3://bucket/" --max-items 1
+#   _s3_aws_run s3api head-bucket --bucket NAME
 # Override (для wizard-режима, когда S3_* ещё не сохранены):
 #   _S3_AWS_KEY_OVERRIDE="<key>" _S3_AWS_SECRET_OVERRIDE="<secret>" \
 #       _s3_aws_run s3 ls ...
@@ -4015,16 +4758,20 @@ _s3_aws_run() {
     local _ak="${_S3_AWS_KEY_OVERRIDE:-$S3_ACCESS_KEY}"
     local _sk="${_S3_AWS_SECRET_OVERRIDE:-$S3_SECRET_KEY}"
     if [[ -z "$_ak" || -z "$_sk" ]]; then
-        debug_log "S3" "_s3_aws_run: пустые credentials, fallback на default chain"
-        aws "$@"
-        return $?
+        debug_log "S3" "_s3_aws_run: пустые credentials — отказ (опаснее тихий fallback на default chain)"
+        print_message "ERROR" "S3 credentials не заданы (S3_ACCESS_KEY / S3_SECRET_KEY)" >&2
+        return 1
     fi
     local _creds_file
-    _creds_file=$(mktemp 2> "$SILENT_LOG") || {
-        print_message "ERROR" "_s3_aws_run: mktemp failed, выполняем aws без приватного файла" >&2
-        aws "$@"
-        return $?
+    # umask 077 + mktemp → файл создаётся сразу с 0600 (без race-окна между mktemp и chmod).
+    _creds_file=$(umask 077 && mktemp "${TMPDIR:-/tmp}/lazarus_s3_creds.XXXXXX" 2> "$SILENT_LOG") || {
+        print_message "ERROR" "_s3_aws_run: mktemp failed — невозможно создать creds-файл" >&2
+        return 1
     }
+    # Регистрируем в cleanup_on_exit — если скрипт умрёт между write и rm, креды
+    # удалятся в trap EXIT. Защита от SIGKILL невозможна (kernel-level), но от
+    # ctrl+c/panic/normal-exit — гарантия удаления.
+    register_sensitive_tmp "$_creds_file"
     chmod 600 "$_creds_file" 2> "$SILENT_LOG" || true
     {
         printf '[lazarus]\n'
@@ -4033,12 +4780,209 @@ _s3_aws_run() {
     } > "$_creds_file"
     AWS_SHARED_CREDENTIALS_FILE="$_creds_file" AWS_PROFILE="lazarus" aws "$@"
     local _rc=$?
-    if command -v shred > "$SILENT_LOG" 2>&1; then
-        shred -u "$_creds_file" 2> "$SILENT_LOG" || rm -f "$_creds_file"
-    else
-        rm -f "$_creds_file"
-    fi
+    # /tmp обычно tmpfs → shred бесполезен, rm достаточно. На /var/tmp (если TMPDIR) — shred оправдан.
+    rm -f "$_creds_file"
+    unregister_sensitive_tmp "$_creds_file"
     return $_rc
+}
+
+# =============================================================================
+# _s3_mask_endpoint: маскирует credentials в URL для debug_log / TG-отчётов.
+# =============================================================================
+# Если кто-то задал S3_ENDPOINT="https://AKIA...:secret@s3.example.com" — голый
+# echo в debug-лог утечёт ключ в /var/log и журналы Telegram. Маскируем юзера
+# и пароль (если есть в URL) на <CREDS>. Сам endpoint не трогаем, только лог.
+# =============================================================================
+_s3_mask_endpoint() {
+    local _ep="$1"
+    [[ -z "$_ep" ]] && { echo ""; return 0; }
+    # scheme://user:pass@host → scheme://<CREDS>@host (regex без extended bash для портабельности)
+    if [[ "$_ep" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+@)(.*)$ ]]; then
+        echo "${BASH_REMATCH[1]}<CREDS>@${BASH_REMATCH[3]}"
+    else
+        echo "$_ep"
+    fi
+}
+
+# =============================================================================
+# _s3_aws_version: детектит major-версию AWS CLI один раз и кэширует в глобале.
+# =============================================================================
+# Возвращает "1", "2" или "unknown". v1 (`aws-cli/1.x`) НЕ поддерживает флаг
+# `--quiet` у `aws s3 cp` — только `--only-show-errors`. v2 поддерживает оба.
+# Кэш в _AWS_CLI_MAJOR_CACHED — пересчёт только если не задан.
+# =============================================================================
+_AWS_CLI_MAJOR_CACHED=""
+_s3_aws_version() {
+    if [[ -n "$_AWS_CLI_MAJOR_CACHED" ]]; then
+        echo "$_AWS_CLI_MAJOR_CACHED"
+        return 0
+    fi
+    if ! command -v aws > "$SILENT_LOG" 2>&1; then
+        _AWS_CLI_MAJOR_CACHED="unknown"
+        echo "unknown"
+        return 1
+    fi
+    local _ver_out
+    _ver_out=$(aws --version 2>&1 | head -1)
+    # Формат: "aws-cli/2.x.y Python/... Linux/..." или "aws-cli/1.x.y ..."
+    if [[ "$_ver_out" =~ aws-cli/([0-9]+) ]]; then
+        _AWS_CLI_MAJOR_CACHED="${BASH_REMATCH[1]}"
+    else
+        _AWS_CLI_MAJOR_CACHED="unknown"
+    fi
+    echo "$_AWS_CLI_MAJOR_CACHED"
+}
+
+# =============================================================================
+# _s3_quiet_flag: правильный «тихий» флаг для `aws s3 cp`.
+# =============================================================================
+# v2: --quiet (полностью молчит, даже errors)
+# v1: --only-show-errors (только errors)
+# Для non-TTY режима без debug — хотим только errors, не молчание полностью,
+# поэтому всегда `--only-show-errors`. Это работает на обеих версиях.
+# =============================================================================
+_s3_quiet_flag() {
+    echo "--only-show-errors"
+}
+
+# =============================================================================
+# _s3_arch_suffix: возвращает суффикс архитектуры для AWS CLI installer.
+# =============================================================================
+# AWS CLI v2 поставляет два билда: linux-x86_64 и linux-aarch64. Скрипт
+# install_aws_cli всегда грузил x86_64 — на ARM (Oracle Cloud Ampere, AWS
+# Graviton, Raspberry Pi 4/5) это даёт `Exec format error`.
+# =============================================================================
+_s3_arch_suffix() {
+    local _arch
+    _arch=$(uname -m 2>/dev/null)
+    case "$_arch" in
+        x86_64|amd64) echo "x86_64" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) echo "" ;;  # неподдерживаемая → caller покажет ошибку
+    esac
+}
+
+# =============================================================================
+# _s3_abort_multiparts: abort'ит висящие multipart uploads для конкретного key.
+# =============================================================================
+# При сбое `aws s3 cp` (особенно по таймауту/потерянной сети) на стороне
+# storage остаются Initiated multipart uploads. У AWS они тарифицируются как
+# Standard Storage, у MinIO/RustFS могут блокировать дальнейшие uploads того
+# же ключа. Вызывать ПОСЛЕ failed upload с тем же $bucket/$key — abort'ит ВСЕ
+# нашедшиеся uploads с этим Key. Не падает если их нет.
+#
+# Аргументы:
+#   $1 - bucket
+#   $2 - key (полный путь внутри bucket)
+#   $3 - массив доп.опций (--endpoint-url, --region)
+# =============================================================================
+_s3_abort_multiparts() {
+    local _bucket="$1"
+    local _key="$2"
+    shift 2
+    local _opts=("$@")
+    local _list_json
+    # list-multipart-uploads с Prefix=key — фильтр по конкретному файлу.
+    _list_json=$(_s3_aws_run s3api list-multipart-uploads \
+        --bucket "$_bucket" --prefix "$_key" \
+        "${_opts[@]}" --output json 2> "$SILENT_LOG") || {
+        debug_log "S3" "list-multipart-uploads failed (provider не поддерживает или нет прав)"
+        return 0
+    }
+    [[ -z "$_list_json" || "$_list_json" == "null" ]] && return 0
+    # Достаём UploadId'ы для нашего key. Используем python3 (есть на всех Debian);
+    # fallback на grep — крайний случай.
+    local _ids=""
+    if command -v python3 > "$SILENT_LOG" 2>&1; then
+        _ids=$(echo "$_list_json" | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+key=sys.argv[1]
+for u in (d.get("Uploads") or []):
+    if u.get("Key")==key:
+        print(u.get("UploadId",""))
+' "$_key" 2> "$SILENT_LOG")
+    else
+        # Грубый grep-fallback — может зацепить лишнее, но это всё равно abort,
+        # не destructive операция: висящие multipart-parts чужих файлов нас не волнуют.
+        _ids=$(echo "$_list_json" | grep -oE '"UploadId":\s*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/')
+    fi
+    [[ -z "$_ids" ]] && return 0
+    local _aborted=0 _id
+    while IFS= read -r _id; do
+        [[ -z "$_id" ]] && continue
+        if _s3_aws_run s3api abort-multipart-upload \
+                --bucket "$_bucket" --key "$_key" --upload-id "$_id" \
+                "${_opts[@]}" > "$SILENT_LOG" 2>&1; then
+            _aborted=$((_aborted + 1))
+        fi
+    done <<< "$_ids"
+    [[ $_aborted -gt 0 ]] && debug_log "S3" "Aborted $_aborted orphaned multipart upload(s) for $_key"
+    return 0
+}
+
+# =============================================================================
+# _s3_verify_uploaded: подтверждает что объект реально доехал и не повреждён.
+# =============================================================================
+# 1. head-object → ContentLength должен совпадать с локальным size.
+# 2. Для не-multipart upload (single PUT) — ETag это MD5 hex. Сравниваем
+#    с локальным MD5 как доп.проверку.
+#    Для multipart ETag имеет формат "<md5>-<parts>" — сравнить с локальным
+#    MD5 нельзя (multipart хеш считается иначе). Только size match.
+#
+# Аргументы:
+#   $1 - bucket
+#   $2 - key
+#   $3 - local_size
+#   $4 - local_file (для MD5 — только для не-multipart)
+#   $5+ - массив доп.опций (--endpoint-url, --region)
+# Return: 0 — OK, 1 — mismatch, 2 — head-object не сработал (не fatal — warn)
+# =============================================================================
+_s3_verify_uploaded() {
+    local _bucket="$1"
+    local _key="$2"
+    local _local_size="$3"
+    local _local_file="$4"
+    shift 4
+    local _opts=("$@")
+    local _head_json
+    _head_json=$(_s3_aws_run s3api head-object \
+        --bucket "$_bucket" --key "$_key" \
+        "${_opts[@]}" --output json 2> "$SILENT_LOG") || {
+        debug_log "S3" "head-object failed (нет прав / object не виден сразу — eventual consistency)"
+        return 2
+    }
+    # Извлекаем ContentLength и ETag (без python — простой parse).
+    local _remote_size _etag
+    _remote_size=$(echo "$_head_json" | grep -oE '"ContentLength":\s*[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    _etag=$(echo "$_head_json" | grep -oE '"ETag":\s*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)"$/\1/' | tr -d '"\\')
+    if [[ -z "$_remote_size" ]]; then
+        debug_log "S3" "verify: не удалось распарсить ContentLength из head-object"
+        return 2
+    fi
+    if [[ "$_remote_size" != "$_local_size" ]]; then
+        debug_log "S3" "verify FAIL: remote size=$_remote_size, local size=$_local_size"
+        return 1
+    fi
+    debug_log "S3" "verify: size match ($_remote_size bytes)"
+    # MD5 проверка только для не-multipart (ETag без дефиса).
+    if [[ -n "$_etag" && "$_etag" != *-* && -f "$_local_file" ]]; then
+        if command -v md5sum > "$SILENT_LOG" 2>&1; then
+            local _local_md5
+            _local_md5=$(md5sum "$_local_file" 2> "$SILENT_LOG" | awk '{print $1}')
+            if [[ -n "$_local_md5" && "$_local_md5" != "$_etag" ]]; then
+                debug_log "S3" "verify FAIL: ETag=$_etag, local MD5=$_local_md5"
+                return 1
+            fi
+            [[ -n "$_local_md5" ]] && debug_log "S3" "verify: ETag MD5 match"
+        fi
+    else
+        debug_log "S3" "verify: multipart upload (ETag=$_etag) — size-only check"
+    fi
+    return 0
 }
 
 upload_to_remote() {
@@ -4057,8 +5001,14 @@ upload_to_remote() {
     debug_log "REMOTE" "Type: $REMOTE_STORAGE_TYPE"
     debug_log "REMOTE" "URL: $REMOTE_STORAGE_URL"
 
-    if [[ "$REMOTE_STORAGE_TYPE" == "off" || -z "$REMOTE_STORAGE_URL" ]]; then 
-        debug_log "REMOTE" "Remote storage disabled or URL empty"
+    # S3 не использует REMOTE_STORAGE_URL (хранит endpoint/bucket в S3_*),
+    # поэтому URL-check применяем только к FTP/WebDAV/Rclone.
+    if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+        debug_log "REMOTE" "Remote storage disabled"
+        return 0
+    fi
+    if [[ "$REMOTE_STORAGE_TYPE" != "s3" && -z "$REMOTE_STORAGE_URL" ]]; then
+        debug_log "REMOTE" "Remote storage URL empty (type=$REMOTE_STORAGE_TYPE)"
         return 0
     fi
     
@@ -4105,7 +5055,10 @@ upload_to_remote() {
         # Проверяем AWS CLI
         if ! command -v aws > "$SILENT_LOG" 2>&1; then
             print_message "ERROR" "AWS CLI не установлен!" >&2
-            echo -e "Установка: ${GRAY}curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o awscliv2.zip && unzip awscliv2.zip && sudo ./aws/install${RESET}" >&2
+            local _arch_hint
+            _arch_hint=$(_s3_arch_suffix)
+            [[ -z "$_arch_hint" ]] && _arch_hint="x86_64"
+            echo -e "Установка: ${GRAY}curl \"https://awscli.amazonaws.com/awscli-exe-linux-${_arch_hint}.zip\" -o awscliv2.zip && unzip awscliv2.zip && sudo ./aws/install${RESET}" >&2
             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: AWS CLI не установлен'
             return 1
         fi
@@ -4117,42 +5070,124 @@ upload_to_remote() {
             return 1
         fi
         
-        # Формируем путь в bucket
-        local s3_path="${S3_PATH%/}"
+        # Формируем путь в bucket с защитой от path-traversal (.., leading /).
+        local s3_path="${S3_PATH#/}"             # strip leading /
+        s3_path="${s3_path%/}"                   # strip trailing /
+        if [[ "$s3_path" == *".."* ]]; then
+            print_message "ERROR" "S3_PATH содержит '..' — отказ для защиты от path-traversal: $S3_PATH" >&2
+            log_message "ERROR" "S3_PATH contains '..': $S3_PATH"
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: Ошибка (S3_PATH невалиден)'
+            return 1
+        fi
         [[ -n "$s3_path" ]] && s3_path="${s3_path}/"
+        # Нормализуем S3_ENDPOINT — strip trailing /
+        local _s3_endpoint="${S3_ENDPOINT%/}"
         local s3_dest="s3://${S3_BUCKET}/${s3_path}${filename}"
-        
-        debug_log "REMOTE" "S3 Endpoint: $S3_ENDPOINT"
+
+        # NB: маскируем credentials в URL если пользователь задал endpoint вида
+        # https://AKIA...:secret@host (плохая практика, но встречается).
+        local _s3_endpoint_masked
+        _s3_endpoint_masked=$(_s3_mask_endpoint "$_s3_endpoint")
+        debug_log "REMOTE" "S3 Endpoint: $_s3_endpoint_masked"
         debug_log "REMOTE" "S3 Bucket: $S3_BUCKET"
         debug_log "REMOTE" "S3 Region: $S3_REGION"
-        debug_log "REMOTE" "S3 Destination: $s3_dest"
-        
+        debug_log "REMOTE" "S3 Destination: s3://${S3_BUCKET}/${s3_path}${filename}"
+        debug_log "REMOTE" "AWS CLI version: $(_s3_aws_version)"
+
         # Формируем команду
         local aws_opts=()
-        [[ -n "$S3_ENDPOINT" ]] && aws_opts+=(--endpoint-url "$S3_ENDPOINT")
+        [[ -n "$_s3_endpoint" ]] && aws_opts+=(--endpoint-url "$_s3_endpoint")
         [[ -n "$S3_REGION" ]] && aws_opts+=(--region "$S3_REGION")
+        # CLI таймауты: 30 сек на TCP-connect, 600 сек на read-один-чанк.
+        aws_opts+=(--cli-connect-timeout 30 --cli-read-timeout 600)
 
-        # Credentials передаются через _s3_aws_run без export
-        debug_log "REMOTE" "Running: _s3_aws_run s3 cp $file_path $s3_dest ${aws_opts[*]}"
-        local s3_output
-        if [[ "$IS_INTERACTIVE" == "true" ]]; then
-            s3_output=$(_s3_aws_run s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --only-show-errors 2>&1)
-        else
-            s3_output=$(_s3_aws_run s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" --quiet 2>&1)
-        fi
-        local s3_result=$?
+        # Retry × 3 с exp backoff (5, 15, 45 сек) — приводим к паритету с FTP/WebDAV.
+        # Timeout на весь call: 120s + 60s на каждые 50 MB, capped at 1800s (30 мин).
+        # Аналог расчёта что для FTP (line ~4441).
+        local s3_timeout=$((120 + (file_size / 50000000) * 60))
+        [[ $s3_timeout -gt 1800 ]] && s3_timeout=1800
+        debug_log "REMOTE" "S3 timeout per attempt: ${s3_timeout}s, max retries: 3"
+
+        # `timeout` не используем — _s3_aws_run это bash-функция (не export'нутая).
+        # Вместо этого полагаемся на --cli-connect-timeout/--cli-read-timeout (выше).
+        # При совсем зависшей сессии aws сам прекратится по read-timeout.
+        # Универсальный «тихий» флаг — работает на v1 и v2.
+        local s3_quiet
+        s3_quiet=$(_s3_quiet_flag)
+        # Key для head-object / abort-multipart (без префикса s3://bucket/).
+        local s3_key="${s3_path}${filename}"
+        local s3_attempt=1
+        local s3_max=3
+        local s3_delay=5
+        local s3_output=""
+        local s3_result=1
+        while [[ $s3_attempt -le $s3_max ]]; do
+            debug_log "REMOTE" "S3 upload attempt $s3_attempt/$s3_max"
+            [[ $s3_attempt -gt 1 ]] && print_message "INFO" "S3 retry $s3_attempt/$s3_max..." >&2
+            s3_output=$(_s3_aws_run s3 cp "$file_path" "$s3_dest" "${aws_opts[@]}" "$s3_quiet" 2>&1)
+            s3_result=$?
+
+            [[ $s3_result -eq 0 ]] && break
+
+            log_message "WARN" "S3 upload attempt $s3_attempt failed (rc=$s3_result): $(echo "$s3_output" | head -1)"
+            # Перед retry — abort висящих multipart-parts (если есть). Не блокируется
+            # на ошибку — просто best-effort cleanup.
+            _s3_abort_multiparts "$S3_BUCKET" "$s3_key" "${aws_opts[@]}"
+            s3_attempt=$((s3_attempt + 1))
+            if [[ $s3_attempt -le $s3_max ]]; then
+                sleep "$s3_delay"
+                s3_delay=$((s3_delay * 3))   # 5 → 15 → 45
+            fi
+        done
 
         if [[ $s3_result -eq 0 ]]; then
-            print_message "SUCCESS" "Файл загружен в S3." >&2
-            debug_log "REMOTE" "S3 upload SUCCESS"
-            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: OK'
-            log_message "SUCCESS" "Uploaded $filename to S3 ($s3_dest)"
-            return 0
+            # Integrity verify — size match + ETag MD5 (для не-multipart).
+            # eventual consistency у некоторых провайдеров: даём 1 retry с 2-сек паузой.
+            local _verify_rc=2 _verify_try=1
+            while [[ $_verify_try -le 2 ]]; do
+                _s3_verify_uploaded "$S3_BUCKET" "$s3_key" "$file_size" "$file_path" "${aws_opts[@]}"
+                _verify_rc=$?
+                [[ $_verify_rc -ne 2 ]] && break
+                sleep 2
+                _verify_try=$((_verify_try + 1))
+            done
+            case $_verify_rc in
+                0)
+                    print_message "SUCCESS" "Файл загружен в S3 (verified)." >&2
+                    debug_log "REMOTE" "S3 upload SUCCESS + verify OK"
+                    REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: OK'
+                    log_message "SUCCESS" "Uploaded $filename to S3 ($s3_dest), size=$file_size verified"
+                    return 0
+                    ;;
+                1)
+                    # Size или MD5 не сходятся — это destructive corruption. Не считаем upload успешным.
+                    print_message "ERROR" "S3 verify FAIL — size/ETag не совпадают, удалённый файл повреждён!" >&2
+                    debug_log "REMOTE" "S3 upload OK, но verify FAILED → треат как fail"
+                    REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: Verify FAIL'
+                    log_message "ERROR" "S3 verify FAIL for $filename — ContentLength/ETag mismatch"
+                    return 1
+                    ;;
+                *)
+                    # head-object недоступен (нет ListBucket/GetObject прав или provider не отвечает).
+                    # Это не fail — продолжаем считать upload OK, но WARN'им.
+                    print_message "SUCCESS" "Файл загружен в S3 (verify пропущен — нет прав на head-object)." >&2
+                    debug_log "REMOTE" "S3 upload SUCCESS, verify skipped (head-object недоступен)"
+                    REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: OK (verify skipped)'
+                    log_message "WARN" "Uploaded $filename to S3, но head-object verify пропущен"
+                    return 0
+                    ;;
+            esac
         else
-            print_message "ERROR" "Ошибка загрузки в S3: $s3_output" >&2
-            debug_log "REMOTE" "S3 upload FAILED: $s3_output"
+            # Берём первые 200 символов stderr — длинные python-tracebacks от aws CLI ломают TG MarkdownV2.
+            local s3_err_short
+            s3_err_short=$(echo "$s3_output" | head -3 | tr '\n' ' ' | head -c 200)
+            print_message "ERROR" "Ошибка загрузки в S3 после $s3_max попыток: $s3_err_short" >&2
+            debug_log "REMOTE" "S3 upload FAILED (rc=$s3_result): $s3_output"
             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: Ошибка'
-            log_message "ERROR" "Failed upload $filename to S3: $s3_output"
+            log_message "ERROR" "Failed upload $filename to S3 after $s3_max attempts (rc=$s3_result): $s3_err_short"
+            # Финальный cleanup — vot эти multipart-parts билятся даже когда «retry-логика»
+            # их не успела зачистить (например при exit по таймауту bash-цикла).
+            _s3_abort_multiparts "$S3_BUCKET" "$s3_key" "${aws_opts[@]}"
             return 1
         fi
     fi
@@ -4421,12 +5456,22 @@ configure_remote_storage() {
                 echo -e "Установить автоматически? (требуется ~100MB)"
                 read -erp "(Y/n): " install_aws
                 if [[ ! "$install_aws" =~ ^[Nn]$ ]]; then
-                    print_message "INFO" "Устанавливаю AWS CLI..."
-                    if curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip && \
+                    # Определяем CPU arch — AWS CLI v2 поставляет линукс-бинари в x86_64 и aarch64.
+                    # x86_64 на ARM-сервере (Oracle Ampere, AWS Graviton, RPi) даёт Exec format error.
+                    _aws_arch=$(_s3_arch_suffix)
+                    if [[ -z "$_aws_arch" ]]; then
+                        print_message "ERROR" "Неподдерживаемая CPU арх: $(uname -m). Установите AWS CLI вручную."
+                        echo -e "Документация: ${GRAY}https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${RESET}"
+                        read -erp "Enter..." dummy
+                        continue
+                    fi
+                    print_message "INFO" "Устанавливаю AWS CLI ($_aws_arch)..."
+                    if curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-${_aws_arch}.zip" -o /tmp/awscliv2.zip && \
                        unzip -q /tmp/awscliv2.zip -d /tmp && \
                        sudo /tmp/aws/install --update 2> "$SILENT_LOG"; then
                         rm -rf /tmp/awscliv2.zip /tmp/aws
                         print_message "SUCCESS" "AWS CLI установлен!"
+                        _AWS_CLI_MAJOR_CACHED=""  # сбрасываем кэш — пересчитаем при первом вызове.
                     else
                         rm -rf /tmp/awscliv2.zip /tmp/aws
                         print_message "ERROR" "Ошибка установки AWS CLI"
@@ -4446,12 +5491,14 @@ configure_remote_storage() {
             echo " 3. RustFS"
             echo " 4. Yandex Cloud Object Storage"
             echo " 5. Selectel Cloud Storage"
-            echo " 6. Другой S3-совместимый"
+            echo " 6. Cloudflare R2"
+            echo " 7. Backblaze B2"
+            echo " 8. Другой S3-совместимый"
             echo ""
             read -erp "Выбор (Enter - назад): " s3_provider
             [[ -z "$s3_provider" ]] && continue
-            
-            local default_endpoint="" default_region=""
+
+            local default_endpoint="" default_region="" provider_hint=""
             case $s3_provider in
                 1) # AWS
                     default_endpoint=""  # AWS CLI использует дефолтный endpoint
@@ -4473,7 +5520,21 @@ configure_remote_storage() {
                     default_endpoint="https://s3.storage.selcloud.ru"
                     default_region="ru-1"
                     ;;
-                6) # Custom
+                6) # Cloudflare R2
+                    # R2: endpoint вида https://<account-id>.r2.cloudflarestorage.com,
+                    # region ОБЯЗАТЕЛЬНО "auto" — иначе SignatureDoesNotMatch.
+                    default_endpoint=""
+                    default_region="auto"
+                    provider_hint="r2"
+                    ;;
+                7) # Backblaze B2 (S3-compatible API)
+                    # B2: endpoint вида https://s3.<region>.backblazeb2.com,
+                    # region из endpoint (us-west-001, eu-central-003 и т.д.).
+                    default_endpoint=""
+                    default_region="us-west-001"
+                    provider_hint="b2"
+                    ;;
+                8) # Custom
                     default_endpoint=""
                     default_region="us-east-1"
                     ;;
@@ -4487,11 +5548,30 @@ configure_remote_storage() {
                 echo "(Оставьте пустым для значения по умолчанию)"
             elif [[ "$s3_provider" == "1" ]]; then
                 echo -e "${GRAY}Для AWS оставьте пустым (используется стандартный endpoint)${RESET}"
+            elif [[ "$provider_hint" == "r2" ]]; then
+                echo -e "Формат: ${GRAY}https://<account-id>.r2.cloudflarestorage.com${RESET}"
+                echo -e "${GRAY}Account ID — в Cloudflare dashboard → R2 → Overview${RESET}"
+            elif [[ "$provider_hint" == "b2" ]]; then
+                echo -e "Формат: ${GRAY}https://s3.<region>.backblazeb2.com${RESET}"
+                echo -e "${GRAY}Region виден в Backblaze B2 → Buckets → Endpoint${RESET}"
             else
                 echo -e "Пример: ${GRAY}https://s3.example.com${RESET}"
             fi
             read -erp "Endpoint URL: " input_endpoint
             [[ -z "$input_endpoint" ]] && input_endpoint="$default_endpoint"
+
+            # Валидация endpoint: должен быть http(s)://host, без \n / spaces / control chars.
+            # Не блокирующая — только WARN, потому что custom S3 может быть IP+port.
+            if [[ -n "$input_endpoint" ]]; then
+                if [[ ! "$input_endpoint" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]+)?(/.*)?$ ]]; then
+                    print_message "WARN" "Endpoint выглядит подозрительно: $input_endpoint"
+                    echo -e "${GRAY}Ожидается формат http(s)://host[:port][/path]${RESET}"
+                    read -erp "Использовать всё равно? (y/N): " _ep_force
+                    if [[ ! "$_ep_force" =~ ^[Yy]$ ]]; then
+                        continue
+                    fi
+                fi
+            fi
             
             echo ""
             echo -e "${GRAY}Шаг 3/5: Bucket и путь${RESET}"
@@ -4510,6 +5590,9 @@ configure_remote_storage() {
             echo ""
             echo -e "${GRAY}Шаг 4/5: Регион${RESET}"
             echo -e "По умолчанию: ${CYAN}${default_region}${RESET}"
+            if [[ "$provider_hint" == "r2" ]]; then
+                echo -e "${YELLOW}Для Cloudflare R2 регион ДОЛЖЕН быть \"auto\" — иначе SignatureDoesNotMatch${RESET}"
+            fi
             read -erp "Регион: " input_region
             [[ -z "$input_region" ]] && input_region="$default_region"
             
@@ -4534,7 +5617,7 @@ configure_remote_storage() {
             test_opts+=(--region "$input_region")
 
             if _S3_AWS_KEY_OVERRIDE="$input_access_key" _S3_AWS_SECRET_OVERRIDE="$input_secret_key" \
-                    _s3_aws_run s3 ls "s3://${input_bucket}/" "${test_opts[@]}" --max-items 1 > "$SILENT_LOG" 2>&1; then
+                    _s3_aws_run s3api head-bucket --bucket "$input_bucket" "${test_opts[@]}" > "$SILENT_LOG" 2>&1; then
                 print_message "SUCCESS" "Подключение успешно!"
                 
                 # Сохраняем настройки
@@ -4920,6 +6003,140 @@ format_size_mb() {
     fi
 }
 
+# build_skipped_report: сканирует BOT_PATH и записывает в output_file список
+# файлов, которые НЕ попадут в архив, с причиной. Формат строки (TSV):
+#     SIZE_BYTES \t RELATIVE_PATH \t REASON
+# Категории причин (порядок важен — первое совпадение):
+#   1) size > MAX_FILE_SIZE_MB MB
+#   2) .git directory
+#   3) backups/ directory
+#   4) bot image .tar (private-remnawave-*.tar / rwp_shop*.tar / telegram-shop*.tar)
+#   5) log file (если BACKUP_LOG_FILES != "true")
+#   6) EXCLUDE_DIRS: <pattern>
+# Возвращает в stdout: общее число пропущенных файлов.
+build_skipped_report() {
+    local bot_path="$1"
+    local output_file="$2"
+
+    [[ -z "$bot_path" || ! -d "$bot_path" ]] && return 1
+    if ! find /dev/null -printf '' 2>/dev/null; then
+        return 1  # нет GNU find -printf
+    fi
+
+    : > "$output_file"
+    local max_bytes=0
+    if [[ "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ ]] && [[ "$MAX_FILE_SIZE_MB" -gt 0 ]]; then
+        max_bytes=$((MAX_FILE_SIZE_MB * 1048576))
+    fi
+
+    local EXCL_ARR=()
+    [[ -n "$EXCLUDE_DIRS" ]] && IFS=' ' read -r -a EXCL_ARR <<< "$EXCLUDE_DIRS"
+
+    local skip_logs="true"
+    [[ "$BACKUP_LOG_FILES" == "true" ]] && skip_logs="false"
+
+    local count=0
+    # extglob: сохраняем текущее состояние и восстанавливаем при выходе из функции
+    # через trap RETURN. Иначе при ошибочном early-return extglob утечёт в parent,
+    # ломая последующие ${var//pattern/} c `(`/`)` в шаблоне (например, CAPTION_ESC).
+    local _eg_prev
+    _eg_prev=$(shopt -p extglob)
+    shopt -s extglob
+    # shellcheck disable=SC2064
+    trap "$_eg_prev" RETURN
+
+    while IFS=$'\t' read -r size rel_path; do
+        [[ -z "$rel_path" ]] && continue
+        local reason=""
+
+        if [[ $max_bytes -gt 0 && -n "$size" && $size -gt $max_bytes ]]; then
+            # Унифицированная причина без конкретного размера — чтобы все большие файлы
+            # попадали в ОДНУ группу при группировке по reason в show_skipped_report.
+            reason="size > MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB}MB"
+        elif [[ "$rel_path" == .git || "$rel_path" == .git/* || "$rel_path" == */.git/* ]]; then
+            reason=".git directory"
+        elif [[ "$rel_path" == backups || "$rel_path" == backups/* || "$rel_path" == */backups/* ]]; then
+            reason="backups/ directory"
+        elif [[ "$rel_path" == *private-remnawave-*.tar || "$rel_path" == *rwp_shop*.tar || "$rel_path" == *telegram-shop*.tar ]]; then
+            reason="bot image .tar"
+        elif [[ "$skip_logs" == "true" ]] && \
+             { [[ "$rel_path" == *.log ]] || [[ "$rel_path" == *.log.+([0-9]) ]] || \
+               [[ "$rel_path" == *.log.+([0-9]).gz ]] || [[ "$rel_path" == *.log-+([0-9]) ]] || \
+               [[ "$rel_path" == *.log-+([0-9]).gz ]] || [[ "$rel_path" == logs/* ]] || \
+               [[ "$rel_path" == */logs/* ]]; }; then
+            reason="log file (BACKUP_LOG_FILES=$BACKUP_LOG_FILES)"
+        else
+            for ex in "${EXCL_ARR[@]}"; do
+                [[ -z "$ex" ]] && continue
+                if [[ "$rel_path" == "$ex" || "$rel_path" == "$ex"/* || "$rel_path" == */"$ex"/* ]]; then
+                    reason="EXCLUDE_DIRS: $ex"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$reason" ]]; then
+            printf '%s\t%s\t%s\n' "${size:-0}" "$rel_path" "$reason" >> "$output_file"
+            count=$((count + 1))
+        fi
+    done < <(cd "$bot_path" 2>/dev/null && find . -type f -printf '%s\t%P\n' 2> "$SILENT_LOG")
+
+    # extglob восстанавливается через trap RETURN (см. выше)
+    echo "$count"
+}
+
+# get_top_files_in_archive: возвращает топ-N крупных файлов в BOT_PATH,
+# которые попадут в архив (фильтр по MAX_FILE_SIZE_MB + EXCLUDE_DIRS).
+# Используется в TG pre-flight уведомлении когда архив >50 MB —
+# чтобы пользователь понял, что раздувает бэкап.
+# Аргументы: $1=bot_path  $2=max_size_mb  $3=exclude_dirs_str  $4=limit (default 5)
+# Вывод (stdout, по одной строке): "  • SIZE — relative/path"
+get_top_files_in_archive() {
+    local bot_path="$1"
+    local max_size_mb="${2:-0}"
+    local exclude_dirs_str="$3"
+    local limit="${4:-5}"
+
+    [[ -z "$bot_path" || ! -d "$bot_path" ]] && return 1
+
+    # Проверка наличия GNU find -printf (BusyBox не поддерживает)
+    if ! find /dev/null -printf '' 2>/dev/null; then
+        debug_log "TG" "get_top_files_in_archive: GNU find -printf не поддерживается, пропуск"
+        return 1
+    fi
+
+    local FIND_ARGS=(".")
+    if [[ -n "$exclude_dirs_str" ]]; then
+        local EXCL_ARR=()
+        IFS=' ' read -r -a EXCL_ARR <<< "$exclude_dirs_str"
+        for ex in "${EXCL_ARR[@]}"; do
+            if [[ -n "$ex" && "$ex" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+                FIND_ARGS+=("-path" "./$ex" "-prune" "-o")
+            fi
+        done
+    fi
+    FIND_ARGS+=("-type" "f")
+    # Фильтр по max_size_mb (исключаем то что и так пропущено)
+    if [[ "$max_size_mb" =~ ^[0-9]+$ ]] && [[ "$max_size_mb" -gt 0 ]]; then
+        FIND_ARGS+=("!" "-size" "+${max_size_mb}M")
+    fi
+    FIND_ARGS+=("-printf" "%s\t%P\n")
+
+    (cd "$bot_path" 2>/dev/null && find "${FIND_ARGS[@]}" 2>/dev/null) \
+        | sort -rn \
+        | head -n "$limit" \
+        | awk -F'\t' '{
+            sz=$1; path=$2;
+            h=sz; u="B";
+            if (h>=1024) { h/=1024; u="K" }
+            if (h>=1024) { h/=1024; u="M" }
+            if (h>=1024) { h/=1024; u="G" }
+            # Обрезаем длинные пути до 60 символов для красоты в TG
+            if (length(path) > 60) path = "..." substr(path, length(path)-57);
+            printf "  • %.1f%s — %s\n", h, u, path
+        }'
+}
+
 uninstall_script() {
     if [[ "$EUID" -ne 0 ]]; then
         print_message "ERROR" "Uninstall requires root (sudo)."
@@ -5161,12 +6378,53 @@ create_backup() {
         LOCK_ACQUIRED="true"
     fi
     
-    # Проверка свободного места (минимум 1GB)
+    # === ПРОВЕРКА ДИСКА ===
+    # Два слоя защиты:
+    #   1) Процентный (DISK_WARN_PERCENT / DISK_CRITICAL_PERCENT) — нужно для больших дисков
+    #   2) Абсолютный (MIN_SPACE_MB=1024) — fallback для маленьких дисков (1 GB обязательно)
     local MIN_SPACE_MB=1024
     local free_space_kb=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
     local free_space_mb=$((free_space_kb / 1024))
     local free_space_human=$(df -h "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
-    debug_log "DISK" "Free space: ${free_space_mb}MB (${free_space_human}), required: ${MIN_SPACE_MB}MB"
+    local disk_used_percent=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $5}' | tr -d '%')
+    local disk_mount=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $6}')
+    debug_log "DISK" "Used: ${disk_used_percent}% (mount=${disk_mount}, free=${free_space_human}), thresholds: WARN=${DISK_WARN_PERCENT}% CRIT=${DISK_CRITICAL_PERCENT}% MIN_ABS=${MIN_SPACE_MB}MB"
+
+    # 1) CRITICAL: >= 95% — отменяем бэкап
+    # Валидация: на NFS/FUSE/stale mount df может вернуть "?" — пропускаем процентные проверки.
+    if ! [[ "$disk_used_percent" =~ ^[0-9]+$ ]]; then
+        debug_log "DISK" "disk_used_percent not numeric ('$disk_used_percent'), skip percent checks"
+        disk_used_percent=""
+    fi
+
+    if [[ -n "$disk_used_percent" && "$disk_used_percent" -ge "$DISK_CRITICAL_PERCENT" ]]; then
+        print_message "ERROR" "Диск заполнен на ${disk_used_percent}% (порог CRITICAL=${DISK_CRITICAL_PERCENT}%). Бэкап отменён."
+        log_message "ERROR" "Backup aborted: disk ${disk_used_percent}% >= CRITICAL ${DISK_CRITICAL_PERCENT}% on ${disk_mount}"
+        local crit_msg="🔴 $(tg_emoji "⚠️" "$EMO_WARN") *Бэкап остановлен: диск переполнен*
+
+📊 Заполнение: ${disk_used_percent}% \\(порог: ${DISK_CRITICAL_PERCENT}%\\)
+💾 Свободно: ${free_space_human}
+
+$(tg_emoji "💡" "$EMO_INFO") Запустите cleanup старых бэкапов:
+\`lazarus cleanup\`"
+        send_telegram_text "$crit_msg"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    fi
+
+    # 2) WARN: >= 90% — уведомление, продолжаем
+    if [[ -n "$disk_used_percent" && "$disk_used_percent" -ge "$DISK_WARN_PERCENT" ]]; then
+        print_message "WARN" "Диск заполнен на ${disk_used_percent}% (порог WARN=${DISK_WARN_PERCENT}%). Рекомендуется cleanup."
+        log_message "WARN" "Disk usage ${disk_used_percent}% >= WARN ${DISK_WARN_PERCENT}% on ${disk_mount}"
+        local warn_msg="🟡 $(tg_emoji "⚠️" "$EMO_WARN") *Диск заполняется*
+
+📊 Заполнение: ${disk_used_percent}% \\(порог: ${DISK_WARN_PERCENT}%\\)
+💾 Свободно: ${free_space_human}
+
+$(tg_emoji "⚠️" "$EMO_WARN") При ${DISK_CRITICAL_PERCENT}% бэкапы будут отменяться\\.
+$(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить старые архивы"
+        send_telegram_text "$warn_msg"
+    fi
     
     if [[ $free_space_mb -lt $MIN_SPACE_MB ]]; then
         print_message "ERROR" "Недостаточно места на диске! Свободно: ${free_space_human} (нужно минимум 1GB)"
@@ -5232,13 +6490,63 @@ create_backup() {
         echo " 2. Установить пароль сейчас"
         echo " 0. Отмена"
         echo ""
-        read -erp "Ваш выбор: " enc_choice
+        safe_read -erp "Ваш выбор: " enc_choice
         case $enc_choice in
-            1) ;; 
-                2) read -s -erp "Введите пароль шифрования: " np
-                    echo ""; if [[ -n "$np" ]]; then write_password_file "$np"; BACKUP_PASSWORD="$np"; save_config; print_message "SUCCESS" "Пароль установлен."; else print_message "ERROR" "Пустой пароль. Отмена."; return; fi ;;
-            *) print_message "INFO" "Бэкап отменен."; return ;;
+            1) ;;
+            2)
+                # Двойной ввод с подтверждением + явный feedback.
+                safe_read -s -erp "Введите пароль шифрования: " np
+                echo ""
+                if [[ -z "$np" ]]; then
+                    print_message "ERROR" "✗ Пустой пароль. Бэкап отменён."
+                    safe_read -rp "Enter — закрыть " _dummy
+                    return
+                fi
+                safe_read -s -erp "Повторите пароль для подтверждения: " np_confirm
+                echo ""
+                if [[ "$np" != "$np_confirm" ]]; then
+                    print_message "ERROR" "✗ Пароли НЕ совпадают. Бэкап отменён."
+                    safe_read -rp "Enter — закрыть " _dummy
+                    return
+                fi
+                # write_password_file валидирует путь/newline/chmod — отказ означает,
+                # что пароль НЕ сохранён, БД-бэкап без шифрования не должен идти,
+                # если пользователь его явно запросил.
+                if ! write_password_file "$np"; then
+                    print_message "ERROR" "Не удалось сохранить пароль. Бэкап отменён."
+                    safe_read -rp "Enter — закрыть " _dummy
+                    return
+                fi
+                BACKUP_PASSWORD="$np"
+                save_config
+                print_message "SUCCESS" "✓ Пароль установлен (${#np} символов). Продолжаем бэкап..."
+                ;;
+            *) print_message "INFO" "Бэкап отменён."; return ;;
         esac
+    fi
+
+    # === ВОПРОС ПРО ЛОГИ (если ещё не настроено и есть файловая часть бэкапа) ===
+    # Спрашиваем только при interactive ручном бэкапе и только при типах с файлами.
+    # Ответ сохраняется в config — повторно не спросим.
+    if [[ "$IS_INTERACTIVE" == "true" && "$TYPE" != "db_only" && "$BACKUP_LOG_FILES" == "ask" ]]; then
+        clear_screen
+        echo -e "${CYAN}${BOLD}━━━ Бэкапить ли файлы логов? ━━━${RESET}"
+        echo ""
+        echo "В папке бота могут быть файлы вроде:"
+        echo -e "  ${GRAY}access.log, access.log.1, access.log.2.gz, access.log-20260510.gz${RESET}"
+        echo -e "  ${GRAY}error.log, error.log.1, error.log.5.gz${RESET}"
+        echo ""
+        echo "Обычно они не нужны для восстановления бота и только раздувают архив."
+        echo ""
+        echo -e " ${GREEN}1. Нет, не бэкапить логи${RESET} ${GRAY}(рекомендуется, экономит место)${RESET}"
+        echo -e " ${YELLOW}2. Да, включить логи в архив${RESET}"
+        echo ""
+        safe_read -erp "Выбор (Enter = 1): " log_choice
+        case "$log_choice" in
+            2) BACKUP_LOG_FILES="true";  print_message "INFO" "Логи будут включены в архив (запомнено)" ;;
+            *) BACKUP_LOG_FILES="false"; print_message "INFO" "Логи будут исключены из архива (запомнено)" ;;
+        esac
+        save_config
     fi
 
     local TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
@@ -5259,38 +6567,78 @@ create_backup() {
     echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
     debug_log "BACKUP" "Bot version saved: ${CURRENT_VER:-Unknown}"
 
+    # Версионный суффикс для имени архива — чтобы не плодить .version файлы-спутники.
+    # Безопасно: оставляем только [A-Za-z0-9.-_], остальное заменяем на '-'.
+    local VER_SUFFIX=""
+    if [[ -n "$CURRENT_VER" && "$CURRENT_VER" != "Unknown" ]]; then
+        local _safe_ver
+        _safe_ver=$(printf '%s' "$CURRENT_VER" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')
+        [[ -n "$_safe_ver" ]] && VER_SUFFIX="__v${_safe_ver}"
+    fi
+    debug_log "BACKUP" "Version suffix for filename: '${VER_SUFFIX}'"
+
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
         # Получаем параметры БД из .env бота (согласно официальной документации)
         local ACTUAL_DB_USER=$(get_db_user)
         local ACTUAL_DB_NAME=$(get_db_name)
         debug_log "DB" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
         
-        # Проверяем готовность БД через pg_isready (согласно healthcheck из документации)
+        # Проверяем готовность БД через pg_isready с retry.
+        # pg_isready может возвращать transient not-ready при высокой нагрузке,
+        # short-lived lock, или race с healthcheck — 3 попытки спасают от false-fail.
         print_message "INFO" "Проверка готовности БД..."
         debug_log "DB" "Running: docker exec $DB_CONTAINER_NAME pg_isready -U $ACTUAL_DB_USER -d $ACTUAL_DB_NAME"
-        if ! docker exec "$DB_CONTAINER_NAME" pg_isready -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" > "$SILENT_LOG" 2>&1; then
-            print_message "ERROR" "База данных не готова! (pg_isready failed)"
-            log_message "ERROR" "Backup aborted: pg_isready failed for $DB_CONTAINER_NAME"
+        local _pg_ready=false
+        local _pg_attempt
+        for _pg_attempt in 1 2 3; do
+            # timeout 10 защищает от висящего docker exec (контейнер заблокирован,
+            # OOM-killer убил BD-процесс, network issue с docker daemon).
+            # Если docker сам не отвечает 10 сек — переходим к retry, не виснем навсегда.
+            if timeout 10 docker exec "$DB_CONTAINER_NAME" pg_isready -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" > "$SILENT_LOG" 2>&1; then
+                _pg_ready=true
+                debug_log "DB" "pg_isready: OK (attempt $_pg_attempt)"
+                break
+            fi
+            debug_log "DB" "pg_isready failed/timeout (attempt $_pg_attempt/3) — retry in 2s"
+            [[ $_pg_attempt -lt 3 ]] && sleep 2
+        done
+
+        if [[ "$_pg_ready" != "true" ]]; then
+            print_message "ERROR" "База данных не готова! (pg_isready failed 3x)"
+            log_message "ERROR" "Backup aborted: pg_isready failed 3 times for $DB_CONTAINER_NAME"
             if [[ "$IS_INTERACTIVE" != "true" ]]; then
-                send_telegram_notification "Бэкап прерван: БД не готова ($DB_CONTAINER_NAME)"
+                send_telegram_notification "Бэкап прерван: БД не готова после 3 попыток ($DB_CONTAINER_NAME)"
             fi
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
-        debug_log "DB" "pg_isready: OK"
         
         print_message "INFO" "Дамп базы данных ($DB_CONTAINER_NAME, user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME)..."
         debug_log "DB" "Running: docker exec $DB_CONTAINER_NAME pg_dump -U $ACTUAL_DB_USER $ACTUAL_DB_NAME | gzip -9 > $BACKUP_DIR/$FILE_DB"
         
-        # Используем pg_dump вместо pg_dumpall (согласно официальной документации)
-        # pg_dump быстрее и проще для одной БД
-        if ! docker exec "$DB_CONTAINER_NAME" pg_dump -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" 2> "$SILENT_LOG" | gzip -9 > "$BACKUP_DIR/$FILE_DB"; then
-            print_message "ERROR" "Ошибка дампа БД."
-            debug_log "DB" "pg_dump FAILED"
+        # Используем pg_dump вместо pg_dumpall (согласно официальной документации).
+        # КРИТИЧНО: проверяем PIPESTATUS обоих звеньев, иначе при падении pg_dump
+        # gzip успешно создаст пустой архив и backup пройдёт как SUCCESS → silent data loss.
+        docker exec "$DB_CONTAINER_NAME" pg_dump -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" 2> "$SILENT_LOG" \
+            | gzip -9 > "$BACKUP_DIR/$FILE_DB"
+        local _pg_rc=${PIPESTATUS[0]} _gz_rc=${PIPESTATUS[1]}
+        if [[ $_pg_rc -ne 0 || $_gz_rc -ne 0 ]]; then
+            print_message "ERROR" "Ошибка дампа БД (pg_dump=$_pg_rc gzip=$_gz_rc)."
+            debug_log "DB" "pg_dump FAILED: pg_dump=$_pg_rc gzip=$_gz_rc"
+            log_message "ERROR" "pg_dump failed: pg_dump rc=$_pg_rc gzip rc=$_gz_rc"
             HAS_ERROR=1
         else
             local db_size=$(du -h "$BACKUP_DIR/$FILE_DB" 2>/dev/null | cut -f1)
-            debug_log "DB" "pg_dump SUCCESS, file size: $db_size"
+            local db_bytes=$(stat -c%s "$BACKUP_DIR/$FILE_DB" 2>/dev/null || echo 0)
+            # Sanity check: minimal valid gzipped pg_dump > 100 bytes (заголовок + CREATE/INSERT).
+            # Пустой gzip ~20 байт — явный признак повреждённого дампа.
+            if [[ "$db_bytes" -lt 100 ]]; then
+                print_message "ERROR" "Дамп БД подозрительно мал (${db_bytes}b) — возможно pg_dump упал."
+                log_message "ERROR" "Suspicious DB dump size: ${db_bytes}b (file: $FILE_DB)"
+                HAS_ERROR=1
+            else
+                debug_log "DB" "pg_dump SUCCESS, file size: $db_size ($db_bytes bytes)"
+            fi
         fi
     fi
 
@@ -5300,18 +6648,57 @@ create_backup() {
         return 1
     fi
 
+    local -a EXCLUDE_ARRAY=() EXCLUDE_FLAGS=()
     IFS=' ' read -r -a EXCLUDE_ARRAY <<< "$EXCLUDE_DIRS"
-    EXCLUDE_FLAGS=()
+    local ex
     for ex in "${EXCLUDE_ARRAY[@]}"; do if [[ -n "$ex" ]]; then EXCLUDE_FLAGS+=(--exclude="$ex"); fi; done
-    # Исключаем согласно официальной документации:
-    # - *.log файлы
+    # Базовые исключения (всегда):
     # - .git директория
-    # - Docker образы (*.tar файлы)
-    # - logs/ директория (access-логи из ACCESS_LOG_PATH)
+    # - Docker образы бота (*.tar файлы)
     # - backups/ директория (локальные бэкапы пользователя)
-    EXCLUDE_FLAGS+=(--exclude="*.log" --exclude=".git" --exclude="logs" --exclude="backups")
+    EXCLUDE_FLAGS+=(--exclude=".git" --exclude="backups")
     EXCLUDE_FLAGS+=(--exclude="private-remnawave-*.tar" --exclude="rwp_shop*.tar" --exclude="telegram-shop*.tar")
+
+    # Логи: исключаем если BACKUP_LOG_FILES != "true".
+    # Паттерны покрывают сырые и ротированные форматы:
+    #   *.log              — access.log, error.log
+    #   *.log.[0-9]*       — error.log.1, access.log.2
+    #   *.log.[0-9]*.gz    — error.log.1.gz, access.log.2.gz
+    #   *.log-[0-9]*       — access.log-20260510
+    #   *.log-[0-9]*.gz    — access.log-20260510.gz
+    #   logs/ logs.*       — папка logs/ и её варианты
+    if [[ "$BACKUP_LOG_FILES" != "true" ]]; then
+        EXCLUDE_FLAGS+=(--exclude="*.log")
+        EXCLUDE_FLAGS+=(--exclude="*.log.[0-9]*")
+        EXCLUDE_FLAGS+=(--exclude="*.log.[0-9]*.gz")
+        EXCLUDE_FLAGS+=(--exclude="*.log-[0-9]*")
+        EXCLUDE_FLAGS+=(--exclude="*.log-[0-9]*.gz")
+        EXCLUDE_FLAGS+=(--exclude="logs")
+        debug_log "TAR" "Logs excluded (BACKUP_LOG_FILES=$BACKUP_LOG_FILES)"
+    else
+        debug_log "TAR" "Logs INCLUDED in archive (BACKUP_LOG_FILES=true)"
+    fi
     debug_log "TAR" "Exclude flags: ${EXCLUDE_FLAGS[*]}"
+
+    # === Отчёт о пропущенных файлах (для меню 88 / lazarus skipped) ===
+    # Сохраняем всегда (persistent, не плодит файлы — один общий .last_skipped.txt)
+    local LAST_SKIPPED_FILE="$BACKUP_DIR/.last_skipped.txt"
+    local LAST_SKIPPED_META="$BACKUP_DIR/.last_skipped.meta"
+    if [[ "$TYPE" != "db_only" ]] && [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+        local _skip_count
+        _skip_count=$(build_skipped_report "$BOT_PATH" "$LAST_SKIPPED_FILE" 2> "$SILENT_LOG" || echo "0")
+        debug_log "TAR" "Skipped report: $_skip_count entries → $LAST_SKIPPED_FILE"
+        # Метаданные: timestamp, bot path, размер архива (заполнится позже)
+        printf 'archive=%s\nbot_path=%s\ncount=%s\ntimestamp=%s\n' \
+            "(в процессе)" "$BOT_PATH" "$_skip_count" "$(date '+%Y-%m-%d %H:%M:%S')" \
+            > "$LAST_SKIPPED_META"
+    else
+        # db_only — сбрасываем отчёт (файлы не архивируются)
+        : > "$LAST_SKIPPED_FILE"
+        printf 'archive=%s\nbot_path=%s\ncount=0\ntimestamp=%s\nnote=db_only — файлы не архивируются\n' \
+            "(db_only)" "${BOT_PATH:-?}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+            > "$LAST_SKIPPED_META"
+    fi
 
     if [[ "$TYPE" != "db_only" ]]; then
         : > "$SKIP_FILE"
@@ -5331,7 +6718,9 @@ create_backup() {
         done
         FIND_ARGS+=("-type" "f" "-size" "+${MAX_FILE_SIZE_MB}M" "-print")
         debug_log "TAR" "Find args: ${FIND_ARGS[*]}"
-        cd "$BOT_PATH"; find "${FIND_ARGS[@]}" | while read -r f; do
+        # Subshell: cd не утечёт в parent (cwd используется в других местах create_backup).
+        # Если cd упал — find работает в текущей cwd → BACKUP_DIR обходим, что неправильно.
+        ( cd "$BOT_PATH" && find "${FIND_ARGS[@]}" ) | while IFS= read -r f; do
             # Преобразуем ./path/file в BOT_DIRNAME/path/file для корректной работы --exclude-from
             echo "${BOT_DIRNAME}${f#.}"
         done > "$SKIP_FILE"
@@ -5347,29 +6736,67 @@ create_backup() {
         fi
     fi
 
+    # tar exit codes:
+    #   0  = OK
+    #   1  = some files differ/changed during read (warning, archive OK)
+    #   2+ = serious error (поломанный архив)
+    # stderr → SILENT_LOG чтобы не спамить console «Cannot stat» от файлов,
+    # которые бот пишет/удаляет в собственной директории (race). Запишем в log_message.
+    local _tar_rc=0 _tar_err
+    _tar_err=$(mktemp 2> "$SILENT_LOG") || _tar_err="/tmp/lazarus_tar_err.$$"
     if [[ "$TYPE" == "db_only" ]]; then
-        FILE_FINAL="lazarus_db_${TIMESTAMP}.tar.gz"
+        FILE_FINAL="lazarus_db_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         debug_log "TAR" "Creating DB archive: $FILE_FINAL"
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB"
+        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" 2> "$_tar_err"
+        _tar_rc=$?
         rm -f "$BACKUP_DIR/$FILE_DB"
     elif [[ "$TYPE" == "files_only" ]]; then
-        FILE_FINAL="lazarus_files_${TIMESTAMP}.tar.gz"
+        FILE_FINAL="lazarus_files_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         local FILE_DIR="bot_files_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
         debug_log "TAR" "Creating files archive: $FILE_FINAL"
         debug_log "TAR" "Running: tar -czf $BACKUP_DIR/$FILE_DIR ${EXCLUDE_FLAGS[*]} -C $(dirname "$BOT_PATH") $(basename "$BOT_PATH")"
         # Сначала архивируем файлы бота с исключениями
-        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
-        # Затем объединяем с версией
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR"
+        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
+        _tar_rc=$?
+        [[ $_tar_rc -eq 0 ]] && {
+            # Затем объединяем с версией
+            tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR" 2>> "$_tar_err"
+            _tar_rc=$?
+        }
         rm -f "$BACKUP_DIR/$FILE_DIR"
-    else 
-        FILE_FINAL="lazarus_full_${TIMESTAMP}.tar.gz"
+    else
+        FILE_FINAL="lazarus_full_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
         debug_log "TAR" "Creating full archive: $FILE_FINAL"
-        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")"
-        tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR"
+        tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
+        _tar_rc=$?
+        [[ $_tar_rc -le 1 ]] && {
+            tar -czf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR" 2>> "$_tar_err"
+            _tar_rc=$?
+        }
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
+    fi
+
+    # Анализ tar exit code:
+    # rc=1: некритично (файл бота изменился во время чтения, race). Логируем WARN.
+    # rc>=2: серьёзная ошибка. HAS_ERROR=1.
+    if [[ $_tar_rc -eq 1 ]]; then
+        local _tar_err_head
+        _tar_err_head=$(head -3 "$_tar_err" 2>/dev/null | tr '\n' '|')
+        print_message "WARN" "tar предупреждение (некритично, архив создан): ${_tar_err_head}"
+        log_message "WARN" "tar warning (rc=1) during $TYPE backup: $(cat "$_tar_err" 2>/dev/null | head -5 | tr '\n' ' ')"
+    elif [[ $_tar_rc -ge 2 ]]; then
+        print_message "ERROR" "tar упал (rc=$_tar_rc) — архив возможно повреждён"
+        log_message "ERROR" "tar failed (rc=$_tar_rc) during $TYPE backup: $(cat "$_tar_err" 2>/dev/null | head -5 | tr '\n' ' ')"
+        HAS_ERROR=1
+    fi
+    rm -f "$_tar_err"
+
+    if [[ $HAS_ERROR -eq 1 ]]; then
+        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_FINAL"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
     fi
 
     rm -f "$SKIP_FILE"
@@ -5379,12 +6806,15 @@ create_backup() {
 
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         print_message "INFO" "Шифрование архива (это может занять время)..."
-        # Pass password via env var to avoid process listing leak
-        # AES-256-CBC + PBKDF2 with 100k iterations for brute-force protection
-        export LAZARUS_ENC_PASS="$BACKUP_PASSWORD"
-        openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$BACKUP_DIR/$FILE_FINAL" -out "$BACKUP_DIR/${FILE_FINAL}.enc" -pass env:LAZARUS_ENC_PASS
+        # v2 envelope: AES-256-CBC + PBKDF2 100k + HMAC-SHA256 (encrypt-then-MAC).
+        # HMAC защищает от targeted ciphertext-tampering (важно для backup'ов в
+        # public S3 / FTP). Wrong-password detect ДО decrypt через MAC pre-check.
+        # Старые v1 архивы (без MAC) остаются совместимыми при restore.
+        _hmac_envelope_create \
+            "$BACKUP_DIR/$FILE_FINAL" \
+            "$BACKUP_DIR/${FILE_FINAL}.enc" \
+            "$BACKUP_PASSWORD"
         local enc_res=$?
-        unset LAZARUS_ENC_PASS
         
         if [[ $enc_res -eq 0 ]]; then
             rm "$BACKUP_DIR/$FILE_FINAL"
@@ -5398,24 +6828,31 @@ create_backup() {
         fi
     fi
 
-    local FINAL_VERSION_FILE="$BACKUP_DIR/$FILE_FINAL.version"
-    cp "$BACKUP_DIR/$FILE_VERSION" "$FINAL_VERSION_FILE"
+    # Версия зашита в имя файла как __vX.Y.Z — отдельный .version файл-спутник
+    # больше не создаём (раньше получалось 2 файла на каждый бэкап).
+    # bot_version.txt внутри tar остаётся (нужен при restore).
     rm -f "$BACKUP_DIR/$FILE_VERSION"
-    debug_log "BACKUP" "Version file: $FINAL_VERSION_FILE"
+    debug_log "BACKUP" "Version encoded in filename: ${VER_SUFFIX:-<none>}"
     
     # --- VERIFY ARCHIVE ---
     print_message "INFO" "Проверка целостности архива..."
     debug_log "VERIFY" "Verifying archive integrity..."
     local VERIFY_OK="false"
     if [[ "$FILE_FINAL" == *".enc" ]]; then
-        # For encrypted files, we can't easily verify without decrypting. 
-        # We assume openssl exit code 0 was enough, or we could decrypt to /dev/null
-        debug_log "VERIFY" "Running: openssl enc -d ... | gzip -t"
-        export LAZARUS_VERIFY_PASS="$BACKUP_PASSWORD"
-        if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$BACKUP_DIR/$FILE_FINAL" -pass env:LAZARUS_VERIFY_PASS | gzip -t 2> "$SILENT_LOG"; then
-             VERIFY_OK="true"
+        # Verify v2 envelope: HMAC pre-check + decrypt → gzip -t.
+        # MAC проверяется ДО decrypt, gadget-protected.
+        debug_log "VERIFY" "Running: _hmac_envelope_verify + decrypt | gzip -t"
+        local _verify_decrypted
+        _verify_decrypted=$(mktemp "${TMPDIR:-/tmp}/lazarus_verify.XXXXXX") || _verify_decrypted=""
+        if [[ -n "$_verify_decrypted" ]]; then
+            register_sensitive_tmp "$_verify_decrypted"
+            if _hmac_envelope_decrypt "$BACKUP_DIR/$FILE_FINAL" "$_verify_decrypted" "$BACKUP_PASSWORD" \
+                && gzip -t "$_verify_decrypted" 2> "$SILENT_LOG"; then
+                VERIFY_OK="true"
+            fi
+            rm -f "$_verify_decrypted"
+            unregister_sensitive_tmp "$_verify_decrypted"
         fi
-        unset LAZARUS_VERIFY_PASS
     else
         debug_log "VERIFY" "Running: gzip -t $BACKUP_DIR/$FILE_FINAL"
         if gzip -t "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
@@ -5436,27 +6873,158 @@ create_backup() {
     log_message "SUCCESS" "Backup created: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS, verify=$VERIFY_OK)"
     debug_log "BACKUP" "Final file: $FILE_FINAL, size: $SIZE"
 
+    # === Терминальный вывод: контроль содержимого + S3-рекомендация ===
+    # Архив >50 MB: топ-5 крупных файлов + красный баннер если remote off
+    # Архив ≤50 MB: ненавязчивая подсказка про S3 если remote off
+    local _backup_bytes
+    _backup_bytes=$(stat -c%s "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG" || echo 0)
+    local _TG_LIMIT=52428800   # 50 MB
+    local _backup_mb=$((_backup_bytes / 1048576))
+
+    # Обновляем мета финальным именем архива (если файл существует)
+    if [[ -f "$LAST_SKIPPED_META" ]]; then
+        sed -i "s|^archive=.*|archive=$FILE_FINAL|" "$LAST_SKIPPED_META" 2> "$SILENT_LOG" || true
+    fi
+
+    # === Короткий статус (без больших блоков) ===
+    # Топ-5 / красный баннер показываем только по запросу через post-backup меню (77/88/99).
+    local _skipped_count=0
+    if [[ -f "$LAST_SKIPPED_FILE" && -s "$LAST_SKIPPED_FILE" ]]; then
+        _skipped_count=$(wc -l < "$LAST_SKIPPED_FILE" | tr -d ' ')
+    fi
+
+    if [[ $_backup_bytes -ge $_TG_LIMIT && "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+        echo ""
+        echo -e "${RED}${BOLD}🔴 Архив ${_backup_mb} MB > лимит Telegram (50 MB) — настройте S3/FTP (99 в меню)${RESET}"
+    elif [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+        echo ""
+        echo -e "${YELLOW}💡 Удалённое хранилище не настроено — бэкап только в Telegram (99 в меню)${RESET}"
+    fi
+
+    if [[ "$_skipped_count" -gt 0 ]]; then
+        echo -e "${GRAY}ℹ Пропущено файлов: ${_skipped_count} (детали — пункт 88 в меню ниже)${RESET}"
+    fi
+
     debug_log "UPLOAD" "Starting remote upload..."
+    local _UPLOAD_REMOTE_OK="false"
+    local _UPLOAD_TG_OK="false"
     upload_to_remote "$BACKUP_DIR/$FILE_FINAL"
-    debug_log "UPLOAD" "Remote upload complete"
-    
+    local _remote_rc=$?
+    if [[ "$REMOTE_STORAGE_TYPE" != "off" && "$SEND_TO_REMOTE" == "true" && $_remote_rc -eq 0 ]]; then
+        _UPLOAD_REMOTE_OK="true"
+    fi
+    debug_log "UPLOAD" "Remote upload complete (rc=$_remote_rc, ok=$_UPLOAD_REMOTE_OK)"
+
     local DISPLAY_DATE=$(date "+%d.%m.%Y %H:%M:%S")
     local HASHTAG=""; local TYPE_NAME=""; local ROTATION_KEY=""
-    
+
     case "$TYPE" in
         "full") HASHTAG="💾 #full_backup"; TYPE_NAME="📦 Полный бэкап"; ROTATION_KEY="Полные бэкапы" ;;
         "db_only") HASHTAG="💾 #db_only"; TYPE_NAME="🗄 Дамп базы данных"; ROTATION_KEY="Базы данных" ;;
         "files_only") HASHTAG="💾 #files_only"; TYPE_NAME="📂 Файлы бота"; ROTATION_KEY="Архивы файлов" ;;
     esac
 
+    # 📏 (размер) → 📊 в Premium через EMO_STATS
+    # 🏷 (версия) → ✅ бейдж с галочкой в Premium через EMO_BADGE
     local VER_MSG=""; [[ -n "$CURRENT_VER" ]] && VER_MSG=" | 🏷 v${CURRENT_VER}"
     local CAPTION="${HASHTAG}
 📅 ${DISPLAY_DATE}
 ${TYPE_NAME}
 📏 ${SIZE}${VER_MSG}
 ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
-    
-    send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION"
+
+    # Premium emoji в caption: escape MarkdownV2 целиком, затем заменяем
+    # Unicode emoji на Premium-обёрнутый MarkdownV2-литерал (после escape).
+    # ВАЖНО: Premium emoji видны ТОЛЬКО у получателей с Telegram Premium.
+    # Не-Premium клиенты увидят fallback Unicode (что и есть в [...] часть).
+    # Замены делаем ТОЛЬКО для verified ID (см. audit 2026-05-25).
+    local CAPTION_ESC
+    CAPTION_ESC=$(escape_markdown_v2 "$CAPTION")
+    debug_log "TG" "CAPTION_ESC before premium replace: $CAPTION_ESC"
+    CAPTION_ESC="${CAPTION_ESC//📂/$(tg_emoji "📂" "$EMO_FOLDER")}"
+    CAPTION_ESC="${CAPTION_ESC//📅/$(tg_emoji "📅" "$EMO_CALENDAR")}"
+    CAPTION_ESC="${CAPTION_ESC//🔒/$(tg_emoji "🔒" "$EMO_LOCK")}"
+    CAPTION_ESC="${CAPTION_ESC//⚠️/$(tg_emoji "⚠️" "$EMO_WARN")}"
+    CAPTION_ESC="${CAPTION_ESC//🏷/$(tg_emoji "🏷" "$EMO_BADGE")}"
+    # 💾, 📦, 🗄, 📏, ☁️ — Unicode-only (verified ID mismatch).
+    debug_log "TG" "CAPTION_ESC after premium replace: $CAPTION_ESC"
+
+    send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION_ESC" "pre-escaped"
+    local _tg_rc=$?
+    # TG success — только rc=0 (sendDocument 200 OK). rc=2 (>50MB) — НЕ считаем доставленным.
+    if [[ "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" && $_tg_rc -eq 0 ]]; then
+        _UPLOAD_TG_OK="true"
+    fi
+    debug_log "UPLOAD" "TG send complete (rc=$_tg_rc, ok=$_UPLOAD_TG_OK)"
+
+    # === УДАЛЕНИЕ ЛОКАЛЬНОГО ФАЙЛА ПОСЛЕ УСПЕШНОЙ ОТПРАВКИ ===
+    # Режимы:
+    #   false       — не удалять (default)
+    #   any         — удалить если хотя бы один канал доставил
+    #   all         — удалить только если ВСЕ настроенные каналы доставили
+    #   remote_only — удалить если remote (S3/FTP/WebDAV/Rclone) доставил, TG не учитываем
+    if [[ "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" != "false" && -n "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" ]]; then
+        local _can_delete="false"
+        local _delete_reason=""
+        case "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" in
+            any)
+                if [[ "$_UPLOAD_TG_OK" == "true" || "$_UPLOAD_REMOTE_OK" == "true" ]]; then
+                    _can_delete="true"
+                    _delete_reason="any: tg=$_UPLOAD_TG_OK remote=$_UPLOAD_REMOTE_OK"
+                else
+                    _delete_reason="any: оба канала провалились"
+                fi
+                ;;
+            all)
+                local _tg_required="false" _remote_required="false"
+                [[ "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]] && _tg_required="true"
+                [[ "$REMOTE_STORAGE_TYPE" != "off" && "$SEND_TO_REMOTE" == "true" ]] && _remote_required="true"
+                if [[ "$_tg_required" == "false" && "$_remote_required" == "false" ]]; then
+                    _delete_reason="all: ни один канал не настроен, удаление пропущено"
+                elif [[ ( "$_tg_required" != "true" || "$_UPLOAD_TG_OK" == "true" ) \
+                     && ( "$_remote_required" != "true" || "$_UPLOAD_REMOTE_OK" == "true" ) ]]; then
+                    _can_delete="true"
+                    _delete_reason="all: tg_req=$_tg_required tg_ok=$_UPLOAD_TG_OK remote_req=$_remote_required remote_ok=$_UPLOAD_REMOTE_OK"
+                else
+                    _delete_reason="all: не все каналы доставили"
+                fi
+                ;;
+            remote_only)
+                if [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]]; then
+                    _delete_reason="remote_only: remote не настроен, удаление пропущено"
+                elif [[ "$_UPLOAD_REMOTE_OK" == "true" ]]; then
+                    _can_delete="true"
+                    _delete_reason="remote_only: remote=$_UPLOAD_REMOTE_OK"
+                else
+                    _delete_reason="remote_only: remote upload провален"
+                fi
+                ;;
+            *)
+                _delete_reason="неизвестный режим: $DELETE_LOCAL_AFTER_REMOTE_UPLOAD"
+                ;;
+        esac
+
+        if [[ "$_can_delete" == "true" ]]; then
+            print_message "INFO" "Локальный бэкап удалён после отправки (${DELETE_LOCAL_AFTER_REMOTE_UPLOAD}): $_delete_reason"
+            log_message "INFO" "Local backup deleted after upload: $FILE_FINAL ($_delete_reason)"
+            debug_log "BACKUP" "Deleting local: $BACKUP_DIR/$FILE_FINAL"
+            # $FINAL_VERSION_FILE убран — мы больше не создаём .version файлы-спутники
+            # (версия в имени архива). Legacy .version рядом удалит rotate_*.
+            rm -f "$BACKUP_DIR/$FILE_FINAL"
+        else
+            print_message "WARN" "Локальный бэкап СОХРАНЁН (доставка не подтверждена): $_delete_reason"
+            log_message "WARN" "Local backup kept: $FILE_FINAL ($_delete_reason)"
+            # TG-уведомление о том что delete пропущен — только если опция была включена
+            if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+                local _kept_msg="$(tg_emoji "⚠️" "$EMO_WARN") *Локальный бэкап СОХРАНЁН*
+
+Опция \`DELETE_LOCAL_AFTER_REMOTE_UPLOAD=${DELETE_LOCAL_AFTER_REMOTE_UPLOAD}\` включена, но условие удаления не выполнено\\.
+
+$(tg_emoji "💡" "$EMO_INFO") Причина: $(escape_markdown_v2 "$_delete_reason")"
+                send_telegram_text "$_kept_msg"
+            fi
+        fi
+    fi
 
     # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
     local ROTATION_PREFIX="lazarus_$TYPE"
@@ -5515,15 +7083,28 @@ select_backup_file() {
         for (( i=0; i<loop_limit; i++ )); do
             local file="${sorted_backups[$i]}"
             local filename=$(basename "$file")
-            
-            local CACHE_FILE="${file}.version"
+
+            # Извлечение версии бота: 3 уровня fallback
+            #   1) Из имени файла: lazarus_*_TIMESTAMP__vX.Y.Z.tar.gz[.enc]   (новый формат)
+            #   2) Из .version файла-спутника                                  (legacy, до удаления)
+            #   3) Из tar -xO bot_version.txt                                  (для незашифрованных)
             local B_VER=""
-            if [[ -f "$CACHE_FILE" ]]; then B_VER=$(cat "$CACHE_FILE")
-            else
-                if [[ "$file" != *".enc" ]]; then
-                    B_VER=$(tar -xzf "$file" -O bot_version.txt 2> "$SILENT_LOG")
+            local _name_noext="${filename%.enc}"
+            _name_noext="${_name_noext%.tar.gz}"
+            if [[ "$_name_noext" =~ __v(.+)$ ]]; then
+                B_VER="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -z "$B_VER" ]]; then
+                local CACHE_FILE="${file}.version"
+                if [[ -f "$CACHE_FILE" ]]; then
+                    B_VER=$(cat "$CACHE_FILE")
+                else
+                    if [[ "$file" != *".enc" ]]; then
+                        B_VER=$(tar -xzf "$file" -O bot_version.txt 2> "$SILENT_LOG")
+                    fi
+                    [[ -z "$B_VER" ]] && B_VER="?"
                 fi
-                if [[ -n "$B_VER" ]]; then echo "$B_VER" > "$CACHE_FILE"; else echo "?" > "$CACHE_FILE"; B_VER="?"; fi
             fi
             
             local ENC_MARK=""; [[ "$file" == *".enc" ]] && ENC_MARK="${RED}[ENC]${RESET} "
@@ -5693,6 +7274,9 @@ confirm_restore_target() {
         print_message "WARN" "Введите точную строку подтверждения для продолжения:"
         local expected="RESTORE_TO:$BOT_PATH"
         echo -e "${CYAN}$expected${RESET}"
+        # NB: bare `read` намеренно (НЕ safe_read) — Ctrl+C должен ОТМЕНЯТЬ
+        # деструктивную операцию (restore), а не переcпрашивать prompt.
+        # safe_read retry'ит на SIGINT и сделает Ctrl+C бесполезным здесь.
         read -r confirm
         if [[ "$confirm" != "$expected" ]]; then
             print_message "INFO" "Отменено пользователем."
@@ -5721,6 +7305,7 @@ confirm_drop_volume() {
         print_message "WARN" "Будет удален volume БД. Это полностью удалит данные в volume."
         local expected="DROP_VOLUME:$volume_name"
         echo -e "${CYAN}$expected${RESET}"
+        # NB: bare `read` намеренно — Ctrl+C должен ОТМЕНЯТЬ удаление volume.
         read -r confirm
         if [[ "$confirm" != "$expected" ]]; then
             print_message "INFO" "Удаление volume отменено пользователем."
@@ -5892,12 +7477,19 @@ confirm_drop_schema() {
     # === БЕЗОПАСНЫЙ СНАПШОТ ПЕРЕД DROP ===
     local snapshot_file="${backup_dir}/pre_restore_snapshot_$(date +%Y%m%d_%H%M%S).sql.gz"
     print_message "INFO" "Создание safety snapshot БД перед DROP SCHEMA..."
-    if docker exec "$db_container" pg_dump -U "$db_user" "$db_name" 2> "$SILENT_LOG" | gzip > "$snapshot_file"; then
+    # КРИТИЧНО: PIPESTATUS обоих, иначе при падении pg_dump snapshot будет пустым
+    # gzip-файлом, а DROP SCHEMA уже выполнится — rollback станет невозможен.
+    docker exec "$db_container" pg_dump -U "$db_user" "$db_name" 2> "$SILENT_LOG" | gzip > "$snapshot_file"
+    local _pg_rc=${PIPESTATUS[0]} _gz_rc=${PIPESTATUS[1]}
+    local snap_bytes=0
+    [[ -f "$snapshot_file" ]] && snap_bytes=$(stat -c%s "$snapshot_file" 2>/dev/null || echo 0)
+    if [[ $_pg_rc -eq 0 && $_gz_rc -eq 0 && $snap_bytes -ge 100 ]]; then
         local snap_size
         snap_size=$(du -h "$snapshot_file" 2>/dev/null | cut -f1)
         print_message "SUCCESS" "Safety snapshot: $snapshot_file ($snap_size)"
     else
-        print_message "ERROR" "Не удалось создать safety snapshot! Восстановление прервано."
+        print_message "ERROR" "Не удалось создать safety snapshot (pg_dump=$_pg_rc gzip=$_gz_rc size=${snap_bytes}b). Восстановление прервано."
+        log_message "ERROR" "Safety snapshot failed: pg_dump=$_pg_rc gzip=$_gz_rc size=${snap_bytes}b"
         rm -f "$snapshot_file"
         return 1
     fi
@@ -5929,6 +7521,7 @@ confirm_drop_schema() {
         local expected="DROP_SCHEMA_IN:${db_name}"
         echo -n "Введите для подтверждения: "
         echo -e "${CYAN}$expected${RESET}"
+        # NB: bare `read` намеренно — Ctrl+C должен ОТМЕНЯТЬ DROP SCHEMA, а не retry'ить.
         read -r confirm
         if [[ "$confirm" != "$expected" ]]; then
             print_message "INFO" "DROP SCHEMA отменён пользователем."
@@ -5960,26 +7553,125 @@ execute_restore() {
         read -erp "Продолжить? (y/n): " confirm; [[ "$confirm" != "y" ]] && return
     fi
 
-    local TMP_DIR="$BACKUP_DIR/restore_tmp_$$"
-    mkdir -p "$TMP_DIR"
-    debug_log "RESTORE" "Temp dir: $TMP_DIR"
+    # КРИТИЧНО: TMP_DIR создаём через mktemp в /var/tmp (НЕ в BACKUP_DIR — там mode 0755
+    # → decrypted plaintext БД был бы доступен другим юзерам сервера).
+    # umask 077 + chmod 700 гарантируют owner-only доступ. Регистрируем в SENSITIVE_TMP_PATHS
+    # чтобы cleanup_on_exit удалил даже при ctrl+c / panic.
+    local TMP_DIR
+    if ! TMP_DIR=$(umask 077 && mktemp -d "${TMPDIR:-/var/tmp}/lazarus_restore.XXXXXX" 2> "$SILENT_LOG"); then
+        print_message "ERROR" "Не удалось создать temp-каталог для restore"
+        log_message "ERROR" "mktemp -d failed in execute_restore"
+        return 1
+    fi
+    chmod 700 "$TMP_DIR" 2> "$SILENT_LOG" || true
+    register_sensitive_tmp "$TMP_DIR"
+    debug_log "RESTORE" "Temp dir: $TMP_DIR (mode $(stat -c '%a' "$TMP_DIR" 2>/dev/null))"
 
     local WORK_FILE="$FILE"
     if [[ "$FILE" == *".enc" ]]; then
+        # Pre-flight: проверка openssl версии (PBKDF2 требует ≥1.1.0).
+        # На старых системах (Ubuntu 16.04, CentOS 7) openssl 1.0.x — -pbkdf2 unknown.
+        local _ossl_ver
+        _ossl_ver=$(openssl version 2>/dev/null | awk '{print $2}' || echo "")
+        if [[ "$_ossl_ver" =~ ^1\.0\. || "$_ossl_ver" =~ ^0\. ]]; then
+            print_message "ERROR" "openssl $_ossl_ver не поддерживает -pbkdf2 (требуется ≥1.1.0)."
+            log_message "ERROR" "openssl version too old for restore: $_ossl_ver"
+            rm -rf "$TMP_DIR"
+            unregister_sensitive_tmp "$TMP_DIR"
+            return 1
+        fi
+        # Pre-flight: проверка читаемости файла.
+        if [[ ! -r "$FILE" ]]; then
+            print_message "ERROR" "Файл бэкапа недоступен для чтения: $FILE"
+            log_message "ERROR" "Backup file not readable: $FILE"
+            rm -rf "$TMP_DIR"
+            unregister_sensitive_tmp "$TMP_DIR"
+            return 1
+        fi
+        # Pre-flight: проверка openssl-маркера "Salted__" в начале файла.
+        # Если первых 8 байт нет "Salted__" — файл либо не openssl-формата, либо повреждён.
+        local _ossl_magic
+        # Detect v2/v1/unknown заранее (без пароля).
+        local _archive_format
+        _archive_magic4=$(head -c 4 "$FILE" 2>/dev/null)
+        _archive_magic8=$(head -c 8 "$FILE" 2>/dev/null)
+        if [[ "$_archive_magic4" == "LAZ2" ]]; then
+            _archive_format="v2"
+            debug_log "RESTORE" "Archive format: v2 (HMAC-protected)"
+        elif [[ "$_archive_magic8" == "Salted__" ]]; then
+            _archive_format="v1"
+            debug_log "RESTORE" "Archive format: v1 (legacy, no HMAC)"
+            print_message "WARN" "Архив legacy v1 (без HMAC) — менее защищён от tampering. После restore рекомендуется пере-создать."
+        else
+            print_message "WARN" "Файл не имеет известного маркера (LAZ2/Salted__) — возможно повреждён"
+            log_message "WARN" "Backup file missing magic: $FILE"
+            _archive_format="unknown"
+        fi
+
         print_message "INFO" "Файл зашифрован. Требуется пароль."
         debug_log "RESTORE" "File is encrypted, requesting password..."
-        read -s -erp "Пароль: " decrypt_pass; echo ""
         local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
+        local _dec_attempt=0
+        local _dec_max=3
+        local _dec_ok=false
+        while [[ $_dec_attempt -lt $_dec_max ]]; do
+            local decrypt_pass=""
+            read -s -erp "Пароль (попытка $((_dec_attempt + 1))/${_dec_max}): " decrypt_pass; echo ""
+            if [[ -z "$decrypt_pass" ]]; then
+                print_message "WARN" "Пустой пароль — попробуйте снова (попытка не засчитана)."
+                continue
+            fi
+            _dec_attempt=$((_dec_attempt + 1))
+            debug_log "RESTORE" "Decrypting to: $DECRYPTED_FILE (attempt $_dec_attempt, format=$_archive_format)"
 
-        debug_log "RESTORE" "Decrypting to: $DECRYPTED_FILE"
-        export LAZARUS_DEC_PASS="$decrypt_pass"
-        openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$FILE" -out "$DECRYPTED_FILE" -pass env:LAZARUS_DEC_PASS 2> "$SILENT_LOG"
-        local dec_res=$?
-        unset LAZARUS_DEC_PASS
-        debug_log "RESTORE" "Decryption result: $dec_res"
+            _hmac_envelope_decrypt "$FILE" "$DECRYPTED_FILE" "$decrypt_pass"
+            local dec_res=$?
+            decrypt_pass=""
+            debug_log "RESTORE" "Decryption attempt $_dec_attempt: rc=$dec_res"
 
-        if [[ $dec_res -ne 0 ]]; then print_message "ERROR" "Неверный пароль или поврежденный файл!"; rm -rf "$TMP_DIR"; return; fi
-        print_message "SUCCESS" "Пароль принят."
+            case $dec_res in
+                0)
+                    # v2: MAC уже проверен. v1: дополнительный gzip -t (см. ниже).
+                    if [[ "$_archive_format" == "v2" ]]; then
+                        # Sanity: для v2 MAC уже гарантирует целостность.
+                        _dec_ok=true
+                        break
+                    fi
+                    # v1: без MAC, нужен gzip -t как раньше.
+                    if gzip -t "$DECRYPTED_FILE" 2> "$SILENT_LOG"; then
+                        _dec_ok=true
+                        break
+                    fi
+                    debug_log "RESTORE" "v1 decrypt rc=0 but not valid gzip — wrong password"
+                    print_message "WARN" "Неверный пароль (расшифрованный файл не валиден, попытка $_dec_attempt/$_dec_max)"
+                    rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                    ;;
+                1)
+                    # v2 MAC mismatch — либо wrong password, либо tampering.
+                    print_message "WARN" "Неверный пароль или подделанный архив (HMAC не совпал, попытка $_dec_attempt/$_dec_max)"
+                    rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                    ;;
+                2)
+                    # MAC OK, но decrypt упал — крайне редко (corrupted ciphertext после MAC verify)
+                    print_message "WARN" "MAC прошёл, но decrypt упал (попытка $_dec_attempt/$_dec_max)"
+                    rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                    ;;
+                *)
+                    print_message "WARN" "Неверный пароль или повреждённый файл (попытка $_dec_attempt/$_dec_max)"
+                    rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                    ;;
+            esac
+        done
+        if [[ "$_dec_ok" != "true" ]]; then
+            print_message "ERROR" "Расшифровка не удалась после $_dec_max попыток. Восстановление отменено."
+            log_message "ERROR" "Decryption failed after $_dec_max attempts (file: $(basename "$FILE"))"
+            rm -rf "$TMP_DIR"
+            unregister_sensitive_tmp "$TMP_DIR"
+            return
+        fi
+        # Дополнительный chmod 600 (на случай если umask 077 не сработал на каком-то FS)
+        chmod 600 "$DECRYPTED_FILE" 2> "$SILENT_LOG" || true
+        print_message "SUCCESS" "Пароль принят. Файл расшифрован."
         WORK_FILE="$DECRYPTED_FILE"
     fi
 
@@ -6104,9 +7796,23 @@ execute_restore() {
         fi
 
         print_message "INFO" "Импорт данных (user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME)..."
-        debug_log "RESTORE" "Running: zcat $DB_DUMP | docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER $ACTUAL_DB_NAME"
-        zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" > "$SILENT_LOG" 2>&1
-        debug_log "RESTORE" "DB import complete"
+        debug_log "RESTORE" "Running: zcat $DB_DUMP | docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER $ACTUAL_DB_NAME -v ON_ERROR_STOP=1"
+        # -v ON_ERROR_STOP=1: psql останавливается на первой ошибке (FK violation,
+        # syntax error, etc) — без этого silent partial restore.
+        # PIPESTATUS[1] нужен потому что psql exit code теряется в pipe.
+        zcat "$DB_DUMP" | docker exec -i "$DB_CONTAINER_NAME" \
+            psql -U "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" -v ON_ERROR_STOP=1 > "$SILENT_LOG" 2>&1
+        local _zc_rc=${PIPESTATUS[0]} _ps_rc=${PIPESTATUS[1]}
+        debug_log "RESTORE" "DB import: zcat=$_zc_rc psql=$_ps_rc"
+        if [[ $_zc_rc -ne 0 || $_ps_rc -ne 0 ]]; then
+            print_message "ERROR" "Импорт БД провалился (zcat=$_zc_rc psql=$_ps_rc). БД в неконсистентном состоянии."
+            log_message "ERROR" "Restore psql failed: zcat=$_zc_rc psql=$_ps_rc (dump: $DB_DUMP)"
+            if [[ "$IS_INTERACTIVE" == true ]]; then
+                echo -e "${RED}Для отката восстановите safety snapshot из ${BACKUP_DIR}/pre_restore_snapshot_*.sql.gz${RESET}"
+            fi
+            return 1
+        fi
+        debug_log "RESTORE" "DB import complete (psql exit 0)"
     fi
 
     if [[ "$MODE" == "full" || "$MODE" == "files_only" ]]; then
@@ -6126,6 +7832,156 @@ execute_restore() {
 
 # --- МЕНЮШКИ ---
 
+# show_skipped_report: вывод полного отчёта о пропущенных файлах последнего бэкапа.
+# Читает $BACKUP_DIR/.last_skipped.txt + meta, форматирует human-friendly, группирует
+# по причине, страничный вывод через less при наличии.
+show_skipped_report() {
+    local report="$BACKUP_DIR/.last_skipped.txt"
+    local meta="$BACKUP_DIR/.last_skipped.meta"
+
+    clear_screen
+    echo -e "${CYAN}${BOLD}━━━ Пропущенные файлы (последний бэкап) ━━━${RESET}"
+    echo ""
+
+    if [[ -f "$meta" ]]; then
+        local _arch _bp _cnt _ts _note
+        _arch=$(grep '^archive='   "$meta" | cut -d= -f2-)
+        _bp=$(grep   '^bot_path='  "$meta" | cut -d= -f2-)
+        _cnt=$(grep  '^count='     "$meta" | cut -d= -f2-)
+        _ts=$(grep   '^timestamp=' "$meta" | cut -d= -f2-)
+        _note=$(grep '^note='      "$meta" | cut -d= -f2-)
+        echo -e "${GRAY}Архив:    ${_arch:-?}${RESET}"
+        echo -e "${GRAY}BOT_PATH: ${_bp:-?}${RESET}"
+        echo -e "${GRAY}Дата:     ${_ts:-?}${RESET}"
+        echo -e "${GRAY}Файлов:   ${_cnt:-0}${RESET}"
+        [[ -n "$_note" ]] && echo -e "${YELLOW}Примечание: ${_note}${RESET}"
+        echo ""
+    fi
+
+    if [[ ! -f "$report" || ! -s "$report" ]]; then
+        echo -e "${GREEN}✓ Все файлы вошли в архив. Пропущенных нет.${RESET}"
+        echo ""
+        read -erp "Enter..." dummy
+        return 0
+    fi
+
+    # Группируем по причине + сортируем внутри группы по размеру
+    local _tmp
+    _tmp=$(mktemp 2> "$SILENT_LOG") || _tmp="/tmp/lazarus_skipped_view.$$"
+    local _total_bytes
+    _total_bytes=$(awk -F'\t' '{s+=$1} END{print s+0}' "$report")
+    # Полные пути НЕ обрезаем — show_skipped_report детальный, без потерь префикса.
+    awk -F'\t' '{print $3 "\t" $1 "\t" $2}' "$report" \
+        | sort -t$'\t' -k1,1 -k2,2rn \
+        | awk -F'\t' '
+            BEGIN { last_reason = "" }
+            {
+                reason = $1; sz = $2; path = $3;
+                if (reason != last_reason) {
+                    if (last_reason != "") print "";
+                    printf "\033[33m\033[1m[%s]\033[0m\n", reason;
+                    last_reason = reason;
+                }
+                h = sz; u = "B";
+                if (h>=1024) { h/=1024; u="K" }
+                if (h>=1024) { h/=1024; u="M" }
+                if (h>=1024) { h/=1024; u="G" }
+                printf "  %7.1f%s  %s\n", h, u, path;
+            }
+        ' > "$_tmp"
+
+    local _human_total
+    _human_total=$(awk -v b="$_total_bytes" 'BEGIN{
+        h=b; u="B";
+        if (h>=1024) { h/=1024; u="K" }
+        if (h>=1024) { h/=1024; u="M" }
+        if (h>=1024) { h/=1024; u="G" }
+        printf "%.1f%s", h, u
+    }')
+
+    echo -e "${GRAY}Общий вес пропущенных: ${_human_total}${RESET}"
+    echo ""
+    # less используем только если stdout — TTY. В non-tty (pipe, redirect)
+    # `less` либо падает с "WARNING: terminal is not fully functional", либо ждёт.
+    # При `lazarus skipped > file.txt` или `lazarus skipped | grep ...` — просто cat.
+    if [[ -t 1 ]] && command -v less > "$SILENT_LOG" 2>&1; then
+        # -R: пропускать ANSI-цвета
+        # -F: auto-quit если контент влезает на один экран (output останется в терминале)
+        # -X: не очищать экран при выходе (контент остаётся виден)
+        # --prompt: показывает подсказку как выйти
+        echo -e "${GRAY}💡 Стрелки/PgUp/PgDn — прокрутка, ${BOLD}q${RESET}${GRAY} — выход${RESET}"
+        echo ""
+        sleep 1
+        less -R -F -X --prompt="[Пропущенные файлы] стрелки=прокрутка | q=выход" "$_tmp"
+    else
+        cat "$_tmp"
+        # Prompt только в интерактиве (без него `lazarus skipped > file` тупо ждёт ввода)
+        if [[ -t 0 && -t 1 ]]; then
+            echo ""
+            safe_read -rp "Enter — продолжить " dummy
+        fi
+    fi
+    rm -f "$_tmp"
+    return 0
+}
+
+# menu_list_backups: показать общий список бэкапов (все категории).
+# Используется командой `lazarus backup list` / `lazarus -B -l`.
+menu_list_backups() {
+    clear_screen
+    echo -e "${GREEN}${BOLD}Список бэкапов${RESET}"
+    echo -e "${GRAY}Каталог: ${BACKUP_DIR}${RESET}"
+    echo ""
+
+    local total_count=0
+    local total_size_bytes=0
+    for prefix in lazarus_full lazarus_db lazarus_files; do
+        local label
+        case "$prefix" in
+            lazarus_full)  label="📦 Полные (БД+файлы)" ;;
+            lazarus_db)    label="🗄 Только БД" ;;
+            lazarus_files) label="📂 Только файлы" ;;
+        esac
+        local files=()
+        while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(
+            find "$BACKUP_DIR" -maxdepth 1 -type f \
+                \( -name "${prefix}_*.tar.gz" -o -name "${prefix}_*.tar.gz.enc" \) 2> "$SILENT_LOG" | sort -r
+        )
+        local n=${#files[@]}
+        total_count=$((total_count + n))
+        if [[ $n -eq 0 ]]; then
+            echo -e "  ${GRAY}${label}: пусто${RESET}"
+        else
+            local cat_bytes=0
+            for f in "${files[@]}"; do
+                local sz
+                sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                cat_bytes=$((cat_bytes + sz))
+            done
+            total_size_bytes=$((total_size_bytes + cat_bytes))
+            local cat_h
+            cat_h=$(awk -v b="$cat_bytes" 'BEGIN{h=b;u="B";if(h>=1024){h/=1024;u="K"}if(h>=1024){h/=1024;u="M"}if(h>=1024){h/=1024;u="G"}printf "%.1f%s",h,u}')
+            echo -e "  ${CYAN}${label}: ${n} шт${RESET} ${GRAY}(${cat_h})${RESET}"
+            local _shown=0
+            for f in "${files[@]}"; do
+                [[ $_shown -ge 3 ]] && break
+                local fname=$(basename "$f")
+                local fsize=$(du -h "$f" 2>/dev/null | cut -f1)
+                echo -e "      ${GRAY}${fsize}\t${fname}${RESET}"
+                _shown=$((_shown + 1))
+            done
+            [[ $n -gt 3 ]] && echo -e "      ${GRAY}... ещё $((n - 3)) (см. меню 3 Восстановить)${RESET}"
+        fi
+    done
+
+    local total_h
+    total_h=$(awk -v b="$total_size_bytes" 'BEGIN{h=b;u="B";if(h>=1024){h/=1024;u="K"}if(h>=1024){h/=1024;u="M"}if(h>=1024){h/=1024;u="G"}printf "%.1f%s",h,u}')
+    echo ""
+    echo -e "${BOLD}Всего: ${total_count} файлов, ${total_h}${RESET}"
+    echo ""
+    safe_read -rp "Enter — назад " _dummy
+}
+
 menu_manual_backup() {
     while true; do
         clear_screen; echo -e "${GREEN}Создание ручного бэкапа${RESET}"
@@ -6134,15 +7990,86 @@ menu_manual_backup() {
         echo " 3. Только Файлы"
         echo " 0. Назад"
         echo ""
-        read -erp "Ваш выбор (Enter - Назад): " m_choice
+        safe_read -erp "Ваш выбор (Enter - Назад): " m_choice
         [[ -z "$m_choice" ]] && return
         case $m_choice in
-            1) create_backup "full"; read -erp "Enter..." dummy; return ;;
-            2) create_backup "db_only"; read -erp "Enter..." dummy; return ;;
-            3) create_backup "files_only"; read -erp "Enter..." dummy; return ;;
+            1) create_backup "full";       _post_backup_prompt; return ;;
+            2) create_backup "db_only";    _post_backup_prompt; return ;;
+            3) create_backup "files_only"; _post_backup_prompt; return ;;
             0) return ;;
         esac
     done
+}
+
+# _post_backup_prompt: интерактивный prompt после create_backup с опциями:
+#   77 — топ-5 крупных файлов в архиве (что попало)
+#   88 — пропущенные файлы (что НЕ попало) с группировкой по причине
+#   99 — настроить удалённое хранилище (если REMOTE_STORAGE_TYPE=off)
+#   Enter / 0 — вернуться в меню
+_post_backup_prompt() {
+    local _skipped="$BACKUP_DIR/.last_skipped.txt"
+    local _has_skipped=0
+    [[ -f "$_skipped" && -s "$_skipped" ]] && _has_skipped=$(wc -l < "$_skipped" | tr -d ' ')
+
+    while true; do
+        printf '\n'
+        printf '%s\n' "─────────────────────────────────────────────"
+        printf '%s\n' "  77 — топ-5 крупных файлов в архиве"
+        if [[ "$_has_skipped" -gt 0 ]]; then
+            printf '%b\n' "  ${YELLOW}88${RESET} — пропущенные файлы (${_has_skipped} шт)"
+        fi
+        if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+            printf '%b\n' "  ${RED}99${RESET} — настроить S3 / FTP / WebDAV хранилище"
+        fi
+        printf '%s\n' "  Enter или 0 — вернуться"
+        printf '%s\n' "─────────────────────────────────────────────"
+        safe_read -rp "Ваш выбор: " _pb_choice
+        case "$_pb_choice" in
+            77) _show_top_in_archive ;;
+            88)
+                if [[ "$_has_skipped" -gt 0 ]]; then
+                    show_skipped_report
+                else
+                    print_message "INFO" "Пропущенных файлов нет."
+                    sleep 1
+                fi
+                ;;
+            99)
+                if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+                    configure_remote_storage
+                else
+                    print_message "INFO" "Хранилище уже настроено: $REMOTE_STORAGE_TYPE"
+                    sleep 1
+                fi
+                ;;
+            ""|0) return ;;
+            *) print_message "ERROR" "Введите 77, 88, 99 или Enter" ; sleep 1 ;;
+        esac
+    done
+}
+
+# _show_top_in_archive: показывает топ-5 крупных файлов которые ПОПАЛИ в архив.
+# Используется из пункта 77 в _post_backup_prompt.
+_show_top_in_archive() {
+    clear_screen
+    echo -e "${CYAN}${BOLD}━━━ Самые крупные файлы в архиве (топ-5) ━━━${RESET}"
+    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
+        echo -e "${GRAY}(BOT_PATH не задан)${RESET}"
+    else
+        echo -e "${GRAY}из ${BOT_PATH}${RESET}"
+        echo ""
+        local _top
+        _top=$(get_top_files_in_archive "$BOT_PATH" "${MAX_FILE_SIZE_MB:-0}" "${EXCLUDE_DIRS:-}" 5 2> "$SILENT_LOG")
+        if [[ -n "$_top" ]]; then
+            echo "$_top"
+        else
+            echo -e "${GRAY}(нет данных, требуется GNU find -printf)${RESET}"
+        fi
+    fi
+    echo ""
+    echo -e "${GRAY}💡 Чтобы исключить — Настройки → 5 (EXCLUDE_DIRS) или → 6 (MAX_FILE_SIZE_MB)${RESET}"
+    echo ""
+    safe_read -rp "Enter — назад " _dummy
 }
 
 menu_restore() {
@@ -6389,12 +8316,17 @@ menu_settings() {
         echo -e " 11. Отправка файла:    $ST_TG_FILE"
         echo -e " 12. Проверить связь"
 
-        echo -e "\n${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET}"
-        echo -e " 13. Тип:               ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
-        echo -e " 14. URL:               ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
-        echo -e " 15. Пользователь:      ${GRAY}${MASKED_REMOTE_USER}${RESET}"
-        echo -e " 16. Загрузка:          $ST_REM"
-        echo -e " 17. Настроить / Проверить"
+        if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
+            echo -e "\n${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET}"
+            echo -e " 13. Тип:               ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
+            echo -e " 14. URL:               ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
+            echo -e " 15. Пользователь:      ${GRAY}${MASKED_REMOTE_USER}${RESET}"
+            echo -e " 16. Загрузка:          $ST_REM"
+            echo -e " 17. Настроить / Проверить"
+        else
+            echo -e "\n${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET} ${GRAY}(не настроено)${RESET}"
+            echo -e " 17. ${YELLOW}Настроить хранилище (S3/FTP/WebDAV/Rclone)${RESET}"
+        fi
 
         echo -e "\n${CYAN}--- БЕЗОПАСНОСТЬ ---${RESET}"
         echo -e " 18. Пароль шифрования: ${GRAY}${PASS_MASK}${RESET}"
@@ -6408,12 +8340,43 @@ menu_settings() {
             echo -e " 20. Срок хранения:     ${GRAY}${RETENTION_DAYS} дней${RESET}"
         fi
         echo -e " 21. Лимит размера:     ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
-        
+
+        echo -e "\n${CYAN}--- ДИСК И ХРАНЕНИЕ ---${RESET}"
+        # Текущий disk usage для подсказки
+        local _disk_cur_pct=$(df -P "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
+        local _disk_cur_free=$(df -h "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+        local _disk_color="$GREEN"
+        if [[ -n "$_disk_cur_pct" ]]; then
+            [[ "$_disk_cur_pct" -ge "$DISK_WARN_PERCENT" ]] && _disk_color="$YELLOW"
+            [[ "$_disk_cur_pct" -ge "$DISK_CRITICAL_PERCENT" ]] && _disk_color="$RED"
+        fi
+        echo -e " 22. Порог WARN:        ${YELLOW}${DISK_WARN_PERCENT}%${RESET} ${GRAY}(TG-уведомление при заполнении)${RESET}"
+        echo -e " 23. Порог CRITICAL:    ${RED}${DISK_CRITICAL_PERCENT}%${RESET} ${RED}(остановка бэкапов)${RESET}"
+
+        local _del_disp="${RED}Выкл${RESET}"
+        case "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" in
+            any)         _del_disp="${YELLOW}any${RESET} (любой канал OK)" ;;
+            all)         _del_disp="${YELLOW}all${RESET} (все каналы OK)" ;;
+            remote_only) _del_disp="${YELLOW}remote_only${RESET} (S3/FTP/WebDAV OK)" ;;
+        esac
+        echo -e " 24. Удалять локально:  $_del_disp"
+        if [[ -n "$_disk_cur_pct" ]]; then
+            echo -e "     ${GRAY}Текущее заполнение: ${_disk_color}${_disk_cur_pct}%${RESET}${GRAY}, свободно: $_disk_cur_free${RESET}"
+        fi
+
+        local _log_disp
+        case "$BACKUP_LOG_FILES" in
+            true)  _log_disp="${YELLOW}Да${RESET} (логи в архиве)" ;;
+            false) _log_disp="${GREEN}Нет${RESET} (логи исключены)" ;;
+            ask|*) _log_disp="${GRAY}спросить при первом бэкапе${RESET}" ;;
+        esac
+        echo -e " 25. Бэкап логов:       $_log_disp"
+
         echo -e "\n 0. Назад"
         echo ""
-        read -erp "Выбор: " s
+        safe_read -erp "Выбор: " s
         [[ -z "$s" ]] && return
-        
+
         case $s in
             1) read -erp "Новый путь: " np
                if [[ -n "$np" ]]; then 
@@ -6517,14 +8480,57 @@ menu_settings() {
                 save_config ;;
 
             18) echo ""
-                read -s -erp "Новый пароль шифрования (пусто - отключить): " new_pass
+                echo -e "${CYAN}${BOLD}━━━ Пароль шифрования бэкапов ━━━${RESET}"
+                echo -e "${GRAY}Алгоритм: AES-256-CBC + PBKDF2 (100k итераций)${RESET}"
+                echo -e "${GRAY}Хранится в файле ${BACKUP_PASSWORD_FILE} (chmod 600)${RESET}"
                 echo ""
-                BACKUP_PASSWORD="$new_pass"
-                save_config
-                if [[ -n "$new_pass" ]]; then
-                    print_message "SUCCESS" "Шифрование включено"
+                read -s -erp "Новый пароль (пусто = отключить шифрование): " new_pass
+                echo ""
+
+                if [[ -z "$new_pass" ]]; then
+                    # Сброс шифрования — спрашиваем явное подтверждение
+                    echo ""
+                    echo -e "${YELLOW}Пароль пустой → шифрование БУДЕТ ОТКЛЮЧЕНО${RESET}"
+                    safe_read -rp "Подтвердить отключение шифрования? (y/N): " _confirm
+                    if [[ "$_confirm" =~ ^[YyДд]$ ]]; then
+                        rm -f "$BACKUP_PASSWORD_FILE" 2> "$SILENT_LOG" || true
+                        BACKUP_PASSWORD=""
+                        save_config
+                        echo ""
+                        print_message "INFO" "✓ Шифрование отключено. Файл пароля удалён."
+                        echo -e "${YELLOW}⚠ Новые бэкапы будут создаваться БЕЗ шифрования.${RESET}"
+                    else
+                        print_message "INFO" "Отменено. Шифрование без изменений."
+                    fi
+                    echo ""
+                    safe_read -rp "Enter — назад в меню " _dummy
                 else
-                    print_message "INFO" "Шифрование отключено"
+                    # Подтверждение пароля — второй ввод
+                    read -s -erp "Повторите пароль для подтверждения: " new_pass_confirm
+                    echo ""
+                    if [[ "$new_pass" != "$new_pass_confirm" ]]; then
+                        echo ""
+                        print_message "ERROR" "✗ Пароли НЕ совпадают. Попытка отменена."
+                        echo -e "${GRAY}Шифрование оставлено как было.${RESET}"
+                        echo ""
+                        safe_read -rp "Enter — назад в меню " _dummy
+                    else
+                        # save_config пишет BACKUP_PASSWORD="" — реальный пароль идёт в файл.
+                        # write_password_file валидирует путь и chmod — может отказать.
+                        if write_password_file "$new_pass"; then
+                            BACKUP_PASSWORD="$new_pass"
+                            save_config
+                            echo ""
+                            print_message "SUCCESS" "✓ Шифрование включено (пароль ${#new_pass} символов сохранён)"
+                            echo -e "${GRAY}Файл: ${BACKUP_PASSWORD_FILE}${RESET}"
+                            echo -e "${YELLOW}⚠ Важно: запомните или сохраните пароль — без него восстановление невозможно.${RESET}"
+                        else
+                            echo ""
+                            print_message "ERROR" "Не удалось сохранить пароль (см. сообщение выше). Шифрование НЕ включено."
+                        fi
+                        echo ""
+                        safe_read -rp "Enter — назад в меню " _dummy
+                    fi
                 fi ;;
                 
             19) echo ""
@@ -6560,7 +8566,7 @@ menu_settings() {
                 local current_mb="$MAX_BACKUP_SIZE_MB"
                 echo -e "Текущий лимит: ${CYAN}$(format_size_mb "$current_mb")${RESET}"
                 read -erp "Новый лимит (MB): " new_limit
-                if [[ "$new_limit" =~ ^[0-9]+$ ]]; then 
+                if [[ "$new_limit" =~ ^[0-9]+$ ]]; then
                     MAX_BACKUP_SIZE_MB="$new_limit"
                     save_config
                     if [[ "$new_limit" == "0" ]]; then
@@ -6568,193 +8574,102 @@ menu_settings() {
                     else
                         print_message "SUCCESS" "Установлен лимит: $(format_size_mb "$new_limit")"
                     fi
-                else 
+                else
                     print_message "ERROR" "Введите целое число (0 для отключения)"
                 fi ;;
-            
+
+            22) # Порог WARN заполнения диска
+                echo ""
+                echo -e "Текущий порог WARN: ${CYAN}${DISK_WARN_PERCENT}%${RESET}"
+                echo "При достижении этого процента — TG-уведомление, бэкап продолжается."
+                echo "Допустимо: 50–94 (должен быть меньше CRITICAL=${DISK_CRITICAL_PERCENT}%)"
+                read -erp "Новый порог WARN (%): " new_warn
+                if [[ "$new_warn" =~ ^[0-9]+$ ]] && [ "$new_warn" -ge 50 ] && [ "$new_warn" -lt "$DISK_CRITICAL_PERCENT" ]; then
+                    DISK_WARN_PERCENT="$new_warn"
+                    save_config
+                    print_message "SUCCESS" "Порог WARN установлен: ${DISK_WARN_PERCENT}%"
+                else
+                    print_message "ERROR" "Введите число 50–$((DISK_CRITICAL_PERCENT - 1))"
+                fi ;;
+
+            23) # Порог CRITICAL заполнения диска
+                echo ""
+                echo -e "Текущий порог CRITICAL: ${CYAN}${DISK_CRITICAL_PERCENT}%${RESET}"
+                echo "При достижении этого процента — бэкапы ОТМЕНЯЮТСЯ + TG-уведомление."
+                echo "Допустимо: $((DISK_WARN_PERCENT + 1))–99 (должен быть больше WARN=${DISK_WARN_PERCENT}%)"
+                read -erp "Новый порог CRITICAL (%): " new_crit
+                if [[ "$new_crit" =~ ^[0-9]+$ ]] && [ "$new_crit" -gt "$DISK_WARN_PERCENT" ] && [ "$new_crit" -le 99 ]; then
+                    DISK_CRITICAL_PERCENT="$new_crit"
+                    save_config
+                    print_message "SUCCESS" "Порог CRITICAL установлен: ${DISK_CRITICAL_PERCENT}%"
+                else
+                    print_message "ERROR" "Введите число $((DISK_WARN_PERCENT + 1))–99"
+                fi ;;
+
+            24) # Удаление локального бэкапа после успешной отправки
+                echo ""
+                echo -e "${RED}${BOLD}⚠️  ВНИМАНИЕ:${RESET} при включении этой опции локальный архив УДАЛЯЕТСЯ"
+                echo -e "после подтверждённой отправки. В случае ошибки отправки или сбоя сети"
+                echo -e "${RED}вы можете потерять единственную копию бэкапа.${RESET}"
+                echo ""
+                echo "Режимы:"
+                echo " 0. Выкл (безопасно, default)"
+                echo " 1. any         — удалить если хотя бы один канал (TG или remote) доставил"
+                echo " 2. all         — удалить только если ВСЕ настроенные каналы успешны"
+                echo " 3. remote_only — удалить если remote (S3/FTP/WebDAV) доставил, TG не учитывается"
+                echo ""
+                echo -e "Текущий режим: ${CYAN}${DELETE_LOCAL_AFTER_REMOTE_UPLOAD}${RESET}"
+                read -erp "Выбор (0/1/2/3): " del_mode
+                case "$del_mode" in
+                    0) DELETE_LOCAL_AFTER_REMOTE_UPLOAD="false"; save_config; print_message "SUCCESS" "Удаление отключено" ;;
+                    1)
+                        if [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]]; then
+                            print_message "WARN" "Remote выключен — режим any будет полагаться только на TG."
+                            print_message "WARN" "TG-канал ограничен 50 MB. Для больших бэкапов это РИСК потери данных."
+                            read -erp "Всё равно включить? (y/N): " confirm_any
+                            [[ ! "$confirm_any" =~ ^[Yy]$ ]] && { print_message "INFO" "Отменено"; continue; }
+                        fi
+                        DELETE_LOCAL_AFTER_REMOTE_UPLOAD="any"; save_config
+                        print_message "SUCCESS" "Режим any включён"
+                        ;;
+                    2)
+                        DELETE_LOCAL_AFTER_REMOTE_UPLOAD="all"; save_config
+                        print_message "SUCCESS" "Режим all включён (удаляет только когда все настроенные каналы успешны)"
+                        ;;
+                    3)
+                        if [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]]; then
+                            print_message "ERROR" "Сначала настройте удалённое хранилище (пункт 17) — режим remote_only без него не работает."
+                            continue
+                        fi
+                        DELETE_LOCAL_AFTER_REMOTE_UPLOAD="remote_only"; save_config
+                        print_message "SUCCESS" "Режим remote_only включён"
+                        ;;
+                    *) print_message "ERROR" "Введите 0, 1, 2 или 3" ;;
+                esac ;;
+
+            25) # Бэкап файлов логов
+                echo ""
+                echo "Бэкапить ли файлы логов (*.log, *.log.N, *.log-DATE.gz)?"
+                echo ""
+                echo -e "Текущий режим: ${CYAN}${BACKUP_LOG_FILES}${RESET}"
+                echo ""
+                echo " 1. Нет (исключать, экономит место)"
+                echo " 2. Да (включать в архив)"
+                echo " 3. Спросить при следующем ручном бэкапе"
+                echo ""
+                safe_read -erp "Выбор (1/2/3): " log_mode
+                case "$log_mode" in
+                    1) BACKUP_LOG_FILES="false"; save_config; print_message "SUCCESS" "Логи будут исключены из архива" ;;
+                    2) BACKUP_LOG_FILES="true";  save_config; print_message "SUCCESS" "Логи будут включены в архив" ;;
+                    3) BACKUP_LOG_FILES="ask";   save_config; print_message "SUCCESS" "Будет спрошено при следующем бэкапе" ;;
+                    *) print_message "ERROR" "Введите 1, 2 или 3" ;;
+                esac ;;
+
             0) return ;;
         esac
         [[ -n "$s" ]] && sleep 0.5
     done
 }
-
-# =============================================================================
-# МИГРАЦИЯ МЕЖДУ БОТАМИ (Bedolaga → RWP-Shop) — plugin entry
-# =============================================================================
-# Реальный код миграции вынесен в отдельный плагин: lazarus-migrator
-# Расположение: $LAZARUS_MIGRATOR_PATH (по умолчанию /opt/lazarus-backup/lazarus-migrator)
-#
-# Если плагин установлен — main script подхватывает его через source и все
-# функции migrate_*/migration_*/menu_migration становятся доступны как раньше.
-# Если плагина нет — определяется stub menu_migration() с инструкцией по установке.
-# Это позволяет держать main script компактным (~7300 строк vs 14k) и обновлять
-# логику миграции независимо.
-
-LAZARUS_MIGRATOR_PATH="${LAZARUS_MIGRATOR_PATH:-/opt/lazarus-backup/lazarus-migrator}"
-LAZARUS_MIGRATOR_LOADED=0
-
-# install_migrator: скачивает плагин миграции с GitHub, проверяет валидность,
-# сохраняет в $LAZARUS_MIGRATOR_PATH с правами 644. Использует те же зеркала,
-# что и check_for_updates (REMOTE_URLS) — берёт первое доступное.
-install_migrator() {
-    local target="$LAZARUS_MIGRATOR_PATH"
-    local target_dir; target_dir="$(dirname "$target")"
-    local cache_buster="?t=$(date +%s)"
-    local timeout=20
-
-    # Список зеркал для плагина (соответствует REMOTE_URLS, но для lazarus-migrator)
-    local mirrors=(
-        "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator"
-        "https://raw.githack.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator"
-        "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@main/lazarus-migrator"
-    )
-
-    clear_screen
-    echo -e "${CYAN}${BOLD}Установка плагина миграции (lazarus-migrator)${RESET}"
-    echo ""
-
-    # Проверка прав записи
-    if [[ ! -d "$target_dir" ]]; then
-        if ! mkdir -p "$target_dir" 2> "$SILENT_LOG"; then
-            print_message "ERROR" "Не удалось создать каталог: $target_dir"
-            return 1
-        fi
-    fi
-    if [[ ! -w "$target_dir" ]]; then
-        print_message "ERROR" "Нет прав записи в $target_dir (запустите от root)."
-        return 1
-    fi
-
-    # Проверка наличия curl/wget
-    local fetcher=""
-    if command -v curl > "$SILENT_LOG" 2>&1; then
-        fetcher="curl"
-    elif command -v wget > "$SILENT_LOG" 2>&1; then
-        fetcher="wget"
-    else
-        print_message "ERROR" "Нет curl или wget — установка невозможна."
-        return 1
-    fi
-
-    local tmp; tmp=$(mktemp 2> "$SILENT_LOG") || {
-        print_message "ERROR" "Не удалось создать временный файл."
-        return 1
-    }
-    # shellcheck disable=SC2064
-    trap "rm -f '$tmp'" RETURN
-
-    local downloaded=0
-    local source_url=""
-    for url in "${mirrors[@]}"; do
-        local fetch_url="${url}${cache_buster}"
-        echo -e "${GRAY}Загружаю: ${url}...${RESET}"
-        : > "$tmp"
-        if [[ "$fetcher" == "curl" ]]; then
-            curl $CURL_SILENT -L --connect-timeout "$timeout" --max-time 60 -o "$tmp" "$fetch_url" 2> "$SILENT_LOG" || true
-        else
-            wget $WGET_SILENT -O "$tmp" --timeout="$timeout" "$fetch_url" 2> "$SILENT_LOG" || true
-        fi
-
-        # Валидация: shebang + plugin guard + версия
-        if [[ -s "$tmp" ]] \
-            && head -1 "$tmp" | grep -q '^#!/bin/bash' \
-            && grep -q 'LAZARUS_MIGRATOR_VERSION=' "$tmp" \
-            && grep -q 'BASH_SOURCE\[0\]' "$tmp"; then
-            downloaded=1
-            source_url="$url"
-            echo -e "${GREEN}  ✓ OK${RESET}"
-            break
-        fi
-        echo -e "${YELLOW}  ✗ Невалидный или недоступен${RESET}"
-    done
-
-    if [[ "$downloaded" != "1" ]]; then
-        print_message "ERROR" "Не удалось скачать плагин ни с одного зеркала."
-        return 1
-    fi
-
-    # Синтакс-проверка перед установкой
-    if ! bash -n "$tmp" 2> "$SILENT_LOG"; then
-        print_message "ERROR" "Скачанный плагин не прошёл проверку синтаксиса (bash -n)."
-        return 1
-    fi
-
-    # Извлекаем версию плагина для отчёта
-    local plugin_version
-    plugin_version=$(grep '^LAZARUS_MIGRATOR_VERSION=' "$tmp" | head -1 | cut -d'"' -f2)
-    [[ -z "$plugin_version" ]] && plugin_version="(unknown)"
-
-    # Атомарная установка
-    if ! install -m 0644 "$tmp" "$target" 2> "$SILENT_LOG"; then
-        # fallback на cp+chmod если install отсутствует
-        cp "$tmp" "$target" 2> "$SILENT_LOG" || {
-            print_message "ERROR" "Не удалось записать плагин в $target."
-            return 1
-        }
-        chmod 0644 "$target" 2> "$SILENT_LOG" || true
-    fi
-
-    echo ""
-    print_message "OK" "Плагин установлен: $target"
-    echo -e "  Версия: ${GREEN}${plugin_version}${RESET}"
-    echo -e "  Источник: ${GRAY}${source_url}${RESET}"
-    echo ""
-    echo -e "${CYAN}Перезапустите ${SCRIPT_NAME}, чтобы плагин загрузился.${RESET}"
-    return 0
-}
-
-if [[ -f "$LAZARUS_MIGRATOR_PATH" && -r "$LAZARUS_MIGRATOR_PATH" ]]; then
-    # shellcheck source=/dev/null
-    if source "$LAZARUS_MIGRATOR_PATH" 2> "$SILENT_LOG"; then
-        LAZARUS_MIGRATOR_LOADED=1
-        debug_log "PLUGIN" "Bedolaga migrator loaded from: $LAZARUS_MIGRATOR_PATH"
-    else
-        debug_log "PLUGIN" "Failed to source migrator: $LAZARUS_MIGRATOR_PATH"
-    fi
-else
-    debug_log "PLUGIN" "Migrator plugin not installed (expected at: $LAZARUS_MIGRATOR_PATH)"
-fi
-
-# Stub: показывается если плагин не установлен. Перекрывается реальной menu_migration
-# из плагина при наличии (определения функций в bash работают по принципу last-wins,
-# поэтому source ВЫШЕ перекрывает этот stub если плагин загружен).
-if [[ "$LAZARUS_MIGRATOR_LOADED" != "1" ]]; then
-    menu_migration() {
-        clear_screen
-        echo ""
-        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
-        echo -e "${MAGENTA}${BOLD}    🔄  МИГРАЦИЯ Bedolaga → RWP-Shop (требуется плагин)           ${RESET}"
-        echo -e "${MAGENTA}${BOLD}═══════════════════════════════════════════════════════════════════${RESET}"
-        echo ""
-        echo -e "${YELLOW}⚠  Плагин миграции не установлен.${RESET}"
-        echo ""
-        echo "Это дополнительный модуль для переноса данных из Bedolaga в RWP-Shop."
-        echo "Он не нужен для обычной работы с бэкапами и обновлением бота."
-        echo ""
-        echo -e "${CYAN}Установка:${RESET}"
-        echo ""
-        echo -e "  ${BOLD}Вариант 1${RESET} (рекомендуется):"
-        echo "    lazarus install-migrator"
-        echo ""
-        echo -e "  ${BOLD}Вариант 2${RESET} (вручную):"
-        echo "    curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-migrator \\"
-        echo "      -o $LAZARUS_MIGRATOR_PATH && chmod 644 $LAZARUS_MIGRATOR_PATH"
-        echo ""
-        local _ans=""
-        read -erp "Установить плагин сейчас? [y/N]: " _ans
-        if [[ "$_ans" =~ ^[YyДд]$ ]]; then
-            install_migrator
-        fi
-        echo ""
-        read -erp "Нажмите Enter для возврата в главное меню..." _dummy
-        return 0
-    }
-
-    menu_migrate_settings() {
-        print_message "WARN" "Плагин миграции не установлен. См. пункт 7 главного меню."
-        return 1
-    }
-fi
 
 cleanup_old_backups() {
     clear_screen; echo -e "${RED}Очистка старых бэкапов${RESET}"
@@ -6979,7 +8894,10 @@ set -- "${_NEWARGS[@]}"
 # Debug mode banner
     if [[ "$DEBUG_MODE" == true ]]; then
         SILENT_LOG="/dev/stderr"
-        CURL_SILENT="-v"
+        # SECURITY: НЕ ставим curl -v — он печатает `> POST /bot<TOKEN>/...` в stderr,
+        # и BOT_TOKEN утекает в логи / pastebins при ловле бага. debug_log даёт
+        # достаточно инфы через bash-side трассировку (URL без токена).
+        CURL_SILENT="-s"
         WGET_SILENT=""
         echo -e "${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════════╗${RESET}"
         echo -e "${MAGENTA}${BOLD}║                    DEBUG MODE ENABLED                          ║${RESET}"
@@ -7078,14 +8996,16 @@ set -- "${_NEWARGS[@]}"
     fi
 
 case "$1" in
-    backup_full) create_backup "full" ;;
-    backup_db)   create_backup "db_only" ;;
-    backup_files) create_backup "files_only" ;;
+    # Legacy команды (для совместимости с cron — обычно non-interactive)
+    # Sentinel-check: создаём marker если есть v1 backup'ы (для следующего interactive run).
+    backup_full)  create_backup "full";       _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+    backup_db)    create_backup "db_only";    _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+    backup_files) create_backup "files_only"; _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
     backup|-B)
         case "$2" in
-            create|full|-c)     create_backup "full" ;;
-            db|-d)              create_backup "db_only" ;;
-            files|-f)           create_backup "files_only" ;;
+            create|full|-c)     create_backup "full";       [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+            db|-d)              create_backup "db_only";    [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+            files|-f)           create_backup "files_only"; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
             list|-l)            menu_list_backups ;;
             *)
                 echo "Использование: lazarus backup <команда>"
@@ -7109,9 +9029,65 @@ case "$1" in
     cleanup|cleanup_old_backups)
         cleanup_old_backups ;;
     restore) menu_restore ;;
-    check_update) check_for_updates ;;
-    install-migrator) install_migrator ;;
+    check_update|update|self-update) check_for_updates ;;
+    skipped|skip-list) show_skipped_report ;;
     upgrade) auto_update_bot "$2" ;;
+    migrate-v2|migrate_v2)
+        # Конверсия v1 (Salted__) backup'ов в v2 (LAZ2 + HMAC).
+        # Безопасно — оригинал удаляется только после успешной верификации v2.
+        # Глобальный --yes (AUTO_CONFIRM=true) пропускает prompt — для cron / ssh non-tty.
+        [[ "$AUTO_CONFIRM" == "true" ]] && _MIGRATE_AUTO_YES="true"
+        migrate_v1_backups
+        exit $?
+        ;;
+    help|--help|-h)
+        echo "LAZARUS Backup Manager v${VERSION}"
+        echo ""
+        echo "Использование: lazarus [global flags] <команда> [аргументы]"
+        echo ""
+        echo "Глобальные флаги:"
+        echo "  --yes, -y                   Автоподтверждение (для cron)"
+        echo "  --dry-run, -n               Предпросмотр без выполнения"
+        echo "  --debug, -d                 Подробное логирование"
+        echo "  --report-tg                 Отправить отчёт в Telegram"
+        echo "  --i-know-what-i-am-doing    Разрешить деструктивные операции"
+        echo "  --restore-include-env       Восстановить .env из бэкапа"
+        echo "  --restore-drop-volume       Удалить Docker volume БД при restore"
+        echo "  --restore-drop-schema       Выполнить DROP SCHEMA перед импортом"
+        echo ""
+        echo "Бэкап (см. lazarus backup --help для деталей):"
+        echo "  backup create | -B -c       Полный бэкап (БД + файлы)"
+        echo "  backup db     | -B -d       Только БД"
+        echo "  backup files  | -B -f       Только файлы"
+        echo "  backup list   | -B -l       Список бэкапов"
+        echo ""
+        echo "Управление ботом (см. lazarus bot --help):"
+        echo "  bot status    | -b -s       Статус контейнера"
+        echo "  bot up                      Запустить контейнеры бота"
+        echo "  bot down                    Остановить контейнеры бота"
+        echo "  bot upgrade   | -b -u [KEY] Обновить бота (опц. LICENSE_KEY)"
+        echo ""
+        echo "S3 хранилище (см. lazarus s3 --help):"
+        echo "  s3 test       | -S -t       Проверить подключение"
+        echo "  s3 list       | -S -l       Список файлов в bucket"
+        echo "  s3 upload <file> | -S -u    Загрузить файл"
+        echo ""
+        echo "Восстановление и обслуживание:"
+        echo "  restore                     Меню восстановления"
+        echo "  cleanup                     Удалить старые бэкапы по ротации"
+        echo "  skipped                     Просмотр пропущенных файлов последнего бэкапа"
+        echo "  migrate-v2                  Конвертировать старые v1 backup'ы в v2 (с HMAC)"
+        echo ""
+        echo "Скрипт:"
+        echo "  update | check_update       Проверить обновления самого скрипта"
+        echo ""
+        echo "Примеры:"
+        echo "  lazarus                              # интерактивное меню"
+        echo "  lazarus --yes backup db              # cron-режим: бэкап БД"
+        echo "  lazarus --debug backup create        # с подробным логом"
+        echo "  lazarus bot upgrade abc123...64hex   # обновить бота с ключом"
+        echo "  lazarus --dry-run cleanup            # предпросмотр очистки"
+        ;;
     bot|-b)
         case "$2" in
             up)                 bot_up ;;
@@ -7119,21 +9095,29 @@ case "$1" in
             status|-s)          bot_status ;;
             upgrade|update|-u)  auto_update_bot "$3" ;;
             *)
-                echo "Использование: lazarus bot <команда>"
-                echo "           или: lazarus -b <команда>"
+                echo "Использование: lazarus bot <команда> [LICENSE_KEY]"
+                echo "           или: lazarus -b <команда> [LICENSE_KEY]"
                 echo ""
                 echo "Команды:"
-                echo "  up              - Запустить бота (если не запущен)"
-                echo "  down            - Остановить бота"
+                echo "  up              - Запустить контейнеры бота (если не запущены)"
+                echo "  down            - Остановить контейнеры бота"
                 echo "  status,  -s     - Статус контейнера, версия, healthcheck"
                 echo "  upgrade, -u     - Обновить бота до последней версии"
                 echo "  update          - Алиас для upgrade"
                 echo ""
+                echo "LICENSE_KEY (опционально для upgrade) — 64 hex символа от @rwp_shop_bot"
+                echo "Если не указан и не задан в .env — будет запрошен интерактивно."
+                echo ""
                 echo "Примеры:"
-                echo "  lazarus bot status"
-                echo "  lazarus bot upgrade"
+                echo "  lazarus bot status                       # текущая версия + healthcheck"
+                echo "  lazarus bot upgrade                      # обновить без ключа (если есть)"
+                echo "  lazarus bot upgrade abc...64hex          # обновить с переданным ключом"
                 echo "  lazarus -b -s"
-                echo "  lazarus -b -u"
+                echo "  lazarus -b -u                            # короткая форма upgrade"
+                echo "  lazarus -b -u abc...64hex"
+                echo ""
+                echo "Замечание: для обновления бота используется паттерн docker compose down → up -d"
+                echo "(не restart) — это безопасный путь для bot+db связки."
                 ;;
         esac
         ;;
@@ -7146,15 +9130,23 @@ case "$1" in
                     exit 1
                 fi
                 echo "Проверка подключения к S3..."
+                echo "  Endpoint: ${S3_ENDPOINT:-default}"
+                echo "  Region:   ${S3_REGION:-us-east-1}"
+                echo "  Bucket:   ${S3_BUCKET}"
+                echo ""
                 _s3_test_opts=()
                 [[ -n "$S3_ENDPOINT" ]] && _s3_test_opts+=(--endpoint-url "$S3_ENDPOINT")
                 [[ -n "$S3_REGION" ]] && _s3_test_opts+=(--region "$S3_REGION")
-                if _s3_aws_run s3 ls "s3://${S3_BUCKET}/" "${_s3_test_opts[@]}" --max-items 1 > /dev/null 2>&1; then
+                # Не глушим stderr — пользователь должен видеть реальную причину при fail.
+                # Stdout (список файлов) глушим — нам нужен только rc.
+                _s3_test_err=$(_s3_aws_run s3api head-bucket --bucket "$S3_BUCKET" "${_s3_test_opts[@]}" 2>&1 >/dev/null)
+                if [[ $? -eq 0 ]]; then
                     echo -e "${GREEN}✓${RESET} Подключение успешно!"
-                    echo "  Bucket: $S3_BUCKET"
                     [[ -n "$S3_PATH" ]] && echo "  Path: $S3_PATH"
                 else
-                    echo -e "${RED}✗${RESET} Ошибка подключения!"
+                    echo -e "${RED}✗${RESET} Ошибка подключения:"
+                    # Первые 5 строк stderr — обычно достаточно для диагностики.
+                    echo "$_s3_test_err" | head -5 | sed 's/^/    /'
                 fi
                 ;;
             list|-l)
@@ -7186,8 +9178,15 @@ case "$1" in
                     echo -e "${RED}Файл не найден: $_s3_file_to_upload${RESET}"
                     exit 1
                 fi
-                SEND_TO_REMOTE="true"
-                upload_to_remote "$_s3_file_to_upload"
+                # NB: subshell-обёртка — иначе SEND_TO_REMOTE="true" утечёт за пределы команды
+                # и любой случайный save_config (например из других веток) запишет в .env
+                # "true", даже если пользователь намеренно отключил автоматический upload.
+                # Override локален к subshell, exit code пробрасывается через $?.
+                (
+                    SEND_TO_REMOTE="true"
+                    upload_to_remote "$_s3_file_to_upload"
+                )
+                exit $?
                 ;;
             *)
                 echo "Использование: lazarus s3 <команда>"
@@ -7308,8 +9307,18 @@ case "$1" in
             # Уведомление о доступном обновлении скрипта
             if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
                 echo -e "${CYAN}${BOLD}🆕 Доступно обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION}${RESET}"
-                echo -e "${GRAY}   Выберите пункт 8 для обновления${RESET}"
+                echo -e "${GRAY}   Выберите пункт 7 для обновления${RESET}"
                 echo ""
+            fi
+
+            # Уведомление о pending v1→v2 миграции (sentinel создан cron-режимом)
+            if [[ -f "$INSTALL_DIR/.v2_migration_pending" ]]; then
+                _V2_PENDING_COUNT=$(cat "$INSTALL_DIR/.v2_migration_pending" 2>/dev/null | head -1)
+                if [[ "$_V2_PENDING_COUNT" =~ ^[0-9]+$ && "$_V2_PENDING_COUNT" -gt 0 ]]; then
+                    echo -e "${YELLOW}${BOLD}🔐 Найдено ${_V2_PENDING_COUNT} backup'ов в формате v1 (без HMAC integrity)${RESET}"
+                    echo -e "${GRAY}   Команда: ${CYAN}lazarus migrate-v2${GRAY} — конвертация в v2 (с HMAC)${RESET}"
+                    echo ""
+                fi
             fi
             
             # Статистика бэкапов
@@ -7351,23 +9360,22 @@ case "$1" in
             fi
             echo " 5. Удалить старые бэкапы $CLEANUP_LABEL"
             echo -e " 6. ${CYAN}Обновить бота${RESET}"
-            echo -e " 7. ${MAGENTA}Миграция между ботами${RESET}"
             echo ""
-            
+
             # Подсветка пункта обновления если доступно
             if [[ -n "$UPDATE_AVAILABLE" ]]; then
-                echo -e " ${CYAN}${BOLD}8. Проверить обновления скрипта [NEW!]${RESET}"
+                echo -e " ${CYAN}${BOLD}7. Проверить обновления скрипта [NEW!]${RESET}"
             else
-                echo -e " 8. Проверить обновления скрипта"
+                echo -e " 7. Проверить обновления скрипта"
             fi
             echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
             echo " 0. Выход"
             echo ""
-            read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
+            safe_read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
             case $opt in
-                1) menu_manual_backup ;; 2) menu_automation ;; 3) menu_restore ;; 
-                4) menu_settings ;; 5) cleanup_old_backups ;; 6) update_bot ;; 
-                7) menu_migration ;; 8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
+                1) menu_manual_backup ;; 2) menu_automation ;; 3) menu_restore ;;
+                4) menu_settings ;; 5) cleanup_old_backups ;; 6) update_bot ;;
+                7|8) check_for_updates ;; 666) uninstall_script ;; 0) exit 0 ;;
             esac
         done
         ;;

@@ -8,9 +8,6 @@ config.env
 !.github/workflows/
 !.github/tests/
 
-# Migrator development (will be merged into lazarus-backup later)
-lazarus-migrator/
-
 # Development notes (local only)
 TODO.md
 
@@ -31,3 +28,5 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+DEBUG_FILES
+decrypt_test.sh
