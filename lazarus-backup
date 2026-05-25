@@ -6954,6 +6954,18 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
     # которые бот пишет/удаляет в собственной директории (race). Запишем в log_message.
     local _tar_rc=0 _tar_err
     _tar_err=$(mktemp 2> "$SILENT_LOG") || _tar_err="/tmp/lazarus_tar_err.$$"
+
+    # Progress-индикатор: tar --checkpoint=N печатает точку каждые N records
+    # (1 record = 512 байт, checkpoint=2000 ≈ 1 MB). Активен только в interactive
+    # режиме И не в debug (там и так много вывода). Cron / non-tty — без точек,
+    # чтобы log не загромождать.
+    local _tar_progress=()
+    if [[ "$IS_INTERACTIVE" == "true" && "$DEBUG_MODE" != "true" ]]; then
+        # `--checkpoint-action=dot` → "." в stdout каждые `--checkpoint=N` records.
+        # `--checkpoint-action=ttyout='...'` для красивых индикаторов недоступен на
+        # старых GNU tar, поэтому используем простые точки + новая строка после.
+        _tar_progress=(--checkpoint=2000 --checkpoint-action=dot)
+    fi
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="lazarus_db_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         debug_log "TAR" "Creating DB archive: $FILE_FINAL"
@@ -6967,12 +6979,14 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
         FILE_FINAL="lazarus_files_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         local FILE_DIR="bot_files_${TIMESTAMP}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
+        [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
         debug_log "TAR" "Creating files archive: $FILE_FINAL"
         debug_log "TAR" "Running: tar -czf $BACKUP_DIR/$FILE_DIR ${EXCLUDE_FLAGS[*]} -C $(dirname "$BOT_PATH") $(basename "$BOT_PATH")"
         # Сначала архивируем файлы бота с исключениями
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files" \
-            tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
+            tar -czf "$BACKUP_DIR/$FILE_DIR" "${_tar_progress[@]}" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
+        [[ ${#_tar_progress[@]} -gt 0 ]] && echo "]${RESET}"
         # NB: rc=1 = warning «файл изменился во время чтения» — архив OK,
         # combine можно делать (то же что и в `full` ниже).
         [[ $_tar_rc -le 1 ]] && {
@@ -6987,10 +7001,12 @@ $(tg_emoji "💡" "$EMO_INFO") \`lazarus cleanup\` — удалить стары
     else
         FILE_FINAL="lazarus_full_${TIMESTAMP}${VER_SUFFIX}.tar.gz"
         print_message "INFO" "Архивация файлов (это может занять время)..."
+        [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
         debug_log "TAR" "Creating full archive: $FILE_FINAL"
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full" \
-            tar -czf "$BACKUP_DIR/$FILE_DIR" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
+            tar -czf "$BACKUP_DIR/$FILE_DIR" "${_tar_progress[@]}" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
+        [[ ${#_tar_progress[@]} -gt 0 ]] && echo "]${RESET}"
         # rc=1 = warning (файл изменился во время чтения), archive валиден → combine OK.
         [[ $_tar_rc -le 1 ]] && {
             local _first_rc=$_tar_rc
@@ -7278,30 +7294,59 @@ $(tg_emoji "💡" "$EMO_INFO") Причина: $(escape_markdown_v2 "$_delete_re
 select_backup_file() {
     local FILTER_PREFIX="$1"; local TITLE="$2"
     local show_limit=5; local show_filenames=false
+    # Фильтр по дате: пусто = все файлы, иначе паттерн вида "DD.MM" или "DD.MM.YYYY"
+    # Нормализуется в "YYYY-MM-DD" или частичный "MM-DD" для regex по имени файла.
+    local date_filter=""        # raw input (для отображения)
+    local date_pattern=""       # regex pattern для grep по имени
 
     while true; do
         local files_raw=("$BACKUP_DIR/${FILTER_PREFIX}_"*.tar.gz*)
-        local valid_files=()
+        local all_valid=()
         for f in "${files_raw[@]}"; do
-            if [[ ! -e "$f" ]]; then continue; fi 
+            if [[ ! -e "$f" ]]; then continue; fi
             if [[ "$f" == *".version" ]]; then continue; fi
             if [[ ! "$f" =~ \.tar\.gz(\.enc)?$ ]]; then continue; fi
-            valid_files+=("$f")
+            all_valid+=("$f")
         done
-        
+
+        local valid_files=()
+        if [[ -n "$date_pattern" ]]; then
+            # Применяем фильтр: имя файла содержит подстроку YYYY-MM-DD или *_MM-DD
+            for f in "${all_valid[@]}"; do
+                if [[ "$(basename "$f")" =~ $date_pattern ]]; then
+                    valid_files+=("$f")
+                fi
+            done
+        else
+            valid_files=("${all_valid[@]}")
+        fi
+
         local total_count=${#valid_files[@]}
-        
+        local total_all=${#all_valid[@]}
+
         if [[ "$total_count" -eq 0 ]]; then
+            if [[ -n "$date_filter" ]]; then
+                # При активном фильтре — не выходим, сбрасываем фильтр.
+                print_message "WARN" "За дату '$date_filter' файлов не найдено (всего $total_all)."
+                read -erp "Enter — сбросить фильтр..." dummy
+                date_filter=""; date_pattern=""
+                continue
+            fi
             print_message "WARN" "Файлов типа '${TITLE}' не найдено."; read -erp "Enter..." dummy; return 1
         fi
-        
+
         IFS=$'\n' sorted_backups=($(sort -r <<<"${valid_files[*]}"))
         unset IFS
         
         local CURRENT_VER=$(get_raw_bot_version)
 
         clear_screen; echo -e "${GREEN}Восстановление: ${BOLD}${TITLE}${RESET}"
-        echo -e "Всего файлов: ${CYAN}${total_count}${RESET}"; echo ""
+        if [[ -n "$date_filter" ]]; then
+            echo -e "Найдено: ${CYAN}${total_count}${RESET} из ${GRAY}${total_all}${RESET} (фильтр: ${YELLOW}${date_filter}${RESET})"
+        else
+            echo -e "Всего файлов: ${CYAN}${total_count}${RESET}"
+        fi
+        echo ""
 
         local loop_limit=$show_limit
         if [[ $loop_limit -gt $total_count ]]; then loop_limit=$total_count; fi
@@ -7368,20 +7413,63 @@ select_backup_file() {
         fi
 
         if [[ "$show_filenames" == "false" ]]; then
-            echo -e " 999. Показать имена файлов"; 
+            echo -e " 999. Показать имена файлов";
         else
-            echo -e " 999. Показать дату и размер"; 
+            echo -e " 999. Показать дату и размер";
+        fi
+        # Date filter (показываем только если файлов > 5 — иначе бесполезно)
+        if [[ $total_all -gt 5 ]]; then
+            if [[ -n "$date_filter" ]]; then
+                echo -e " 777. Сбросить фильтр даты (${YELLOW}${date_filter}${RESET})"
+            else
+                echo -e " 777. Фильтр по дате (например: 25.12 или 25.12.2026)"
+            fi
         fi
         echo " 0. Назад"; echo ""
         read -erp "Номер файла или команда (Enter - Назад): " choice
-        
+
         if [[ -z "$choice" || "$choice" == "0" ]]; then return 1
-        elif [[ "$choice" == "888" ]]; then 
+        elif [[ "$choice" == "888" ]]; then
             if [[ $loop_limit -lt $total_count ]]; then loop_limit=$total_count; else loop_limit=5; fi
             show_limit=$loop_limit
             continue
-        elif [[ "$choice" == "999" ]]; then 
+        elif [[ "$choice" == "999" ]]; then
             if [[ "$show_filenames" == "false" ]]; then show_filenames=true; else show_filenames=false; fi
+            continue
+        elif [[ "$choice" == "777" ]]; then
+            if [[ -n "$date_filter" ]]; then
+                date_filter=""; date_pattern=""
+                continue
+            fi
+            echo ""
+            echo -e "${GRAY}Форматы:${RESET}"
+            echo -e "  ${CYAN}25.12${RESET}        — все файлы за 25 декабря (любой год)"
+            echo -e "  ${CYAN}25.12.2026${RESET}   — конкретная дата"
+            echo -e "  ${CYAN}25/12${RESET}        — синоним 25.12 (slash)"
+            echo -e "  ${CYAN}2026-12-25${RESET}   — ISO формат"
+            read -erp "Дата (Enter — отмена): " date_input
+            [[ -z "$date_input" ]] && continue
+
+            # Нормализация → паттерн поиска по имени файла
+            # Имя файла формата: lazarus_db_YYYY-MM-DD_HH_MM_SS__vX.Y.Z.tar.gz[.enc]
+            local _df_re=""
+            if [[ "$date_input" =~ ^([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+                # ISO: 2026-12-25 → точное совпадение
+                _df_re=$(printf "%04d-%02d-%02d" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+            elif [[ "$date_input" =~ ^([0-9]{1,2})[\./]([0-9]{1,2})\.([0-9]{4})$ ]]; then
+                # 25.12.2026 → 2026-12-25
+                _df_re=$(printf "%04d-%02d-%02d" "${BASH_REMATCH[3]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}")
+            elif [[ "$date_input" =~ ^([0-9]{1,2})[\./]([0-9]{1,2})$ ]]; then
+                # 25.12 → любой год: regex '[0-9]{4}-12-25'
+                _df_re=$(printf "[0-9]{4}-%02d-%02d" "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}")
+            else
+                print_message "ERROR" "Неверный формат даты: '$date_input'"
+                sleep 1.5
+                continue
+            fi
+            date_filter="$date_input"
+            date_pattern="$_df_re"
+            debug_log "RESTORE" "Date filter: input='$date_input' pattern='$_df_re'"
             continue
         elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$total_count" ]]; then SELECTED_FILE="${sorted_backups[$((choice-1))]}"; return 0
         else print_message "ERROR" "Неверный выбор."; sleep 1; fi
