@@ -25,5 +25,6 @@ run_test "s3 helpers"            "$ROOT_DIR/.github/tests/test_s3_helpers.sh"
 run_test "timeout helpers"       "$ROOT_DIR/.github/tests/test_timeout_helpers.sh"
 run_test "exclude_dirs split"    "$ROOT_DIR/.github/tests/test_exclude_dirs_split.sh"
 run_test "skipped print0"        "$ROOT_DIR/.github/tests/test_skipped_print0.sh"
+run_test "telegram alert"        "$ROOT_DIR/.github/tests/test_telegram_alert.sh"
 
 echo "All tests passed"
