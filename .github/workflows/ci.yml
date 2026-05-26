@@ -30,7 +30,7 @@ jobs:
           which python3 timeout gzip find tr
           uname -a
       - name: Install test deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq openssl coreutils python3 gzip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq openssl coreutils python3 gzip zstd
       # Каждый тест отдельным step — увидим в Job Summary какой именно упал.
       - name: test_restore_safety
         run: bash .github/tests/test_restore_safety.sh
@@ -52,3 +52,5 @@ jobs:
         run: bash .github/tests/test_skipped_print0.sh
       - name: test_telegram_alert
         run: bash .github/tests/test_telegram_alert.sh
+      - name: test_compression_helpers
+        run: bash .github/tests/test_compression_helpers.sh
