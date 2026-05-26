@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.4.0"
+VERSION="5.5.0"
 # SCRIPT_NAME — имя файла внутри INSTALL_DIR, совпадает с именем в репо.
 # Раньше было "lazarus" (расхождение с именем в Git), теперь "lazarus-backup".
 # install_script автоматически мигрирует старые установки.
@@ -769,7 +769,7 @@ _manifest_generate() {
 
 # Compare current manifest vs base manifest → output list of CHANGED files.
 # Changed = (new file) OR (size differs) OR (mtime > base.mtime).
-# Args: $1 = base_manifest, $2 = current_manifest, $3 = out_file (list of paths)
+# Args: $1 = base_manifest, $2 = current_manifest, $3 = out_changes (list of paths to backup)
 _manifest_diff() {
     local _base="$1"
     local _curr="$2"
@@ -799,6 +799,245 @@ _manifest_diff() {
             }
         }
     ' "$_base" "$_curr" > "$_out"
+}
+
+# Compare base vs current — найти DELETED files (были в base, нет в current).
+# Args: $1 = base_manifest, $2 = current_manifest, $3 = out_file (list of deleted paths)
+_manifest_deletions() {
+    local _base="$1"
+    local _curr="$2"
+    local _out="$3"
+
+    # awk: load curr entries в hash, iterate base, emit those absent from curr.
+    awk -F'\t' '
+        FNR==NR {
+            if ($1 ~ /^#/) next
+            if ($1 == "") next
+            curr[$1] = 1
+            next
+        }
+        {
+            if ($1 ~ /^#/) next
+            if ($1 == "") next
+            if (!($1 in curr)) print $1
+        }
+    ' "$_curr" "$_base" > "$_out"
+}
+
+# =============================================================================
+# _find_base_for_inc: по имени incremental-backup'а найти соответствующий full.
+# =============================================================================
+# Парсит base_ts из имени `lazarus_inc_<ts>__base_<base_ts>__vX.tar.*`,
+# затем ищет в $BACKUP_DIR файл `lazarus_full_<base_ts>__*.tar.*[.enc]`.
+# Stdout: полный путь к base full, либо empty если не найден.
+_find_base_for_inc() {
+    local _inc_path="$1"
+    local _inc_name
+    _inc_name=$(basename "$_inc_path")
+    # Парсим base_ts: между "__base_" и (либо "__v" version-suffix, либо ".tar.")
+    # NB: regex [0-9_-]+ greedy и захватывает trailing `__`, поэтому используем
+    # 2 паттерна (with / without version-suffix) и strip trailing _ если остался.
+    local _base_ts=""
+    if [[ "$_inc_name" =~ __base_([0-9_-]+)__v ]]; then
+        _base_ts="${BASH_REMATCH[1]}"
+    elif [[ "$_inc_name" =~ __base_([0-9_-]+)\.tar\. ]]; then
+        _base_ts="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+    # Strip trailing underscores на всякий случай
+    _base_ts="${_base_ts%%_}"; _base_ts="${_base_ts%%_}"
+    # Ищем full с этим timestamp
+    local _candidate
+    for _candidate in "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.gz \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.gz.enc \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.zst \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.zst.enc \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.gz \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.gz.enc \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.zst \
+                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.zst.enc; do
+        if [[ -f "$_candidate" ]]; then
+            echo "$_candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# =============================================================================
+# _resolve_incremental_chain: разрешает inc backup в merged content.
+# =============================================================================
+# Шаги:
+#   1. Найти base full (через _find_base_for_inc)
+#   2. Decrypt + extract base full → $stage_dir/base/
+#   3. Decrypt + extract inc → $stage_dir/inc/
+#   4. Merge:
+#      - bot_version.txt: использовать из inc (newer)
+#      - manifest.txt:    использовать из inc
+#      - db_*.sql.*:      ТОЛЬКО из inc (fresh, base'овский игнорируем)
+#      - bot_files inner archive:
+#          a. Extract base inner archive (bot_dir/*) в $stage_dir/files/
+#          b. Extract inc inner archive (только changed files) поверх — overwrite
+#          c. Apply manifest_deletions.txt — удалить файлы из base которые были deleted в inc
+#   5. Re-archive merged content → $stage_dir/merged.tar.{gz|zst} для нормального restore
+#
+# Args:
+#   $1 — inc_path (полный путь к incremental .enc)
+#   $2 — stage_dir (mktemp -d куда положить промежуточные + merged.tar.*)
+#   $3 — password (для decrypt)
+# Stdout: путь к merged.tar.{gz|zst} файлу (для последующей передачи в restore).
+# NB: все info/error сообщения уходят в stderr — stdout зарезервирован под path.
+# Return: 0 OK, 1 fail.
+# =============================================================================
+_resolve_incremental_chain() {
+    local _inc_path="$1"
+    local _stage="$2"
+    local _password="$3"
+
+    [[ ! -d "$_stage" ]] && { print_message "ERROR" "stage_dir не существует: $_stage" >&2; return 1; }
+
+    # Step 1: find base
+    local _base_path
+    _base_path=$(_find_base_for_inc "$_inc_path")
+    if [[ -z "$_base_path" ]]; then
+        local _inc_name; _inc_name=$(basename "$_inc_path")
+        local _base_ts=""
+        [[ "$_inc_name" =~ __base_([0-9_-]+)__v ]] && _base_ts="${BASH_REMATCH[1]}"
+        print_message "ERROR" "Base full '$_base_ts' не найден — incremental orphaned, restore невозможен" >&2
+        log_message "ERROR" "Restore-chain: base full for $_inc_name not found"
+        return 1
+    fi
+    print_message "INFO" "Restore-chain: base = $(basename "$_base_path")" >&2
+    print_message "INFO" "Restore-chain: inc  = $(basename "$_inc_path")" >&2
+
+    # Step 2: decrypt + extract base full
+    mkdir -p "$_stage/base"
+    local _base_tar="$_stage/base.tar"
+    if [[ "$_base_path" == *".enc" ]]; then
+        if [[ -z "$_password" ]]; then
+            print_message "ERROR" "Base full зашифрован — нужен BACKUP_PASSWORD" >&2
+            return 1
+        fi
+        if ! _hmac_envelope_decrypt "$_base_path" "$_base_tar" "$_password" 2> "$SILENT_LOG"; then
+            print_message "ERROR" "Не удалось decrypt base full" >&2
+            return 1
+        fi
+    else
+        cp "$_base_path" "$_base_tar"
+    fi
+    local _base_fmt _base_tar_args
+    _base_fmt=$(_compress_detect_format "$_base_tar")
+    _base_tar_args=$(_tar_extract_args_for "$_base_fmt")
+    if ! tar $_base_tar_args -xf "$_base_tar" -C "$_stage/base" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Extract base full failed" >&2
+        rm -f "$_base_tar"; return 1
+    fi
+    rm -f "$_base_tar"
+    debug_log "RESTORE-CHAIN" "Base extracted: $(ls "$_stage/base" | tr '\n' ' ')"
+
+    # Step 3: decrypt + extract inc
+    mkdir -p "$_stage/inc"
+    local _inc_tar="$_stage/inc.tar"
+    if [[ "$_inc_path" == *".enc" ]]; then
+        if [[ -z "$_password" ]]; then
+            print_message "ERROR" "Inc зашифрован — нужен BACKUP_PASSWORD" >&2
+            return 1
+        fi
+        if ! _hmac_envelope_decrypt "$_inc_path" "$_inc_tar" "$_password" 2> "$SILENT_LOG"; then
+            print_message "ERROR" "Не удалось decrypt inc" >&2
+            return 1
+        fi
+    else
+        cp "$_inc_path" "$_inc_tar"
+    fi
+    local _inc_fmt _inc_tar_args
+    _inc_fmt=$(_compress_detect_format "$_inc_tar")
+    _inc_tar_args=$(_tar_extract_args_for "$_inc_fmt")
+    if ! tar $_inc_tar_args -xf "$_inc_tar" -C "$_stage/inc" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Extract inc failed" >&2
+        rm -f "$_inc_tar"; return 1
+    fi
+    rm -f "$_inc_tar"
+    debug_log "RESTORE-CHAIN" "Inc extracted: $(ls "$_stage/inc" | tr '\n' ' ')"
+
+    # Step 4: merge
+    mkdir -p "$_stage/merged"
+    # 4a: bot_version + manifest from inc (newer)
+    [[ -f "$_stage/inc/bot_version.txt" ]] && cp "$_stage/inc/bot_version.txt" "$_stage/merged/"
+    [[ -f "$_stage/inc/manifest.txt" ]] && cp "$_stage/inc/manifest.txt" "$_stage/merged/"
+    # 4b: DB dump from inc (fresh)
+    local _inc_db
+    _inc_db=$(find "$_stage/inc" -maxdepth 1 \( -name 'db_*.sql.gz' -o -name 'db_*.sql.zst' \) | head -1)
+    if [[ -n "$_inc_db" ]]; then
+        cp "$_inc_db" "$_stage/merged/"
+        debug_log "RESTORE-CHAIN" "DB from inc: $(basename "$_inc_db")"
+    else
+        print_message "WARN" "Нет db_*.sql.* в inc — DB restore будет пропущен" >&2
+    fi
+    # 4c: Files merge — extract base's bot_files dir, then overlay inc's changed files
+    local _base_files
+    _base_files=$(find "$_stage/base" -maxdepth 1 \( -name 'dir_*.tar.gz' -o -name 'dir_*.tar.zst' \) | head -1)
+    local _inc_files
+    _inc_files=$(find "$_stage/inc" -maxdepth 1 \( -name 'bot_files_inc_*.tar.gz' -o -name 'bot_files_inc_*.tar.zst' \) | head -1)
+    if [[ -n "$_base_files" ]]; then
+        mkdir -p "$_stage/files_merged"
+        # Extract base files
+        local _bf_fmt _bf_args
+        _bf_fmt=$(_compress_detect_format "$_base_files")
+        _bf_args=$(_tar_extract_args_for "$_bf_fmt")
+        tar $_bf_args -xf "$_base_files" -C "$_stage/files_merged" 2> "$SILENT_LOG"
+        debug_log "RESTORE-CHAIN" "Base files extracted to $_stage/files_merged"
+        # Overlay inc's changed files (only if inc has them)
+        if [[ -n "$_inc_files" ]]; then
+            local _if_fmt _if_args
+            _if_fmt=$(_compress_detect_format "$_inc_files")
+            _if_args=$(_tar_extract_args_for "$_if_fmt")
+            tar $_if_args -xf "$_inc_files" -C "$_stage/files_merged" 2> "$SILENT_LOG"
+            debug_log "RESTORE-CHAIN" "Inc files overlaid (changed files overwrite base)"
+        fi
+        # Apply deletions: удалить files которые помечены в manifest_deletions.txt.
+        # Paths в deletions относительные к BOT_PATH (без $bot_dirname префикса), но
+        # extracted files в $_stage/files_merged/$bot_dirname/<path>. Найдём dirname:
+        local _bot_dirname
+        _bot_dirname=$(ls "$_stage/files_merged" 2>/dev/null | head -1)
+        if [[ -f "$_stage/inc/manifest_deletions.txt" && -n "$_bot_dirname" ]]; then
+            local _del_count=0
+            while IFS= read -r _del_path; do
+                [[ -z "$_del_path" ]] && continue
+                [[ "$_del_path" =~ ^# ]] && continue
+                local _target="$_stage/files_merged/$_bot_dirname/$_del_path"
+                if [[ -f "$_target" ]]; then
+                    rm -f "$_target"
+                    _del_count=$((_del_count + 1))
+                fi
+            done < "$_stage/inc/manifest_deletions.txt"
+            debug_log "RESTORE-CHAIN" "Applied $_del_count deletions"
+        fi
+        # Re-archive merged files в dir_*.tar.<ext> для нормального restore flow
+        local _merged_ext
+        _merged_ext=$(_compress_ext)
+        local _merged_tar_args
+        _merged_tar_args=$(_tar_create_args)
+        local _merged_inner="$_stage/merged/dir_merged.tar.${_merged_ext}"
+        ( cd "$_stage/files_merged" && tar $_merged_tar_args -cf "$_merged_inner" * 2> "$SILENT_LOG" )
+        debug_log "RESTORE-CHAIN" "Re-archived merged files: $(stat -c%s "$_merged_inner" 2>/dev/null) bytes"
+    else
+        print_message "WARN" "Base full без inner files archive — только DB restore возможен" >&2
+    fi
+
+    # Step 5: re-archive merged → final tar (для menu_restore extract logic)
+    local _final_ext _final_tar_args
+    _final_ext=$(_compress_ext)
+    _final_tar_args=$(_tar_create_args)
+    local _final_path="$_stage/merged_outer.tar.${_final_ext}"
+    ( cd "$_stage/merged" && tar $_final_tar_args -cf "$_final_path" * 2> "$SILENT_LOG" )
+    debug_log "RESTORE-CHAIN" "Final merged tar: $_final_path ($(stat -c%s "$_final_path" 2>/dev/null) bytes)"
+    # Cleanup intermediate (но не итоговый merged_outer.tar — caller его читает)
+    rm -rf "$_stage/base" "$_stage/inc" "$_stage/files_merged" "$_stage/merged"
+
+    echo "$_final_path"
+    return 0
 }
 
 # =============================================================================
@@ -8177,15 +8416,18 @@ create_incremental_backup() {
     _base_manifest_lines=$(grep -cv "^#" "$_base_manifest" 2>/dev/null || echo 0)
     debug_log "INC" "Base manifest: $_base_manifest_lines files"
 
-    # Step 3: generate текущий manifest + diff
+    # Step 3: generate текущий manifest + diff (changes + deletions)
     print_message "INFO" "Сканирую BOT_PATH для изменений..."
     local _curr_manifest="$_work_dir/curr_manifest.txt"
     _manifest_generate "$BOT_PATH" "$_curr_manifest"
     local _diff_list="$_work_dir/changed.txt"
+    local _del_list="$_work_dir/deletions.txt"
     _manifest_diff "$_base_manifest" "$_curr_manifest" "$_diff_list"
-    local _changed_count
+    _manifest_deletions "$_base_manifest" "$_curr_manifest" "$_del_list"
+    local _changed_count _deleted_count
     _changed_count=$(wc -l < "$_diff_list" 2>/dev/null || echo 0)
-    print_message "INFO" "Изменённых файлов: $_changed_count из $_base_manifest_lines (база)"
+    _deleted_count=$(wc -l < "$_del_list" 2>/dev/null || echo 0)
+    print_message "INFO" "Изменено: $_changed_count, удалено: $_deleted_count (из $_base_manifest_lines в базе)"
 
     if [[ "$_changed_count" -eq 0 ]]; then
         print_message "INFO" "Файлы не изменились с последнего full — incremental не нужен."
@@ -8203,6 +8445,7 @@ create_incremental_backup() {
     local FILE_DB="db_${TIMESTAMP}.sql.${_ext}"
     local FILE_VERSION="bot_version.txt"
     local FILE_MANIFEST_INC="manifest.txt"
+    local FILE_DELETIONS="manifest_deletions.txt"
     local _tar_err=$(mktemp 2> "$SILENT_LOG")
     local _tar_compress_args
     _tar_compress_args=$(_tar_create_args)
@@ -8215,6 +8458,9 @@ create_incremental_backup() {
     # Save bot_version + manifest (текущий, для следующих inc/restore)
     echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
     cp "$_curr_manifest" "$BACKUP_DIR/$FILE_MANIFEST_INC"
+    # Deletions list (может быть пустой если ничего не удалено — но файл создаём всегда
+    # чтобы restore-chain мог его читать без проверки existence)
+    cp "$_del_list" "$BACKUP_DIR/$FILE_DELETIONS"
 
     # 4a: fresh DB dump
     if [[ -n "$DB_CONTAINER_NAME" ]]; then
@@ -8257,14 +8503,14 @@ create_incremental_backup() {
         fi
     fi
 
-    # 4c: combine bot_version + db + manifest + (inc_files если есть) → FILE_FINAL
-    local _combine=("$FILE_VERSION" "$FILE_MANIFEST_INC")
+    # 4c: combine bot_version + db + manifest + deletions + (inc_files если есть) → FILE_FINAL
+    local _combine=("$FILE_VERSION" "$FILE_MANIFEST_INC" "$FILE_DELETIONS")
     [[ -f "$BACKUP_DIR/$FILE_DB" ]] && _combine+=("$FILE_DB")
     [[ -f "$BACKUP_DIR/$_inc_files_archive" ]] && _combine+=("$_inc_files_archive")
     _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-inc-combine" \
         tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine[@]}" 2>> "$_tar_err"
     local _combine_rc=$?
-    rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC" "$BACKUP_DIR/$_inc_files_archive"
+    rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC" "$BACKUP_DIR/$FILE_DELETIONS" "$BACKUP_DIR/$_inc_files_archive"
 
     rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"; rm -f "$_tar_err"
 
@@ -8896,6 +9142,33 @@ execute_restore() {
         WORK_FILE="$DECRYPTED_FILE"
     fi
 
+    # === INCREMENTAL CHAIN RESOLUTION ===
+    # Если выбран lazarus_inc_* — найти base full, decrypt оба, merge content.
+    # Результат: WORK_FILE подменяется на merged-tar, дальше restore идёт как обычно.
+    if [[ "$(basename "$FILE")" =~ ^lazarus_inc_ ]]; then
+        print_message "INFO" "Обнаружен incremental backup — разрешаю chain..."
+        # Для chain нужен пароль (если базовый full зашифрован). Возьмём из BACKUP_PASSWORD
+        # ИЛИ из decrypt_pass (если пользователь вводил для inc).
+        local _chain_pwd="${decrypt_pass:-$BACKUP_PASSWORD}"
+        local _merged
+        _merged=$(_resolve_incremental_chain "$FILE" "$TMP_DIR" "$_chain_pwd")
+        local _chain_rc=$?
+        # Очистим decrypt_pass из памяти (был использован в chain)
+        decrypt_pass=""
+        if [[ $_chain_rc -ne 0 || -z "$_merged" || ! -f "$_merged" ]]; then
+            print_message "ERROR" "Restore-chain failed (rc=$_chain_rc)"
+            rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+            return 1
+        fi
+        # Подменяем WORK_FILE на merged-tar. Decrypted inc.tar уже не нужен.
+        [[ -n "${DECRYPTED_FILE:-}" && -f "$DECRYPTED_FILE" ]] && {
+            shred -u "$DECRYPTED_FILE" 2> "$SILENT_LOG" || rm -f "$DECRYPTED_FILE"
+        }
+        WORK_FILE="$_merged"
+        chmod 600 "$WORK_FILE" 2> "$SILENT_LOG" || true
+        debug_log "RESTORE" "Chain resolved → $WORK_FILE"
+    fi
+
     local DB_DUMP=""
     local DIR_ARC=""
 
@@ -9315,19 +9588,30 @@ _show_top_in_archive() {
 
 menu_restore() {
     while true; do
-        # СТРОГАЯ ЛОГИКА ПОДСЧЕТА
-        local n_full=$(find "$BACKUP_DIR" -type f \( -name "lazarus_full_*.tar.gz" -o -name "lazarus_full_*.tar.gz.enc" \) 2> "$SILENT_LOG" | wc -l)
-        local n_db=$(find "$BACKUP_DIR" -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" \) 2> "$SILENT_LOG" | wc -l)
-        local n_files=$(find "$BACKUP_DIR" -type f \( -name "lazarus_files_*.tar.gz" -o -name "lazarus_files_*.tar.gz.enc" \) 2> "$SILENT_LOG" | wc -l)
+        # СТРОГАЯ ЛОГИКА ПОДСЧЕТА. Поддержка обоих compression форматов.
+        local n_full
+        n_full=$(find "$BACKUP_DIR" -type f \( -name "lazarus_full_*.tar.gz" -o -name "lazarus_full_*.tar.gz.enc" \
+                                              -o -name "lazarus_full_*.tar.zst" -o -name "lazarus_full_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
+        local n_db
+        n_db=$(find "$BACKUP_DIR" -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" \
+                                              -o -name "lazarus_db_*.tar.zst" -o -name "lazarus_db_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
+        local n_files
+        n_files=$(find "$BACKUP_DIR" -type f \( -name "lazarus_files_*.tar.gz" -o -name "lazarus_files_*.tar.gz.enc" \
+                                              -o -name "lazarus_files_*.tar.zst" -o -name "lazarus_files_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
+        local n_inc
+        n_inc=$(find "$BACKUP_DIR" -type f \( -name "lazarus_inc_*.tar.gz" -o -name "lazarus_inc_*.tar.gz.enc" \
+                                              -o -name "lazarus_inc_*.tar.zst" -o -name "lazarus_inc_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
 
         local c_f="$CYAN"; [[ "$n_full" == "0" ]] && c_f="$GRAY"
         local c_d="$CYAN"; [[ "$n_db" == "0" ]] && c_d="$GRAY"
         local c_fl="$CYAN"; [[ "$n_files" == "0" ]] && c_fl="$GRAY"
+        local c_i="$CYAN"; [[ "$n_inc" == "0" ]] && c_i="$GRAY"
 
         clear_screen; echo -e "${GREEN}Меню восстановления${RESET}"
         echo -e " 1. Полный бэкап      ${c_f}[${n_full} шт]${RESET}"
         echo -e " 2. Только БД         ${c_d}[${n_db} шт]${RESET}"
         echo -e " 3. Только Файлы      ${c_fl}[${n_files} шт]${RESET}"
+        echo -e " 4. Incremental       ${c_i}[${n_inc} шт]${RESET} ${GRAY}(chain: base full + inc)${RESET}"
         echo " 0. Назад"
         echo ""
         read -erp "Выбор (Enter - Назад): " r_choice
@@ -9339,6 +9623,10 @@ menu_restore() {
             2) if select_backup_file "lazarus_db" "Бэкапы БД"; then execute_restore "db_only" "$SELECTED_FILE"; fi ;;
             3) if select_backup_file "lazarus_files" "Бэкапы Файлов"; then
                    execute_restore "files_only" "$SELECTED_FILE"
+               fi ;;
+            4) if select_backup_file "lazarus_inc" "Incremental бэкапы"; then
+                   # MODE="full" — после chain resolution merged tar содержит DB + files как full.
+                   execute_restore "full" "$SELECTED_FILE"
                fi ;;
             0) return ;;
         esac
