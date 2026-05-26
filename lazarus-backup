@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.5.0"
+VERSION="5.6.0"
 # SCRIPT_NAME — имя файла внутри INSTALL_DIR, совпадает с именем в репо.
 # Раньше было "lazarus" (расхождение с именем в Git), теперь "lazarus-backup".
 # install_script автоматически мигрирует старые установки.
@@ -16,9 +16,12 @@ SYMLINK_PATH="/usr/local/bin/$CLI_NAME"
 
 # --- ИСТОЧНИКИ ОБНОВЛЕНИЙ (проверяются все, берётся максимальная версия) ---
 REMOTE_URLS=(
+    # NB: только raw.githubusercontent.com — единственный official-signed mirror.
+    # 3rd-party CDN зеркала (raw.githack.com, cdn.jsdelivr.net) убраны 2026-05-26
+    # после adversarial-modeler audit: single mirror compromise = root RCE
+    # (max-version-wins logic делает атаку trivial). cdn.jsdelivr известен past
+    # supply-chain incidents с GitHub content.
     "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup"
-    "https://raw.githack.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup"
-    "https://cdn.jsdelivr.net/gh/UnderGut/LAZARUS-Backup-Manager@main/lazarus-backup"
 )
 REMOTE_URL="${REMOTE_URLS[0]}"  # Основной URL для обратной совместимости
 
@@ -745,26 +748,38 @@ _manifest_generate() {
     shift 2
     local _excludes=("$@")
 
+    # Check rc от cd — иначе manifest будет от текущей cwd, broken.
+    if ! ( cd "$(dirname "$_bot_path")" 2>/dev/null ); then
+        log_message "ERROR" "_manifest_generate: cannot cd to $(dirname "$_bot_path")"
+        return 1
+    fi
+
     {
         echo "# lazarus manifest v1"
         echo "# base="
         echo "# created=$(date -Iseconds 2>/dev/null || date)"
-        # Find все файлы, формат "size mtime path\0".
-        # Hash считаем только для маленьких файлов (<10 MB) — на больших sha256
-        # медленный и проще полагаться на (size, mtime) tuple для detection.
+        # Find через -print0 (NUL-delimited): защита от файлов с tab/newline в имени.
+        # Атакующий с write-доступом к BOT_PATH мог бы создать `evil\nfake\t0\t0\t-`
+        # → инжекция в manifest. С NUL — каждая запись доезжает целиком, потом
+        # tr/awk sanitize.
         local _bot_dirname
         _bot_dirname=$(basename "$_bot_path")
-        ( cd "$(dirname "$_bot_path")" 2>/dev/null && \
-          find "$_bot_dirname" -type f -printf '%s\t%T@\t%P\n' 2>/dev/null ) | \
-        awk -F'\t' -v base="$_bot_path" '
+        ( cd "$(dirname "$_bot_path")" && \
+          find "$_bot_dirname" -type f -printf '%s\t%T@\t%P\0' 2>/dev/null ) | \
+        awk -v RS='\0' -F'\t' '
             {
                 size=$1; mtime=$2; rel=$3
-                # Для скорости: hash пустой "-" если size>10MB. Для inc detection
-                # достаточно (size,mtime). hash как secondary check.
+                # Sanitize: tab/newline/carriage-return в имени → marker.
+                # Если злоумышленник создаст файл с tab — он будет represented
+                # безопасно, но manifest всё равно покажет file change.
+                gsub(/\t/, "<TAB>", rel)
+                gsub(/\n/, "<NL>", rel)
+                gsub(/\r/, "<CR>", rel)
                 printf "%s\t%s\t%d\t-\n", rel, size, mtime
             }
         '
     } > "$_out"
+    return 0
 }
 
 # Compare current manifest vs base manifest → output list of CHANGED files.
@@ -847,17 +862,44 @@ _find_base_for_inc() {
     fi
     # Strip trailing underscores на всякий случай
     _base_ts="${_base_ts%%_}"; _base_ts="${_base_ts%%_}"
-    # Ищем full с этим timestamp
+
+    # === SECURITY (T2): match encryption state ===
+    # Если inc зашифрован (.enc), требуем encrypted base. Иначе атакующий с
+    # write-доступом к BACKUP_DIR мог бы подменить encrypted base на
+    # unencrypted tar → _resolve_incremental_chain пропустит MAC check (cp без
+    # _hmac_envelope_decrypt) и extract'нет attacker-controlled content от root.
+    local _inc_encrypted=false
+    [[ "$_inc_name" == *".enc" ]] && _inc_encrypted=true
+
+    # Ищем full с этим timestamp. ORDER важен: encrypted кандидаты впереди если
+    # inc encrypted (защита от substitution); unencrypted-only если inc plain.
+    local _ordered_patterns=()
+    if $_inc_encrypted; then
+        _ordered_patterns=(
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.gz.enc
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.zst.enc
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.gz.enc
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.zst.enc
+        )
+    else
+        # Для unencrypted inc — только unencrypted base. Encrypted base
+        # требует password, который для unencrypted-chain не предоставляется.
+        _ordered_patterns=(
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.gz
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.zst
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.gz
+            "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.zst
+        )
+    fi
     local _candidate
-    for _candidate in "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.gz \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.gz.enc \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.zst \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}__*.tar.zst.enc \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.gz \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.gz.enc \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.zst \
-                      "$BACKUP_DIR"/lazarus_full_${_base_ts}.tar.zst.enc; do
+    for _candidate in "${_ordered_patterns[@]}"; do
         if [[ -f "$_candidate" ]]; then
+            # Confirm: оба должны быть либо .enc, либо оба без .enc
+            local _cand_encrypted=false
+            [[ "$_candidate" == *".enc" ]] && _cand_encrypted=true
+            if [[ "$_cand_encrypted" != "$_inc_encrypted" ]]; then
+                continue  # mismatch — skip
+            fi
             echo "$_candidate"
             return 0
         fi
@@ -929,7 +971,9 @@ _resolve_incremental_chain() {
     local _base_fmt _base_tar_args
     _base_fmt=$(_compress_detect_format "$_base_tar")
     _base_tar_args=$(_tar_extract_args_for "$_base_fmt")
-    if ! tar $_base_tar_args -xf "$_base_tar" -C "$_stage/base" 2> "$SILENT_LOG"; then
+    # tar safety flags: --no-overwrite-dir, --absolute-names=no (NB: --no-absolute-names
+    # на старых tar не существует, поэтому фильтруем через тестовую опцию ниже).
+    if ! tar --no-overwrite-dir $_base_tar_args -xf "$_base_tar" -C "$_stage/base" 2> "$SILENT_LOG"; then
         print_message "ERROR" "Extract base full failed" >&2
         rm -f "$_base_tar"; return 1
     fi
@@ -998,40 +1042,82 @@ _resolve_incremental_chain() {
         fi
         # Apply deletions: удалить files которые помечены в manifest_deletions.txt.
         # Paths в deletions относительные к BOT_PATH (без $bot_dirname префикса), но
-        # extracted files в $_stage/files_merged/$bot_dirname/<path>. Найдём dirname:
+        # extracted files в $_stage/files_merged/$bot_dirname/<path>. Найдём dirname.
+        # SECURITY: validate $_bot_dirname как safe имя (whitelist). Без этого
+        # malicious archive с top-level entry `../../etc` мог бы сделать `_target`
+        # путь типа `$_stage/files_merged/../../etc/$_del_path` — обход sandbox.
         local _bot_dirname
         _bot_dirname=$(ls "$_stage/files_merged" 2>/dev/null | head -1)
+        if [[ ! "$_bot_dirname" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            debug_log "RESTORE-CHAIN" "BLOCKED unsafe _bot_dirname: '$_bot_dirname'"
+            log_message "WARN" "Restore-chain blocked unsafe bot dirname: $_bot_dirname"
+            _bot_dirname=""  # пропускаем deletion apply
+        fi
         if [[ -f "$_stage/inc/manifest_deletions.txt" && -n "$_bot_dirname" ]]; then
-            local _del_count=0
+            local _del_count=0 _del_blocked=0
             while IFS= read -r _del_path; do
                 [[ -z "$_del_path" ]] && continue
                 [[ "$_del_path" =~ ^# ]] && continue
+                # === PATH TRAVERSAL DEFENSE (CRITICAL) ===
+                # _del_path приходит из manifest_deletions.txt в inc archive.
+                # Если manifest poisoned (compromised archive в BACKUP_DIR), злоумышленник
+                # мог бы положить туда `../../etc/passwd` чтобы заставить rm -f удалить
+                # arbitrary file как root. Отвергаем:
+                #   - absolute paths (/)
+                #   - ".." segments anywhere
+                #   - newlines / shell metacharacters
+                if [[ "$_del_path" == /* ]] || [[ "$_del_path" == *".."* ]] || \
+                   [[ "$_del_path" == *$'\n'* ]] || [[ "$_del_path" == *$'\r'* ]]; then
+                    debug_log "RESTORE-CHAIN" "BLOCKED traversal in deletion: $_del_path"
+                    log_message "WARN" "Restore-chain blocked path-traversal deletion: $_del_path"
+                    _del_blocked=$((_del_blocked + 1))
+                    continue
+                fi
                 local _target="$_stage/files_merged/$_bot_dirname/$_del_path"
+                # Second-line defense: realpath check (если есть)
+                if command -v realpath > "$SILENT_LOG" 2>&1; then
+                    local _real_target _real_base
+                    _real_target=$(realpath -m "$_target" 2>/dev/null)
+                    _real_base=$(realpath -m "$_stage/files_merged/$_bot_dirname" 2>/dev/null)
+                    if [[ -n "$_real_target" && -n "$_real_base" ]] && \
+                       [[ "$_real_target" != "$_real_base"/* ]]; then
+                        debug_log "RESTORE-CHAIN" "BLOCKED realpath escape: $_del_path → $_real_target"
+                        log_message "WARN" "Restore-chain blocked realpath-escape: $_del_path"
+                        _del_blocked=$((_del_blocked + 1))
+                        continue
+                    fi
+                fi
                 if [[ -f "$_target" ]]; then
                     rm -f "$_target"
                     _del_count=$((_del_count + 1))
                 fi
             done < "$_stage/inc/manifest_deletions.txt"
-            debug_log "RESTORE-CHAIN" "Applied $_del_count deletions"
+            debug_log "RESTORE-CHAIN" "Applied $_del_count deletions, blocked $_del_blocked traversal attempts"
+            [[ $_del_blocked -gt 0 ]] && \
+                print_message "WARN" "Restore-chain: blocked $_del_blocked path-traversal deletions (см. лог)" >&2
         fi
-        # Re-archive merged files в dir_*.tar.<ext> для нормального restore flow
+        # Re-archive merged files в dir_*.tar.<ext> для нормального restore flow.
+        # NB: используем `.` вместо `*` чтобы tar НЕ интерпретировал filename
+        # начинающийся с `-` как опцию (filename `--checkpoint-action=exec=sh evil`
+        # был бы RCE — sharp-edges H3).
         local _merged_ext
         _merged_ext=$(_compress_ext)
         local _merged_tar_args
         _merged_tar_args=$(_tar_create_args)
         local _merged_inner="$_stage/merged/dir_merged.tar.${_merged_ext}"
-        ( cd "$_stage/files_merged" && tar $_merged_tar_args -cf "$_merged_inner" * 2> "$SILENT_LOG" )
+        ( cd "$_stage/files_merged" && tar $_merged_tar_args -cf "$_merged_inner" . 2> "$SILENT_LOG" )
         debug_log "RESTORE-CHAIN" "Re-archived merged files: $(stat -c%s "$_merged_inner" 2>/dev/null) bytes"
     else
         print_message "WARN" "Base full без inner files archive — только DB restore возможен" >&2
     fi
 
-    # Step 5: re-archive merged → final tar (для menu_restore extract logic)
+    # Step 5: re-archive merged → final tar (для menu_restore extract logic).
+    # Используем `.` вместо `*` — защита от dash-prefix filename injection.
     local _final_ext _final_tar_args
     _final_ext=$(_compress_ext)
     _final_tar_args=$(_tar_create_args)
     local _final_path="$_stage/merged_outer.tar.${_final_ext}"
-    ( cd "$_stage/merged" && tar $_final_tar_args -cf "$_final_path" * 2> "$SILENT_LOG" )
+    ( cd "$_stage/merged" && tar $_final_tar_args -cf "$_final_path" . 2> "$SILENT_LOG" )
     debug_log "RESTORE-CHAIN" "Final merged tar: $_final_path ($(stat -c%s "$_final_path" 2>/dev/null) bytes)"
     # Cleanup intermediate (но не итоговый merged_outer.tar — caller его читает)
     rm -rf "$_stage/base" "$_stage/inc" "$_stage/files_merged" "$_stage/merged"
@@ -6670,6 +6756,7 @@ rotate_backups_by_count() {
                 return 0
             fi
             echo -e "${YELLOW}Очистка категории '$LABEL' (удаление $diff старых файлов):${RESET}"
+            local _orphan_inc_deleted=0
             for (( i=0; i<diff; i++ )); do
                 local file_to_del="${files[$i]}"
                 if [[ -f "$file_to_del" ]]; then
@@ -6678,9 +6765,40 @@ rotate_backups_by_count() {
                     rm -f "$file_to_del.version"
                     echo "  🗑 Удален: $(basename "$file_to_del")"
                     log_message "INFO" "Deleted $file_to_del (count-based rotation, prefix=$PREFIX)"
+
+                    # === Orphan inc cleanup ===
+                    # При удалении lazarus_full_<ts>__ автоматически удаляем все
+                    # inc'ы, ссылающиеся на этот full (lazarus_inc_*__base_<ts>__).
+                    # Без этого inc становятся orphan и не могут быть restored.
+                    if [[ "$PREFIX" == "lazarus_full" ]]; then
+                        local _del_name; _del_name=$(basename "$file_to_del")
+                        # Extract full timestamp из имени deleted full
+                        local _full_ts="${_del_name#lazarus_full_}"
+                        _full_ts="${_full_ts%%__v*}"
+                        _full_ts="${_full_ts%.tar.gz}"
+                        _full_ts="${_full_ts%.tar.gz.enc}"
+                        _full_ts="${_full_ts%.tar.zst}"
+                        _full_ts="${_full_ts%.tar.zst.enc}"
+                        # Найти orphan inc'ы и удалить
+                        local _orphan_count=0
+                        for orphan in "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz \
+                                      "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz.enc \
+                                      "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst \
+                                      "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst.enc; do
+                            if [[ -f "$orphan" ]]; then
+                                rm -f "$orphan" "$orphan.version"
+                                echo "  🗑 Orphan inc удалён: $(basename "$orphan")"
+                                log_message "INFO" "Deleted orphan inc $orphan (base full was rotated)"
+                                _orphan_count=$((_orphan_count + 1))
+                                _orphan_inc_deleted=$((_orphan_inc_deleted + 1))
+                            fi
+                        done
+                        [[ $_orphan_count -gt 0 ]] && debug_log "ROTATION" "Deleted $_orphan_count orphan inc'ы для base $_full_ts"
+                    fi
                 fi
             done
-            debug_log "ROTATION" "Deleted $diff files"
+            [[ $_orphan_inc_deleted -gt 0 ]] && echo -e "  ${GRAY}(дополнительно удалено $_orphan_inc_deleted orphan inc'ов)${RESET}"
+            debug_log "ROTATION" "Deleted $diff files + $_orphan_inc_deleted orphan inc'ов"
             echo "$diff"
             return 0
         else
@@ -8320,18 +8438,32 @@ select_backup_file() {
 # create_incremental_backup: создаёт incremental backup относительно последнего full.
 # =============================================================================
 # Логика:
-#   1. Найти последний lazarus_full_*.tar.* — это base
+#   1. Найти ПОСЛЕДНИЙ lazarus_full_*.tar.* — это всегда базой будет (НЕ inc).
 #   2. Decrypt + extract его manifest.txt
-#   3. Сравнить с текущим состоянием BOT_PATH (через _manifest_diff)
-#   4. Сделать `tar -czf` ТОЛЬКО из changed files
-#   5. + добавить fresh DB-dump (БД всегда full — pg_dump cheap, без logical replication)
-#   6. + добавить manifest_diff.txt (новый список) и base_full=<timestamp>
+#   3. Сравнить с текущим состоянием BOT_PATH (_manifest_diff + _manifest_deletions)
+#   4. Сделать `tar` ТОЛЬКО из changed files
+#   5. + fresh DB-dump (БД всегда full — pg_dump cheap, без WAL archiving)
+#   6. + manifest.txt (текущий список) + manifest_deletions.txt
 #   7. Имя: lazarus_inc_<ts>__base_<full_ts>__vX.tar.{gz,zst}[.enc]
 #
-# Restore chain работает в menu_restore: если выбран inc — найти base full, apply chain.
+# ВАЖНО про SEMANTICS:
+#   - Inc ВСЕГДА ссылается на full (не на другой inc) — `ls -t lazarus_full_*`
+#   - Если есть full → inc1 (changes A) → inc2 (changes A+B):
+#     * inc2 содержит ВСЕ изменения с момента full (A+B), не diff от inc1
+#     * inc1 становится outdated, но не orphan (его base full всё ещё существует)
+#     * При restore inc2 → используется только пара (full + inc2)
+#   - Multi-step chain (full → inc1 → inc2 → inc3) НЕ существует by design —
+#     это упрощает логику и избегает chain-orphan проблем.
+#
+# Restore chain работает в menu_restore: если выбран inc — найти base full,
+# decrypt оба, merge content, apply deletions → нормальный restore flow.
 #
 # DB всегда полный — потому что cheap pg_dump (~36 MB → 12 MB zstd) и сложность
 # incremental DB (WAL archiving + base) для бот-сценария overkill.
+#
+# Rotation: при удалении base full через rotate_backups_by_count — все его
+# inc'ы автоматически удаляются как orphan (см. fix #3 в rotate function).
+# Verify: `lazarus verify` проверяет что у каждого inc есть его base full.
 # =============================================================================
 create_incremental_backup() {
     debug_log "INC" "=== Starting incremental backup ==="
@@ -8530,6 +8662,9 @@ create_incremental_backup() {
             print_message "SUCCESS" "Архив зашифрован."
         else
             print_message "ERROR" "Ошибка шифрования"
+            # SECURITY: если encryption failed — удаляем plaintext чтобы не
+            # оставлять unencrypted backup на диске (был MEDIUM finding).
+            rm -f "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc"
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
@@ -8787,18 +8922,50 @@ validate_tar_safety() {
     local archive="$1"
     local list_file="$2"
 
-    if ! tar -tzf "$archive" > "$list_file" 2> "$SILENT_LOG"; then
-        print_message "ERROR" "Архив поврежден или не tar.gz: $archive"
+    # Auto-detect формат (gzip / zstd / unencrypted tar) и использовать правильный
+    # tar-флаг. Раньше был hardcoded `tar -tzf` → zstd archives silently failed
+    # validation и FALL THROUGH к extract без safety check (sharp-edges H1).
+    local _fmt _list_args _tv_args
+    _fmt=$(_compress_detect_format "$archive")
+    case "$_fmt" in
+        zstd)
+            _list_args="--use-compress-program=zstd -tf"
+            _tv_args="--use-compress-program=zstd -tvf"
+            ;;
+        gzip)
+            _list_args="-tzf"
+            _tv_args="-tvf"
+            ;;
+        *)
+            # Plain tar или unknown — пробуем без compress
+            _list_args="-tf"
+            _tv_args="-tvf"
+            ;;
+    esac
+
+    if ! tar $_list_args "$archive" > "$list_file" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Архив поврежден или не tar/$_fmt: $archive"
         return 1
     fi
 
+    # Reject:
+    #   - absolute paths (/foo, C:\bar)
+    #   - .. segments (../../etc)
+    #   - paths с control chars (tab/newline) — могут обходить line-based filter
     if grep -Eq '(^/|^[A-Za-z]:|(^|/)\.\.(|/))' "$list_file"; then
         print_message "ERROR" "Архив содержит небезопасные пути: $archive"
         return 1
     fi
+    # Tab или newline в filenames — атакующий может попытаться обойти filter
+    if grep -qP '[\t]' "$list_file" 2>/dev/null; then
+        print_message "ERROR" "Архив содержит TAB в путях — отказ" >&2
+        return 1
+    fi
 
-    if tar -tvf "$archive" 2> "$SILENT_LOG" | awk '{print substr($1,1,1)}' | grep -Eq '^[lh]'; then
-        print_message "ERROR" "Архив содержит ссылки (symlink/hardlink), восстановление запрещено"
+    # Symlink / hardlink / device-files (c, b) — все запрещены
+    # File type chars в `tar -tvf`: -=regular, d=dir, l=symlink, h=hardlink, c=char-dev, b=block-dev, s=socket, p=fifo
+    if tar $_tv_args "$archive" 2> "$SILENT_LOG" | awk '{print substr($1,1,1)}' | grep -Eq '^[lhcbsp]'; then
+        print_message "ERROR" "Архив содержит ссылки/устройства (symlink/hardlink/dev/socket/fifo), восстановление запрещено"
         return 1
     fi
 
@@ -10557,6 +10724,17 @@ verify_all_backups() {
             _plain_fmt=$(_compress_detect_format "$f")
             if ! _verify_compressed "$f" "$_plain_fmt"; then
                 _ok_this=false; _reason="verify $_plain_fmt FAIL"
+            fi
+        fi
+
+        # Дополнительная проверка для INC: его base full должен существовать.
+        # Если base удалён (rotation / ручное удаление) — inc становится orphan.
+        if $_ok_this && [[ "$_base" =~ ^lazarus_inc_ ]]; then
+            local _base_for_this
+            _base_for_this=$(_find_base_for_inc "$f")
+            if [[ -z "$_base_for_this" ]]; then
+                _ok_this=false
+                _reason="orphan inc (base full not found)"
             fi
         fi
 
