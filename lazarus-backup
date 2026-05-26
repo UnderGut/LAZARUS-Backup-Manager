@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.3.0"
+VERSION="5.4.0"
 # SCRIPT_NAME — имя файла внутри INSTALL_DIR, совпадает с именем в репо.
 # Раньше было "lazarus" (расхождение с именем в Git), теперь "lazarus-backup".
 # install_script автоматически мигрирует старые установки.
@@ -719,6 +719,86 @@ _verify_compressed() {
         gzip) gzip -t "$_file" > "$SILENT_LOG" 2>&1 ;;
         *) return 2 ;;
     esac
+}
+
+# =============================================================================
+# Manifest helpers — для инкрементальных бэкапов (incremental backups).
+# =============================================================================
+# Формат manifest.txt (внутри tar):
+#   # lazarus manifest v1
+#   # base=<full_ts>      (для inc) | base=  (для full)
+#   # created=<iso>
+#   <path>\t<size>\t<mtime>\t<sha256>
+#
+# При CREATE incremental: сравниваем текущие mtime/size файлов с base manifest,
+# берём ТОЛЬКО изменённые (mtime > base.mtime ИЛИ size != base.size).
+# При RESTORE incremental: применяем chain (base full → inc1 → inc2 → ...),
+# каждый последующий inc перезаписывает совпадающие пути.
+# =============================================================================
+
+# Generate manifest для BOT_PATH. Записывает в $out_file.
+# Format: relative_path\tsize\tmtime\tsha256
+# Args: $1 = bot_path, $2 = out_file, $3+ = excludes (как для find -not -path)
+_manifest_generate() {
+    local _bot_path="$1"
+    local _out="$2"
+    shift 2
+    local _excludes=("$@")
+
+    {
+        echo "# lazarus manifest v1"
+        echo "# base="
+        echo "# created=$(date -Iseconds 2>/dev/null || date)"
+        # Find все файлы, формат "size mtime path\0".
+        # Hash считаем только для маленьких файлов (<10 MB) — на больших sha256
+        # медленный и проще полагаться на (size, mtime) tuple для detection.
+        local _bot_dirname
+        _bot_dirname=$(basename "$_bot_path")
+        ( cd "$(dirname "$_bot_path")" 2>/dev/null && \
+          find "$_bot_dirname" -type f -printf '%s\t%T@\t%P\n' 2>/dev/null ) | \
+        awk -F'\t' -v base="$_bot_path" '
+            {
+                size=$1; mtime=$2; rel=$3
+                # Для скорости: hash пустой "-" если size>10MB. Для inc detection
+                # достаточно (size,mtime). hash как secondary check.
+                printf "%s\t%s\t%d\t-\n", rel, size, mtime
+            }
+        '
+    } > "$_out"
+}
+
+# Compare current manifest vs base manifest → output list of CHANGED files.
+# Changed = (new file) OR (size differs) OR (mtime > base.mtime).
+# Args: $1 = base_manifest, $2 = current_manifest, $3 = out_file (list of paths)
+_manifest_diff() {
+    local _base="$1"
+    local _curr="$2"
+    local _out="$3"
+
+    # awk: load base entries (path → "size:mtime"), then iterate current,
+    # emit path if absent or differs.
+    awk -F'\t' '
+        FNR==NR {
+            # Skip comments
+            if ($1 ~ /^#/) next
+            if ($1 == "") next
+            base[$1] = $2 ":" $3
+            next
+        }
+        {
+            if ($1 ~ /^#/) next
+            if ($1 == "") next
+            key = $1
+            cur = $2 ":" $3
+            if (!(key in base)) {
+                # New file
+                print key
+            } else if (base[key] != cur) {
+                # Changed (size or mtime differs)
+                print key
+            }
+        }
+    ' "$_base" "$_curr" > "$_out"
 }
 
 # =============================================================================
@@ -7451,6 +7531,19 @@ create_backup() {
     # Для gzip → "-z", для zstd → "--use-compress-program=zstd".
     local _tar_compress_args
     _tar_compress_args=$(_tar_create_args)
+
+    # Manifest для full/files backup'ов — позволит создавать incremental позже.
+    # Для db_only manifest не нужен (там нет файлов).
+    # Manifest идёт ВНУТРИ tar как `manifest.txt` рядом с bot_version.txt.
+    local FILE_MANIFEST=""
+    if [[ "$TYPE" != "db_only" && -d "$BOT_PATH" ]]; then
+        FILE_MANIFEST="manifest.txt"
+        debug_log "MANIFEST" "Generating manifest for $BOT_PATH..."
+        _manifest_generate "$BOT_PATH" "$BACKUP_DIR/$FILE_MANIFEST" 2> "$SILENT_LOG"
+        local _manifest_lines
+        _manifest_lines=$(grep -cv "^#" "$BACKUP_DIR/$FILE_MANIFEST" 2>/dev/null || echo 0)
+        debug_log "MANIFEST" "Manifest: $_manifest_lines files"
+    fi
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="lazarus_db_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
         debug_log "TAR" "Creating DB archive: $FILE_FINAL (compression: $(_compress_current))"
@@ -7476,13 +7569,17 @@ create_backup() {
         # combine можно делать (то же что и в `full` ниже).
         [[ $_tar_rc -le 1 ]] && {
             local _first_rc=$_tar_rc
+            # Combine: + manifest.txt если был сгенерирован
+            local _combine_inputs=("$FILE_VERSION" "$FILE_DIR")
+            [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files-combine" \
-                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DIR" 2>> "$_tar_err"
+                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
             _tar_rc=$?
             # Если combine OK (0) но первый tar был warning (1) — финальный статус = warning.
             [[ $_tar_rc -eq 0 && $_first_rc -eq 1 ]] && _tar_rc=1
         }
         rm -f "$BACKUP_DIR/$FILE_DIR"
+        [[ -n "$FILE_MANIFEST" ]] && rm -f "$BACKUP_DIR/$FILE_MANIFEST"
     else
         FILE_FINAL="lazarus_full_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
         print_message "INFO" "Архивация файлов (это может занять время)..."
@@ -7495,14 +7592,17 @@ create_backup() {
         # rc=1 = warning (файл изменился во время чтения), archive валиден → combine OK.
         [[ $_tar_rc -le 1 ]] && {
             local _first_rc=$_tar_rc
+            local _combine_inputs=("$FILE_VERSION" "$FILE_DB" "$FILE_DIR")
+            [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full-combine" \
-                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "$FILE_VERSION" "$FILE_DB" "$FILE_DIR" 2>> "$_tar_err"
+                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
             _tar_rc=$?
             # Sticky warning: если первый tar дал rc=1 (warning), а combine — 0,
             # финальный статус остаётся 1, чтобы пользователь увидел WARN в логе.
             [[ $_tar_rc -eq 0 && $_first_rc -eq 1 ]] && _tar_rc=1
         }
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
+        [[ -n "$FILE_MANIFEST" ]] && rm -f "$BACKUP_DIR/$FILE_MANIFEST"
     fi
 
     # Анализ tar exit code:
@@ -7975,6 +8075,226 @@ select_backup_file() {
         elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$total_count" ]]; then SELECTED_FILE="${sorted_backups[$((choice-1))]}"; return 0
         else print_message "ERROR" "Неверный выбор."; sleep 1; fi
     done
+}
+
+# =============================================================================
+# create_incremental_backup: создаёт incremental backup относительно последнего full.
+# =============================================================================
+# Логика:
+#   1. Найти последний lazarus_full_*.tar.* — это base
+#   2. Decrypt + extract его manifest.txt
+#   3. Сравнить с текущим состоянием BOT_PATH (через _manifest_diff)
+#   4. Сделать `tar -czf` ТОЛЬКО из changed files
+#   5. + добавить fresh DB-dump (БД всегда full — pg_dump cheap, без logical replication)
+#   6. + добавить manifest_diff.txt (новый список) и base_full=<timestamp>
+#   7. Имя: lazarus_inc_<ts>__base_<full_ts>__vX.tar.{gz,zst}[.enc]
+#
+# Restore chain работает в menu_restore: если выбран inc — найти base full, apply chain.
+#
+# DB всегда полный — потому что cheap pg_dump (~36 MB → 12 MB zstd) и сложность
+# incremental DB (WAL archiving + base) для бот-сценария overkill.
+# =============================================================================
+create_incremental_backup() {
+    debug_log "INC" "=== Starting incremental backup ==="
+
+    local LOCK_ACQUIRED="false"
+    if [[ "$IS_INTERACTIVE" == "false" ]]; then
+        if ! acquire_lock; then
+            local owner_pid=$(check_lock_owner)
+            log_message "WARN" "Inc backup skipped: another instance is running (PID: $owner_pid)"
+            print_message "WARN" "Другой процесс бэкапа уже запущен (PID: $owner_pid)"
+            return 1
+        fi
+        LOCK_ACQUIRED="true"
+    fi
+
+    # Step 1: найти последний full backup (с manifest)
+    local _last_full
+    _last_full=$(ls -t "$BACKUP_DIR"/lazarus_full_*.tar.gz "$BACKUP_DIR"/lazarus_full_*.tar.gz.enc \
+                       "$BACKUP_DIR"/lazarus_full_*.tar.zst "$BACKUP_DIR"/lazarus_full_*.tar.zst.enc \
+                       2>/dev/null | head -1)
+    if [[ -z "$_last_full" ]]; then
+        print_message "ERROR" "Нет существующего full backup. Запустите 'lazarus backup full' для создания base."
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    fi
+    debug_log "INC" "Base full: $(basename "$_last_full")"
+
+    # Extract base timestamp из имени (lazarus_full_<ts>__vX.tar...)
+    local _base_filename _base_ts
+    _base_filename=$(basename "$_last_full")
+    # Strip prefix "lazarus_full_" и suffix "__vX.Y.Z.tar.*[.enc]"
+    _base_ts="${_base_filename#lazarus_full_}"
+    _base_ts="${_base_ts%%__v*}"
+    _base_ts="${_base_ts%.tar.gz}"   # на случай если нет version-suffix
+    _base_ts="${_base_ts%.tar.gz.enc}"
+    _base_ts="${_base_ts%.tar.zst}"
+    _base_ts="${_base_ts%.tar.zst.enc}"
+    debug_log "INC" "Base timestamp: $_base_ts"
+
+    # Step 2: extract manifest из base full
+    print_message "INFO" "Извлекаю manifest из base: $(basename "$_last_full")"
+    local _work_dir
+    _work_dir=$(mktemp -d "${TMPDIR:-/tmp}/lazarus_inc.XXXXXX") || {
+        print_message "ERROR" "mktemp failed"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    }
+    register_sensitive_tmp "$_work_dir"
+
+    local _base_manifest="$_work_dir/base_manifest.txt"
+    local _base_extracted="$_work_dir/base_inner.tar"
+    if [[ "$_last_full" == *".enc" ]]; then
+        if [[ -z "$BACKUP_PASSWORD" ]]; then
+            print_message "ERROR" "Base full зашифрован но BACKUP_PASSWORD не задан"
+            rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+        if ! _hmac_envelope_decrypt "$_last_full" "$_base_extracted" "$BACKUP_PASSWORD" 2> "$SILENT_LOG"; then
+            print_message "ERROR" "Не удалось decrypt base full"
+            rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+    else
+        cp "$_last_full" "$_base_extracted"
+    fi
+
+    # Detect compression + extract ТОЛЬКО manifest.txt
+    local _base_fmt _base_tar_args
+    _base_fmt=$(_compress_detect_format "$_base_extracted")
+    _base_tar_args=$(_tar_extract_args_for "$_base_fmt")
+    if ! tar $_base_tar_args -xf "$_base_extracted" -C "$_work_dir" manifest.txt 2> "$SILENT_LOG"; then
+        print_message "ERROR" "В base full нет manifest.txt. Этот full создан старой версией скрипта — incremental невозможен. Сделайте новый full."
+        rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    fi
+    mv "$_work_dir/manifest.txt" "$_base_manifest"
+    rm -f "$_base_extracted"
+    local _base_manifest_lines
+    _base_manifest_lines=$(grep -cv "^#" "$_base_manifest" 2>/dev/null || echo 0)
+    debug_log "INC" "Base manifest: $_base_manifest_lines files"
+
+    # Step 3: generate текущий manifest + diff
+    print_message "INFO" "Сканирую BOT_PATH для изменений..."
+    local _curr_manifest="$_work_dir/curr_manifest.txt"
+    _manifest_generate "$BOT_PATH" "$_curr_manifest"
+    local _diff_list="$_work_dir/changed.txt"
+    _manifest_diff "$_base_manifest" "$_curr_manifest" "$_diff_list"
+    local _changed_count
+    _changed_count=$(wc -l < "$_diff_list" 2>/dev/null || echo 0)
+    print_message "INFO" "Изменённых файлов: $_changed_count из $_base_manifest_lines (база)"
+
+    if [[ "$_changed_count" -eq 0 ]]; then
+        print_message "INFO" "Файлы не изменились с последнего full — incremental не нужен."
+        print_message "INFO" "Создаю только DB-дамп (БД всегда меняется)."
+    fi
+
+    # Step 4: создать inc-архив
+    local TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
+    local _ext
+    _ext=$(_compress_ext)
+    local VER_SUFFIX=""
+    local CURRENT_VER=$(get_raw_bot_version 2>/dev/null)
+    [[ -n "$CURRENT_VER" ]] && VER_SUFFIX="__v${CURRENT_VER}"
+    local FILE_FINAL="lazarus_inc_${TIMESTAMP}__base_${_base_ts}${VER_SUFFIX}.tar.${_ext}"
+    local FILE_DB="db_${TIMESTAMP}.sql.${_ext}"
+    local FILE_VERSION="bot_version.txt"
+    local FILE_MANIFEST_INC="manifest.txt"
+    local _tar_err=$(mktemp 2> "$SILENT_LOG")
+    local _tar_compress_args
+    _tar_compress_args=$(_tar_create_args)
+    local _compress_pipe_cmd
+    case "$(_compress_current)" in
+        zstd) _compress_pipe_cmd="zstd -9 -q" ;;
+        *)    _compress_pipe_cmd="gzip -9" ;;
+    esac
+
+    # Save bot_version + manifest (текущий, для следующих inc/restore)
+    echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
+    cp "$_curr_manifest" "$BACKUP_DIR/$FILE_MANIFEST_INC"
+
+    # 4a: fresh DB dump
+    if [[ -n "$DB_CONTAINER_NAME" ]]; then
+        local ACTUAL_DB_USER ACTUAL_DB_NAME
+        ACTUAL_DB_USER=$(get_db_user 2>/dev/null)
+        ACTUAL_DB_NAME=$(get_db_name 2>/dev/null)
+        print_message "INFO" "Дамп БД..."
+        _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-inc" \
+            'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
+            "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$BACKUP_DIR/$FILE_DB" "$_compress_pipe_cmd"
+        local _pg_rc=$?
+        if [[ $_pg_rc -ne 0 ]]; then
+            print_message "ERROR" "Ошибка дампа БД (rc=$_pg_rc)"
+            rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC"
+            rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"; rm -f "$_tar_err"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+    fi
+
+    # 4b: tar ТОЛЬКО изменённые файлы (из _diff_list)
+    print_message "INFO" "Архивация $_changed_count изменённых файлов..."
+    local _inc_files_archive="bot_files_inc_${TIMESTAMP}.tar.${_ext}"
+    if [[ "$_changed_count" -gt 0 ]]; then
+        # tar -T file: список файлов для архивации. Paths относительно $(dirname BOT_PATH).
+        local _bot_dirname
+        _bot_dirname=$(basename "$BOT_PATH")
+        # Prefix каждый путь с $_bot_dirname (так как find отдаёт без префикса)
+        sed "s|^|$_bot_dirname/|" "$_diff_list" > "$_work_dir/changed_prefixed.txt"
+        _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-inc" \
+            tar $_tar_compress_args -cf "$BACKUP_DIR/$_inc_files_archive" \
+            -C "$(dirname "$BOT_PATH")" -T "$_work_dir/changed_prefixed.txt" 2>> "$_tar_err"
+        local _tar_inc_rc=$?
+        if [[ $_tar_inc_rc -gt 1 ]]; then
+            print_message "ERROR" "tar для inc упал (rc=$_tar_inc_rc)"
+            rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC" "$BACKUP_DIR/$_inc_files_archive"
+            rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"; rm -f "$_tar_err"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+    fi
+
+    # 4c: combine bot_version + db + manifest + (inc_files если есть) → FILE_FINAL
+    local _combine=("$FILE_VERSION" "$FILE_MANIFEST_INC")
+    [[ -f "$BACKUP_DIR/$FILE_DB" ]] && _combine+=("$FILE_DB")
+    [[ -f "$BACKUP_DIR/$_inc_files_archive" ]] && _combine+=("$_inc_files_archive")
+    _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-inc-combine" \
+        tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine[@]}" 2>> "$_tar_err"
+    local _combine_rc=$?
+    rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC" "$BACKUP_DIR/$_inc_files_archive"
+
+    rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"; rm -f "$_tar_err"
+
+    if [[ $_combine_rc -ne 0 ]]; then
+        print_message "ERROR" "tar combine failed (rc=$_combine_rc)"
+        rm -f "$BACKUP_DIR/$FILE_FINAL"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    fi
+
+    # Step 5: encrypt если задан BACKUP_PASSWORD
+    if [[ -n "$BACKUP_PASSWORD" ]]; then
+        print_message "INFO" "Шифрование архива..."
+        if _hmac_envelope_create "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
+            rm -f "$BACKUP_DIR/$FILE_FINAL"
+            FILE_FINAL="${FILE_FINAL}.enc"
+            print_message "SUCCESS" "Архив зашифрован."
+        else
+            print_message "ERROR" "Ошибка шифрования"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+    fi
+
+    local _size
+    _size=$(stat -c%s "$BACKUP_DIR/$FILE_FINAL" 2>/dev/null | numfmt --to=iec 2>/dev/null || echo "?")
+    print_message "SUCCESS" "Incremental создан: $FILE_FINAL ($_size, $_changed_count изменённых)"
+    log_message "SUCCESS" "Incremental backup: $FILE_FINAL (base=$_base_ts, changed=$_changed_count, size=$_size)"
+    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+    return 0
 }
 
 normalize_path() {
@@ -10449,11 +10769,16 @@ case "$1" in
     backup_full)  create_backup "full";       _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
     backup_db)    create_backup "db_only";    _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
     backup_files) create_backup "files_only"; _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+    backup_inc|backup_incremental)
+        create_incremental_backup
+        [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt
+        ;;
     backup|-B)
         case "$2" in
             create|full|-c)     create_backup "full";       [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
             db|-d)              create_backup "db_only";    [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
             files|-f)           create_backup "files_only"; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+            inc|incremental|-i) create_incremental_backup;  [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
             list|-l)            menu_list_backups ;;
             *)
                 echo "Использование: lazarus backup <команда>"
@@ -10464,6 +10789,7 @@ case "$1" in
                 echo "  full            - Алиас для create"
                 echo "  db,     -d      - Создать бэкап только БД"
                 echo "  files,  -f      - Создать бэкап только файлов"
+                echo "  inc,    -i      - Создать incremental бэкап (изменения с последнего full)"
                 echo "  list,   -l      - Список бэкапов"
                 echo ""
                 echo "Примеры:"

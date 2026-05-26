@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-5.1.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-5.4.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -60,8 +60,10 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 
 ### Резервное копирование
 - **Smart Scan** — автоматически находит бота в Docker (поддержка `rwp_shop`, `telegram-shop`, `shopbot`)
-- **3 типа бэкапов** — Full (БД + файлы), DB Only, Files Only
+- **4 типа бэкапов** — Full (БД + файлы), DB Only, Files Only, **Incremental** (только изменённые файлы + DB)
 - **AES-256-CBC + HMAC-SHA256** — encrypt-then-MAC envelope (v2), защита от targeted tampering, wrong-password detect ДО decrypt
+- **gzip / zstd** компрессия — gzip (default, везде), zstd (opt-in, ~3× меньше + ~2× быстрее на SQL дампах)
+- **Manifest tracking** — каждый full backup включает `manifest.txt` (path + size + mtime) для incremental detection
 - **Версионирование** — каждый бэкап содержит версию бота на момент создания
 - **Умная фильтрация** — исключение больших файлов и папок (logs, node_modules, .git)
 - **v1→v2 миграция** — `lazarus migrate-v2` для конверсии старых архивов
@@ -69,21 +71,36 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 ### Хранение и доставка
 - **Telegram** — отправка файлов и уведомлений с premium emoji + retry × 3 для transient errors
 - **FTP / FTPS / WebDAV / Rclone** — облачные хранилища с retry и пошаговой настройкой
-- **S3-совместимые** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2**, **Backblaze B2**, custom
+- **S3-совместимые** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2** (region=auto), **Backblaze B2**, custom
 - **Integrity verify** — `head-object` size+ETag после S3 upload, multipart orphan cleanup при fail
+- **Auto S3-fallback** — если backup >50 MB и remote storage настроен, в TG идёт INFO-summary вместо ERROR
 - **Умная ротация** — по времени (дни) или количеству файлов
+
+### Заметные алерты в Telegram
+- **Severity bands** — CRITICAL 🔴 / ERROR ❌ / WARN ⚠️ / INFO ℹ️
+- **Hashtags на первой строке** — `#alert #critical` / `#warning` / `#info` для quick-scan
+- **Disk monitoring** — TG alert при заполнении диска (WARN 90% / CRITICAL 95%, конфигурируемо)
+- **Bot update notification** — INFO alert при обнаружении новой версии бота
 
 ### Автоматизация
 - **Cron интеграция** — настройка расписания из меню
 - **Блокировка параллельного запуска** — предотвращение конфликтов при запуске из cron
 - **Авто-обновление** — проверка и установка новых версий скрипта
+- **Timeout-обёртки** — hard-limit на pg_dump/tar/encrypt/restore (60 мин default, configurable)
+- **Logrotate** — system-level через `/etc/logrotate.d/lazarus` (weekly, rotate 8, compress)
 
 ### Управление ботом
 - **Восстановление** — Full / DB / Files из любого бэкапа
+- **Date filter** — поиск backup'ов по дате (`25.12` / `25.12.2026` / ISO) в restore меню
+- **Timer-confirm** — для destructive операций (`RESTORE`/`DELETE`/`DROP`) auto-cancel через 60 сек
 - **Обновление бота** — установка новой версии из tar-файла с автобэкапом
 - **Health-check** — проверка контейнеров перед операциями
 
-### Отладка
+### Диагностика
+- **`lazarus diag`** — полный snapshot системы (versions, containers, backups, disk, cron, settings, errors)
+- **`lazarus verify`** — integrity check всех архивов (gzip+zstd) с TG alert при corruption
+- **`lazarus report [weekly|daily|month]`** — статистика backup-активности с success rate
+- **`lazarus emoji probe <id> | scan`** — diagnostics Premium custom emoji
 - **Debug режим** — полное логирование всех операций (`--debug`)
 - **Dry-run** — предпросмотр действий без выполнения (`--dry-run`)
 
@@ -91,10 +108,13 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 
 ## 📋 Требования
 
-- Linux (Debian/Ubuntu/CentOS)
-- Bash 5+, root права
+- Linux (Debian/Ubuntu/CentOS), bash 5+, root права
 - Docker Compose v2 (`docker compose`, не `docker-compose`)
-- tar, gzip, curl/wget, openssl
+- **Обязательно:** tar (≥1.31), gzip, curl/wget, openssl
+- **Опционально:**
+  - `zstd` (для `COMPRESSION=zstd` — `apt install zstd`)
+  - `aws` CLI v1/v2 (для S3/R2/B2 хранилищ)
+  - `rclone` (для Rclone-совместимых хранилищ)
 
 ---
 
@@ -179,16 +199,46 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 
 После upload — автоматический `head-object` verify (size + ETag для не-multipart). При сбое — abort висящих multipart parts (защита от billing waste у AWS).
 
-### Шифрование и фильтрация
+### Шифрование, компрессия и фильтрация
 
 | Параметр | Описание | Пример |
 |----------|----------|--------|
 | `BACKUP_PASSWORD` | Пароль AES-256 шифрования | `MySecretPass123` или пусто |
 | `BACKUP_PASSWORD_FILE` | Файл с паролем шифрования (chmod 600) | `/opt/lazarus-backup/.password` |
+| `COMPRESSION` | Алгоритм сжатия | `gzip` (default) / `zstd` |
 | `MAX_FILE_SIZE_MB` | Макс. размер файла в архиве (MB) | `1` (пропуск больших) |
-| `EXCLUDE_DIRS` | Исключить папки (через пробел) | `node_modules .git cache` |
+| `EXCLUDE_DIRS` | Исключить папки (`,`/`;` для путей с пробелами) | `node_modules, my data/cache, .git` |
 
 > ⚠️ Пароль сохраняется в отдельном файле `BACKUP_PASSWORD_FILE` для безопасности и корректной работы спецсимволов.
+
+#### zstd vs gzip
+
+| Метрика | gzip | zstd |
+|---|---|---|
+| Размер 35 MB БД-дампа | 36 MB | **12 MB** (~3× меньше) |
+| Время создания | 17-22 сек | **9 сек** (~2× быстрее) |
+| Зависимость | везде | `apt install zstd` / `dnf install zstd` |
+| Multi-thread | нет | да |
+
+Переключение: меню → Настройки → 26 (Компрессия) → auto-install через apt/dnf если нужен. Старые `.tar.gz.enc` продолжают восстанавливаться независимо от текущего COMPRESSION (per-file format detection по magic bytes).
+
+### Timeouts (защита от вечно висящего cron)
+
+| Параметр | Default | Описание |
+|----------|---------|----------|
+| `PG_DUMP_TIMEOUT_SEC` | `3600` (60 мин) | Hard-limit на pg_dump + safety snapshot |
+| `TAR_TIMEOUT_SEC` | `3600` | Hard-limit на tar create |
+| `ENCRYPT_TIMEOUT_SEC` | `1800` (30 мин) | Hard-limit на openssl encrypt |
+| `RESTORE_TIMEOUT_SEC` | `3600` | Hard-limit на restore (zcat\|psql) |
+
+`0` = отключить таймер (для очень больших БД >10 GB). При превышении — SIGTERM, через 30 сек SIGKILL.
+
+### Disk monitoring
+
+| Параметр | Default | Описание |
+|----------|---------|----------|
+| `DISK_WARN_PERCENT` | `90` | TG WARN alert + backup продолжается |
+| `DISK_CRITICAL_PERCENT` | `95` | TG CRITICAL alert + backup ОТМЕНЁН |
 
 #### v2 envelope (HMAC encrypt-then-MAC)
 
@@ -215,35 +265,46 @@ lazarus --yes migrate-v2         # автоматически (для cron)
 
 ```bash
 lazarus                       # Интерактивное меню
-lazarus restore               # Меню восстановления
+lazarus restore               # Меню восстановления (с date filter)
 lazarus cleanup               # Очистка старых бэкапов
 lazarus skipped               # Просмотр пропущенных файлов последнего бэкапа
 lazarus migrate-v2            # Конверсия v1 → v2 envelope (HMAC)
 lazarus --yes migrate-v2      # Автоматическая миграция (для cron)
+lazarus verify                # Integrity check всех архивов (gzip+zstd, MAC)
+lazarus report weekly         # TG-отчёт за неделю (counts/size/errors/success rate)
+lazarus report daily|month    # Отчёт за сутки / месяц
+lazarus diag                  # Полный snapshot системы (для troubleshooting)
+lazarus diag > diag.txt       # Сохранить отчёт для шаринга
+lazarus emoji probe <id>      # Проверить Premium custom emoji ID
+lazarus emoji scan            # Извлечь ID Premium emoji из последних TG сообщений
 lazarus check_update          # Проверка обновлений скрипта
 lazarus s3 test               # Проверить подключение к S3
 lazarus s3 list               # Список файлов в S3 bucket
 lazarus s3 upload <file>      # Загрузить файл в S3
 ```
 
-> ⚠️ **ВАЖНО (Restore):** восстановление теперь требует строгую проверку пути и подтверждение строкой
-> `RESTORE_TO:/путь/к/боту`. Для неинтерактивного режима нужно **оба** флага:
-> `--yes --i-know-what-i-am-doing`. По умолчанию `.env` сохраняется (не перезаписывается).
-> Удаление volume БД не выполняется по умолчанию — используйте `--restore-drop-volume` при необходимости.
-> Очистка схемы БД (`DROP SCHEMA`) требует `--restore-drop-schema` — без этого флага данные не удаляются, импорт выполняется поверх существующих таблиц.
+> ⚠️ **ВАЖНО (Restore):** восстановление требует подтверждения коротким словом
+> `RESTORE` для restore-операции, `DELETE` для удаления volume, `DROP` для DROP SCHEMA.
+> При отсутствии ввода — auto-cancel через 60 секунд.
+> Для неинтерактивного режима нужно **оба** флага: `--yes --i-know-what-i-am-doing`.
+> По умолчанию `.env` сохраняется (не перезаписывается).
+> Удаление volume БД не выполняется по умолчанию — используйте `--restore-drop-volume`.
+> Очистка схемы БД (`DROP SCHEMA`) требует `--restore-drop-schema`.
 
 ### 🆕 Резервное копирование (v4.30.0+)
 
 ```bash
-lazarus backup create    # Полный бэкап (БД + файлы)
+lazarus backup create    # Полный бэкап (БД + файлы + manifest)
 lazarus backup db        # Только база данных
 lazarus backup files     # Только файлы
+lazarus backup inc       # Incremental (changed files + DB) — относительно последнего full
 lazarus backup list      # Список бэкапов
 
 # Короткие флаги
 lazarus -B -c            # = lazarus backup create
 lazarus -B -d            # = lazarus backup db
 lazarus -B -f            # = lazarus backup files
+lazarus -B -i            # = lazarus backup inc
 
 # Legacy команды (совместимость)
 lazarus backup_full      # = lazarus backup create
@@ -292,6 +353,15 @@ lazarus --debug backup_db
 
 # Очистка с отчётом в Telegram
 lazarus --yes --report-tg cleanup
+
+# Еженедельный verify integrity (cron)
+0 4 * * 0 /usr/local/bin/lazarus --report-tg verify >> /var/log/lazarus_backup.log 2>&1
+
+# Еженедельный отчёт активности (cron)
+0 5 * * 0 /usr/local/bin/lazarus report weekly >> /var/log/lazarus_backup.log 2>&1
+
+# Diagnostics для шаринга при проблемах
+lazarus diag > /tmp/diag.txt && cat /tmp/diag.txt
 ```
 
 ---
