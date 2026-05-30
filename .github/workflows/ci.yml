@@ -54,3 +54,9 @@ jobs:
         run: bash .github/tests/test_telegram_alert.sh
       - name: test_compression_helpers
         run: bash .github/tests/test_compression_helpers.sh
+      - name: test_db_discovery
+        run: bash .github/tests/test_db_discovery.sh
+      - name: test_mb_to_human
+        run: bash .github/tests/test_mb_to_human.sh
+      - name: test_rotation_zst
+        run: bash .github/tests/test_rotation_zst.sh

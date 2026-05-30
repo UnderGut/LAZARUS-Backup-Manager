@@ -1,7 +1,17 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.6.0"
+VERSION="5.1.2"
+
+# Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
+# после install_script (иначе теряются "$@" при первой установке через cron).
+ORIGINAL_ARGS=("$@")
+
+# Безопасный umask по умолчанию: 077 = создаваемые файлы 0600, директории 0700.
+# Защищает backup-архивы и логи от чтения другими пользователями на multi-user
+# хостах. Скрипт явно chmod'ит критичные файлы (config.env, .password), но
+# umask служит fallback для backup-архивов и временных файлов.
+umask 077
 # SCRIPT_NAME — имя файла внутри INSTALL_DIR, совпадает с именем в репо.
 # Раньше было "lazarus" (расхождение с именем в Git), теперь "lazarus-backup".
 # install_script автоматически мигрирует старые установки.
@@ -184,7 +194,7 @@ cleanup_on_exit() {
         flock -u "$LOCK_FD" 2>/dev/null || true
         eval "exec $LOCK_FD>&-" 2>/dev/null || true
     fi
-    rm -f "$LOCK_FILE" 2>/dev/null || true
+    # C1 fix: lock-файл НЕ удаляем (flock+unlink race — см. release_lock).
 
     # КРИТИЧНО: удаляем sensitive temp paths (decrypted backups, S3 creds).
     # Если скрипт умер по SIGKILL — этот trap не сработает, но при normal exit,
@@ -294,9 +304,7 @@ debug_log() {
 # NB: ID'ы Premium emoji проверены через getStickerSet (tgmacicons set, 134 emoji).
 # Audit'нуто через `lazarus emoji probe <id>`. Используем точное совпадение или
 # visually-closest match (см. комментарии справа).
-EMO_ERROR="5260342697075416641"          # ❌ → ❌ exact
 EMO_WARN="5258474669769497337"           # ⚠️ → ❗️ close
-EMO_INFO="5258216851472654189"           # 💡 → 💡 exact
 EMO_LOCK="5258476306152038031"           # 🔒 → 🔒 exact
 EMO_CALENDAR="5258105663359294787"       # 📅 → 🗓 close (calendar family)
 EMO_FOLDER="5257969839313526622"         # 📂 → 📂 exact
@@ -745,8 +753,12 @@ _verify_compressed() {
 _manifest_generate() {
     local _bot_path="$1"
     local _out="$2"
-    shift 2
-    local _excludes=("$@")
+    # ОГРАНИЧЕНИЕ (известное): манифест строится по ВСЕМ файлам под BOT_PATH без
+    # учёта EXCLUDE_DIRS / MAX_FILE_SIZE_MB. Поэтому incremental-бэкап может
+    # отслеживать и архивировать изменения в node_modules/.git, которые full-бэкап
+    # исключает. TODO: прокинуть exclude-логику full-бэкапа сюда. Раньше тут был
+    # неиспользуемый параметр `_excludes=("$@")` — убран как вводящий в заблуждение
+    # (ни один caller его не передавал, тело не использовало).
 
     # Check rc от cd — иначе manifest будет от текущей cwd, broken.
     if ! ( cd "$(dirname "$_bot_path")" 2>/dev/null ); then
@@ -1620,32 +1632,41 @@ acquire_lock() {
         mkdir -p "$lock_dir" 2> "$SILENT_LOG" || true
     fi
     
-    # Открываем файл на дескриптор LOCK_FD
-    debug_log "LOCK" "Opening lock file on FD $LOCK_FD"
-    eval "exec $LOCK_FD>\"$LOCK_FILE\""
-    
+    # Открываем файл на дескриптор LOCK_FD в режиме append (>>), НЕ truncate (>).
+    # C1 fix: `>` усекал бы файл ПРИ ОТКРЫТИИ, до flock — параллельный процесс
+    # стирал PID владельца (и check_lock_owner показывал пустоту). С `>>`
+    # содержимое не трогается до взятия блокировки.
+    debug_log "LOCK" "Opening lock file on FD $LOCK_FD (append mode)"
+    eval "exec $LOCK_FD>>\"$LOCK_FILE\""
+
     # Пытаемся получить неблокирующую эксклюзивную блокировку
     debug_log "LOCK" "Attempting flock..."
     if ! flock -n "$LOCK_FD" 2> "$SILENT_LOG"; then
         debug_log "LOCK" "FAILED - lock already held by another process"
         return 1  # Блокировка уже занята другим процессом
     fi
-    
-    # Записываем PID в lock-файл для отладки
+
+    # Только ПОСЛЕ взятия блокировки чистим возможный stale-PID и пишем свой.
+    # Безопасно: мы единственный держатель advisory-lock.
+    : > "$LOCK_FILE" 2> "$SILENT_LOG" || true
     echo "$$" >&$LOCK_FD
     debug_log "LOCK" "Lock acquired, PID=$$ written to lock file"
-    
+
     return 0
 }
 
 release_lock() {
-    # Освобождаем блокировку
+    # Освобождаем блокировку.
+    # C1 fix: НЕ удаляем lock-файл (rm -f убран). Удаление inode при живом
+    # waiter'е создаёт flock+unlink race: waiter держит lock на unlinked inode,
+    # а новый процесс создаёт НОВЫЙ inode и берёт "чистый" lock → параллельное
+    # выполнение. Файл persistent, эксклюзивность обеспечивает flock, не наличие
+    # файла. Stale-PID внутри перезапишется при следующем acquire_lock.
     debug_log "LOCK" "=== release_lock ==="
     debug_log "LOCK" "Releasing FD $LOCK_FD"
     flock -u "$LOCK_FD" 2> "$SILENT_LOG" || true
     eval "exec $LOCK_FD>&-" 2> "$SILENT_LOG" || true
-    rm -f "$LOCK_FILE" 2> "$SILENT_LOG" || true
-    debug_log "LOCK" "Lock released and file removed"
+    debug_log "LOCK" "Lock released (file kept to avoid unlink race)"
 }
 
 check_lock_owner() {
@@ -1666,8 +1687,13 @@ check_dependencies() {
     # Required at startup. Without these the script cannot work at all.
     local required=("tar" "gzip" "openssl" "docker" "find" "du" "date")
     # Optional: needed only for specific features. Missing -> warn, do not exit.
-    #   rsync -> needed only for rsync-mode restore (folder sync).
-    local optional=("rsync")
+    #   rsync    -> rsync-mode restore (folder sync)
+    #   zstd     -> COMPRESSION="zstd" — иначе fallback на gzip (хотя config может требовать zstd)
+    #   flock    -> предотвращение параллельного запуска (acquire_lock)
+    #   realpath -> install_script для миграции legacy lazarus → lazarus-backup
+    #   sha256sum-> auto-update integrity verification (H3)
+    # L2 audit fix: явный warn вместо runtime сюрприза.
+    local optional=("rsync" "zstd" "flock" "realpath" "sha256sum")
     local missing=()
     local missing_optional=()
 
@@ -1705,7 +1731,16 @@ check_dependencies() {
 
     if [[ ${#missing_optional[@]} -gt 0 ]]; then
         echo -e "${YELLOW}[WARN]${RESET} Optional tools not found: ${missing_optional[*]}"
-        echo -e "${CYAN}[HINT]${RESET} Install only if you need rsync-mode restore: apt install ${missing_optional[*]}"
+        echo -e "${CYAN}[HINT]${RESET} Install if нужны соответствующие фичи: apt install ${missing_optional[*]}"
+        # L2 audit fix: если COMPRESSION=zstd, но zstd нет — это hard error.
+        # Конфиг прямо требует zstd, fallback на gzip = silent data behavior change.
+        for _miss in "${missing_optional[@]}"; do
+            if [[ "$_miss" == "zstd" && "${COMPRESSION:-}" == "zstd" ]]; then
+                echo -e "${RED}[ERROR]${RESET} COMPRESSION=zstd, но zstd не установлен!"
+                echo -e "${CYAN}[ACTION]${RESET} apt install zstd  ИЛИ  смените COMPRESSION на gzip в $CONFIG_FILE"
+                exit 1
+            fi
+        done
     fi
 }
 
@@ -1713,9 +1748,11 @@ check_dependencies() {
 
 get_backup_stats() {
     # Подсчёт файлов по категориям
-    local n_full=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_full_*.tar.gz" -o -name "lazarus_full_*.tar.gz.enc" \) 2> "$SILENT_LOG" | wc -l)
-    local n_db=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" \) 2> "$SILENT_LOG" | wc -l)
-    local n_files=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_files_*.tar.gz" -o -name "lazarus_files_*.tar.gz.enc" \) 2> "$SILENT_LOG" | wc -l)
+    # Все 4 формата (gz/zst × plain/enc) — иначе при COMPRESSION=zstd статистика
+    # показывает 0 бэкапов хотя они есть (.tar.zst.enc).
+    local n_full=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_full_*.tar.gz" -o -name "lazarus_full_*.tar.gz.enc" -o -name "lazarus_full_*.tar.zst" -o -name "lazarus_full_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
+    local n_db=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" -o -name "lazarus_db_*.tar.zst" -o -name "lazarus_db_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
+    local n_files=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_files_*.tar.gz" -o -name "lazarus_files_*.tar.gz.enc" -o -name "lazarus_files_*.tar.zst" -o -name "lazarus_files_*.tar.zst.enc" \) 2> "$SILENT_LOG" | wc -l)
     
     # Общий размер папки бэкапов
     local total_size="0B"
@@ -1726,7 +1763,7 @@ get_backup_stats() {
     # Последний бэкап (любой тип)
     local last_backup=""
     local last_backup_ago=""
-    local latest_file=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_*.tar.gz" -o -name "lazarus_*.tar.gz.enc" \) -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | awk '{print $2}')
+    local latest_file=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_*.tar.gz" -o -name "lazarus_*.tar.gz.enc" -o -name "lazarus_*.tar.zst" -o -name "lazarus_*.tar.zst.enc" \) -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | awk '{print $2}')
     
     if [[ -n "$latest_file" && -f "$latest_file" ]]; then
         local filename=$(basename "$latest_file")
@@ -2067,10 +2104,15 @@ install_script() {
         print_message "INFO" "Загрузка последней версии..."
         # Добавляем timestamp для обхода кэша GitHub
         local FETCH_URL="${REMOTE_URL}?t=$(date +%s)"
+        local SHA_URL="${REMOTE_URL}.sha256?t=$(date +%s)"
+        local TEMP_SHA="/tmp/lazarus_install_tmp.sha256"
         if command -v curl > "$SILENT_LOG" 2>&1; then
             curl $CURL_SILENT -L --connect-timeout 15 --max-time 60 "$FETCH_URL" -o "$TEMP_FILE"
+            # SHA256 manifest опционален (graceful если не опубликован).
+            curl $CURL_SILENT -L --connect-timeout 10 --max-time 20 "$SHA_URL" -o "$TEMP_SHA" 2> "$SILENT_LOG" || true
         elif command -v wget > "$SILENT_LOG" 2>&1; then
             wget $WGET_SILENT -O "$TEMP_FILE" --timeout=15 "$FETCH_URL"
+            wget $WGET_SILENT -O "$TEMP_SHA" --timeout=10 "$SHA_URL" 2> "$SILENT_LOG" || true
         else
             print_message "ERROR" "Для установки нужен curl или wget!"
             exit 1
@@ -2083,17 +2125,46 @@ install_script() {
                 local FILE_SIZE=$(stat -c%s "$TEMP_FILE" 2> "$SILENT_LOG" || stat -f%z "$TEMP_FILE" 2> "$SILENT_LOG" || echo "0")
                 if [[ $FILE_SIZE -lt 10000 ]]; then
                     print_message "ERROR" "Загруженный файл слишком мал ($FILE_SIZE байт)."
-                    rm -f "$TEMP_FILE"
+                    rm -f "$TEMP_FILE" "$TEMP_SHA"
                     exit 1
                 fi
+
+                # === SHA256 verification (H3 audit fix) ===
+                # Если SHA-manifest опубликован — обязан совпасть. Если 404 — warn
+                # и продолжить (graceful для legacy-релизов до публикации .sha256).
+                # Формат manifest: одна строка "<HEX>  lazarus-backup" (как от sha256sum).
+                if [[ -s "$TEMP_SHA" ]] && command -v sha256sum > "$SILENT_LOG" 2>&1; then
+                    local EXPECTED_SHA ACTUAL_SHA
+                    EXPECTED_SHA=$(awk '{print tolower($1); exit}' "$TEMP_SHA" 2> "$SILENT_LOG")
+                    ACTUAL_SHA=$(sha256sum "$TEMP_FILE" 2> "$SILENT_LOG" | awk '{print tolower($1); exit}')
+                    # Manifest валидный только если 64 hex-символа
+                    if [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{64}$ ]]; then
+                        if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+                            print_message "ERROR" "SHA256 mismatch! Скрипт может быть скомпрометирован."
+                            echo -e "  ${RED}Expected:${RESET} $EXPECTED_SHA"
+                            echo -e "  ${RED}Actual:  ${RESET} $ACTUAL_SHA"
+                            rm -f "$TEMP_FILE" "$TEMP_SHA"
+                            exit 1
+                        else
+                            debug_log "INSTALL" "SHA256 verified: $ACTUAL_SHA"
+                        fi
+                    else
+                        print_message "WARN" "SHA256 manifest невалидный, пропускаем проверку."
+                    fi
+                else
+                    print_message "WARN" "SHA256 manifest недоступен — integrity не проверена."
+                fi
+                rm -f "$TEMP_SHA"
+
                 mv "$TEMP_FILE" "$INSTALLED_SCRIPT_PATH"
                 DOWNLOAD_SUCCESS=true
             else
                 print_message "ERROR" "Ошибка загрузки! Сервер вернул неверный файл."
-                rm -f "$TEMP_FILE"
+                rm -f "$TEMP_FILE" "$TEMP_SHA"
                 exit 1
             fi
         else
+            rm -f "$TEMP_SHA"
             print_message "ERROR" "Не удалось скачать файл."
             exit 1
         fi
@@ -2110,7 +2181,9 @@ install_script() {
 
         print_message "SUCCESS" "Установка завершена. Запуск..."
         echo ""
-        exec "$INSTALLED_SCRIPT_PATH"
+        # Передаём ORIGINAL_ARGS, чтобы cron-задачи типа `lazarus backup_full --yes`
+        # не теряли аргументы после первой авто-установки (H2 audit fix).
+        exec "$INSTALLED_SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
         exit 0
     fi
 }
@@ -2121,8 +2194,14 @@ add_candidate() {
     local path="$1"
     local bot="$2"
     [[ -z "$path" ]] && return
-    for p in "${FOUND_PATHS[@]}"; do
-        [[ "$p" == "$path" ]] && return
+    # L1 audit fix: дедуп по (path, bot) — если две разных пары бот+путь
+    # ссылаются на один path (multiple compose services), регистрируем обе.
+    # Раньше дедуп только по path → второй бот терялся.
+    local i
+    for i in "${!FOUND_PATHS[@]}"; do
+        if [[ "${FOUND_PATHS[i]}" == "$path" && "${FOUND_BOTS[i]}" == "$bot" ]]; then
+            return
+        fi
     done
     FOUND_PATHS+=("$path")
     FOUND_BOTS+=("$bot")
@@ -2146,9 +2225,13 @@ scan_system_for_bot() {
         "certwardenclient"       # Cert Warden
     )
     
-    for container in $running_containers; do
-        local c_name=$(echo "$container" | cut -d'|' -f1)
-        local c_image=$(echo "$container" | cut -d'|' -f2)
+    # C1 audit fix: while-read вместо for in $var — корректная обработка
+    # путей/имён с whitespace (теоретически может встретиться в private registry).
+    while IFS= read -r container; do
+        [[ -z "$container" ]] && continue
+        # Parameter expansion вместо cut: быстрее (без fork) и безопасно с пробелами
+        local c_name="${container%%|*}"
+        local c_image="${container#*|}"
         debug_log "SCAN" "Checking: $c_name ($c_image)"
         
         # Проверяем что это не контейнер панели
@@ -2188,8 +2271,36 @@ scan_system_for_bot() {
                 break
             fi
         done
-    done
-    
+    done <<< "$running_containers"
+
+    # M3 audit fix: если среди running ничего не нашли — пробуем docker ps -a
+    # (бот может быть остановлен во время upgrade/maintenance).
+    if [[ ${#FOUND_PATHS[@]} -eq 0 ]]; then
+        debug_log "SCAN" "No running matches, checking stopped containers (docker ps -a)..."
+        local stopped_containers
+        stopped_containers=$(docker ps -a --format '{{.Names}}|{{.Image}}|{{.State}}' 2> "$SILENT_LOG")
+        while IFS= read -r container; do
+            [[ -z "$container" ]] && continue
+            local c_name="${container%%|*}"
+            local rest="${container#*|}"
+            local c_image="${rest%%|*}"
+            local c_state="${rest##*|}"
+            # Skip running (уже обработали выше), оставляем exited/stopped/dead
+            [[ "$c_state" == "running" ]] && continue
+            for key in "${KEYWORDS[@]}"; do
+                if [[ "$c_image" == *"$key"* || "$c_name" == *"$key"* ]]; then
+                    debug_log "SCAN" "  -> Stopped match: $c_name (state=$c_state)"
+                    local work_dir
+                    work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name" 2> "$SILENT_LOG")
+                    if [[ -n "$work_dir" && -d "$work_dir" && "$work_dir" != "/opt" ]]; then
+                        add_candidate "$work_dir" "$c_name"
+                    fi
+                    break
+                fi
+            done
+        done <<< "$stopped_containers"
+    fi
+
     if [[ ${#FOUND_PATHS[@]} -gt 0 ]]; then
         FOUND_PATH="${FOUND_PATHS[0]}"
         FOUND_BOT="${FOUND_BOTS[0]}"
@@ -2200,8 +2311,15 @@ scan_system_for_bot() {
     if [[ -z "$FOUND_PATH" ]]; then
         debug_log "SCAN" "No containers found, searching compose files..."
         local search_dirs=("/opt" "/home" "/root")
-        local compose_files=$(find "${search_dirs[@]}" -maxdepth 4 -name "docker-compose.yml" -o -name "compose.yaml" 2> "$SILENT_LOG")
-        for file in $compose_files; do
+        # H1 audit fix: оборачиваем -name ... -o -name ... в \( ... \) —
+        # без скобок `find -maxdepth 4 -name A -o -name B` парсится как
+        # `(-maxdepth 4 AND -name A) OR -name B` и compose.yaml ищется
+        # рекурсивно по всей FS под /opt, /home, /root.
+        local compose_files
+        compose_files=$(find "${search_dirs[@]}" -maxdepth 4 \( -name "docker-compose.yml" -o -name "compose.yaml" \) 2> "$SILENT_LOG")
+        # C1 audit fix: while-read для путей с whitespace
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
             # Пропускаем compose файлы панели управления
             if grep -q "remnawave/backend" "$file"; then continue; fi
             if grep -q "remnawave/subscription-page" "$file"; then continue; fi
@@ -2238,25 +2356,43 @@ scan_system_for_bot() {
                 fi
                 add_candidate "$candidate_path" "$candidate_bot"
             fi
-        done
+        done <<< "$compose_files"
     fi
 
     # Поиск контейнера БД
     # subshell: cd локален, результат передаётся через stdout
+    # M2 audit fix: после стандартных имён сервисов — fallback на image-match
+    # (postgres/postgis/timescale) для кастомных compose-файлов.
     if [[ -n "$FOUND_PATH" ]]; then
         local _found_db
         _found_db=$(
             cd "$FOUND_PATH" 2> "$SILENT_LOG" || exit 0
             local db_services=("db" "postgres" "database" "postgresql")
+            # Шаг 1: стандартные имена сервисов
             for svc in "${db_services[@]}"; do
                 local db_c
                 db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
                 # Исключаем БД панели
                 if [[ -n "$db_c" && "$db_c" != "remnawave-db" && "$db_c" != *"remnawave_"* ]]; then
                     echo "$db_c"
-                    break
+                    exit 0
                 fi
             done
+            # Шаг 2: image-based fallback — ищем postgres-like контейнер в проекте
+            local all_in_project
+            all_in_project=$(docker compose ps -a --format '{{.Name}}|{{.Image}}' 2> "$SILENT_LOG")
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local _n="${line%%|*}"
+                local _i="${line#*|}"
+                # Образы PostgreSQL-семейства
+                if [[ "$_i" =~ ^(postgres|postgis|timescale/timescaledb|library/postgres) ]]; then
+                    if [[ "$_n" != "remnawave-db" && "$_n" != *"remnawave_"* ]]; then
+                        echo "$_n"
+                        exit 0
+                    fi
+                fi
+            done <<< "$all_in_project"
         )
         [[ -n "$_found_db" ]] && FOUND_DB="$_found_db"
     fi
@@ -2374,10 +2510,15 @@ read_bot_env() {
     echo "$value"
 }
 
-# Получение имени пользователя БД из .env бота или fallback на глобальную настройку
+# Получение имени пользователя БД из .env бота или fallback на глобальную настройку.
+# M8 audit fix: предупреждаем если config.env DB_USER явно отличается от .env
+# POSTGRES_USER (discoverability — пользователь думал что переопределил, но .env wins).
 get_db_user() {
     local env_user=$(read_bot_env "POSTGRES_USER")
     if [[ -n "$env_user" ]]; then
+        if [[ -n "$DB_USER" && "$DB_USER" != "postgres" && "$DB_USER" != "$env_user" ]]; then
+            debug_log "DB" "WARNING: config.env DB_USER='$DB_USER' overridden by .env POSTGRES_USER='$env_user'"
+        fi
         debug_log "DB" "get_db_user: using env POSTGRES_USER=$env_user"
         echo "$env_user"
     else
@@ -2386,16 +2527,28 @@ get_db_user() {
     fi
 }
 
-# Получение имени базы данных из .env бота или fallback на postgres
+# Получение имени базы данных из .env бота.
+# H5 audit fix: silent default 'postgres' убран — раньше это могло привести
+# к бэкапу пустой системной БД вместо данных бота, если .env не найден.
+# Теперь rc=1 и понятная ошибка — caller обязан её обработать.
 get_db_name() {
     local env_db=$(read_bot_env "POSTGRES_DB")
     if [[ -n "$env_db" ]]; then
         debug_log "DB" "get_db_name: using env POSTGRES_DB=$env_db"
         echo "$env_db"
-    else
-        debug_log "DB" "get_db_name: using default 'postgres'"
-        echo "postgres"
+        return 0
     fi
+    debug_log "DB" "get_db_name: POSTGRES_DB not found in .env"
+    # Опциональный override через config.env (DB_NAME) для нестандартных установок
+    if [[ -n "${DB_NAME:-}" ]]; then
+        debug_log "DB" "get_db_name: using config.env DB_NAME=$DB_NAME"
+        echo "$DB_NAME"
+        return 0
+    fi
+    echo "" >&2
+    echo "[ERROR] Не удалось определить имя БД: POSTGRES_DB отсутствует в \$BOT_PATH/.env." >&2
+    echo "[HINT]  Проверьте \$BOT_PATH/.env или задайте DB_NAME в $CONFIG_FILE." >&2
+    return 1
 }
 
 # --- ФУНКЦИЯ ОБНОВЛЕНИЯ БОТА ---
@@ -3524,7 +3677,7 @@ check_bot_health() {
 
 # Получить последний бэкап БД для возможного rollback
 get_latest_db_backup() {
-    local latest=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" \) -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | awk '{print $2}')
+    local latest=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_db_*.tar.gz" -o -name "lazarus_db_*.tar.gz.enc" -o -name "lazarus_db_*.tar.zst" -o -name "lazarus_db_*.tar.zst.enc" \) -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | awk '{print $2}')
     echo "$latest"
 }
 
@@ -4737,18 +4890,41 @@ update_bot() {
 find_db_container_for_path() {
     local path="$1"
     [[ -z "$path" || ! -d "$path" ]] && return 1
-    local db_services=("db" "postgres" "database" "postgresql")
-    local db_name=""
-    if cd "$path" 2> "$SILENT_LOG"; then
+    # M7 audit fix: subshell вместо `cd $path; ... cd -` — изолирует cd,
+    # не зависит от OLDPWD, не поломает caller'а при сигналах между cd.
+    # M2 audit fix: image-based fallback для кастомных db-сервисов.
+    local db_name
+    db_name=$(
+        cd "$path" 2> "$SILENT_LOG" || exit 1
+        local db_services=("db" "postgres" "database" "postgresql")
+        # Шаг 1: стандартные имена сервисов
         for svc in "${db_services[@]}"; do
-            db_name=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
-            if [[ -n "$db_name" && "$db_name" != "remnawave-db" && "$db_name" != *"remnawave_"* ]]; then
-                cd - > "$SILENT_LOG"
-                echo "$db_name"
-                return 0
+            local n
+            n=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
+            if [[ -n "$n" && "$n" != "remnawave-db" && "$n" != *"remnawave_"* ]]; then
+                echo "$n"
+                exit 0
             fi
         done
-        cd - > "$SILENT_LOG"
+        # Шаг 2: image-based fallback (postgres/postgis/timescale)
+        local all
+        all=$(docker compose ps -a --format '{{.Name}}|{{.Image}}' 2> "$SILENT_LOG")
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local _n="${line%%|*}"
+            local _i="${line#*|}"
+            if [[ "$_i" =~ ^(postgres|postgis|timescale/timescaledb|library/postgres) ]]; then
+                if [[ "$_n" != "remnawave-db" && "$_n" != *"remnawave_"* ]]; then
+                    echo "$_n"
+                    exit 0
+                fi
+            fi
+        done <<< "$all"
+        exit 1
+    )
+    if [[ -n "$db_name" ]]; then
+        echo "$db_name"
+        return 0
     fi
     return 1
 }
@@ -4756,8 +4932,18 @@ find_db_container_for_path() {
 detect_bot_installation() {
     debug_log "SCAN" "=== detect_bot_installation ==="
     print_message "INFO" "Запуск интеллектуального поиска..."
-    scan_system_for_bot 
+    scan_system_for_bot
     if [[ ${#FOUND_PATHS[@]} -gt 1 ]]; then
+        # H4 audit fix: в неинтерактивном режиме (cron) — берём первый кандидат
+        # вместо подвешивания на read. Логируем выбор для аудита.
+        if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+            debug_log "SCAN" "Non-interactive: auto-selecting first candidate ${FOUND_PATHS[0]}"
+            print_message "WARN" "Найдено ${#FOUND_PATHS[@]} установок, в неинтерактивном режиме выбран первый: ${FOUND_PATHS[0]}"
+            BOT_PATH="${FOUND_PATHS[0]}"
+            [[ -n "${FOUND_BOTS[0]}" ]] && BOT_CONTAINER_NAME="${FOUND_BOTS[0]}"
+            DB_CONTAINER_NAME=$(find_db_container_for_path "$BOT_PATH")
+            save_config; print_message "SUCCESS" "Настройки сохранены автоматически."; return 0
+        fi
         echo ""; print_message "WARN" "Найдено несколько установок. Выберите нужную:"
         local idx=1
         for path in "${FOUND_PATHS[@]}"; do
@@ -4777,6 +4963,14 @@ detect_bot_installation() {
         fi
     elif [[ -n "$FOUND_PATH" ]]; then
         debug_log "SCAN" "Found installation: PATH=$FOUND_PATH, BOT=$FOUND_BOT, DB=$FOUND_DB"
+        # H4 audit fix: в неинтерактивном режиме — auto-apply без подтверждения
+        if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+            debug_log "SCAN" "Non-interactive: auto-applying single candidate"
+            BOT_PATH="$FOUND_PATH"
+            [[ -n "$FOUND_BOT" ]] && BOT_CONTAINER_NAME="$FOUND_BOT"
+            [[ -n "$FOUND_DB" ]] && DB_CONTAINER_NAME="$FOUND_DB"
+            save_config; print_message "SUCCESS" "Настройки применены автоматически: $FOUND_PATH"; return 0
+        fi
         echo ""; print_message "SUCCESS" "Обнаружена установка!"
         echo -e "   Путь:      ${BOLD}$FOUND_PATH${RESET}"
         [[ -n "$FOUND_BOT" ]] && echo -e "   Бот:       ${BOLD}$FOUND_BOT${RESET}"
@@ -4811,6 +5005,18 @@ check_config_mismatch() {
             scan_system_for_bot
             if [[ -n "$FOUND_BOT" && "$FOUND_BOT" != "$BOT_CONTAINER_NAME" ]]; then
                 debug_log "CONFIG" "Found alternative: $FOUND_BOT (was: $BOT_CONTAINER_NAME)"
+                # H4 audit fix: non-interactive — авто-применяем найденную замену
+                # (alternative — это backup-восстановление работоспособности при
+                # переименовании контейнера, безопасно).
+                if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+                    debug_log "CONFIG" "Non-interactive: auto-applying replacement container"
+                    print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден — авто-замена на '$FOUND_BOT'"
+                    BOT_CONTAINER_NAME="$FOUND_BOT"
+                    [[ -n "$FOUND_DB" ]] && DB_CONTAINER_NAME="$FOUND_DB"
+                    [[ -n "$FOUND_PATH" ]] && BOT_PATH="$FOUND_PATH"
+                    save_config
+                    return 0
+                fi
                 echo ""; print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден, но найден '$FOUND_BOT'."
                 echo -e " ${GREEN}Предлагаю обновить настройки.${RESET}"
                 read -erp "Обновить? (Y/n): " upd
@@ -4864,36 +5070,72 @@ ensure_bot_path() {
         fi
 
         if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
-            debug_log "CONFIG" "BOT_PATH still invalid, prompting user"
-            echo ""; print_message "ACTION" "Укажите путь к папке бота вручную."
-            read -erp "Путь (Enter для '$DEFAULT_BOT_PATH'): " input_path
-            BOT_PATH="${input_path:-$DEFAULT_BOT_PATH}"
-            debug_log "CONFIG" "User entered BOT_PATH=$BOT_PATH"
-            if [[ ! -d "$BOT_PATH" ]]; then 
-                debug_log "CONFIG" "ERROR: Path does not exist"
-                print_message "ERROR" "Папка не найдена!"; return 1
+            debug_log "CONFIG" "BOT_PATH still invalid"
+            # H4 audit fix: non-interactive — пробуем DEFAULT_BOT_PATH без prompt;
+            # если и его нет — fail с понятной ошибкой.
+            if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+                if [[ -d "$DEFAULT_BOT_PATH" ]]; then
+                    BOT_PATH="$DEFAULT_BOT_PATH"
+                    debug_log "CONFIG" "Non-interactive: using DEFAULT_BOT_PATH=$BOT_PATH"
+                    save_config
+                else
+                    print_message "ERROR" "BOT_PATH не настроен и DEFAULT_BOT_PATH ('$DEFAULT_BOT_PATH') не существует. Запустите 'lazarus' интерактивно для настройки." >&2
+                    return 1
+                fi
+            else
+                echo ""; print_message "ACTION" "Укажите путь к папке бота вручную."
+                read -erp "Путь (Enter для '$DEFAULT_BOT_PATH'): " input_path
+                BOT_PATH="${input_path:-$DEFAULT_BOT_PATH}"
+                debug_log "CONFIG" "User entered BOT_PATH=$BOT_PATH"
+                if [[ ! -d "$BOT_PATH" ]]; then
+                    debug_log "CONFIG" "ERROR: Path does not exist"
+                    print_message "ERROR" "Папка не найдена!"; return 1
+                fi
+                save_config
             fi
-            save_config
         fi
 
         if [[ -z "$BOT_CONTAINER_NAME" ]] || ! docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
-            debug_log "CONFIG" "BOT_CONTAINER_NAME invalid, prompting user"
-            echo ""; print_message "WARN" "Контейнер бота не определен."
-            print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
-            read -erp "Имя (Enter для '$DEFAULT_BOT_CONTAINER'): " input_name
-            BOT_CONTAINER_NAME="${input_name:-$DEFAULT_BOT_CONTAINER}"
-            debug_log "CONFIG" "User entered BOT_CONTAINER_NAME=$BOT_CONTAINER_NAME"
-            save_config
+            debug_log "CONFIG" "BOT_CONTAINER_NAME invalid"
+            if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+                # Non-interactive: пробуем DEFAULT_BOT_CONTAINER, если он реально существует
+                if docker inspect "$DEFAULT_BOT_CONTAINER" > /dev/null 2> "$SILENT_LOG"; then
+                    BOT_CONTAINER_NAME="$DEFAULT_BOT_CONTAINER"
+                    debug_log "CONFIG" "Non-interactive: using DEFAULT_BOT_CONTAINER=$BOT_CONTAINER_NAME"
+                    save_config
+                else
+                    print_message "ERROR" "BOT_CONTAINER_NAME не настроен и DEFAULT_BOT_CONTAINER ('$DEFAULT_BOT_CONTAINER') не найден. Запустите 'lazarus' интерактивно." >&2
+                    return 1
+                fi
+            else
+                echo ""; print_message "WARN" "Контейнер бота не определен."
+                print_message "ACTION" "Введите имя контейнера бота (как в 'docker ps')."
+                read -erp "Имя (Enter для '$DEFAULT_BOT_CONTAINER'): " input_name
+                BOT_CONTAINER_NAME="${input_name:-$DEFAULT_BOT_CONTAINER}"
+                debug_log "CONFIG" "User entered BOT_CONTAINER_NAME=$BOT_CONTAINER_NAME"
+                save_config
+            fi
         fi
 
         if [[ -z "$DB_CONTAINER_NAME" ]] || ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
-            debug_log "CONFIG" "DB_CONTAINER_NAME invalid, prompting user"
-            echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
-            print_message "ACTION" "Введите имя контейнера БД."
-            read -erp "Имя БД (Enter для '$DEFAULT_DB_CONTAINER'): " input_db
-            DB_CONTAINER_NAME="${input_db:-$DEFAULT_DB_CONTAINER}"
-            debug_log "CONFIG" "User entered DB_CONTAINER_NAME=$DB_CONTAINER_NAME"
-            save_config
+            debug_log "CONFIG" "DB_CONTAINER_NAME invalid"
+            if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+                if docker inspect "$DEFAULT_DB_CONTAINER" > /dev/null 2> "$SILENT_LOG"; then
+                    DB_CONTAINER_NAME="$DEFAULT_DB_CONTAINER"
+                    debug_log "CONFIG" "Non-interactive: using DEFAULT_DB_CONTAINER=$DB_CONTAINER_NAME"
+                    save_config
+                else
+                    print_message "ERROR" "DB_CONTAINER_NAME не настроен и DEFAULT_DB_CONTAINER ('$DEFAULT_DB_CONTAINER') не найден." >&2
+                    return 1
+                fi
+            else
+                echo ""; print_message "WARN" "Контейнер Базы Данных не найден."
+                print_message "ACTION" "Введите имя контейнера БД."
+                read -erp "Имя БД (Enter для '$DEFAULT_DB_CONTAINER'): " input_db
+                DB_CONTAINER_NAME="${input_db:-$DEFAULT_DB_CONTAINER}"
+                debug_log "CONFIG" "User entered DB_CONTAINER_NAME=$DB_CONTAINER_NAME"
+                save_config
+            fi
         fi
     fi
     debug_log "CONFIG" "=== ensure_bot_path completed ==="
@@ -5186,7 +5428,9 @@ load_or_create_config() {
     else
         debug_log "CONFIG" "Config file not found, using defaults"
     fi
-    if [[ -z "$MAX_BACKUPS_COUNT" ]]; then MAX_BACKUPS_COUNT=100; fi
+    # M9 fix: MAX_BACKUPS_COUNT=0 или нечисло привело бы к diff=count-0=count →
+    # count-based ротация удалила бы ВСЕ бэкапы. Минимум 1.
+    if [[ -z "$MAX_BACKUPS_COUNT" || ! "$MAX_BACKUPS_COUNT" =~ ^[0-9]+$ || "$MAX_BACKUPS_COUNT" -lt 1 ]]; then MAX_BACKUPS_COUNT=100; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
     if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
     if [[ -z "$REMOTE_STORAGE_TYPE" ]]; then REMOTE_STORAGE_TYPE="off"; fi
@@ -5205,6 +5449,9 @@ load_or_create_config() {
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
+    # M6 audit fix: 0700 — backup-архивы могут содержать незашифрованный dump БД
+    # (если BACKUP_PASSWORD пустой). Защита от чтения другими юзерами на multi-user серверах.
+    chmod 700 "$BACKUP_DIR" 2> "$SILENT_LOG" || true
 
     local updated=false
     
@@ -5421,19 +5668,6 @@ S3/R2/FTP/WebDAV/Rclone поддерживаются"
 
     print_message "ERROR" "Не удалось отправить в Telegram (HTTP код: $http_code)."
     return 1
-}
-
-send_telegram_text() {
-    # send simple text message to configured chat (expects already escaped MarkdownV2 text)
-    local text="$1"
-    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
-    [[ "$SEND_TO_TELEGRAM" != "true" ]] && return 0
-    local thread_param=""
-    [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param="-d message_thread_id=$TG_MESSAGE_THREAD_ID"
-    curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-        -d chat_id="$CHAT_ID" \
-        --data-urlencode text="$text" \
-        -d parse_mode="MarkdownV2" $thread_param > "$SILENT_LOG" 2>&1
 }
 
 # =============================================================================
@@ -6725,6 +6959,40 @@ configure_remote_storage() {
 
 # --- РОТАЦИЯ (УДАЛЕНИЕ ЛИШНИХ) ---
 
+# _delete_orphan_inc_for_full: при удалении base full удаляет все inc'ы, что на
+# него ссылаются (lazarus_inc_*__base_<ts>__). Без этого inc становятся orphan и
+# не восстанавливаются. Число удалённых пишет в глобал _LAST_ORPHAN_COUNT (stdout
+# занят "🗑"-строками UX). Используется в by_count И by_age (ROT-4 fix — раньше
+# orphan-cleanup был только в count-режиме, на time-режиме inc'ы оставались).
+_LAST_ORPHAN_COUNT=0
+_delete_orphan_inc_for_full() {
+    local _full_path="$1"
+    _LAST_ORPHAN_COUNT=0
+    local _del_name; _del_name=$(basename "$_full_path")
+    # Extract timestamp из имени deleted full (поддержка всех 4 форматов)
+    local _full_ts="${_del_name#lazarus_full_}"
+    _full_ts="${_full_ts%%__v*}"
+    _full_ts="${_full_ts%.tar.gz}"
+    _full_ts="${_full_ts%.tar.gz.enc}"
+    _full_ts="${_full_ts%.tar.zst}"
+    _full_ts="${_full_ts%.tar.zst.enc}"
+    [[ -z "$_full_ts" ]] && return 0
+    local orphan
+    for orphan in "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz.enc \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst.enc; do
+        if [[ -f "$orphan" ]]; then
+            rm -f "$orphan" "$orphan.version"
+            echo "  🗑 Orphan inc удалён: $(basename "$orphan")"
+            log_message "INFO" "Deleted orphan inc $orphan (base full was rotated)"
+            _LAST_ORPHAN_COUNT=$((_LAST_ORPHAN_COUNT + 1))
+        fi
+    done
+    [[ $_LAST_ORPHAN_COUNT -gt 0 ]] && debug_log "ROTATION" "Deleted $_LAST_ORPHAN_COUNT orphan inc'ы для base $_full_ts"
+    return 0
+}
+
 rotate_backups_by_count() {
     local PREFIX="$1"
     local LABEL="$2"
@@ -6766,34 +7034,10 @@ rotate_backups_by_count() {
                     echo "  🗑 Удален: $(basename "$file_to_del")"
                     log_message "INFO" "Deleted $file_to_del (count-based rotation, prefix=$PREFIX)"
 
-                    # === Orphan inc cleanup ===
-                    # При удалении lazarus_full_<ts>__ автоматически удаляем все
-                    # inc'ы, ссылающиеся на этот full (lazarus_inc_*__base_<ts>__).
-                    # Без этого inc становятся orphan и не могут быть restored.
+                    # Orphan inc cleanup при удалении base full (helper, см. ROT-4)
                     if [[ "$PREFIX" == "lazarus_full" ]]; then
-                        local _del_name; _del_name=$(basename "$file_to_del")
-                        # Extract full timestamp из имени deleted full
-                        local _full_ts="${_del_name#lazarus_full_}"
-                        _full_ts="${_full_ts%%__v*}"
-                        _full_ts="${_full_ts%.tar.gz}"
-                        _full_ts="${_full_ts%.tar.gz.enc}"
-                        _full_ts="${_full_ts%.tar.zst}"
-                        _full_ts="${_full_ts%.tar.zst.enc}"
-                        # Найти orphan inc'ы и удалить
-                        local _orphan_count=0
-                        for orphan in "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz \
-                                      "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz.enc \
-                                      "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst \
-                                      "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst.enc; do
-                            if [[ -f "$orphan" ]]; then
-                                rm -f "$orphan" "$orphan.version"
-                                echo "  🗑 Orphan inc удалён: $(basename "$orphan")"
-                                log_message "INFO" "Deleted orphan inc $orphan (base full was rotated)"
-                                _orphan_count=$((_orphan_count + 1))
-                                _orphan_inc_deleted=$((_orphan_inc_deleted + 1))
-                            fi
-                        done
-                        [[ $_orphan_count -gt 0 ]] && debug_log "ROTATION" "Deleted $_orphan_count orphan inc'ы для base $_full_ts"
+                        _delete_orphan_inc_for_full "$file_to_del"
+                        _orphan_inc_deleted=$((_orphan_inc_deleted + _LAST_ORPHAN_COUNT))
                     fi
                 fi
             done
@@ -6828,8 +7072,13 @@ rotate_backups_by_age() {
     # find -mtime +N означает "строго больше N дней". Чтобы RETENTION_DAYS=N означал
     # "удалять файлы старше N дней", используем -mtime +$((N-1)). Для N==0 — будем
     # удалять все подходящие файлы.
-    # Собираем аргументы find без eval
-    local find_args=("$BACKUP_DIR" -maxdepth 1 \( -name "${PREFIX}_*.tar.gz" -o -name "${PREFIX}_*.tar.gz.enc" \) -type f)
+    # Собираем аргументы find без eval.
+    # ВАЖНО: матчим все 4 формата (gz/zst × plain/enc). Раньше тут были только
+    # .tar.gz/.tar.gz.enc → при COMPRESSION=zstd time-based ротация молча НЕ
+    # работала, диск заполнялся (root cause disk-full инцидента 2026-05-28).
+    local find_args=("$BACKUP_DIR" -maxdepth 1 \( \
+        -name "${PREFIX}_*.tar.gz"      -o -name "${PREFIX}_*.tar.gz.enc" \
+        -o -name "${PREFIX}_*.tar.zst"  -o -name "${PREFIX}_*.tar.zst.enc" \) -type f)
     if [[ "$DAYS" -le 0 ]]; then
         # Если 0 или меньше - не удаляем ничего (защита от полной очистки)
         debug_log "ROTATION" "Days <= 0, skipping rotation"
@@ -6855,6 +7104,7 @@ rotate_backups_by_age() {
                 return 0
             fi
             echo -e "${YELLOW}Очистка категории '$LABEL' (удаление $count файлов старше $DAYS дней):${RESET}"
+            local _orphan_inc_deleted=0
             for f in "${files[@]}"; do
                 if [[ -f "$f" ]]; then
                     debug_log "ROTATION" "Deleting: $f"
@@ -6862,9 +7112,15 @@ rotate_backups_by_age() {
                     rm -f "$f.version"
                     echo "  🗑 Удален: $(basename "$f")"
                     log_message "INFO" "Deleted $f (age-based rotation, prefix=$PREFIX, days=$DAYS)"
+                    # ROT-4 fix: orphan inc cleanup и в time-режиме (раньше только count)
+                    if [[ "$PREFIX" == "lazarus_full" ]]; then
+                        _delete_orphan_inc_for_full "$f"
+                        _orphan_inc_deleted=$((_orphan_inc_deleted + _LAST_ORPHAN_COUNT))
+                    fi
                 fi
             done
-            debug_log "ROTATION" "Deleted $count files"
+            [[ $_orphan_inc_deleted -gt 0 ]] && echo -e "  ${GRAY}(дополнительно удалено $_orphan_inc_deleted orphan inc'ов)${RESET}"
+            debug_log "ROTATION" "Deleted $count files + $_orphan_inc_deleted orphan inc'ов"
             echo "$count"
             return 0
         else
@@ -6879,6 +7135,35 @@ rotate_backups_by_age() {
         echo "0"
         return 0
     fi
+}
+
+# _mb_to_human: форматирует MB в "X MB" или "X.Y GB" (один знак после запятой).
+# Чистый bash, без зависимости от bc/awk. Round-half-up на десятой.
+# Раньше использовался `echo "scale=1; $mb / 1024" | bc`, что падало с
+# `bc: command not found` на минимальных Debian-инсталляциях (Debian 12 minimal
+# не включает bc в base). Bug: пустой stdout от bc → переменная "" → отображение
+# "Размер бэкапов:  GB / 500 MB" (двойной пробел перед GB).
+_mb_to_human() {
+    local mb="$1"
+    if [[ -z "$mb" || ! "$mb" =~ ^[0-9]+$ ]]; then
+        echo "0 MB"
+        return
+    fi
+    if [[ $mb -lt 1024 ]]; then
+        echo "${mb} MB"
+        return
+    fi
+    # GB с одним знаком после запятой и округлением half-up
+    local gb_int=$((mb / 1024))
+    local remainder=$((mb % 1024))
+    # remainder ∈ [0..1023]; десятая = (remainder * 10 + 512) / 1024 (round half-up)
+    local gb_frac=$(( (remainder * 10 + 512) / 1024 ))
+    # Если frac округлилось в 10 — переносим в целую часть
+    if [[ $gb_frac -ge 10 ]]; then
+        gb_int=$((gb_int + 1))
+        gb_frac=0
+    fi
+    echo "${gb_int}.${gb_frac} GB"
 }
 
 # Ротация по размеру - удаляет старые бэкапы пока общий размер не станет <= лимита
@@ -6903,19 +7188,11 @@ rotate_backups_by_size() {
     local current_size_mb=$((current_size_bytes / 1024 / 1024))
     debug_log "SIZE" "Current size: $current_size_mb MB ($current_size_bytes bytes)"
     
-    # Форматирование для отображения
-    local limit_display=""
-    local current_display=""
-    if [[ $limit_mb -ge 1024 ]]; then
-        limit_display="$(echo "scale=1; $limit_mb / 1024" | bc) GB"
-    else
-        limit_display="$limit_mb MB"
-    fi
-    if [[ $current_size_mb -ge 1024 ]]; then
-        current_display="$(echo "scale=1; $current_size_mb / 1024" | bc) GB"
-    else
-        current_display="$current_size_mb MB"
-    fi
+    # Форматирование для отображения (через _mb_to_human — без bc)
+    local limit_display
+    local current_display
+    limit_display=$(_mb_to_human "$limit_mb")
+    current_display=$(_mb_to_human "$current_size_mb")
     
     debug_log "SIZE" "Current: $current_size_bytes bytes ($current_display), Limit: $limit_bytes bytes ($limit_display)"
     
@@ -6929,12 +7206,8 @@ rotate_backups_by_size() {
     
     # Нужно удалить файлы
     local excess_mb=$((current_size_mb - limit_mb))
-    local excess_display=""
-    if [[ $excess_mb -ge 1024 ]]; then
-        excess_display="$(echo "scale=1; $excess_mb / 1024" | bc) GB"
-    else
-        excess_display="$excess_mb MB"
-    fi
+    local excess_display
+    excess_display=$(_mb_to_human "$excess_mb")
     debug_log "SIZE" "Excess: $excess_mb MB ($excess_display)"
     
     if [[ "$PERFORM_DELETE" != "true" ]]; then
@@ -6953,11 +7226,16 @@ rotate_backups_by_size() {
     debug_log "SIZE" "Starting deletion loop..."
     echo -e "${YELLOW}Очистка по лимиту размера (текущий: $current_display, лимит: $limit_display):${RESET}"
     
-    # Получаем список всех бэкапов отсортированный по времени (старые первыми)
+    # Получаем список всех бэкапов отсортированный по времени (старые первыми).
+    # Все 4 формата (gz/zst × plain/enc) — иначе при COMPRESSION=zstd size-based
+    # ротация не видит .tar.zst и не освобождает место (root cause 2026-05-28).
     local files=()
-    while IFS= read -r -d $'\0' f; do 
+    while IFS= read -r -d $'\0' f; do
         files+=("$f")
-    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "lazarus_*.tar.gz" -o -name "lazarus_*.tar.gz.enc" \) -printf '%T@ %p\0' 2> "$SILENT_LOG" | sort -zn | cut -z -d' ' -f2-)
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( \
+                -name "lazarus_*.tar.gz"      -o -name "lazarus_*.tar.gz.enc" \
+                -o -name "lazarus_*.tar.zst"  -o -name "lazarus_*.tar.zst.enc" \) \
+                -printf '%T@ %p\0' 2> "$SILENT_LOG" | sort -zn | cut -z -d' ' -f2-)
     
     debug_log "SIZE" "Found ${#files[@]} backup files to process"
     
@@ -6986,13 +7264,9 @@ rotate_backups_by_size() {
         fi
     done
     
-    local deleted_display=""
+    local deleted_display
     local deleted_mb=$((deleted_size / 1024 / 1024))
-    if [[ $deleted_mb -ge 1024 ]]; then
-        deleted_display="$(echo "scale=1; $deleted_mb / 1024" | bc) GB"
-    else
-        deleted_display="$deleted_mb MB"
-    fi
+    deleted_display=$(_mb_to_human "$deleted_mb")
     
     if [[ $deleted_count -gt 0 ]]; then
         print_message "SUCCESS" "Удалено $deleted_count файлов ($deleted_display)"
@@ -7002,15 +7276,13 @@ rotate_backups_by_size() {
     return 0
 }
 
-# Вспомогательная функция для форматирования размера
+# Вспомогательная функция для форматирования размера лимита (с особым случаем "Без лимита")
 format_size_mb() {
     local size_mb="$1"
     if [[ -z "$size_mb" || "$size_mb" == "0" ]]; then
         echo "Без лимита"
-    elif [[ $size_mb -ge 1024 ]]; then
-        echo "$(echo "scale=1; $size_mb / 1024" | bc) GB"
     else
-        echo "$size_mb MB"
+        _mb_to_human "$size_mb"
     fi
 }
 
@@ -7469,7 +7741,17 @@ create_backup() {
     #   2) Абсолютный (MIN_SPACE_MB=1024) — fallback для маленьких дисков (1 GB обязательно)
     local MIN_SPACE_MB=1024
     local free_space_kb=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
-    local free_space_mb=$((free_space_kb / 1024))
+    # M2 fix: на NFS/FUSE/stale mount `df` возвращает "-" или пусто → арифметика
+    # $((/1024)) упала бы или дала 0 → ложный abort. При невалидном значении
+    # пропускаем абсолютную проверку (полагаемся на ENOSPC от pg_dump/tar).
+    local free_space_mb
+    if [[ "$free_space_kb" =~ ^[0-9]+$ ]]; then
+        free_space_mb=$((free_space_kb / 1024))
+    else
+        debug_log "DISK" "free_space_kb not numeric ('$free_space_kb'), skip absolute MIN_SPACE check"
+        free_space_kb=""
+        free_space_mb=""
+    fi
     local free_space_human=$(df -h "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $4}')
     local disk_used_percent=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $5}' | tr -d '%')
     local disk_mount=$(df -P "$BACKUP_DIR" 2> "$SILENT_LOG" | tail -1 | awk '{print $6}')
@@ -7506,7 +7788,7 @@ create_backup() {
         send_telegram_alert "WARN" "Диск заполняется" "$_warn_body" "$_warn_actions"
     fi
     
-    if [[ $free_space_mb -lt $MIN_SPACE_MB ]]; then
+    if [[ -n "$free_space_mb" && "$free_space_mb" -lt "$MIN_SPACE_MB" ]]; then
         print_message "ERROR" "Недостаточно места на диске! Свободно: ${free_space_human} (нужно минимум 1GB)"
         log_message "ERROR" "Backup aborted: insufficient disk space (free=${free_space_human}, required=1GB)"
         if [[ "$IS_INTERACTIVE" == "true" ]]; then
@@ -7673,8 +7955,19 @@ create_backup() {
 
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
         # Получаем параметры БД из .env бота (согласно официальной документации)
-        local ACTUAL_DB_USER=$(get_db_user)
-        local ACTUAL_DB_NAME=$(get_db_name)
+        local ACTUAL_DB_USER ACTUAL_DB_NAME
+        ACTUAL_DB_USER=$(get_db_user)
+        # H5 audit fix: get_db_name теперь fail с rc=1 если POSTGRES_DB не найден
+        # (раньше молча fallback на 'postgres' → бэкап пустой системной БД).
+        if ! ACTUAL_DB_NAME=$(get_db_name); then
+            print_message "ERROR" "Не удалось определить имя БД (POSTGRES_DB отсутствует в .env)"
+            log_message "ERROR" "Backup aborted: cannot resolve DB name for $DB_CONTAINER_NAME"
+            send_telegram_alert "ERROR" "Бэкап отменён" \
+                "🗄 БД: имя не определено
+📁 BOT_PATH: <code>$BOT_PATH</code>" \
+                "Проверьте \$BOT_PATH/.env (нужна строка <code>POSTGRES_DB=...</code>)"
+            return 1
+        fi
         debug_log "DB" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
         
         # Проверяем готовность БД через pg_isready с retry.
@@ -7733,9 +8026,6 @@ create_backup() {
         local _pipe_rc=$?
         # _run_pipe_with_timeout запускает pipe с set -o pipefail, поэтому
         # rc отражает первую упавшую команду в pipe или 124/137 при timeout.
-        # Для backward-compat сохраняем legacy PIPESTATUS-style логирование:
-        # если timeout — _pg_rc=$_pipe_rc, _gz_rc=0 (логика "первая команда упала").
-        local _pg_rc=$_pipe_rc _gz_rc=0
         if [[ $_pipe_rc -ne 0 ]]; then
             print_message "ERROR" "Ошибка дампа БД (rc=$_pipe_rc)."
             debug_log "DB" "pg_dump FAILED: rc=$_pipe_rc (timeout=124, killed=137)"
@@ -8053,17 +8343,28 @@ create_backup() {
     fi
     debug_log "VERIFY" "Result: $VERIFY_OK"
 
+    local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
     if [[ "$VERIFY_OK" == "true" ]]; then
         print_message "SUCCESS" "Архив валиден."
+        print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
+        log_message "SUCCESS" "Backup created: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS, verify=ok)"
     else
-        print_message "ERROR" "Архив поврежден! (Verification failed)"
-        # We do not delete it, just warn
+        # VERIFY-1 fix: НЕ репортим SUCCESS на повреждённый архив. Раньше код
+        # безусловно писал SUCCESS+create в лог → битый backup шёл в upload+rotation,
+        # вытесняя ВАЛИДНЫЕ бэкапы (потеря единственной рабочей копии).
+        # Файл оставляем на диске для ручного разбора, но помечаем как FAILED и
+        # ниже пропускаем ротацию (чтобы не удалить хорошие бэкапы из-за плохого).
+        print_message "ERROR" "Архив ПОВРЕЖДЁН (verification failed): $FILE_FINAL ($SIZE)"
+        log_message "ERROR" "Backup verification FAILED: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS) — rotation skipped, file kept for inspection"
+        if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+            send_telegram_alert "ERROR" "Бэкап повреждён" \
+                "📦 Файл: <code>$FILE_FINAL</code>
+📏 Размер: $SIZE
+🔒 Шифрование: $ENC_STATUS" \
+                "Архив не прошёл проверку целостности. Ротация пропущена — старые бэкапы сохранены. Проверьте диск/память и повторите бэкап."
+        fi
     fi
-
-    local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
-    print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
-    log_message "SUCCESS" "Backup created: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS, verify=$VERIFY_OK)"
-    debug_log "BACKUP" "Final file: $FILE_FINAL, size: $SIZE"
+    debug_log "BACKUP" "Final file: $FILE_FINAL, size: $SIZE, verify=$VERIFY_OK"
 
     # === Терминальный вывод: контроль содержимого + S3-рекомендация ===
     # Архив >50 MB: топ-5 крупных файлов + красный баннер если remote off
@@ -8158,7 +8459,13 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     #   any         — удалить если хотя бы один канал доставил
     #   all         — удалить только если ВСЕ настроенные каналы доставили
     #   remote_only — удалить если remote (S3/FTP/WebDAV/Rclone) доставил, TG не учитываем
-    if [[ "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" != "false" && -n "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" ]]; then
+    if [[ "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" != "false" && -n "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" && "$VERIFY_OK" != "true" ]]; then
+        # VERIFY-1 fix: НЕ удаляем локальную копию повреждённого бэкапа после
+        # upload — иначе единственная (хоть и битая) копия теряется, а если
+        # verify провалился из-за нехватки места/памяти, remote-копия тоже битая.
+        print_message "WARN" "Локальный бэкап СОХРАНЁН: verify провален, авто-удаление пропущено"
+        log_message "WARN" "Local backup kept: $FILE_FINAL (verify failed, delete-after-upload skipped)"
+    elif [[ "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" != "false" && -n "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" ]]; then
         local _can_delete="false"
         local _delete_reason=""
         case "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" in
@@ -8220,25 +8527,34 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
         fi
     fi
 
-    # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
-    local ROTATION_PREFIX="lazarus_$TYPE"
-    if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="lazarus_db"; fi
-    if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="lazarus_files"; fi
+    # VERIFY-1 fix: ротацию запускаем ТОЛЬКО если архив прошёл verify. Иначе
+    # повреждённый backup мог бы вытеснить валидные (count/age/size rotation).
+    if [[ "$VERIFY_OK" == "true" ]]; then
+        # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
+        local ROTATION_PREFIX="lazarus_$TYPE"
+        if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="lazarus_db"; fi
+        if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="lazarus_files"; fi
 
-    # Ротация в зависимости от настроек DELETE_MODE
-    if [[ "$DELETE_MODE" == "count" ]]; then
-        rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true" > /dev/null
+        # Ротация в зависимости от настроек DELETE_MODE
+        if [[ "$DELETE_MODE" == "count" ]]; then
+            rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true" > /dev/null
+        else
+            rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true" > /dev/null
+        fi
+
+        # Ротация по размеру (если настроен лимит)
+        rotate_backups_by_size "true" > /dev/null
     else
-        rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true" > /dev/null
+        debug_log "ROTATION" "Skipped rotation: VERIFY_OK=false (защита валидных бэкапов)"
     fi
-    
-    # Ротация по размеру (если настроен лимит)
-    rotate_backups_by_size "true" > /dev/null
-    
+
     # Освобождаем блокировку
     [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
-    
-    return 0
+
+    # VERIFY-1 fix: возвращаем non-zero при verify-fail, чтобы cron/wrapper
+    # видели провал в exit-коде (а не ложный success).
+    [[ "$VERIFY_OK" == "true" ]] && return 0
+    return 1
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
@@ -8598,7 +8914,14 @@ create_incremental_backup() {
     if [[ -n "$DB_CONTAINER_NAME" ]]; then
         local ACTUAL_DB_USER ACTUAL_DB_NAME
         ACTUAL_DB_USER=$(get_db_user 2>/dev/null)
-        ACTUAL_DB_NAME=$(get_db_name 2>/dev/null)
+        # H5 audit fix: явная ошибка при неудаче get_db_name (раньше silent 'postgres')
+        if ! ACTUAL_DB_NAME=$(get_db_name 2>/dev/null); then
+            print_message "ERROR" "Inc-бэкап отменён: не удалось определить имя БД из .env"
+            log_message "ERROR" "Incremental backup aborted: cannot resolve DB name"
+            rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"; rm -f "$_tar_err"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
         print_message "INFO" "Дамп БД..."
         _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-inc" \
             'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
@@ -8998,10 +9321,23 @@ require_rsync() {
     return 0
 }
 
+# CHAIN-4 fix: пустой src + `rsync --delete` стёр бы ВСЁ содержимое dst (BOT_PATH).
+# Сценарий: restore inc-бэкапа где 0 файлов изменилось, либо повреждённый/пустой
+# merged-архив. Защита: отказываемся синхронизировать из пустого источника.
+_rsync_src_nonempty() {
+    local src="$1"
+    [[ -d "$src" && -n "$(ls -A "$src" 2>/dev/null)" ]]
+}
+
 restore_rsync_preview() {
     local src="$1"
     local dst="$2"
     require_rsync || return 1
+    if ! _rsync_src_nonempty "$src"; then
+        print_message "ERROR" "Источник восстановления пуст — отмена (rsync --delete стёр бы все файлы бота)"
+        log_message "ERROR" "Restore preview aborted: empty source '$src' would wipe '$dst'"
+        return 1
+    fi
     local extra_excludes=()
     if [[ "$RESTORE_INCLUDE_ENV" != "true" ]]; then
         extra_excludes+=("--exclude" ".env")
@@ -9015,6 +9351,11 @@ restore_rsync_apply() {
     local src="$1"
     local dst="$2"
     require_rsync || return 1
+    if ! _rsync_src_nonempty "$src"; then
+        print_message "ERROR" "Источник восстановления пуст — отмена (rsync --delete стёр бы все файлы бота)"
+        log_message "ERROR" "Restore aborted: empty source '$src' would wipe '$dst' via rsync --delete"
+        return 1
+    fi
     local extra_excludes=()
     if [[ "$RESTORE_INCLUDE_ENV" != "true" ]]; then
         extra_excludes+=("--exclude" ".env")
@@ -9113,8 +9454,6 @@ confirm_drop_schema() {
         'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | gzip > "$5"' \
         "$db_container" "$db_user" "$db_name" "$SILENT_LOG" "$snapshot_file"
     local _snap_rc=$?
-    # Для backward-compat сохраняем _pg_rc/_gz_rc для последующих логов.
-    local _pg_rc=$_snap_rc _gz_rc=0
     local snap_bytes=0
     [[ -f "$snapshot_file" ]] && snap_bytes=$(stat -c%s "$snapshot_file" 2>/dev/null || echo 0)
     if [[ $_snap_rc -eq 0 && $snap_bytes -ge 100 ]]; then
@@ -9445,10 +9784,15 @@ execute_restore() {
         if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return; fi
         if ! assert_db_container_matches_bot; then rm -rf "$TMP_DIR"; return; fi
 
-        local ACTUAL_DB_USER
-        local ACTUAL_DB_NAME
+        local ACTUAL_DB_USER ACTUAL_DB_NAME
         ACTUAL_DB_USER=$(get_db_user)
-        ACTUAL_DB_NAME=$(get_db_name)
+        # H5 audit fix: явная ошибка при невозможности определить имя БД
+        if ! ACTUAL_DB_NAME=$(get_db_name); then
+            print_message "ERROR" "Не удалось определить имя БД для restore (POSTGRES_DB отсутствует в .env)"
+            log_message "ERROR" "Restore aborted: cannot resolve DB name"
+            rm -rf "$TMP_DIR"
+            return
+        fi
         debug_log "RESTORE" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
 
         # Проверяем что целевая БД валидна
@@ -9482,8 +9826,6 @@ execute_restore() {
             '$6 "$1" | docker exec -i "$2" psql -U "$3" "$4" -v ON_ERROR_STOP=1 > "$5" 2>&1' \
             "$DB_DUMP" "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$_dump_decompress"
         local _restore_rc=$?
-        # Сохраняем legacy log-style: _zc_rc + _ps_rc для debug.
-        local _zc_rc=$_restore_rc _ps_rc=$_restore_rc
         debug_log "RESTORE" "DB import: rc=$_restore_rc (timeout=${RESTORE_TIMEOUT_SEC}s)"
         if [[ $_restore_rc -ne 0 ]]; then
             print_message "ERROR" "Импорт БД провалился (rc=$_restore_rc). БД в неконсистентном состоянии."
