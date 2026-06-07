@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.6.1"
+VERSION="5.6.2"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -5514,22 +5514,16 @@ send_telegram_document() {
     if [[ "$TG_SEND_FILE" != "true" ]]; then
         print_message "INFO" "Отправка файла в TG отключена, отправляем уведомление..."
         debug_log "TG" "File sending disabled, sending text only"
-        local filename=$(basename "$file_path")
-        # Экранируем для MarkdownV2
-        local escaped_filename=$(escape_markdown_v2 "$filename")
         local escaped_caption
         if [[ "$caption_mode" == "pre-escaped" ]]; then
             escaped_caption="$caption"
         else
             escaped_caption=$(escape_markdown_v2 "$caption")
         fi
-        # Формируем сообщение (уже экранированное)
-        local notify_text="📦 *Бэкап создан*
+        # Заголовок с Premium 📦 (EMO_PACKAGE), без блока "Файл:/отправка отключена".
+        local notify_text="$(tg_emoji "📦" "$EMO_PACKAGE") *Бэкап создан*
 
-${escaped_caption}
-
-📁 Файл: \`${escaped_filename}\`
-💡 _Отправка файла в Telegram отключена_"
+${escaped_caption}"
         
         # Отправляем напрямую (текст уже экранирован)
         local thread_param=""
@@ -8421,6 +8415,7 @@ create_backup() {
     # 🏷 (версия) → ✅ бейдж с галочкой в Premium через EMO_BADGE
     local VER_MSG=""; [[ -n "$CURRENT_VER" ]] && VER_MSG=" | 🏷 v${CURRENT_VER}"
     local CAPTION="${HASHTAG}
+➖➖➖➖➖➖➖➖➖
 📅 ${DISPLAY_DATE}
 ${TYPE_NAME}
 📏 ${SIZE}${VER_MSG}
