@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.6.3"
+VERSION="5.6.4"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -129,6 +129,11 @@ RESTORE_FORCE="false"
 RESTORE_INCLUDE_ENV="false"
 RESTORE_DROP_VOLUME="false"
 RESTORE_DROP_SCHEMA="false"
+
+# Базовый URL релиз-сервера бота rwp_shop. Файл скачивается по схеме:
+#   ${BOT_RELEASE_URL_BASE}/<VERSION>/rwp_shop_<VERSION>.tar
+# Используется в `lazarus bot upgrade <VERSION>` для загрузки релиза напрямую.
+BOT_RELEASE_URL_BASE="https://s3.rwp.rw/releases"
 
 # Значения по умолчанию
 BOT_CONTAINER_NAME="" 
@@ -3693,6 +3698,64 @@ get_latest_db_backup() {
 #   LICENSE_KEY=abc123 lazarus auto_update        # Через переменную окружения
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# download_bot_release: качает релиз бота rwp_shop по версии с релиз-сервера.
+# URL: ${BOT_RELEASE_URL_BASE}/<V>/rwp_shop_<V>.tar
+# Args: $1 = версия (X.Y.Z[.W]), $2 = каталог назначения (default BOT_PATH).
+# Stdout: путь к скачанному .tar (для caller). Все сообщения/прогресс → stderr.
+# Rc: 0 ok, 1 fail. Валидирует размер (>1MB) и что это tar-архив.
+download_bot_release() {
+    local version="$1"
+    local dest_dir="${2:-$BOT_PATH}"
+    if [[ -z "$version" || ! "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+        print_message "ERROR" "Некорректная версия для загрузки: '$version'" >&2
+        return 1
+    fi
+    if [[ -z "$BOT_RELEASE_URL_BASE" ]]; then
+        print_message "ERROR" "BOT_RELEASE_URL_BASE не задан (config.env)" >&2
+        return 1
+    fi
+    if [[ -z "$dest_dir" || ! -d "$dest_dir" ]]; then
+        print_message "ERROR" "Каталог назначения не найден: '$dest_dir'" >&2
+        return 1
+    fi
+    local url="${BOT_RELEASE_URL_BASE%/}/${version}/rwp_shop_${version}.tar"
+    local out="${dest_dir%/}/rwp_shop_${version}.tar"
+    print_message "INFO" "Загрузка релиза: $url" >&2
+    # Параметры повторяют референс-команду пользователя (retry/backoff/timeout).
+    if command -v curl > "$SILENT_LOG" 2>&1; then
+        if ! curl -fSL --retry 3 --retry-delay 2 --connect-timeout 30 -o "$out" "$url" >&2; then
+            print_message "ERROR" "Не удалось скачать релиз $version (curl)" >&2
+            rm -f "$out"
+            return 1
+        fi
+    elif command -v wget > "$SILENT_LOG" 2>&1; then
+        if ! wget --tries=3 --timeout=30 -O "$out" "$url" >&2; then
+            print_message "ERROR" "Не удалось скачать релиз $version (wget)" >&2
+            rm -f "$out"
+            return 1
+        fi
+    else
+        print_message "ERROR" "Нужен curl или wget для загрузки релиза" >&2
+        return 1
+    fi
+    # Валидация: размер > 1 MB (docker image tar — десятки/сотни MB; 404-страница мелкая)
+    local sz; sz=$(stat -c%s "$out" 2>/dev/null || echo 0)
+    if [[ "$sz" -lt 1000000 ]]; then
+        print_message "ERROR" "Файл подозрительно мал ($sz байт) — вероятно 404/ошибка сервера" >&2
+        rm -f "$out"
+        return 1
+    fi
+    # Валидация: это настоящий tar (docker save output)
+    if ! tar -tf "$out" > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "Скачанный файл не является валидным tar-архивом" >&2
+        rm -f "$out"
+        return 1
+    fi
+    print_message "SUCCESS" "Релиз скачан: $(basename "$out") ($((sz/1048576)) MB)" >&2
+    echo "$out"
+    return 0
+}
+
 # show_bot_startup_logs: печатает последние N строк логов контейнера бота после
 # рестарта — чтобы увидеть, чисто ли он стартовал (миграции, конфиг, коннект к БД,
 # ошибки лицензии). One-shot (--tail, без -f), не блокирует. Предпочитает
@@ -3715,7 +3778,21 @@ show_bot_startup_logs() {
 }
 
 auto_update_bot() {
-    local provided_key="${1:-$LICENSE_KEY}"  # Из аргумента или env
+    # Аргументы в любом порядке:
+    #   <VERSION> (X.Y.Z[.W]) → скачать этот релиз с BOT_RELEASE_URL_BASE
+    #   <LICENSE_KEY> (64 hex) → ключ лицензии
+    # Примеры: lazarus bot upgrade 6.5.19 / ... 6.5.19 <key> / ... <key> / ...
+    local requested_version="" provided_key=""
+    local _a
+    for _a in "$1" "$2"; do
+        [[ -z "$_a" ]] && continue
+        if [[ "$_a" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+            requested_version="$_a"
+        elif [[ "$_a" =~ ^[0-9a-f]{64}$ ]]; then
+            provided_key="$_a"
+        fi
+    done
+    [[ -z "$provided_key" ]] && provided_key="$LICENSE_KEY"  # fallback на env/.env
     
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
     echo -e "${GREEN}${BOLD}  LAZARUS Auto Update v${VERSION}${RESET}"
@@ -3754,8 +3831,33 @@ auto_update_bot() {
     # === 3. ТЕКУЩАЯ ВЕРСИЯ ===
     local current_version=$(get_current_bot_version)
     print_message "INFO" "Текущая версия: ${current_version:-не определена}"
-    
-    # === 4. ПОИСК НОВОЙ ВЕРСИИ ===
+
+    # Переменные выбора версии/образа — заполнит либо download-by-version (3b),
+    # либо auto-detect (шаг 4). _downloaded_tar — путь скачанного .tar для cleanup.
+    local selected_version="" selected_file="" selected_image="" need_docker_load=false
+    local _downloaded_tar=""
+
+    # === 3b. ЯВНО ЗАПРОШЕННАЯ ВЕРСИЯ → СКАЧАТЬ С РЕЛИЗ-СЕРВЕРА ===
+    if [[ -n "$requested_version" ]]; then
+        if [[ "$requested_version" == "$current_version" ]] && is_image_loaded_in_docker "rwp_shop" "$requested_version"; then
+            print_message "SUCCESS" "Уже установлена версия $requested_version (образ в Docker)"
+            selected_version="$current_version"
+        else
+            echo ""
+            print_message "INFO" "Запрошена версия $requested_version — скачиваю с релиз-сервера..."
+            local _dl
+            if ! _dl=$(download_bot_release "$requested_version"); then
+                print_message "ERROR" "Загрузка релиза $requested_version не удалась — обновление прервано"
+                return 1
+            fi
+            selected_version="$requested_version"
+            selected_file="$_dl"
+            _downloaded_tar="$_dl"
+            need_docker_load=true
+        fi
+    fi
+
+    # === 4. ПОИСК НОВОЙ ВЕРСИИ (только если версия не задана явно) ===
     # Сначала проверяем Docker images
     local latest_docker_version=""
     local latest_docker_image=""
@@ -3789,14 +3891,11 @@ auto_update_bot() {
         done <<< "$tar_files"
     fi
     
-    # Определяем что использовать
-    local selected_version=""
-    local selected_file=""
-    local selected_image=""
-    local need_docker_load=false
-    
+    # Определяем что использовать.
+    # Все ветки выбора guard'ятся `-z "$selected_version"` — если версия задана
+    # явно (3b) или уже выбрана, auto-detect её НЕ перезаписывает.
     # Приоритет: Docker image > tar file
-    if [[ -n "$latest_docker_version" ]]; then
+    if [[ -z "$selected_version" && -n "$latest_docker_version" ]]; then
         if [[ -z "$current_version" ]] || version_gt "$latest_docker_version" "$current_version"; then
             selected_version="$latest_docker_version"
             selected_image="$latest_docker_image"
@@ -3933,12 +4032,36 @@ auto_update_bot() {
             print_message "INFO" "Загрузка образа в Docker..."
             if ! docker load -i "$selected_file"; then
                 print_message "ERROR" "Ошибка загрузки образа!"
+                # Скачанный tar убираем даже при ошибке load — не копим мусор
+                [[ -n "$_downloaded_tar" && -f "$_downloaded_tar" ]] && rm -f "$_downloaded_tar"
                 return 1
             fi
             selected_image=$(get_image_name_from_tar "$selected_file")
             print_message "SUCCESS" "Образ загружен: ${selected_image}:${selected_version}"
+            # Удаляем скачанный .tar после успешного load (как в reference-команде)
+            if [[ -n "$_downloaded_tar" && -f "$_downloaded_tar" ]]; then
+                rm -f "$_downloaded_tar"
+                debug_log "UPDATE" "Removed downloaded tar: $_downloaded_tar"
+            fi
         fi
-        
+
+        # Pre-upgrade DB backup — свежий шифрованный дамп БД ПЕРЕД рискованным
+        # обновлением (аналог `pg_dump > backup.sql` из reference-команды, но через
+        # lazarus: шифрование + off-site + ротация). Best-effort: не блокирует апгрейд.
+        if [[ -n "$DB_CONTAINER_NAME" ]] && docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+            echo ""
+            print_message "INFO" "Резервная копия БД перед обновлением..."
+            if create_backup "db_only"; then
+                print_message "SUCCESS" "Pre-upgrade бэкап БД создан"
+            else
+                print_message "WARN" "Pre-upgrade бэкап БД не удался — продолжаю (есть cron-бэкапы)"
+                if [[ "$IS_INTERACTIVE" == true ]]; then
+                    read -erp "Продолжить обновление без свежего бэкапа? (y/N): " _cont
+                    [[ ! "$_cont" =~ ^[Yy]$ ]] && { print_message "INFO" "Обновление отменено."; return 1; }
+                fi
+            fi
+        fi
+
         # Обновляем версию в compose
         print_message "INFO" "Обновление compose файла..."
         if ! update_compose_image_version "$compose_file" "$selected_version" "$selected_image"; then
@@ -5244,6 +5367,7 @@ load_config_file() {
             ENCRYPT_TIMEOUT_SEC) ENCRYPT_TIMEOUT_SEC="$val" ;;
             RESTORE_TIMEOUT_SEC) RESTORE_TIMEOUT_SEC="$val" ;;
             COMPRESSION) COMPRESSION="$val" ;;
+            BOT_RELEASE_URL_BASE) BOT_RELEASE_URL_BASE="$val" ;;
             *) debug_log "CONFIG" "Unknown key in config (ignored): $key" ;;
         esac
     done < "$file"
@@ -5384,12 +5508,13 @@ save_config() {
     DISK_CRITICAL_PERCENT_ESC=$(env_escape "$DISK_CRITICAL_PERCENT")
     DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC=$(env_escape "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD")
     BACKUP_LOG_FILES_ESC=$(env_escape "$BACKUP_LOG_FILES")
-    local PG_DUMP_TIMEOUT_SEC_ESC TAR_TIMEOUT_SEC_ESC ENCRYPT_TIMEOUT_SEC_ESC RESTORE_TIMEOUT_SEC_ESC COMPRESSION_ESC
+    local PG_DUMP_TIMEOUT_SEC_ESC TAR_TIMEOUT_SEC_ESC ENCRYPT_TIMEOUT_SEC_ESC RESTORE_TIMEOUT_SEC_ESC COMPRESSION_ESC BOT_RELEASE_URL_BASE_ESC
     PG_DUMP_TIMEOUT_SEC_ESC=$(env_escape "$PG_DUMP_TIMEOUT_SEC")
     TAR_TIMEOUT_SEC_ESC=$(env_escape "$TAR_TIMEOUT_SEC")
     ENCRYPT_TIMEOUT_SEC_ESC=$(env_escape "$ENCRYPT_TIMEOUT_SEC")
     RESTORE_TIMEOUT_SEC_ESC=$(env_escape "$RESTORE_TIMEOUT_SEC")
     COMPRESSION_ESC=$(env_escape "$COMPRESSION")
+    BOT_RELEASE_URL_BASE_ESC=$(env_escape "$BOT_RELEASE_URL_BASE")
 
     cat > "$CONFIG_FILE" <<EOF
 BOT_TOKEN="$BOT_TOKEN_ESC"
@@ -5433,6 +5558,7 @@ TAR_TIMEOUT_SEC="$TAR_TIMEOUT_SEC_ESC"
 ENCRYPT_TIMEOUT_SEC="$ENCRYPT_TIMEOUT_SEC_ESC"
 RESTORE_TIMEOUT_SEC="$RESTORE_TIMEOUT_SEC_ESC"
 COMPRESSION="$COMPRESSION_ESC"
+BOT_RELEASE_URL_BASE="$BOT_RELEASE_URL_BASE_ESC"
 EOF
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
@@ -5457,6 +5583,7 @@ load_or_create_config() {
     # M9 fix: MAX_BACKUPS_COUNT=0 или нечисло привело бы к diff=count-0=count →
     # count-based ротация удалила бы ВСЕ бэкапы. Минимум 1.
     if [[ -z "$MAX_BACKUPS_COUNT" || ! "$MAX_BACKUPS_COUNT" =~ ^[0-9]+$ || "$MAX_BACKUPS_COUNT" -lt 1 ]]; then MAX_BACKUPS_COUNT=100; fi
+    if [[ -z "$BOT_RELEASE_URL_BASE" ]]; then BOT_RELEASE_URL_BASE="https://s3.rwp.rw/releases"; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
     if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
     if [[ -z "$REMOTE_STORAGE_TYPE" ]]; then REMOTE_STORAGE_TYPE="off"; fi
@@ -11634,7 +11761,7 @@ case "$1" in
     restore) menu_restore ;;
     check_update|update|self-update) check_for_updates ;;
     skipped|skip-list) show_skipped_report ;;
-    upgrade) auto_update_bot "$2" ;;
+    upgrade) auto_update_bot "$2" "$3" ;;
     migrate-v2|migrate_v2)
         # Конверсия v1 (Salted__) backup'ов в v2 (LAZ2 + HMAC).
         # Безопасно — оригинал удаляется только после успешной верификации v2.
@@ -11733,29 +11860,33 @@ case "$1" in
             down)               bot_down ;;
             status|-s)          bot_status ;;
             logs|-l)            show_bot_startup_logs "${3:-40}" ;;
-            upgrade|update|-u)  auto_update_bot "$3" ;;
+            upgrade|update|-u)  auto_update_bot "$3" "$4" ;;
             *)
-                echo "Использование: lazarus bot <команда> [LICENSE_KEY]"
-                echo "           или: lazarus -b <команда> [LICENSE_KEY]"
+                echo "Использование: lazarus bot <команда> [VERSION|LICENSE_KEY]"
+                echo "           или: lazarus -b <команда> [VERSION|LICENSE_KEY]"
                 echo ""
                 echo "Команды:"
                 echo "  up              - Запустить контейнеры бота (если не запущены)"
                 echo "  down            - Остановить контейнеры бота"
                 echo "  status,  -s     - Статус контейнера, версия, healthcheck"
                 echo "  logs [N], -l    - Последние N строк логов бота (default 40)"
-                echo "  upgrade, -u     - Обновить бота до последней версии"
+                echo "  upgrade, -u     - Обновить бота (локальный .tar/образ ИЛИ скачать версию)"
                 echo "  update          - Алиас для upgrade"
                 echo ""
-                echo "LICENSE_KEY (опционально для upgrade) — 64 hex символа от @rwp_shop_bot"
-                echo "Если не указан и не задан в .env — будет запрошен интерактивно."
+                echo "Аргументы upgrade (в любом порядке, оба опциональны):"
+                echo "  <VERSION>       - X.Y.Z → скачать релиз с BOT_RELEASE_URL_BASE"
+                echo "                    (\${BASE}/<V>/rwp_shop_<V>.tar), затем load+restart"
+                echo "  <LICENSE_KEY>   - 64 hex символа от @rwp_shop_bot"
+                echo "Без аргументов — auto-detect локального .tar/Docker-образа."
+                echo "Перед обновлением делается шифрованный pre-upgrade бэкап БД."
                 echo ""
                 echo "Примеры:"
                 echo "  lazarus bot status                       # текущая версия + healthcheck"
-                echo "  lazarus bot upgrade                      # обновить без ключа (если есть)"
-                echo "  lazarus bot upgrade abc...64hex          # обновить с переданным ключом"
-                echo "  lazarus -b -s"
-                echo "  lazarus -b -u                            # короткая форма upgrade"
-                echo "  lazarus -b -u abc...64hex"
+                echo "  lazarus bot upgrade                      # auto-detect локального образа"
+                echo "  lazarus bot upgrade 6.5.19               # скачать и установить 6.5.19"
+                echo "  lazarus bot upgrade 6.5.19 abc...64hex   # версия + ключ лицензии"
+                echo "  lazarus bot upgrade abc...64hex          # auto-detect + ключ"
+                echo "  lazarus -b -u 6.5.19                     # короткая форма"
                 echo ""
                 echo "Замечание: для обновления бота используется паттерн docker compose down → up -d"
                 echo "(не restart) — это безопасный путь для bot+db связки."
