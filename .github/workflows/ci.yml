@@ -60,3 +60,5 @@ jobs:
         run: bash .github/tests/test_mb_to_human.sh
       - name: test_rotation_zst
         run: bash .github/tests/test_rotation_zst.sh
+      - name: test_bot_release_download
+        run: bash .github/tests/test_bot_release_download.sh
