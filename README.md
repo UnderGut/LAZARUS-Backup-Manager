@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-5.6.4-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-5.7.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
@@ -57,6 +57,21 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 ---
 
 ## ✨ Возможности
+
+### 🛡️ Гарантии безопасности данных (v5.7.0)
+По итогам глубокого аудита скрипт спроектирован так, чтобы **не терять данные**:
+- **Restore с точкой отката** — перед уничтожением БД снимается snapshot ЖИВОЙ БД
+  (с контент-проверкой), деструктив hard-gated на валидный snapshot, при провале импорта —
+  авто-откат + поднятие контейнеров.
+- **Verify до удаления** — каждый архив (full и incremental) проверяется (для `.enc` — полным
+  decrypt round-trip) ПЕРЕД удалением plaintext и репортом success.
+- **Шифрование обязательно** — если задан пароль и шифрование провалилось, незашифрованный
+  архив НЕ отправляется (cron — abort, интерактив — явное подтверждение).
+- **Ротация не обнуляет** — size-rotation никогда не удаляет новейший бэкап и каскадно
+  чистит orphan-инкременты; нечисловые лимиты не приводят к удалению всего.
+- **Upload с verify** — S3/FTP/WebDAV/rclone сверяют размер на remote ПЕРЕД тем как
+  `delete-local` удалит локальную копию.
+- **Сериализация под flock** — параллельные бэкапы (cron + ручной) не портят друг друга.
 
 ### Резервное копирование
 - **Smart Scan** — автоматически находит бота в Docker (поддержка `rwp_shop`, `telegram-shop`, `shopbot`)

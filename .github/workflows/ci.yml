@@ -62,3 +62,9 @@ jobs:
         run: bash .github/tests/test_rotation_zst.sh
       - name: test_bot_release_download
         run: bash .github/tests/test_bot_release_download.sh
+      - name: test_restore_snapshot
+        run: bash .github/tests/test_restore_snapshot.sh
+      - name: test_rotation_floor
+        run: bash .github/tests/test_rotation_floor.sh
+      - name: test_config_roundtrip
+        run: bash .github/tests/test_config_roundtrip.sh

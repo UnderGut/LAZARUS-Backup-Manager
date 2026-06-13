@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.6.4"
+VERSION="5.7.0"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -236,8 +236,16 @@ _lazarus_int_handler() {
     printf '\033[90m       (если этого не сделать, операция продолжится)\033[0m\n'
 }
 
+# CSC-4 fix: TERM (systemctl stop / kill) НЕ должен попадать в double-confirm — там
+# нет человека, чтобы «нажать ещё раз», и первый сигнал молча проглатывался (процесс
+# игнорировал остановку). TERM → немедленный чистый выход (EXIT-trap снимет lock/tmp).
+_lazarus_term_handler() {
+    printf '\n\033[33m\033[1m[WARN] SIGTERM получен — завершаем\033[0m\n' >&2
+    exit 143
+}
 trap cleanup_on_exit EXIT
-trap _lazarus_int_handler INT TERM
+trap _lazarus_int_handler INT
+trap _lazarus_term_handler TERM
 
 # safe_read: обёртка над builtin read. При SIGINT (rc=130) повторяет prompt —
 # полезно в меню, где Ctrl+C во время read не должен интерпретироваться
@@ -383,6 +391,16 @@ _hmac_envelope_create() {
         return 1
     fi
 
+    # Step 1.5: ciphertext не должен быть пустым (silently-empty openssl output =
+    # битый infile / openssl error, который пайплайн мог не поймать).
+    local _cipher_sz
+    _cipher_sz=$(stat -c%s "$cipher_tmp" 2>/dev/null || echo 0)
+    if [[ "$_cipher_sz" -lt 1 ]]; then
+        debug_log "ENC" "empty ciphertext after openssl enc"
+        rm -f "$cipher_tmp" "$outfile"; unregister_sensitive_tmp "$cipher_tmp"
+        return 1
+    fi
+
     # Step 2: derive K_mac
     local k_mac
     k_mac=$(_derive_hmac_key "$password")
@@ -391,12 +409,25 @@ _hmac_envelope_create() {
         return 1
     fi
 
-    # Step 3: write LAZ2 + ciphertext + HMAC
+    # Step 3: write LAZ2 + ciphertext + HMAC.
+    # BKP-3/ENC-2 fix: раньше brace-group redirect НЕ проверял rc — при ENOSPC/IO-error
+    # outfile усекался (битый/недешифруемый .enc), а функция возвращала 0 → caller
+    # (особенно create_incremental_backup) удалял plaintext и отгружал нерабочий .enc.
+    # Теперь ловим rc записи И сверяем итоговый размер = 4(magic)+cipher+32(HMAC).
+    local _wrc=0
     {
-        printf 'LAZ2'
-        cat "$cipher_tmp"
-        openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp"
-    } > "$outfile"
+        printf 'LAZ2' \
+        && cat "$cipher_tmp" \
+        && openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp"
+    } > "$outfile" || _wrc=1
+    local _want=$((4 + _cipher_sz + 32))
+    local _got
+    _got=$(stat -c%s "$outfile" 2>/dev/null || echo 0)
+    if [[ "$_wrc" -ne 0 || "$_got" -ne "$_want" || "$_want" -lt 68 ]]; then
+        debug_log "ENC" "envelope write failed/truncated: wrc=$_wrc got=$_got want=$_want"
+        rm -f "$outfile" "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+        return 1
+    fi
 
     rm -f "$cipher_tmp"
     unregister_sensitive_tmp "$cipher_tmp"
@@ -988,9 +1019,14 @@ _resolve_incremental_chain() {
     local _base_fmt _base_tar_args
     _base_fmt=$(_compress_detect_format "$_base_tar")
     _base_tar_args=$(_tar_extract_args_for "$_base_fmt")
-    # tar safety flags: --no-overwrite-dir, --absolute-names=no (NB: --no-absolute-names
-    # на старых tar не существует, поэтому фильтруем через тестовую опцию ниже).
-    if ! tar --no-overwrite-dir $_base_tar_args -xf "$_base_tar" -C "$_stage/base" 2> "$SILENT_LOG"; then
+    # RST-4 fix: validate ДО extract. Раньше inc-chain распаковывал base/inc БЕЗ
+    # validate_tar_safety и без --no-same-owner/--no-same-permissions → подделанный
+    # backup с symlink/`..`/абсолютным путём писал как root вне sandbox.
+    if ! validate_tar_safety "$_base_tar" "$_stage/.base_list" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Base full не прошёл tar-safety" >&2
+        rm -f "$_base_tar"; return 1
+    fi
+    if ! tar --no-overwrite-dir --no-same-owner --no-same-permissions $_base_tar_args -xf "$_base_tar" -C "$_stage/base" 2> "$SILENT_LOG"; then
         print_message "ERROR" "Extract base full failed" >&2
         rm -f "$_base_tar"; return 1
     fi
@@ -1015,7 +1051,11 @@ _resolve_incremental_chain() {
     local _inc_fmt _inc_tar_args
     _inc_fmt=$(_compress_detect_format "$_inc_tar")
     _inc_tar_args=$(_tar_extract_args_for "$_inc_fmt")
-    if ! tar $_inc_tar_args -xf "$_inc_tar" -C "$_stage/inc" 2> "$SILENT_LOG"; then
+    if ! validate_tar_safety "$_inc_tar" "$_stage/.inc_list" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Inc не прошёл tar-safety" >&2
+        rm -f "$_inc_tar"; return 1
+    fi
+    if ! tar --no-overwrite-dir --no-same-owner --no-same-permissions $_inc_tar_args -xf "$_inc_tar" -C "$_stage/inc" 2> "$SILENT_LOG"; then
         print_message "ERROR" "Extract inc failed" >&2
         rm -f "$_inc_tar"; return 1
     fi
@@ -1043,18 +1083,26 @@ _resolve_incremental_chain() {
     _inc_files=$(find "$_stage/inc" -maxdepth 1 \( -name 'bot_files_inc_*.tar.gz' -o -name 'bot_files_inc_*.tar.zst' \) | head -1)
     if [[ -n "$_base_files" ]]; then
         mkdir -p "$_stage/files_merged"
-        # Extract base files
+        # Extract base files (RST-4: validate + anti-symlink/ownership flags)
         local _bf_fmt _bf_args
         _bf_fmt=$(_compress_detect_format "$_base_files")
         _bf_args=$(_tar_extract_args_for "$_bf_fmt")
-        tar $_bf_args -xf "$_base_files" -C "$_stage/files_merged" 2> "$SILENT_LOG"
+        if ! validate_tar_safety "$_base_files" "$_stage/.bf_list" 2> "$SILENT_LOG"; then
+            print_message "ERROR" "Base files-архив не прошёл tar-safety" >&2
+            return 1
+        fi
+        tar --no-overwrite-dir --no-same-owner --no-same-permissions $_bf_args -xf "$_base_files" -C "$_stage/files_merged" 2> "$SILENT_LOG"
         debug_log "RESTORE-CHAIN" "Base files extracted to $_stage/files_merged"
         # Overlay inc's changed files (only if inc has them)
         if [[ -n "$_inc_files" ]]; then
             local _if_fmt _if_args
             _if_fmt=$(_compress_detect_format "$_inc_files")
             _if_args=$(_tar_extract_args_for "$_if_fmt")
-            tar $_if_args -xf "$_inc_files" -C "$_stage/files_merged" 2> "$SILENT_LOG"
+            if ! validate_tar_safety "$_inc_files" "$_stage/.if_list" 2> "$SILENT_LOG"; then
+                print_message "ERROR" "Inc files-архив не прошёл tar-safety" >&2
+                return 1
+            fi
+            tar --no-overwrite-dir --no-same-owner --no-same-permissions $_if_args -xf "$_inc_files" -C "$_stage/files_merged" 2> "$SILENT_LOG"
             debug_log "RESTORE-CHAIN" "Inc files overlaid (changed files overwrite base)"
         fi
         # Apply deletions: удалить files которые помечены в manifest_deletions.txt.
@@ -1184,7 +1232,10 @@ _convert_v1_to_v2() {
     local _plain_tmp _v2_tmp
     _plain_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_mig_plain.XXXXXX") || return 1
     register_sensitive_tmp "$_plain_tmp"
-    _v2_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_mig_v2.XXXXXX") || {
+    # MIG-1 fix: _v2_tmp создаём В ТОМ ЖЕ каталоге, что и оригинал (BACKUP_DIR), чтобы
+    # финальный `mv` был атомарным rename. Раньше mktemp в /tmp → при разных ФС mv =
+    # copy+delete (не атомарно): прерывание оставляло бы частичный/битый файл.
+    _v2_tmp=$(mktemp "$(dirname "$_v1file")/.lazarus_mig_v2.XXXXXX") || {
         rm -f "$_plain_tmp"; unregister_sensitive_tmp "$_plain_tmp"
         return 1
     }
@@ -1198,6 +1249,16 @@ _convert_v1_to_v2() {
         return 1
     fi
 
+    # Step 1.5: расшифрованный v1 ОБЯЗАН быть валидным архивом. ENC-1 fix: v1 без MAC,
+    # неверный пароль может пройти слабую проверку и дать мусор. Если plain невалиден —
+    # не мигрируем (оригинал не трогаем).
+    if ! _verify_compressed "$_plain_tmp" "$(_compress_detect_format "$_plain_tmp")"; then
+        debug_log "MIGRATE" "v1 plaintext not a valid archive for $_v1file — skip"
+        rm -f "$_plain_tmp" "$_v2_tmp"
+        unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"
+        return 1
+    fi
+
     # Step 2: encrypt plain → v2
     if ! _hmac_envelope_create "$_plain_tmp" "$_v2_tmp" "$_password"; then
         debug_log "MIGRATE" "encrypt FAIL for $_v1file"
@@ -1206,15 +1267,25 @@ _convert_v1_to_v2() {
         return 1
     fi
 
-    # Step 3: verify v2 (MAC pre-check)
-    local _verify_fmt
-    _verify_fmt=$(_hmac_envelope_verify "$_v2_tmp" "$_password")
-    if [[ "$_verify_fmt" != "v2" ]]; then
-        debug_log "MIGRATE" "v2 verify FAIL for $_v1file (got format: $_verify_fmt)"
+    # Step 3: ПОЛНЫЙ verify v2 — decrypt round-trip + целостность сжатия ДО перезаписи
+    # оригинала. ENC-1 fix: раньше была лишь MAC-pre-check (_hmac_envelope_verify),
+    # которая НЕ подтверждает, что v2 реально дешифруется в валидный архив. Перезапись
+    # единственной копии после такой проверки могла оставить нерабочий v2 + потерю v1.
+    local _mig_chk
+    _mig_chk=$(mktemp "${TMPDIR:-/tmp}/lazarus_mig_chk.XXXXXX") || {
         rm -f "$_plain_tmp" "$_v2_tmp"
         unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"
         return 1
+    }
+    register_sensitive_tmp "$_mig_chk"
+    if ! _hmac_envelope_decrypt "$_v2_tmp" "$_mig_chk" "$_password" \
+       || ! _verify_compressed "$_mig_chk" "$(_compress_detect_format "$_mig_chk")"; then
+        debug_log "MIGRATE" "v2 round-trip verify FAIL for $_v1file — original kept"
+        rm -f "$_plain_tmp" "$_v2_tmp" "$_mig_chk"
+        unregister_sensitive_tmp "$_plain_tmp"; unregister_sensitive_tmp "$_v2_tmp"; unregister_sensitive_tmp "$_mig_chk"
+        return 1
     fi
+    rm -f "$_mig_chk"; unregister_sensitive_tmp "$_mig_chk"
 
     # Step 4: atomic replace (v2 → original path)
     # mv в той же ФС атомарен; v1 файл существует до самого конца только на случай
@@ -3111,6 +3182,13 @@ offer_tar_load_and_update() {
 
 # Очистка установочных .tar файлов после загрузки image
 cleanup_tar_files() {
+    # UPD-7 fix: только интерактивно. В cron/non-interactive `while read` ниже висел бы
+    # вечно (пустой stdin), а авто-удаление .tar по широкому скану (/root /tmp /opt /home)
+    # без подтверждения опасно. Без TTY — выходим, ничего не удаляя.
+    if [[ "$IS_INTERACTIVE" != "true" ]]; then
+        debug_log "CLEANUP" "cleanup_tar_files skipped (non-interactive)"
+        return 0
+    fi
     # Стандартные директории куда пользователь попадает по SSH
     local search_dirs=(
         "/root"
@@ -3577,7 +3655,10 @@ update_compose_image_version() {
     # Если новое имя image не указано, используем rwp_shop (официальное)
     [[ -z "$new_image_name" ]] && new_image_name="rwp_shop"
     debug_log "COMPOSE" "Target image name: $new_image_name"
-    
+
+    # UPD-3 fix: бэкап compose ДО правки — для отката, если бот не поднимется.
+    cp "$compose_file" "${compose_file}.lazarus-bak" 2> "$SILENT_LOG" || true
+
     # Список всех возможных имён image бота
     local image_patterns=(
         "rwp_shop"
@@ -3585,7 +3666,7 @@ update_compose_image_version() {
         "telegram-shop"
         "shopbot"
     )
-    
+
     local found=false
     for pattern in "${image_patterns[@]}"; do
         debug_log "COMPOSE" "Checking for pattern: $pattern"
@@ -3593,6 +3674,14 @@ update_compose_image_version() {
             debug_log "COMPOSE" "Pattern matched: $pattern"
             # Заменяем на новое имя и версию
             sed -i -E "s|(image:\s*['\"]?)${pattern}:[0-9]+(\.[0-9]+){1,3}|\1${new_image_name}:${new_version}|g" "$compose_file"
+            # UPD-2 fix: убеждаемся, что нужный тег реально появился (sed мог не сматчить
+            # нестандартный формат версии → раньше репортил SUCCESS без изменения).
+            if ! grep -qE "image:\s*['\"]?${new_image_name}:${new_version}([\"' ]|\$)" "$compose_file"; then
+                print_message "ERROR" "Compose не обновился до ${new_image_name}:${new_version} (нестандартный формат тега?)"
+                debug_log "COMPOSE" "post-sed verify FAILED — restoring backup"
+                [[ -f "${compose_file}.lazarus-bak" ]] && mv -f "${compose_file}.lazarus-bak" "$compose_file"
+                return 1
+            fi
             found=true
             debug_log "COMPOSE" "Sed replacement done: ${pattern} -> ${new_image_name}:${new_version}"
             print_message "SUCCESS" "Image обновлён: ${pattern} → ${new_image_name}:${new_version}"
@@ -4079,13 +4168,34 @@ auto_update_bot() {
 
         sleep 3
 
-        # Проверяем статус
+        # UPD-3 fix: проверяем, что бот реально поднялся (а не просто up -d вернул 0).
+        # Если нет — откатываем compose к бэкапу и поднимаем старую версию, чтобы НЕ
+        # оставить бота offline после неудачного обновления.
         local new_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
         if [[ "$new_status" == *"Up"* ]]; then
             print_message "SUCCESS" "Бот успешно обновлён до версии $selected_version"
         else
-            print_message "WARN" "Бот запущен, но статус: $new_status"
+            print_message "ERROR" "Бот НЕ поднялся после обновления (статус: ${new_status:-none}). Откат..."
+            log_message "ERROR" "Bot did not come up after update to $selected_version — rolling back"
+            if [[ -f "${compose_file}.lazarus-bak" ]]; then
+                mv -f "${compose_file}.lazarus-bak" "$compose_file"
+                docker compose down 2>/dev/null || docker-compose down 2>/dev/null
+                sleep 2
+                docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null
+                sleep 3
+                local _rb_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
+                if [[ "$_rb_status" == *"Up"* ]]; then
+                    print_message "WARN" "Откат выполнен — бот работает на предыдущей версии."
+                    log_message "WARN" "Rolled back compose; bot up on previous version"
+                else
+                    print_message "ERROR" "Откат не помог (статус: ${_rb_status:-none}) — нужно ручное вмешательство."
+                fi
+            else
+                print_message "ERROR" "Бэкап compose не найден — откат невозможен. Проверьте $compose_file вручную."
+            fi
         fi
+        # Успешное обновление — бэкап compose больше не нужен.
+        [[ "$new_status" == *"Up"* ]] && rm -f "${compose_file}.lazarus-bak" 2> "$SILENT_LOG"
 
         # Логи запуска бота — чтобы сразу увидеть, чисто ли он поднялся
         # (даём пару секунд накопить стартовый вывод: миграции/коннект к БД).
@@ -5333,6 +5443,7 @@ load_config_file() {
             BOT_CONTAINER_NAME) BOT_CONTAINER_NAME="$val" ;;
             DB_CONTAINER_NAME) DB_CONTAINER_NAME="$val" ;;
             DB_USER) DB_USER="$val" ;;
+            DB_NAME) DB_NAME="$val" ;;
             IGNORE_MISMATCH) IGNORE_MISMATCH="$val" ;;
             EXCLUDE_DIRS) EXCLUDE_DIRS="$val" ;;
             MAX_FILE_SIZE_MB) MAX_FILE_SIZE_MB="$val" ;;
@@ -5377,6 +5488,11 @@ env_escape() {
     local val="$1"
     val="${val//\\/\\\\}"
     val="${val//\"/\\\"}"
+    # CFG-1 fix: убираем CR/LF. Значение с переносом строки при reload распалось бы
+    # на фейковую вторую `key=value` строку → порча конфига и подмена кредов/настроек.
+    # Конфиг-значения по природе однострочные (токены/пути/креды).
+    val="${val//$'\n'/}"
+    val="${val//$'\r'/}"
     echo "$val"
 }
 
@@ -5478,6 +5594,7 @@ save_config() {
     TG_MESSAGE_THREAD_ID_ESC=$(env_escape "$TG_MESSAGE_THREAD_ID")
     BOT_PATH_ESC=$(env_escape "$BOT_PATH")
     DB_USER_ESC=$(env_escape "$DB_USER")
+    local DB_NAME_ESC; DB_NAME_ESC=$(env_escape "${DB_NAME:-}")
     SCHEDULE_FULL_ESC=$(env_escape "$SCHEDULE_FULL")
     SCHEDULE_DB_ESC=$(env_escape "$SCHEDULE_DB")
     SCHEDULE_FILES_ESC=$(env_escape "$SCHEDULE_FILES")
@@ -5522,6 +5639,7 @@ CHAT_ID="$CHAT_ID_ESC"
 TG_MESSAGE_THREAD_ID="$TG_MESSAGE_THREAD_ID_ESC"
 BOT_PATH="$BOT_PATH_ESC"
 DB_USER="$DB_USER_ESC"
+DB_NAME="$DB_NAME_ESC"
 SCHEDULE_FULL="$SCHEDULE_FULL_ESC"
 SCHEDULE_DB="$SCHEDULE_DB_ESC"
 SCHEDULE_FILES="$SCHEDULE_FILES_ESC"
@@ -5585,20 +5703,31 @@ load_or_create_config() {
     if [[ -z "$MAX_BACKUPS_COUNT" || ! "$MAX_BACKUPS_COUNT" =~ ^[0-9]+$ || "$MAX_BACKUPS_COUNT" -lt 1 ]]; then MAX_BACKUPS_COUNT=100; fi
     if [[ -z "$BOT_RELEASE_URL_BASE" ]]; then BOT_RELEASE_URL_BASE="https://s3.rwp.rw/releases"; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
-    if [[ -z "$MAX_FILE_SIZE_MB" ]]; then MAX_FILE_SIZE_MB="1"; fi
+    # ROT-4/CFG-5/SHELL-1/SHELL-2/SHELL-4 fix: численные ключи валидируем как
+    # ^[0-9]+$ (не только -z). Раньше hand-edited "500MB"/"abc"/"0.5" сохранялись
+    # дословно → bash-арифметика трактовала их как 0 → size-rotation сносила ВСЁ,
+    # а MAX_FILE_SIZE_MB=мусор исключал все файлы. Невалидное → безопасный дефолт.
+    if [[ -z "$MAX_FILE_SIZE_MB" || ! "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ ]]; then MAX_FILE_SIZE_MB="1"; fi
     if [[ -z "$REMOTE_STORAGE_TYPE" ]]; then REMOTE_STORAGE_TYPE="off"; fi
     if [[ -z "$SEND_TO_TELEGRAM" ]]; then SEND_TO_TELEGRAM="true"; fi
     if [[ -z "$TG_SEND_FILE" ]]; then TG_SEND_FILE="true"; fi
     if [[ -z "$SEND_TO_REMOTE" ]]; then SEND_TO_REMOTE="true"; fi
     if [[ -z "$DELETE_MODE" ]]; then DELETE_MODE="time"; fi
-    if [[ -z "$RETENTION_DAYS" ]]; then RETENTION_DAYS="7"; fi
-    if [[ -z "$MAX_BACKUP_SIZE_MB" ]]; then MAX_BACKUP_SIZE_MB="0"; fi
+    if [[ -z "$RETENTION_DAYS" || ! "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then RETENTION_DAYS="7"; fi
+    if [[ -z "$MAX_BACKUP_SIZE_MB" || ! "$MAX_BACKUP_SIZE_MB" =~ ^[0-9]+$ ]]; then MAX_BACKUP_SIZE_MB="0"; fi
     if [[ -z "$S3_REGION" ]]; then S3_REGION="us-east-1"; fi
     if [[ -z "$BACKUP_PASSWORD_FILE" ]]; then BACKUP_PASSWORD_FILE="$INSTALL_DIR/.password"; fi
-    if [[ -z "$DISK_WARN_PERCENT" ]]; then DISK_WARN_PERCENT="90"; fi
-    if [[ -z "$DISK_CRITICAL_PERCENT" ]]; then DISK_CRITICAL_PERCENT="95"; fi
+    if [[ -z "$DISK_WARN_PERCENT" || ! "$DISK_WARN_PERCENT" =~ ^[0-9]+$ ]]; then DISK_WARN_PERCENT="90"; fi
+    if [[ -z "$DISK_CRITICAL_PERCENT" || ! "$DISK_CRITICAL_PERCENT" =~ ^[0-9]+$ ]]; then DISK_CRITICAL_PERCENT="95"; fi
     if [[ -z "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" ]]; then DELETE_LOCAL_AFTER_REMOTE_UPLOAD="false"; fi
     if [[ -z "$BACKUP_LOG_FILES" ]]; then BACKUP_LOG_FILES="ask"; fi
+    # CSC-5 fix: timeout-ключи должны быть численными (0 допустим = «отключить»).
+    # Невалидное значение (напр. "60m") молча отключало бы timeout → зависший pg_dump/tar
+    # держал бы блокировку вечно и блокировал все следующие бэкапы.
+    [[ "${PG_DUMP_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || PG_DUMP_TIMEOUT_SEC="3600"
+    [[ "${TAR_TIMEOUT_SEC:-}"     =~ ^[0-9]+$ ]] || TAR_TIMEOUT_SEC="3600"
+    [[ "${ENCRYPT_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || ENCRYPT_TIMEOUT_SEC="1800"
+    [[ "${RESTORE_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || RESTORE_TIMEOUT_SEC="3600"
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -6366,8 +6495,13 @@ upload_to_remote() {
         return 0
     fi
     if [[ "$REMOTE_STORAGE_TYPE" != "s3" && -z "$REMOTE_STORAGE_URL" ]]; then
-        debug_log "REMOTE" "Remote storage URL empty (type=$REMOTE_STORAGE_TYPE)"
-        return 0
+        # BKP-1(storage) fix: remote ВКЛЮЧЁН (type!=off, SEND_TO_REMOTE=true), но URL пуст —
+        # это misconfiguration, а не "нечего делать". Раньше тут был `return 0` → caller
+        # считал upload успешным → delete-local удалял ЕДИНСТВЕННУЮ копию (потеря данных).
+        print_message "ERROR" "Remote включён ($REMOTE_STORAGE_TYPE), но REMOTE_STORAGE_URL пуст — загрузка невозможна" >&2
+        log_message "ERROR" "Remote upload misconfigured: empty URL for type=$REMOTE_STORAGE_TYPE"
+        REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Remote: URL не задан'
+        return 1
     fi
     
     if [[ ! -f "$file_path" ]]; then
@@ -6393,11 +6527,23 @@ upload_to_remote() {
         debug_log "REMOTE" "Running: rclone copy $file_path $dest ${rclone_opts[*]}"
         
         if rclone copy "$file_path" "$dest" "${rclone_opts[@]}" 2>&1; then
-            print_message "SUCCESS" "Файл загружен (rclone)." >&2
-            debug_log "REMOTE" "Rclone upload SUCCESS"
-            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: OK'
-            log_message "SUCCESS" "Uploaded $filename to rclone:$dest"
-            return 0
+            # BKP-3(storage) fix: readback размера на remote. `rclone copy` exit 0 ещё не
+            # гарантирует целостность (битый/частичный объект на misconfigured backend) —
+            # без проверки false success → delete-local теряет единственную копию.
+            local _rc_remote_sz
+            _rc_remote_sz=$(rclone size --json "$dest/$filename" 2> "$SILENT_LOG" | grep -oE '"bytes":[0-9]+' | grep -oE '[0-9]+' | head -1)
+            if [[ "$_rc_remote_sz" =~ ^[0-9]+$ && "$_rc_remote_sz" -eq "$file_size" ]]; then
+                print_message "SUCCESS" "Файл загружен и проверен (rclone)." >&2
+                debug_log "REMOTE" "Rclone upload+verify SUCCESS ($_rc_remote_sz b)"
+                REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: OK (verified)'
+                log_message "SUCCESS" "Uploaded+verified $filename to rclone:$dest"
+                return 0
+            else
+                print_message "ERROR" "Rclone: размер на remote не совпал (local=$file_size, remote=${_rc_remote_sz:-?})" >&2
+                REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: размер не совпал'
+                log_message "ERROR" "Rclone verify FAILED: local=$file_size remote=${_rc_remote_sz:-?}"
+                return 1
+            fi
         else
             print_message "ERROR" "Ошибка загрузки rclone." >&2
             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ Rclone: Ошибка'
@@ -6626,8 +6772,10 @@ upload_to_remote() {
             http_code=$(curl "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
             debug_log "UPLOAD" "WebDAV response code: $http_code"
             
-            # WebDAV коды успеха: 200 OK, 201 Created, 204 No Content
-            if [[ "$http_code" =~ ^(200|201|204)$ ]]; then
+            # WebDAV коды успеха: 200 OK, 201 Created, 202 Accepted (async commit), 204 No Content.
+            # BKP-6(storage) fix: 202 добавлен — серверы с асинхронной фиксацией (некоторые
+            # Nextcloud/проксированные WebDAV) иначе репортили ложный провал.
+            if [[ "$http_code" =~ ^(200|201|202|204)$ ]]; then
                 upload_success=true
                 debug_log "UPLOAD" "WebDAV upload SUCCESS"
                 break
@@ -6643,13 +6791,33 @@ upload_to_remote() {
     done
     
     if [[ "$upload_success" == true ]]; then
-        print_message "SUCCESS" "Файл загружен в хранилище." >&2
-        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then 
-            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: OK'
-        else 
-            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: OK'
+        # FTP-1/BKP-6(storage) fix: readback размера ДО репорта success. Многие FTP/WebDAV
+        # серверы фиксируют файл по закрытию соединения и отвечают 226/201 даже на
+        # обрезанный transfer (quota/диск). Без проверки false success → delete-local
+        # терял единственную копию. HEAD/SIZE → Content-Length, сверяем с локальным.
+        local _vopts=(-sI -m 60)
+        [[ -n "$REMOTE_STORAGE_USER" ]] && _vopts+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
+        [[ "$upload_url" == ftp://*  ]] && _vopts+=(--ftp-pasv)
+        [[ "$upload_url" == ftps://* ]] && _vopts+=(--ftp-pasv --ssl-reqd --insecure)
+        [[ "$upload_url" == https://* ]] && _vopts+=(--insecure)
+        local _rmt_clen
+        _rmt_clen=$(curl "${_vopts[@]}" "$upload_url" 2> "$SILENT_LOG" | grep -iE '^Content-Length:' | tail -1 | tr -dc '0-9')
+        local _label="WebDAV"; [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && _label="FTP"
+        if [[ "$_rmt_clen" =~ ^[0-9]+$ && "$_rmt_clen" -ne "$file_size" ]]; then
+            print_message "ERROR" "$_label: размер на remote не совпал (local=$file_size, remote=$_rmt_clen) — загрузка повреждена" >&2
+            log_message "ERROR" "$_label verify FAILED: local=$file_size remote=$_rmt_clen ($upload_url)"
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_label"': размер не совпал'
+            return 1
         fi
-        log_message "SUCCESS" "Uploaded $filename to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code"
+        print_message "SUCCESS" "Файл загружен в хранилище." >&2
+        if [[ "$_rmt_clen" =~ ^[0-9]+$ ]]; then
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_label"': OK (verified)'
+        else
+            # Сервер не отдал Content-Length на HEAD — verify пропущен (как S3 verify-skip).
+            debug_log "UPLOAD" "$_label: remote size unavailable, verify skipped"
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_label"': OK (verify skipped)'
+        fi
+        log_message "SUCCESS" "Uploaded $filename to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code remote_size=${_rmt_clen:-?}"
         return 0
     else
         print_message "ERROR" "Ошибка загрузки после $max_retries попыток (Код: $http_code)" >&2
@@ -7320,18 +7488,25 @@ rotate_backups_by_size() {
     
     debug_log "SIZE" "=== rotate_backups_by_size(delete=$PERFORM_DELETE) ==="
     
-    # Если лимит 0 или не задан - ничего не делаем
-    if [[ -z "$MAX_BACKUP_SIZE_MB" || "$MAX_BACKUP_SIZE_MB" == "0" ]]; then
-        debug_log "SIZE" "Size limit disabled (MAX_BACKUP_SIZE_MB=$MAX_BACKUP_SIZE_MB)"
+    # Если лимит 0/не задан/НЕ численный - ничего не делаем (ROT-4 defensive:
+    # без этого "500MB"/"abc" → арифметика=0 → удалялись бы ВСЕ бэкапы).
+    if [[ -z "$MAX_BACKUP_SIZE_MB" || ! "$MAX_BACKUP_SIZE_MB" =~ ^[0-9]+$ || "$MAX_BACKUP_SIZE_MB" == "0" ]]; then
+        debug_log "SIZE" "Size limit disabled/invalid (MAX_BACKUP_SIZE_MB='$MAX_BACKUP_SIZE_MB')"
         return 0
     fi
-    
+
     local limit_mb="$MAX_BACKUP_SIZE_MB"
     local limit_bytes=$((limit_mb * 1024 * 1024))
     debug_log "SIZE" "Limit: $limit_mb MB ($limit_bytes bytes)"
-    
+
     # Получаем текущий размер папки бэкапов в байтах
     local current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+    # ROT-6 fix: на stale-mount/FUSE du может вернуть пусто/нечисло → арифметика
+    # упала бы или дала ложное сравнение. Невалидное значение → пропускаем ротацию.
+    if [[ ! "$current_size_bytes" =~ ^[0-9]+$ ]]; then
+        debug_log "SIZE" "du returned non-numeric ('$current_size_bytes') — skip size rotation"
+        return 0
+    fi
     local current_size_mb=$((current_size_bytes / 1024 / 1024))
     debug_log "SIZE" "Current size: $current_size_mb MB ($current_size_bytes bytes)"
     
@@ -7384,21 +7559,35 @@ rotate_backups_by_size() {
                 -o -name "lazarus_*.tar.zst"  -o -name "lazarus_*.tar.zst.enc" \) \
                 -printf '%T@ %p\0' 2> "$SILENT_LOG" | sort -zn | cut -z -d' ' -f2-)
     
-    debug_log "SIZE" "Found ${#files[@]} backup files to process"
-    
+    local _n=${#files[@]}
+    debug_log "SIZE" "Found $_n backup files to process"
+
+    # ROT-5 floor: НИКОГДА не удаляем новейший бэкап (последний в sort -n по mtime),
+    # даже если лимит меньше одного архива. Иначе size-rotation могла снести ВСЁ,
+    # включая только что созданную и проверенную копию → ноль бэкапов.
+    if [[ $_n -le 1 ]]; then
+        echo -e "${YELLOW}Лимит размера меньше одного бэкапа — оставлена 1 копия (защита от полной очистки).${RESET}"
+        log_message "WARN" "Size rotation: <=1 backup, kept despite exceeding limit"
+        return 0
+    fi
+
     local deleted_count=0
     local deleted_size=0
-    
-    for file in "${files[@]}"; do
+    local orphan_total=0
+    local _i
+    # Идём по всем КРОМЕ последнего (новейшего): индексы 0 .. _n-2.
+    for (( _i=0; _i < _n-1; _i++ )); do
+        local file="${files[$_i]}"
         # Пересчитываем текущий размер
         current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+        [[ "$current_size_bytes" =~ ^[0-9]+$ ]] || break
         debug_log "SIZE" "Current: $current_size_bytes bytes, limit: $limit_bytes bytes"
-        
+
         if [[ $current_size_bytes -le $limit_bytes ]]; then
             debug_log "SIZE" "Size now within limit, stopping"
             break
         fi
-        
+
         if [[ -f "$file" ]]; then
             local file_size=$(stat -c%s "$file" 2> "$SILENT_LOG" || echo 0)
             debug_log "SIZE" "Deleting: $file (size=$file_size bytes)"
@@ -7408,18 +7597,34 @@ rotate_backups_by_size() {
             log_message "INFO" "Deleted $file (size-based rotation)"
             ((deleted_count++))
             ((deleted_size += file_size))
+            # ROT-1 fix: при удалении base full каскадно удаляем его orphan inc'ы
+            # (как делают count/age ротации) — иначе осиротевший inc нельзя восстановить.
+            if [[ "$(basename "$file")" == lazarus_full_* ]]; then
+                _delete_orphan_inc_for_full "$file"
+                orphan_total=$((orphan_total + _LAST_ORPHAN_COUNT))
+            fi
         fi
     done
-    
+
+    # Если после удаления всех, КРОМЕ новейшего, размер всё ещё > лимита — новейший
+    # НЕ трогаем (floor). Предупреждаем оператора, что лимит мал.
+    current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+    if [[ "$current_size_bytes" =~ ^[0-9]+$ && $current_size_bytes -gt $limit_bytes ]]; then
+        echo -e "${YELLOW}Лимит меньше новейшего бэкапа — он сохранён (защита от полной очистки). Увеличьте MAX_BACKUP_SIZE_MB.${RESET}"
+        log_message "WARN" "Size rotation: limit smaller than newest backup; newest kept"
+    fi
+
     local deleted_display
     local deleted_mb=$((deleted_size / 1024 / 1024))
     deleted_display=$(_mb_to_human "$deleted_mb")
-    
+
     if [[ $deleted_count -gt 0 ]]; then
-        print_message "SUCCESS" "Удалено $deleted_count файлов ($deleted_display)"
-        log_message "SUCCESS" "Size-based rotation: deleted $deleted_count files ($deleted_display)"
+        local _orph_msg=""
+        [[ $orphan_total -gt 0 ]] && _orph_msg=" + $orphan_total orphan inc"
+        print_message "SUCCESS" "Удалено $deleted_count файлов ($deleted_display)$_orph_msg"
+        log_message "SUCCESS" "Size-based rotation: deleted $deleted_count files ($deleted_display), orphan_inc=$orphan_total"
     fi
-    
+
     return 0
 }
 
@@ -7852,8 +8057,9 @@ recreate_cron_from_schedule() {
     esac
     
     if [[ -n "$NEW_CRON_LINE" ]]; then
-        local CURRENT_CRON=$(crontab -l 2> "$SILENT_LOG" | grep -v "$JOB_ID")
-        echo -e "$CURRENT_CRON\n$NEW_CRON_LINE" | crontab -
+        # SHELL-3 fix: printf вместо echo -e (не интерпретируем backslash'и чужих задач).
+        local CURRENT_CRON; CURRENT_CRON=$(crontab -l 2> "$SILENT_LOG" | grep -v "$JOB_ID")
+        printf '%s\n%s\n' "$CURRENT_CRON" "$NEW_CRON_LINE" | crontab -
         log_message "INFO" "Recreated cron job for $TASK_TYPE: $SCHEDULE"
     fi
 }
@@ -7867,20 +8073,27 @@ create_backup() {
     debug_log "BACKUP" "BOT_CONTAINER=$BOT_CONTAINER_NAME, DB_CONTAINER=$DB_CONTAINER_NAME"
     debug_log "BACKUP" "IS_INTERACTIVE=$IS_INTERACTIVE"
     
-    # Блокировка от параллельного запуска (только в non-interactive режиме)
+    # ROT-3/CSC-2 fix: блокировку берём ВСЕГДА (включая интерактив). Раньше lock был
+    # только в cron-режиме — ручной бэкап параллельно с cron'ом писали в одни и те же
+    # fixed-name промежуточные файлы ($FILE_DB/$FILE_MANIFEST/...) и портили друг друга.
+    # При занятой блокировке cron и интерактив одинаково выходят (без коррупции).
     local LOCK_ACQUIRED="false"
-    if [[ "$IS_INTERACTIVE" == "false" ]]; then
-        debug_log "LOCK" "Attempting to acquire lock..."
-        if ! acquire_lock; then
-            local owner_pid=$(check_lock_owner)
-            debug_log "LOCK" "Lock failed! Owner PID: $owner_pid"
-            log_message "WARN" "Backup skipped: another instance is running (PID: $owner_pid)"
-            print_message "WARN" "Другой процесс бэкапа уже запущен (PID: $owner_pid)"
-            return 1
-        fi
-        debug_log "LOCK" "Lock acquired successfully"
-        LOCK_ACQUIRED="true"
+    debug_log "LOCK" "Attempting to acquire lock..."
+    if ! acquire_lock; then
+        local owner_pid=$(check_lock_owner)
+        debug_log "LOCK" "Lock failed! Owner PID: $owner_pid"
+        log_message "WARN" "Backup skipped: another instance is running (PID: $owner_pid)"
+        print_message "WARN" "Другой процесс бэкапа уже запущен (PID: $owner_pid). Повторите позже."
+        return 1
     fi
+    debug_log "LOCK" "Lock acquired successfully"
+    LOCK_ACQUIRED="true"
+    # CSC-3 fix: RETURN-trap гарантирует release_lock на ЛЮБОМ возврате из create_backup
+    # (включая ранние interactive-отмены, которые раньше не освобождали lock → он висел
+    # до конца процесса/сессии и блокировал следующий бэкап). Без functrace срабатывает
+    # только на возврате самой create_backup. Двойной release безопасен (release_lock
+    # глушит ошибки на уже закрытом FD). Существующие явные release_lock оставлены.
+    trap '[[ "$LOCK_ACQUIRED" == "true" ]] && release_lock' RETURN
     
     # === ПРОВЕРКА ДИСКА ===
     # Два слоя защиты:
@@ -8271,7 +8484,14 @@ create_backup() {
                 fi
             fi
         done
-        FIND_ARGS+=("-type" "f" "-size" "+${MAX_FILE_SIZE_MB}M" "-print0")
+        # SHELL-2 fix: MAX_FILE_SIZE_MB=0 = «без лимита на размер файла» → НЕ исключаем
+        # по размеру. Раньше `-size +0M` матчил ВСЕ непустые файлы → они все попадали в
+        # skip-список → tar исключал почти всё → near-empty бэкап, репортнутый как success.
+        if [[ "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ && "$MAX_FILE_SIZE_MB" -gt 0 ]]; then
+            FIND_ARGS+=("-type" "f" "-size" "+${MAX_FILE_SIZE_MB}M" "-print0")
+        else
+            FIND_ARGS+=("-type" "f" "-false" "-print0")
+        fi
         debug_log "TAR" "Find args: ${FIND_ARGS[*]}"
         # Subshell: cd не утечёт в parent (cwd используется в других местах create_backup).
         # Если cd упал — find работает в текущей cwd → BACKUP_DIR обходим, что неправильно.
@@ -8444,8 +8664,35 @@ create_backup() {
             print_message "SUCCESS" "Архив зашифрован."
             debug_log "ENC" "Encryption successful: $FILE_FINAL"
         else
-            print_message "ERROR" "Ошибка шифрования! Отправка незашифрованного файла."
-            debug_log "ENC" "Encryption FAILED!"
+            # BKP-2/ENC-4 fix: пароль ЗАДАН, но шифрование провалилось. Раньше код молча
+            # отгружал НЕЗАШИФРОВАННЫЙ архив (дамп БД с токенами/PII уходил в S3/FTP/TG
+            # открытым текстом, хотя юзер настроил шифрование) и репортил SUCCESS.
+            # Теперь: всегда чистим частичный .enc; в cron — аборт; в интерактиве —
+            # явное подтверждение PLAINTEXT.
+            rm -f "$BACKUP_DIR/${FILE_FINAL}.enc"
+            print_message "ERROR" "Ошибка шифрования архива!"
+            log_message "ERROR" "Encryption FAILED for $FILE_FINAL (password configured)"
+            local _ship_plain=false
+            if [[ "$IS_INTERACTIVE" == true && "$AUTO_CONFIRM" != "true" ]]; then
+                echo -e "${RED}${BOLD}Архив содержит данные БД. Отправить НЕЗАШИФРОВАННЫМ?${RESET}"
+                echo -e "${RED}Введите ${BOLD}PLAINTEXT${RESET}${RED} для подтверждения (иначе бэкап будет отменён):${RESET}"
+                local _pc=""
+                read -erp "> " _pc
+                [[ "$_pc" == "PLAINTEXT" ]] && _ship_plain=true
+            fi
+            if [[ "$_ship_plain" != "true" ]]; then
+                rm -f "$BACKUP_DIR/$FILE_FINAL"
+                if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+                    send_telegram_alert "ERROR" "Бэкап отменён" \
+                        "🔒 Шифрование задано, но провалилось
+📦 <code>$FILE_FINAL</code>" \
+                        "Незашифрованный бэкап НЕ отправлен. Проверьте openssl/свободное место и повторите."
+                fi
+                [[ "${LOCK_ACQUIRED:-}" == "true" ]] && release_lock
+                return 1
+            fi
+            print_message "WARN" "Отправка НЕЗАШИФРОВАННОГО архива по явному подтверждению (PLAINTEXT)."
+            ENC_STATUS="⚠️ UNENCRYPTED"
         fi
     fi
 
@@ -8932,16 +9179,18 @@ select_backup_file() {
 create_incremental_backup() {
     debug_log "INC" "=== Starting incremental backup ==="
 
+    # ROT-3/CSC-2 fix: блокировку берём ВСЕГДА (включая интерактив) — иначе ручной inc
+    # параллельно с cron-бэкапом портят общие fixed-name промежуточные файлы.
     local LOCK_ACQUIRED="false"
-    if [[ "$IS_INTERACTIVE" == "false" ]]; then
-        if ! acquire_lock; then
-            local owner_pid=$(check_lock_owner)
-            log_message "WARN" "Inc backup skipped: another instance is running (PID: $owner_pid)"
-            print_message "WARN" "Другой процесс бэкапа уже запущен (PID: $owner_pid)"
-            return 1
-        fi
-        LOCK_ACQUIRED="true"
+    if ! acquire_lock; then
+        local owner_pid=$(check_lock_owner)
+        log_message "WARN" "Inc backup skipped: another instance is running (PID: $owner_pid)"
+        print_message "WARN" "Другой процесс бэкапа уже запущен (PID: $owner_pid). Повторите позже."
+        return 1
     fi
+    LOCK_ACQUIRED="true"
+    # CSC-3 fix: RETURN-trap гарантирует release на любом возврате.
+    trap '[[ "$LOCK_ACQUIRED" == "true" ]] && release_lock' RETURN
 
     # Step 1: найти последний full backup (с manifest)
     local _last_full
@@ -9082,6 +9331,19 @@ create_incremental_backup() {
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
+        # BKP-4 fix: sanity-проверка размера дампа (как в create_backup L~8186).
+        # pg_dump может вернуть rc=0 но почти пустой дамп (~20-40b: wrong/empty DB,
+        # schema-only race). Без этого восстановление inc-цепочки молча даст пустой слой.
+        local _inc_db_bytes=0
+        [[ -f "$BACKUP_DIR/$FILE_DB" ]] && _inc_db_bytes=$(stat -c%s "$BACKUP_DIR/$FILE_DB" 2>/dev/null || echo 0)
+        if [[ "$_inc_db_bytes" -lt 100 ]]; then
+            print_message "ERROR" "Дамп БД подозрительно мал (${_inc_db_bytes}b) — inc-бэкап отменён"
+            log_message "ERROR" "Suspicious inc DB dump size: ${_inc_db_bytes}b"
+            rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC"
+            rm -rf "$_work_dir"; unregister_sensitive_tmp "$_work_dir"; rm -f "$_tar_err"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
     fi
 
     # 4b: tar ТОЛЬКО изменённые файлы (из _diff_list)
@@ -9124,18 +9386,47 @@ create_incremental_backup() {
         return 1
     fi
 
-    # Step 5: encrypt если задан BACKUP_PASSWORD
+    # Step 5: encrypt + VERIFY (BKP-1/ENC-3 fix).
+    # Раньше create_incremental_backup НЕ верифицировал архив и удалял plaintext
+    # сразу после _hmac_envelope_create rc=0 → битый/недешифруемый inc отгружался как
+    # SUCCESS, а base потом ротировался → восстановление цепочки невозможно.
+    # Теперь: проверяем целостность (для enc — полный decrypt round-trip) ПЕРЕД
+    # удалением plaintext и репортом SUCCESS. Inc репродуцируется повторным запуском,
+    # поэтому при провале verify безопасно удалить обе копии и вернуть 1 (данные в
+    # source — боте и БД — целы, потери нет).
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         print_message "INFO" "Шифрование архива..."
-        if _hmac_envelope_create "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
-            rm -f "$BACKUP_DIR/$FILE_FINAL"
-            FILE_FINAL="${FILE_FINAL}.enc"
-            print_message "SUCCESS" "Архив зашифрован."
-        else
+        if ! _hmac_envelope_create "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
             print_message "ERROR" "Ошибка шифрования"
-            # SECURITY: если encryption failed — удаляем plaintext чтобы не
-            # оставлять unencrypted backup на диске (был MEDIUM finding).
             rm -f "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+        # Verify: decrypt round-trip + целостность сжатия ДО удаления plaintext.
+        local _incv
+        _incv=$(mktemp "${TMPDIR:-/tmp}/lazarus_incverify.XXXXXX" 2>/dev/null)
+        register_sensitive_tmp "$_incv"
+        if [[ -n "$_incv" ]] \
+           && _hmac_envelope_decrypt "$BACKUP_DIR/${FILE_FINAL}.enc" "$_incv" "$BACKUP_PASSWORD" \
+           && _verify_compressed "$_incv" "$(_compress_detect_format "$_incv")"; then
+            rm -f "$_incv"; unregister_sensitive_tmp "$_incv"
+            rm -f "$BACKUP_DIR/$FILE_FINAL"   # plaintext — ТОЛЬКО после успешного verify
+            FILE_FINAL="${FILE_FINAL}.enc"
+            print_message "SUCCESS" "Архив зашифрован и проверен."
+        else
+            rm -f "$_incv"; unregister_sensitive_tmp "$_incv"
+            print_message "ERROR" "Зашифрованный inc-архив не прошёл verify — отменён."
+            log_message "ERROR" "Incremental encrypted archive verify FAILED: ${FILE_FINAL}.enc"
+            rm -f "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_DIR/$FILE_FINAL"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+    else
+        # Unencrypted: проверяем целостность сжатия архива перед SUCCESS.
+        if ! _verify_compressed "$BACKUP_DIR/$FILE_FINAL" "$(_compress_detect_format "$BACKUP_DIR/$FILE_FINAL")"; then
+            print_message "ERROR" "Inc-архив повреждён (verify failed) — отменён."
+            log_message "ERROR" "Incremental archive verify FAILED: $FILE_FINAL"
+            rm -f "$BACKUP_DIR/$FILE_FINAL"
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
@@ -9145,6 +9436,18 @@ create_incremental_backup() {
     _size=$(stat -c%s "$BACKUP_DIR/$FILE_FINAL" 2>/dev/null | numfmt --to=iec 2>/dev/null || echo "?")
     print_message "SUCCESS" "Incremental создан: $FILE_FINAL ($_size, $_changed_count изменённых)"
     log_message "SUCCESS" "Incremental backup: $FILE_FINAL (base=$_base_ts, changed=$_changed_count, size=$_size)"
+
+    # ROT-2 fix: ротируем inc-бэкапы (раньше росли безгранично между full-бэкапами —
+    # count/age ротации их не трогали, только size). Каждый inc независим (diff от
+    # своего base full), поэтому удаление старых безопасно; зависимость inc→base
+    # покрыта orphan-cleanup при ротации full. Под уже удерживаемой блокировкой.
+    if [[ "$DELETE_MODE" == "count" ]]; then
+        rotate_backups_by_count "lazarus_inc" "Инкрементальные" "true" > /dev/null
+    else
+        rotate_backups_by_age "lazarus_inc" "Инкрементальные" "$RETENTION_DAYS" "true" > /dev/null
+    fi
+    rotate_backups_by_size "true" > /dev/null
+
     [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
     return 0
 }
@@ -9585,34 +9888,73 @@ assert_safe_db_target() {
 
 # --- confirm_drop_schema: подтверждение DROP SCHEMA с safety snapshot ---
 # Безопасное по умолчанию: без флага --restore-drop-schema DROP SCHEMA не выполняется
+# _make_live_db_snapshot: снимок ЖИВОЙ БД перед деструктивным restore.
+# Args: $1 db_container, $2 db_user, $3 db_name, $4 backup_dir.
+# Stdout: путь к созданному snapshot (если файл создан). Все сообщения → stderr.
+# Rc: 0 = валидный snapshot С пользовательскими данными (есть точка отката);
+#     2 = snapshot снят, но БД пуста/без таблиц (отката по сути нет);
+#     1 = снять не удалось (pg_dump rc!=0 / пустой файл / БД недоступна).
+# КРИТИЧНО: вызывать ДО `docker compose down` / `docker volume rm`, пока БД жива.
+_make_live_db_snapshot() {
+    local db_container="$1" db_user="$2" db_name="$3" backup_dir="$4"
+    local snap="${backup_dir}/pre_restore_snapshot_$(date +%Y%m%d_%H%M%S).sql.gz"
+    _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-live-snapshot" \
+        'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | gzip > "$5"' \
+        "$db_container" "$db_user" "$db_name" "$SILENT_LOG" "$snap" >&2
+    local rc=$?
+    local bytes=0
+    [[ -f "$snap" ]] && bytes=$(stat -c%s "$snap" 2>/dev/null || echo 0)
+    if [[ $rc -ne 0 || $bytes -lt 100 ]]; then
+        rm -f "$snap"
+        return 1
+    fi
+    # Контент-проверка: пустой pg_dump = только заголовки (~260b), без таблиц/данных.
+    # >=100b проходит даже для пустой БД, поэтому проверяем НАЛИЧИЕ реального DDL/данных.
+    if gzip -dc "$snap" 2>/dev/null | grep -qE '^(CREATE TABLE|COPY |INSERT INTO|CREATE SEQUENCE)'; then
+        echo "$snap"
+        return 0
+    fi
+    # snapshot есть, но без пользовательских данных
+    echo "$snap"
+    return 2
+}
+
 confirm_drop_schema() {
     local db_container="$1"
     local db_user="$2"
     local db_name="$3"
     local backup_dir="$4"
+    # $5 (опц.): путь к УЖЕ снятому snapshot живой БД (full-restore снимает его ДО
+    # уничтожения volume). Если передан — повторный snapshot не снимаем (БД к этому
+    # моменту уже пустая/свежая). Для db_only restore $5 пуст → снимаем здесь (БД жива).
+    local pretaken_snap="${5:-}"
 
-    # === БЕЗОПАСНЫЙ СНАПШОТ ПЕРЕД DROP ===
-    local snapshot_file="${backup_dir}/pre_restore_snapshot_$(date +%Y%m%d_%H%M%S).sql.gz"
-    print_message "INFO" "Создание safety snapshot БД перед DROP SCHEMA..."
-    # КРИТИЧНО: PIPESTATUS обоих, иначе при падении pg_dump snapshot будет пустым
-    # gzip-файлом, а DROP SCHEMA уже выполнится — rollback станет невозможен.
-    # Timeout-обёртка: snapshot перед DESTRUCTIVE операцией обязан завершиться
-    # за PG_DUMP_TIMEOUT_SEC, иначе DROP SCHEMA без rollback-точки = catastrophe.
-    _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-snapshot" \
-        'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | gzip > "$5"' \
-        "$db_container" "$db_user" "$db_name" "$SILENT_LOG" "$snapshot_file"
-    local _snap_rc=$?
-    local snap_bytes=0
-    [[ -f "$snapshot_file" ]] && snap_bytes=$(stat -c%s "$snapshot_file" 2>/dev/null || echo 0)
-    if [[ $_snap_rc -eq 0 && $snap_bytes -ge 100 ]]; then
-        local snap_size
-        snap_size=$(du -h "$snapshot_file" 2>/dev/null | cut -f1)
-        print_message "SUCCESS" "Safety snapshot: $snapshot_file ($snap_size)"
+    local snapshot_file
+    if [[ -n "$pretaken_snap" && -f "$pretaken_snap" ]]; then
+        snapshot_file="$pretaken_snap"
+        debug_log "RESTORE" "confirm_drop_schema: using pre-taken live snapshot $snapshot_file"
     else
-        print_message "ERROR" "Не удалось создать safety snapshot (rc=$_snap_rc, size=${snap_bytes}b, timeout=${PG_DUMP_TIMEOUT_SEC}s). Восстановление прервано."
-        log_message "ERROR" "Safety snapshot failed: rc=$_snap_rc size=${snap_bytes}b (timeout=${PG_DUMP_TIMEOUT_SEC}s)"
-        rm -f "$snapshot_file"
-        return 1
+        # === БЕЗОПАСНЫЙ СНАПШОТ ПЕРЕД DROP (db_only: БД ещё жива) ===
+        snapshot_file="${backup_dir}/pre_restore_snapshot_$(date +%Y%m%d_%H%M%S).sql.gz"
+        print_message "INFO" "Создание safety snapshot БД перед DROP SCHEMA..."
+        # КРИТИЧНО: PIPESTATUS обоих, иначе при падении pg_dump snapshot будет пустым
+        # gzip-файлом, а DROP SCHEMA уже выполнится — rollback станет невозможен.
+        _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-snapshot" \
+            'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | gzip > "$5"' \
+            "$db_container" "$db_user" "$db_name" "$SILENT_LOG" "$snapshot_file"
+        local _snap_rc=$?
+        local snap_bytes=0
+        [[ -f "$snapshot_file" ]] && snap_bytes=$(stat -c%s "$snapshot_file" 2>/dev/null || echo 0)
+        if [[ $_snap_rc -eq 0 && $snap_bytes -ge 100 ]]; then
+            local snap_size
+            snap_size=$(du -h "$snapshot_file" 2>/dev/null | cut -f1)
+            print_message "SUCCESS" "Safety snapshot: $snapshot_file ($snap_size)"
+        else
+            print_message "ERROR" "Не удалось создать safety snapshot (rc=$_snap_rc, size=${snap_bytes}b, timeout=${PG_DUMP_TIMEOUT_SEC}s). Восстановление прервано."
+            log_message "ERROR" "Safety snapshot failed: rc=$_snap_rc size=${snap_bytes}b (timeout=${PG_DUMP_TIMEOUT_SEC}s)"
+            rm -f "$snapshot_file"
+            return 1
+        fi
     fi
 
     # === ИНТЕРАКТИВНЫЙ РЕЖИМ ===
@@ -9895,6 +10237,64 @@ execute_restore() {
             return
         fi
 
+        # === PRE-DESTRUCTION SAFETY (full mode) — RST-1/RST-8/CMP-1 fix ===
+        # Для full-restore СНАЧАЛА (пока текущая БД жива и доступна) валидируем новый
+        # дамп и снимаем snapshot живой БД, ДО уничтожения volume. Раньше snapshot
+        # снимался ВНУТРИ confirm_drop_schema — уже ПОСЛЕ `docker volume rm`, т.е. с
+        # пустой свежесозданной БД → откат был невозможен (catastrophic data loss).
+        local _live_snap=""
+        if [[ "$MODE" == "full" && -n "$DB_DUMP" ]]; then
+            # 1) Новый дамп ОБЯЗАН быть валиден ДО разрушения текущей БД.
+            local _dd_fmt
+            _dd_fmt=$(_compress_detect_format "$DB_DUMP")
+            local _dd_ok=true
+            case "$_dd_fmt" in
+                gzip) gzip -t "$DB_DUMP" 2> "$SILENT_LOG" || _dd_ok=false ;;
+                zstd) zstd -t "$DB_DUMP" 2> "$SILENT_LOG" || _dd_ok=false ;;
+            esac
+            local _dd_bytes=0; [[ -f "$DB_DUMP" ]] && _dd_bytes=$(stat -c%s "$DB_DUMP" 2>/dev/null || echo 0)
+            if [[ "$_dd_ok" != "true" || "$_dd_bytes" -lt 100 ]]; then
+                print_message "ERROR" "Новый дамп БД повреждён/пуст (fmt=$_dd_fmt, ${_dd_bytes}b) — restore прерван ДО разрушения текущей БД"
+                log_message "ERROR" "Restore aborted pre-destruction: invalid new DB dump ($_dd_fmt, ${_dd_bytes}b)"
+                rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+                return 1
+            fi
+            # 2) Резолвим параметры БД и снимаем snapshot живой БД (точку отката).
+            local _du _dn
+            _du=$(get_db_user)
+            if ! _dn=$(get_db_name); then
+                print_message "ERROR" "Имя БД не определено (POSTGRES_DB) — restore прерван ДО разрушения текущей БД"
+                rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+                return 1
+            fi
+            print_message "INFO" "Snapshot живой БД перед разрушением (точка отката)..."
+            local _snap_state
+            _live_snap=$(_make_live_db_snapshot "$DB_CONTAINER_NAME" "$_du" "$_dn" "$BACKUP_DIR")
+            _snap_state=$?
+            if [[ $_snap_state -eq 0 ]]; then
+                print_message "SUCCESS" "Snapshot живой БД (точка отката): $_live_snap"
+            else
+                # Валидный snapshot снять не удалось (БД недоступна/пуста) → отката не будет.
+                print_message "WARN" "Не удалось снять snapshot живой БД (rc=$_snap_state) — точки отката НЕ будет."
+                log_message "WARN" "Live DB snapshot unavailable before full restore (rc=$_snap_state)"
+                _live_snap=""
+                if [[ "$IS_INTERACTIVE" == true ]]; then
+                    echo -e "${RED}${BOLD}Текущая БД будет уничтожена БЕЗ возможности отката.${RESET}"
+                    local _noroll=""
+                    read -erp "Продолжить без точки отката? введите PROCEED: " _noroll
+                    if [[ "$_noroll" != "PROCEED" ]]; then
+                        print_message "INFO" "Restore отменён (нет точки отката)."
+                        rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+                        return 1
+                    fi
+                elif [[ "$RESTORE_FORCE" != "true" ]]; then
+                    print_message "ERROR" "Нет точки отката и нет --i-know-what-i-am-doing — restore прерван."
+                    rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+                    return 1
+                fi
+            fi
+        fi
+
         print_message "INFO" "Остановка контейнеров..."
         debug_log "RESTORE" "Stopping containers in $BOT_PATH"
         cd "$BOT_PATH" && docker compose down 2> "$SILENT_LOG"
@@ -9951,7 +10351,9 @@ execute_restore() {
         fi
 
         # DROP SCHEMA требует явного подтверждения — safe by default
-        if confirm_drop_schema "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$BACKUP_DIR"; then
+        # full-mode: snapshot живой БД уже снят ДО разрушения (_live_snap) — передаём его,
+        # чтобы confirm_drop_schema не снимал повторный (пустой) snapshot.
+        if confirm_drop_schema "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$BACKUP_DIR" "${_live_snap:-}"; then
             print_message "INFO" "Очистка схемы БД (DROP SCHEMA public CASCADE)..."
             debug_log "RESTORE" "Running: docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER -c 'DROP SCHEMA...'"
             docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
@@ -9978,9 +10380,28 @@ execute_restore() {
         if [[ $_restore_rc -ne 0 ]]; then
             print_message "ERROR" "Импорт БД провалился (rc=$_restore_rc). БД в неконсистентном состоянии."
             log_message "ERROR" "Restore psql failed: rc=$_restore_rc (dump: $DB_DUMP, timeout=${RESTORE_TIMEOUT_SEC}s)"
-            if [[ "$IS_INTERACTIVE" == true ]]; then
-                echo -e "${RED}Для отката восстановите safety snapshot из ${BACKUP_DIR}/pre_restore_snapshot_*.sql.gz${RESET}"
+            # RST-3/CMP-1 fix: при провале импорта НЕ оставляем БД пустой, бота offline и
+            # plaintext-дамп в /var/tmp. Откатываем из snapshot живой БД, поднимаем
+            # контейнеры и чистим temp ДО возврата.
+            if [[ -n "${_live_snap:-}" && -f "${_live_snap:-}" ]]; then
+                print_message "WARN" "Автооткат БД из snapshot живой БД: $_live_snap"
+                log_message "WARN" "Restore failed — auto-rollback from live snapshot $_live_snap"
+                docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+                if gzip -dc "$_live_snap" 2>/dev/null | _run_pipe_with_timeout "$RESTORE_TIMEOUT_SEC" "psql-rollback" \
+                        'cat | docker exec -i "$1" psql -U "$2" "$3" -v ON_ERROR_STOP=1 > "$4" 2>&1' \
+                        "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG"; then
+                    print_message "SUCCESS" "Откат выполнен — БД восстановлена из snapshot живой БД."
+                    log_message "SUCCESS" "Rollback OK from $_live_snap"
+                else
+                    print_message "ERROR" "Автооткат не удался. Snapshot сохранён: $_live_snap (восстановите вручную)."
+                    log_message "ERROR" "Auto-rollback FAILED, snapshot kept: $_live_snap"
+                fi
+            else
+                print_message "ERROR" "Точки отката (snapshot живой БД) нет — требуется ручное восстановление."
             fi
+            # Поднимаем контейнеры, чтобы бот не остался offline после провала restore.
+            ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
+            rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
             return 1
         fi
         debug_log "RESTORE" "DB import complete (psql exit 0)"
@@ -9992,7 +10413,7 @@ execute_restore() {
         cd "$BOT_PATH" && docker compose up -d
     fi
 
-    rm -rf "$TMP_DIR"
+    rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
     debug_log "RESTORE" "Temp dir cleaned up"
     print_message "SUCCESS" "Восстановление успешно завершено."
     log_message "SUCCESS" "Restore completed (mode=$MODE, file=$FILE)"
@@ -10116,7 +10537,7 @@ menu_list_backups() {
         local files=()
         while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(
             find "$BACKUP_DIR" -maxdepth 1 -type f \
-                \( -name "${prefix}_*.tar.gz" -o -name "${prefix}_*.tar.gz.enc" \) 2> "$SILENT_LOG" | sort -r
+                \( -name "${prefix}_*.tar.gz" -o -name "${prefix}_*.tar.gz.enc" -o -name "${prefix}_*.tar.zst" -o -name "${prefix}_*.tar.zst.enc" \) 2> "$SILENT_LOG" | sort -r
         )
         local n=${#files[@]}
         total_count=$((total_count + n))
@@ -10333,18 +10754,36 @@ setup_cron_task() {
         1) NEW_CRON_LINES="0 * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Ежечасно" ;;
         2) NEW_CRON_LINES="0 4 * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Ежедневно 04:00" ;;
         3) NEW_CRON_LINES="0 4 * * 1 $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"; DISPLAY_TIME="Еженедельно" ;;
-        4) 
+        4)
            echo ""
            echo "Введите время (ЧЧ:ММ), можно несколько через пробел:"
            echo -e "${GRAY}Пример: 09:00 18:30${RESET}"
            read -erp "> " times_input
            if [[ -z "$times_input" ]]; then print_message "ERROR" "Время не введено!"; sleep 1; return; fi
-           for t in $times_input; do 
-               if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then 
+           local _valid_times=0
+           for t in $times_input; do
+               if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
                    h=$((10#${BASH_REMATCH[1]})); m=$((10#${BASH_REMATCH[2]}))
-                   NEW_CRON_LINES+="$m $h * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"$'\n'
+                   # CMP-4 fix: range-check ЧЧ 0-23 / ММ 0-59 — иначе мёртвая cron-строка.
+                   if [[ "$h" -ge 0 && "$h" -le 23 && "$m" -ge 0 && "$m" -le 59 ]]; then
+                       NEW_CRON_LINES+="$m $h * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"$'\n'
+                       _valid_times=$((_valid_times + 1))
+                   else
+                       print_message "WARN" "Пропущено (вне диапазона ЧЧ 0-23, ММ 0-59): '$t'"
+                   fi
+               else
+                   print_message "WARN" "Пропущено (формат не ЧЧ:ММ): '$t'"
                fi
            done
+           # CRON-1 fix: если ни одного валидного времени — НЕ перезаписываем crontab.
+           # Раньше пустой NEW_CRON_LINES + непустой DISPLAY_TIME уводил в else-ветку,
+           # которая ставила crontab БЕЗ задачи → существующий бэкап-cron УДАЛЯЛСЯ,
+           # а функция репортила SUCCESS.
+           if [[ "$_valid_times" -eq 0 ]]; then
+               print_message "ERROR" "Нет валидного времени (ЧЧ:ММ) — расписание не изменено."
+               sleep 1
+               return
+           fi
            DISPLAY_TIME="Свое: $times_input" ;;
         5) 
            echo ""
@@ -10363,9 +10802,18 @@ setup_cron_task() {
         *) return ;;
     esac
 
-    local CURRENT_CRON=$(crontab -l 2> "$SILENT_LOG" | grep -v "$JOB_ID")
-    if [[ "$DISPLAY_TIME" != "Выкл" && -n "$NEW_CRON_LINES" ]]; then echo -e "$CURRENT_CRON\n$NEW_CRON_LINES" | crontab -
-    else echo "$CURRENT_CRON" | crontab -; fi
+    # SHELL-3 fix: printf вместо `echo -e` — иначе backslash'и в существующих cron-строках
+    # интерпретируются (порча чужих задач). Плюс защита: job-less crontab пишем ТОЛЬКО
+    # при явном "Выкл", не при пустом расписании из-за ошибки ввода.
+    local CURRENT_CRON; CURRENT_CRON=$(crontab -l 2> "$SILENT_LOG" | grep -v "$JOB_ID")
+    if [[ "$DISPLAY_TIME" != "Выкл" && -n "$NEW_CRON_LINES" ]]; then
+        printf '%s\n%s\n' "$CURRENT_CRON" "$NEW_CRON_LINES" | crontab -
+    elif [[ "$DISPLAY_TIME" == "Выкл" ]]; then
+        printf '%s\n' "$CURRENT_CRON" | crontab -
+    else
+        print_message "ERROR" "Пустое расписание — crontab не изменён (защита от потери задачи)."
+        sleep 1; return
+    fi
 
     # Синхронизируем настройки с реальным состоянием cron
     sync_cron_with_config
@@ -11013,6 +11461,18 @@ cleanup_old_backups() {
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         echo ""
+        # CSC-2 fix: удаление под блокировкой — иначе ручной cleanup может удалить
+        # файл, который прямо сейчас пишет параллельный backup (cron). Если занято —
+        # backup в процессе, cleanup откладываем.
+        local _cl_lock="false"
+        if acquire_lock; then
+            _cl_lock="true"
+        else
+            local _cl_owner; _cl_owner=$(check_lock_owner)
+            print_message "WARN" "Идёт бэкап (PID: $_cl_owner) — очистка отложена, повторите позже."
+            read -erp "Enter..." dummy
+            return
+        fi
         if [[ "$DELETE_MODE" == "count" ]]; then
             rotate_backups_by_count "lazarus_full" "Полные бэкапы" "true" > "$SILENT_LOG"
             rotate_backups_by_count "lazarus_db" "Базы данных" "true" > "$SILENT_LOG"
@@ -11026,6 +11486,7 @@ cleanup_old_backups() {
         if [[ "$size_exceeded" == "true" ]]; then
             rotate_backups_by_size "true"
         fi
+        [[ "$_cl_lock" == "true" ]] && release_lock
         echo ""; print_message "SUCCESS" "Очистка завершена."
         log_message "INFO" "Cleanup completed (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, deleted=$total_del)"
         if [[ "$REPORT_TO_TG" == "true" && "$SEND_TO_TELEGRAM" == "true" ]]; then
@@ -11163,7 +11624,7 @@ verify_all_backups() {
         return 0
     fi
 
-    local _ok=0 _fail=0 _i=0
+    local _ok=0 _fail=0 _skip=0 _i=0
     local -a _failed_list=()
     local _start=$(date +%s)
 
@@ -11176,6 +11637,7 @@ verify_all_backups() {
         if [[ "$f" == *.enc ]]; then
             if [[ -z "$BACKUP_PASSWORD" ]]; then
                 echo -e "${YELLOW}SKIP (no password)${RESET}"
+                _skip=$((_skip + 1))
                 continue
             fi
             # Format detect через magic + MAC verify (для v2).
@@ -11241,7 +11703,13 @@ verify_all_backups() {
 
     local _elapsed=$(($(date +%s) - _start))
     echo ""
-    echo -e "${GREEN}OK: $_ok${RESET} / ${RED}FAIL: $_fail${RESET} / Всего: $_total (за ${_elapsed}с)"
+    echo -e "${GREEN}OK: $_ok${RESET} / ${RED}FAIL: $_fail${RESET} / ${YELLOW}SKIP: $_skip${RESET} / Всего: $_total (за ${_elapsed}с)"
+    # CMP-3 fix: если зашифрованные архивы пропущены (нет пароля) — verify НЕПОЛНЫЙ.
+    # Раньше при всех-skip (_ok=0,_fail=0) показывалось "Все архивы целые" → ложное
+    # доверие к непроверенным (возможно битым) бэкапам.
+    if [[ $_skip -gt 0 ]]; then
+        print_message "WARN" "Пропущено $_skip зашифрованных архивов (нет BACKUP_PASSWORD) — проверка НЕПОЛНАЯ. Задайте пароль для полной верификации."
+    fi
 
     # TG alert только если есть FAIL (good news не спамим).
     if [[ $_fail -gt 0 ]]; then
@@ -11262,8 +11730,10 @@ ${_list_body}" \
         return 1
     elif [[ "$REPORT_TO_TG" == "true" ]]; then
         # Положительный отчёт только если явно запрошено (--report-tg).
-        send_telegram_alert "INFO" "Verify OK · $_total архивов" \
-            "✅ Все архивы целые
+        local _verdict="✅ Все архивы целые"
+        [[ $_skip -gt 0 ]] && _verdict="⚠️ Проверено $_ok, пропущено $_skip (нет пароля) — verify неполный"
+        send_telegram_alert "INFO" "Verify · $_total архивов" \
+            "$_verdict
 ⏱ ${_elapsed}с" ""
     fi
     return 0
@@ -11506,7 +11976,7 @@ report_period_send() {
         # v2 envelope = verified (magic LAZ2 после успешного create)
         local _magic; _magic=$(head -c 4 "$f" 2>/dev/null)
         [[ "$_magic" == "LAZ2" ]] && _verified_count=$((_verified_count + 1))
-    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' \) -print0 2>/dev/null)
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' -o -name '*.tar.zst' -o -name '*.tar.zst.enc' \) -print0 2>/dev/null)
 
     local _total=$((_count_full + _count_db + _count_files))
     local _total_human
