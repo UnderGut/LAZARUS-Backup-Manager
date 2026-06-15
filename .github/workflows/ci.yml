@@ -68,3 +68,5 @@ jobs:
         run: bash .github/tests/test_rotation_floor.sh
       - name: test_config_roundtrip
         run: bash .github/tests/test_config_roundtrip.sh
+      - name: test_panel_target
+        run: bash .github/tests/test_panel_target.sh

@@ -144,7 +144,23 @@ DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
 DEFAULT_BOT_CONTAINER="rwp_shop"
 DEFAULT_DB_CONTAINER="rwp_shop_db"
 # Volume имена (определяются автоматически)
-DB_SERVICE_NAME="db"  # Имя сервиса в compose.yaml 
+DB_SERVICE_NAME="db"  # Имя сервиса в compose.yaml
+
+# --- ЦЕЛЬ БЭКАПА (bot | panel) ---
+# bot   — Telegram shop-бот rwp_shop (поведение по умолчанию, backward-compat).
+# panel — Remnawave panel (контейнер remnawave-db, каталог /opt/remnawave).
+# Серверы раздельные → один деплой = одна цель. resolve_backup_target() мапит
+# panel-переменные на рабочие, дальше исполняется тот же hardened-код.
+BACKUP_TARGET="bot"
+BACKUP_PREFIX="lazarus"            # namespace имён архивов (lazarus | lazarus_panel)
+# Параметры панели (используются при BACKUP_TARGET=panel)
+PANEL_PATH="/opt/remnawave"
+PANEL_DB_CONTAINER="remnawave-db"
+PANEL_DB_NAME=""                  # опц. override; иначе POSTGRES_DB из $PANEL_PATH/.env
+PANEL_DB_SERVICE="remnawave-db"   # compose-сервис БД (для поиска volume)
+PANEL_EXTRA_PATHS=""              # доп. каталоги в files-tar (напр. /opt/.../certwarden), ',' или ';'
+# Ключевые слова для поиска контейнера панели (инверсия bot-исключений в scan)
+PANEL_KEYWORDS=("remnawave")
 
 # Статусы расписаний
 SCHEDULE_FULL="Выкл"
@@ -5444,6 +5460,12 @@ load_config_file() {
             DB_CONTAINER_NAME) DB_CONTAINER_NAME="$val" ;;
             DB_USER) DB_USER="$val" ;;
             DB_NAME) DB_NAME="$val" ;;
+            BACKUP_TARGET) BACKUP_TARGET="$val" ;;
+            PANEL_PATH) PANEL_PATH="$val" ;;
+            PANEL_DB_CONTAINER) PANEL_DB_CONTAINER="$val" ;;
+            PANEL_DB_NAME) PANEL_DB_NAME="$val" ;;
+            PANEL_DB_SERVICE) PANEL_DB_SERVICE="$val" ;;
+            PANEL_EXTRA_PATHS) PANEL_EXTRA_PATHS="$val" ;;
             IGNORE_MISMATCH) IGNORE_MISMATCH="$val" ;;
             EXCLUDE_DIRS) EXCLUDE_DIRS="$val" ;;
             MAX_FILE_SIZE_MB) MAX_FILE_SIZE_MB="$val" ;;
@@ -5632,6 +5654,13 @@ save_config() {
     RESTORE_TIMEOUT_SEC_ESC=$(env_escape "$RESTORE_TIMEOUT_SEC")
     COMPRESSION_ESC=$(env_escape "$COMPRESSION")
     BOT_RELEASE_URL_BASE_ESC=$(env_escape "$BOT_RELEASE_URL_BASE")
+    local BACKUP_TARGET_ESC PANEL_PATH_ESC PANEL_DB_CONTAINER_ESC PANEL_DB_NAME_ESC PANEL_DB_SERVICE_ESC PANEL_EXTRA_PATHS_ESC
+    BACKUP_TARGET_ESC=$(env_escape "$BACKUP_TARGET")
+    PANEL_PATH_ESC=$(env_escape "$PANEL_PATH")
+    PANEL_DB_CONTAINER_ESC=$(env_escape "$PANEL_DB_CONTAINER")
+    PANEL_DB_NAME_ESC=$(env_escape "${PANEL_DB_NAME:-}")
+    PANEL_DB_SERVICE_ESC=$(env_escape "$PANEL_DB_SERVICE")
+    PANEL_EXTRA_PATHS_ESC=$(env_escape "${PANEL_EXTRA_PATHS:-}")
 
     cat > "$CONFIG_FILE" <<EOF
 BOT_TOKEN="$BOT_TOKEN_ESC"
@@ -5677,6 +5706,12 @@ ENCRYPT_TIMEOUT_SEC="$ENCRYPT_TIMEOUT_SEC_ESC"
 RESTORE_TIMEOUT_SEC="$RESTORE_TIMEOUT_SEC_ESC"
 COMPRESSION="$COMPRESSION_ESC"
 BOT_RELEASE_URL_BASE="$BOT_RELEASE_URL_BASE_ESC"
+BACKUP_TARGET="$BACKUP_TARGET_ESC"
+PANEL_PATH="$PANEL_PATH_ESC"
+PANEL_DB_CONTAINER="$PANEL_DB_CONTAINER_ESC"
+PANEL_DB_NAME="$PANEL_DB_NAME_ESC"
+PANEL_DB_SERVICE="$PANEL_DB_SERVICE_ESC"
+PANEL_EXTRA_PATHS="$PANEL_EXTRA_PATHS_ESC"
 EOF
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
@@ -5702,6 +5737,11 @@ load_or_create_config() {
     # count-based ротация удалила бы ВСЕ бэкапы. Минимум 1.
     if [[ -z "$MAX_BACKUPS_COUNT" || ! "$MAX_BACKUPS_COUNT" =~ ^[0-9]+$ || "$MAX_BACKUPS_COUNT" -lt 1 ]]; then MAX_BACKUPS_COUNT=100; fi
     if [[ -z "$BOT_RELEASE_URL_BASE" ]]; then BOT_RELEASE_URL_BASE="https://releases.example.com"; fi
+    # Panel-таргет: enum bot|panel (невалидное → bot, безопасный backward-compat дефолт).
+    if [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_TARGET" != "panel" ]]; then BACKUP_TARGET="bot"; fi
+    if [[ -z "$PANEL_PATH" ]]; then PANEL_PATH="/opt/remnawave"; fi
+    if [[ -z "$PANEL_DB_CONTAINER" ]]; then PANEL_DB_CONTAINER="remnawave-db"; fi
+    if [[ -z "$PANEL_DB_SERVICE" ]]; then PANEL_DB_SERVICE="remnawave-db"; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
     # ROT-4/CFG-5/SHELL-1/SHELL-2/SHELL-4 fix: численные ключи валидируем как
     # ^[0-9]+$ (не только -z). Раньше hand-edited "500MB"/"abc"/"0.5" сохранялись
@@ -5770,6 +5810,31 @@ load_or_create_config() {
         save_config
     fi
     debug_log "CONFIG" "=== load_or_create_config completed ==="
+}
+
+# resolve_backup_target: мапит цель (bot|panel) на рабочие переменные, чтобы hardened
+# create_backup/execute_restore исполнялись для ОБЕИХ целей без структурных изменений
+# (strangler-подход). Вызывается ОДИН раз после load_or_create_config.
+# bot   → BACKUP_PREFIX=lazarus, всё как было (backward-compat).
+# panel → BOT_PATH/DB_CONTAINER_NAME/DB_SERVICE_NAME/KEYWORDS зеркалят PANEL_*,
+#         BACKUP_PREFIX=lazarus_panel, app-контейнер = remnawave.
+resolve_backup_target() {
+    if [[ "$BACKUP_TARGET" == "panel" ]]; then
+        BACKUP_PREFIX="lazarus_panel"
+        BOT_PATH="$PANEL_PATH"
+        DB_CONTAINER_NAME="$PANEL_DB_CONTAINER"
+        DB_SERVICE_NAME="$PANEL_DB_SERVICE"
+        DEFAULT_BOT_PATH="$PANEL_PATH"
+        DEFAULT_DB_CONTAINER="$PANEL_DB_CONTAINER"
+        BOT_CONTAINER_NAME="remnawave"      # panel app-контейнер (стандартное имя)
+        DEFAULT_BOT_CONTAINER="remnawave"
+        KEYWORDS=("${PANEL_KEYWORDS[@]}")
+        [[ -n "${PANEL_DB_NAME:-}" ]] && DB_NAME="$PANEL_DB_NAME"
+        debug_log "TARGET" "Resolved panel: path=$BOT_PATH db=$DB_CONTAINER_NAME prefix=$BACKUP_PREFIX"
+    else
+        BACKUP_PREFIX="lazarus"
+        debug_log "TARGET" "Target=bot (prefix=$BACKUP_PREFIX)"
+    fi
 }
 
 # --- TELEGRAM: ОТПРАВКА ФАЙЛОВ И СООБЩЕНИЙ ---
@@ -8559,7 +8624,7 @@ create_backup() {
         debug_log "MANIFEST" "Manifest: $_manifest_lines files"
     fi
     if [[ "$TYPE" == "db_only" ]]; then
-        FILE_FINAL="lazarus_db_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
+        FILE_FINAL="${BACKUP_PREFIX}_db_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
         debug_log "TAR" "Creating DB archive: $FILE_FINAL (compression: $(_compress_current))"
         # DB archive — это просто 2 маленьких файла, timeout мизерный, но
         # обёртка стандартизирует поведение и логирование.
@@ -8568,7 +8633,7 @@ create_backup() {
         _tar_rc=$?
         rm -f "$BACKUP_DIR/$FILE_DB"
     elif [[ "$TYPE" == "files_only" ]]; then
-        FILE_FINAL="lazarus_files_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
+        FILE_FINAL="${BACKUP_PREFIX}_files_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
         local FILE_DIR="bot_files_${TIMESTAMP}.tar.${_ext}"
         print_message "INFO" "Архивация файлов (это может занять время)..."
         [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
@@ -8595,7 +8660,7 @@ create_backup() {
         rm -f "$BACKUP_DIR/$FILE_DIR"
         [[ -n "$FILE_MANIFEST" ]] && rm -f "$BACKUP_DIR/$FILE_MANIFEST"
     else
-        FILE_FINAL="lazarus_full_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
+        FILE_FINAL="${BACKUP_PREFIX}_full_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
         print_message "INFO" "Архивация файлов (это может занять время)..."
         [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
         debug_log "TAR" "Creating full archive: $FILE_FINAL (compression: $(_compress_current))"
@@ -8926,9 +8991,9 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     # повреждённый backup мог бы вытеснить валидные (count/age/size rotation).
     if [[ "$VERIFY_OK" == "true" ]]; then
         # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
-        local ROTATION_PREFIX="lazarus_$TYPE"
-        if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="lazarus_db"; fi
-        if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="lazarus_files"; fi
+        local ROTATION_PREFIX="${BACKUP_PREFIX}_$TYPE"
+        if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="${BACKUP_PREFIX}_db"; fi
+        if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="${BACKUP_PREFIX}_files"; fi
 
         # Ротация в зависимости от настроек DELETE_MODE
         if [[ "$DELETE_MODE" == "count" ]]; then
@@ -11506,6 +11571,7 @@ if [[ "${LAZARUS_LIB}" != "true" ]]; then
     install_script
     install_logrotate    # idempotent — no-op если /etc/logrotate.d/lazarus уже есть
     load_or_create_config
+    resolve_backup_target   # bot|panel → рабочие переменные + BACKUP_PREFIX
     check_config_mismatch # Проверка при запуске
 
 # Проверка соответствия версий Docker image
