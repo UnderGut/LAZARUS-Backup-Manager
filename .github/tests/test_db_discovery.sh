@@ -85,6 +85,7 @@ fi
 
 # === Test 6: get_db_name — H5 — возвращает rc=1 если POSTGRES_DB нет ===
 # (раньше возвращал silent 'postgres' и rc=0 → бэкап пустой системной БД)
+BACKUP_TARGET="bot"   # DB_NAME-fallback — bot-специфичен (для panel см. Test 7b)
 BOT_PATH="$TMP_DIR/bot3_no_db"
 mkdir -p "$BOT_PATH"
 cat > "$BOT_PATH/.env" <<'EOF'
@@ -97,7 +98,7 @@ else
     [[ -z "$v" ]] && pass || fail "get_db_name H5: stdout should be empty, got '$v'"
 fi
 
-# === Test 7: get_db_name — fallback на DB_NAME из config.env ===
+# === Test 7: get_db_name — fallback на DB_NAME из config.env (bot) ===
 BOT_PATH="$TMP_DIR/bot3_no_db"   # тот же .env без POSTGRES_DB
 DB_NAME="custom_override"
 if v=$(get_db_name 2>/dev/null); then
@@ -105,7 +106,24 @@ if v=$(get_db_name 2>/dev/null); then
 else
     fail "get_db_name should succeed with DB_NAME set"
 fi
-DB_NAME=""
+
+# === Test 7b: PANEL-AUDIT — panel НЕ падает на generic DB_NAME (мог бы дампить БД бота) ===
+BACKUP_TARGET="panel"; PANEL_PATH="$TMP_DIR/panel_no_db"; BOT_PATH="$PANEL_PATH"
+mkdir -p "$PANEL_PATH"; printf 'POSTGRES_USER=pg\n' > "$PANEL_PATH/.env"   # без POSTGRES_DB
+DB_NAME="rwp_shop_bot_db"; PANEL_DB_NAME=""
+if v=$(get_db_name 2>/dev/null); then
+    fail "panel get_db_name: must NOT fall back to bot DB_NAME, got '$v'"
+else
+    [[ -z "$v" ]] && pass || fail "panel get_db_name: stdout should be empty on strict-fail, got '$v'"
+fi
+# panel с явным PANEL_DB_NAME — принимает его
+PANEL_DB_NAME="remnawave_custom"
+if v=$(get_db_name 2>/dev/null); then
+    [[ "$v" == "remnawave_custom" ]] && pass || fail "panel PANEL_DB_NAME: got '$v'"
+else
+    fail "panel get_db_name should succeed with PANEL_DB_NAME set"
+fi
+BACKUP_TARGET="bot"; PANEL_DB_NAME=""; DB_NAME=""
 
 # === Test 8: get_db_user — env wins over global DB_USER ===
 BOT_PATH="$TMP_DIR/bot4"

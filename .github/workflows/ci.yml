@@ -70,3 +70,19 @@ jobs:
         run: bash .github/tests/test_config_roundtrip.sh
       - name: test_panel_target
         run: bash .github/tests/test_panel_target.sh
+      - name: test_panel_prefix_wiring
+        run: bash .github/tests/test_panel_prefix_wiring.sh
+      - name: test_panel_globals_sidecar
+        run: bash .github/tests/test_panel_globals_sidecar.sh
+      - name: test_panel_firstrun
+        run: bash .github/tests/test_panel_firstrun.sh
+      - name: test_panel_both
+        run: bash .github/tests/test_panel_both.sh
+      - name: test_panel_remote
+        run: bash .github/tests/test_panel_remote.sh
+      - name: test_audit_fixes
+        run: bash .github/tests/test_audit_fixes.sh
+      - name: test_menu_ux
+        run: bash .github/tests/test_menu_ux.sh
+      - name: test_billing_sidecar
+        run: bash .github/tests/test_billing_sidecar.sh
