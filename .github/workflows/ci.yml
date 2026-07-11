@@ -86,3 +86,7 @@ jobs:
         run: bash .github/tests/test_menu_ux.sh
       - name: test_billing_sidecar
         run: bash .github/tests/test_billing_sidecar.sh
+      - name: test_mixed_server
+        run: bash .github/tests/test_mixed_server.sh
+      - name: test_stack_guards
+        run: bash .github/tests/test_stack_guards.sh

@@ -40,10 +40,13 @@ UPDATE_AVAILABLE=""       # Если не пусто — доступна нов
 UPDATE_REMOTE_VERSION=""  # Версия на сервере
 
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА БОТА (НЕ ПАНЕЛИ!) ---
-# Согласно документации: rwp_shop, rwp_shop_db
+# Согласно документации: rwp_shop, rwp_shop_db (+ dash-форма rwp-shop: живой каталог /opt/rwp-shop)
 # Также поддержка legacy: telegram-shop, shop-bot, shopbot
-# Порядок важен: сначала более специфичные паттерны
-KEYWORDS=("rwp_shop" "telegram-shop" "shop-bot" "shopbot")
+# Порядок важен: сначала более специфичные паттерны.
+# ЕДИНСТВЕННЫЙ источник набора: resolve_backup_target / resolve_bot_runtime /
+# bind_bot_runtime_or_fail берут копию ИЗ ЭТОЙ константы — дрейф литеральных копий исключён.
+BOT_KEYWORDS_DEFAULT=("rwp_shop" "rwp-shop" "telegram-shop" "shop-bot" "shopbot")
+KEYWORDS=("${BOT_KEYWORDS_DEFAULT[@]}")
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 BOT_PATH=""
@@ -104,11 +107,16 @@ S3_BUCKET=""             # Имя bucket
 S3_PATH=""               # Путь внутри bucket (lazarus-backups/)
 S3_ACCESS_KEY=""         # Access Key ID
 S3_SECRET_KEY=""         # Secret Access Key
+S3_RETENTION_DAYS="0"    # Дней хранить архивы на S3/R2 (0 = не удалять; чистит ТОЛЬКО lazarus_*-ключи)
 S3_REGION="us-east-1"    # Регион (для AWS) или любой для S3-совместимых
 
 # Настройки шифрования
 BACKUP_PASSWORD=""
 BACKUP_PASSWORD_FILE="$INSTALL_DIR/.password"
+# №1: миграция легаси-пароля из config.env в файл ПРОВАЛИЛАСЬ (write_password_file rc!=0).
+# Пока =1, save_config пишет BACKUP_PASSWORD с реальным значением (не ""), иначе первый же
+# save затёр бы ЕДИНСТВЕННУЮ копию пароля → тихие plaintext-бэкапы + невосстановимые .enc.
+_LEGACY_PWD_UNMIGRATED=0
 
 # Timeout-обёртки на критичные команды (защита от вечно висящего cron).
 # Значения по умолчанию выбраны под worst-case 1 GB БД / 5 GB файлы.
@@ -155,6 +163,16 @@ DB_SERVICE_NAME="db"  # Имя сервиса в compose.yaml
 # Дефолт "bot" — это лишь fallback для существующих установок без ключа (backward-compat);
 # НОВЫМ установкам цель предлагается на первом запуске (select_backup_target_firstrun, панель=дефолт).
 BACKUP_TARGET="bot"
+# --- РЕЖИМ ГЛАВНОГО МЕНЮ (standard | expert) ---
+# standard — короткое меню для новичков (бэкап/восстановление/расписание/TG/очистка);
+# ставится на первом запуске. expert — полное меню. Дефолт expert = backward-compat:
+# у существующих установок ключа в конфиге нет → всё выглядит как раньше.
+# Переключение: пункт 77 главного меню (standard → expert) и Настройки → раздел 8 (обратно).
+UI_MODE="expert"
+# Результат экрана намерения первого запуска ("1" настроить бэкапы | "2" перенос панели).
+# Глобал, а не echo-возврат: _firstrun_intent рисует экран (clear_screen/prompt) — в
+# command substitution всё это ушло бы в захват вместо терминала.
+_FIRSTRUN_INTENT="1"
 # BACKUP_SECONDARY (опц.) — ВТОРАЯ цель, которую бэкапим тем же прогоном (co-located both).
 # Пусто = одна цель (текущее поведение). Значение: "bot" или "panel", обязательно ОТЛИЧНОЕ от
 # BACKUP_TARGET. Напр. BACKUP_TARGET=panel + BACKUP_SECONDARY=bot → один `lazarus backup db`
@@ -436,13 +454,19 @@ _hmac_envelope_create() {
     # Step 1: encrypt через openssl (как раньше).
     # Timeout-обёртка: PBKDF2 + AES для очень больших архивов (>5 GB) может
     # затянуться на slow CPU/IO; ENCRYPT_TIMEOUT_SEC=0 → отключить.
-    # Используем _run_pipe_with_timeout с heredoc через FD3 — pipefail сохраняем.
+    # Пароль передаём через ОКРУЖЕНИЕ (openssl -pass env:VAR), НЕ через argv bash -c:
+    # argv виден в ps//proc/*/cmdline любому юзеру на всё время шифрования, а environ
+    # читаем только владельцем процесса (тот же принцип, что sshpass -e в panel_migrate_in).
+    # unset гарантирован trap RETURN (function-local, снимается при выходе из функции).
+    export LAZARUS_ENC_PW="$password"
+    trap 'unset LAZARUS_ENC_PW' RETURN
     if ! _run_pipe_with_timeout "${ENCRYPT_TIMEOUT_SEC:-1800}" "encrypt-aes" \
-            'openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$1" -out "$2" -pass fd:3 3<<<"$3" 2> "$4"' \
-            "$infile" "$cipher_tmp" "$password" "$SILENT_LOG"; then
+            'openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$1" -out "$2" -pass env:LAZARUS_ENC_PW 2> "$3"' \
+            "$infile" "$cipher_tmp" "$SILENT_LOG"; then
         rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
         return 1
     fi
+    unset LAZARUS_ENC_PW   # не ждём RETURN — окно жизни секрета в env минимальное
 
     # Step 1.5: ciphertext не должен быть пустым (silently-empty openssl output =
     # битый infile / openssl error, который пайплайн мог не поймать).
@@ -618,22 +642,30 @@ _hmac_envelope_decrypt() {
             return 1
         fi
 
-        # MAC OK → decrypt тот же cipher_tmp (не extract ещё раз)
+        # MAC OK → decrypt тот же cipher_tmp (не extract ещё раз).
+        # №6 (симметрия с _hmac_envelope_create): пароль через env, не через herestring —
+        # herestring материализуется во временный файл; env: читаем только владельцем.
+        export LAZARUS_ENC_PW="$password"
+        trap 'unset LAZARUS_ENC_PW' RETURN
         ( umask 077 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -in "$cipher_tmp" -out "$outfile" \
-            -pass fd:3 3<<<"$password" ) 2> "$SILENT_LOG"
+            -pass env:LAZARUS_ENC_PW ) 2> "$SILENT_LOG"
         local drc=$?
+        unset LAZARUS_ENC_PW
         rm -f "$cipher_tmp"
         unregister_sensitive_tmp "$cipher_tmp"
         chmod 600 "$outfile" 2> "$SILENT_LOG" || true
         [[ $drc -eq 0 ]] && return 0 || return 2
 
     elif [[ "$_magic8" == "Salted__" ]]; then
-        # === v1 legacy path: нет MAC, decrypt напрямую ===
+        # === v1 legacy path: нет MAC, decrypt напрямую (№6: пароль через env, см. v2-ветку) ===
+        export LAZARUS_ENC_PW="$password"
+        trap 'unset LAZARUS_ENC_PW' RETURN
         ( umask 077 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -in "$infile" -out "$outfile" \
-            -pass fd:3 3<<<"$password" ) 2> "$SILENT_LOG"
+            -pass env:LAZARUS_ENC_PW ) 2> "$SILENT_LOG"
         local drc=$?
+        unset LAZARUS_ENC_PW
         chmod 600 "$outfile" 2> "$SILENT_LOG" || true
         [[ $drc -eq 0 ]] && return 0 || return 2
     fi
@@ -2492,6 +2524,40 @@ scan_system_for_bot() {
     fi
     debug_log "SCAN" "After container scan: FOUND_BOT=$FOUND_BOT, FOUND_PATH=$FOUND_PATH"
 
+    # ИМЯ-НЕЗАВИСИМЫЙ fallback: ключевые слова не сработали (кастомные имена) — кандидатом
+    # становится ЛЮБОЙ не-панельный compose-проект с БД-контейнером (labels живых/остановленных).
+    # ТОЛЬКО ДЛЯ ИНТЕРАКТИВНОГО ВЫБОРА (SCAN_ALLOW_LABEL_FALLBACK=1): такие кандидаты — ДОГАДКА,
+    # cron/resolve не должны молча принять чужой проект за бота и забэкапить/персистнуть его.
+    FOUND_VIA_FALLBACK=0
+    if [[ "${SCAN_ALLOW_LABEL_FALLBACK:-0}" == "1" && ${#FOUND_PATHS[@]} -eq 0 ]]; then
+        FOUND_VIA_FALLBACK=1
+        debug_log "SCAN" "keyword scan empty — label-based project fallback"
+        local _proot_sc; _proot_sc=$(_panel_root_now)
+        local _lines_sc _ln _li _ld _seen_sc=""
+        _lines_sc=$(timeout 20 docker ps -a --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' 2> "$SILENT_LOG")
+        while IFS='|' read -r _ln _li _ld; do
+            [[ -z "$_ld" || ! -d "$_ld" || "$_ld" == "/opt" ]] && continue
+            _same_path "$_ld" "$_proot_sc" && continue
+            _is_db_image "$_li" || continue
+            [[ "$_seen_sc" == *"|$_ld|"* ]] && continue
+            _seen_sc="${_seen_sc}|$_ld|"
+            # app-кандидат проекта: первый не-БД, не-инфраструктурный контейнер того же каталога
+            local _app_sc
+            _app_sc=$(printf '%s\n' "$_lines_sc" | awk -F'|' -v d="$_ld" '$3==d {print $1"|"$2}' \
+                | while IFS='|' read -r _n2 _i2; do
+                    _is_db_image "$_i2" && continue
+                    case "$_i2" in nginx*|*redis*|*valkey*) continue ;; esac
+                    echo "$_n2"; break
+                  done)
+            debug_log "SCAN" "  label-fallback candidate: $_ld (app=${_app_sc:-?})"
+            add_candidate "$_ld" "${_app_sc:-}"
+        done <<< "$_lines_sc"
+        if [[ ${#FOUND_PATHS[@]} -gt 0 ]]; then
+            FOUND_PATH="${FOUND_PATHS[0]}"
+            FOUND_BOT="${FOUND_BOTS[0]}"
+        fi
+    fi
+
     # Если не нашли через контейнеры — ищем по файлам docker-compose
     if [[ -z "$FOUND_PATH" ]]; then
         debug_log "SCAN" "No containers found, searching compose files..."
@@ -2595,11 +2661,6 @@ get_raw_bot_version() {
     fi
 }
 
-get_bot_version_display() {
-    local ver=$(get_raw_bot_version)
-    if [[ -n "$ver" ]]; then echo "$ver"; else echo "N/A"; fi
-}
-
 # Получение статуса контейнера бота
 get_container_status() {
     if [[ -z "$BOT_CONTAINER_NAME" ]]; then
@@ -2641,11 +2702,10 @@ get_db_volume_name() {
     fi
     debug_log "DB" "No volume from docker inspect, trying compose fallback"
     
-    # Fallback: пытаемся определить из docker-compose.yml
+    # Fallback: пытаемся определить из compose-файла (№12: _compose_in — все 4 имени)
     if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
-        local compose_file=""
-        [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-        [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+        local compose_file
+        compose_file=$(_compose_in "$BOT_PATH" || echo "")
         debug_log "DB" "Compose file: $compose_file"
         
         if [[ -n "$compose_file" ]]; then
@@ -2939,9 +2999,8 @@ has_license_key() {
 # Быстрая проверка наличия machine-id volume в compose (без интерактива)
 # Возвращает: 0 если volume есть, 1 если нет
 has_machine_id_volume() {
-    local compose_file=""
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    local compose_file
+    compose_file=$(_compose_in "$BOT_PATH" || echo "")   # №12: все 4 имени compose
     [[ -z "$compose_file" ]] && return 1
     
     grep -q "/etc/machine-id" "$compose_file" 2>/dev/null && return 0
@@ -3004,11 +3063,10 @@ get_current_bot_version() {
         return 0
     fi
     
-    # Затем из compose файла
-    local compose_file=""
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
-    
+    # Затем из compose файла (№12: все 4 имени)
+    local compose_file
+    compose_file=$(_compose_in "$BOT_PATH" || echo "")
+
     if [[ -n "$compose_file" ]]; then
         local compose_ver=$(get_compose_image_version "$compose_file")
         if [[ -n "$compose_ver" ]]; then
@@ -3044,13 +3102,12 @@ get_loaded_bot_images() {
 check_image_version_match() {
     debug_log "VERSION" "=== check_image_version_match() ==="
     
-    # Определяем compose файл
+    # Определяем compose файл (№12: все 4 имени)
     local compose_file=""
     if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
-        [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-        [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+        compose_file=$(_compose_in "$BOT_PATH" || echo "")
     fi
-    
+
     if [[ -z "$compose_file" ]]; then
         debug_log "VERSION" "Compose file not found"
         return 2
@@ -3410,11 +3467,10 @@ offer_compose_update() {
     local loaded_version="$2"
     local image_name="$3"
     
-    # Определяем compose файл
-    local compose_file=""
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
-    
+    # Определяем compose файл (№12: все 4 имени)
+    local compose_file
+    compose_file=$(_compose_in "$BOT_PATH" || echo "")
+
     if [[ -z "$compose_file" ]]; then
         print_message "ERROR" "Compose файл не найден"
         return 1
@@ -3512,11 +3568,10 @@ offer_compose_update() {
 # Проверка и добавление LICENSE_KEY в .env файл (требуется с версии 3.25.5+)
 ensure_license_key_in_env() {
     local env_file="$BOT_PATH/.env"
-    local compose_file=""
-    
-    # Определяем compose файл для проверки конфигурации
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    local compose_file
+
+    # Определяем compose файл для проверки конфигурации (№12: все 4 имени)
+    compose_file=$(_compose_in "$BOT_PATH" || echo "")
     
     if [[ ! -f "$env_file" ]]; then
         debug_log "LICENSE" ".env file not found: $env_file"
@@ -3992,10 +4047,15 @@ show_bot_startup_logs() {
     local lines="${1:-40}"
     echo ""
     echo -e "${CYAN}${BOLD}─── Логи запуска бота (последние ${lines} строк) ───${RESET}"
-    if [[ -n "$BOT_CONTAINER_NAME" ]] && docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+    # Soft-resolve: если контейнер пуст/панельный (panel/both-режим), находим реальный бот,
+    # чтобы не показать логи ПАНЕЛИ. Read-only — без громкого отказа, только best-effort.
+    if [[ -z "$BOT_CONTAINER_NAME" ]] || _is_panel_container "$BOT_CONTAINER_NAME"; then
+        if resolve_bot_runtime; then BOT_CONTAINER_NAME="$RB_APP"; BOT_PATH="$RB_PATH"; fi
+    fi
+    if [[ -n "$BOT_CONTAINER_NAME" ]] && ! _is_panel_container "$BOT_CONTAINER_NAME" && docker inspect "$BOT_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
         docker logs --tail "$lines" "$BOT_CONTAINER_NAME" 2>&1 || print_message "WARN" "Логи недоступны ($BOT_CONTAINER_NAME)"
         echo -e "${GRAY}Следить в реальном времени: ${RESET}docker logs -f ${BOT_CONTAINER_NAME}"
-    elif [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]]; then
+    elif [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]] && ! _dir_is_panel "$BOT_PATH"; then
         ( cd "$BOT_PATH" && { docker compose logs --tail "$lines" 2>&1 || docker-compose logs --tail "$lines" 2>&1; } )
         echo -e "${GRAY}Следить в реальном времени: ${RESET}cd ${BOT_PATH} && docker compose logs -f"
     else
@@ -4006,11 +4066,10 @@ show_bot_startup_logs() {
 }
 
 auto_update_bot() {
-    # Defense-in-depth: НИКОГДА не обновлять «бота» в panel-режиме (BOT_PATH=/opt/remnawave →
-    # перезапись контейнера remnawave). CLI/меню уже гейтят это, но дублируем у источника.
-    if [[ "$BACKUP_TARGET" == "panel" ]]; then
-        print_message "ERROR" "Обновление бота недоступно в режиме panel — операция отклонена."
-        log_message "ERROR" "auto_update_bot blocked: BACKUP_TARGET=panel"
+    # Привязка к РЕАЛЬНОМУ боту (не панель) независимо от BACKUP_TARGET. На смешанном сервере
+    # (бот+панель) находит /opt/rwp-shop и форсит bot-контекст; на сервере панели без бота —
+    # жёсткий отказ. Defense-in-depth: bind гарантирует RB_PATH != panel до любого compose down.
+    if ! bind_bot_runtime_or_fail "обновление бота"; then
         return 2
     fi
     # Аргументы в любом порядке:
@@ -4038,8 +4097,8 @@ auto_update_bot() {
     log_message "INFO" "[AUTO] Starting auto update..."
     
     if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
-        # Пробуем найти автоматически
-        if [[ -d "$DEFAULT_BOT_PATH" && ( -f "$DEFAULT_BOT_PATH/docker-compose.yml" || -f "$DEFAULT_BOT_PATH/compose.yaml" ) ]]; then
+        # Пробуем найти автоматически (№12: _compose_in — все 4 имени compose)
+        if [[ -d "$DEFAULT_BOT_PATH" ]] && _compose_in "$DEFAULT_BOT_PATH" > /dev/null 2>&1; then
             BOT_PATH="$DEFAULT_BOT_PATH"
             save_config
         else
@@ -4053,11 +4112,10 @@ auto_update_bot() {
     
     print_message "INFO" "Путь к боту: $BOT_PATH"
     
-    # === 2. ОПРЕДЕЛЯЕМ COMPOSE ФАЙЛ ===
-    local compose_file=""
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
-    
+    # === 2. ОПРЕДЕЛЯЕМ COMPOSE ФАЙЛ (№12: все 4 имени) ===
+    local compose_file
+    compose_file=$(_compose_in "$BOT_PATH" || echo "")
+
     if [[ -z "$compose_file" ]]; then
         print_message "ERROR" "Compose файл не найден в $BOT_PATH"
         return 1
@@ -4369,14 +4427,11 @@ auto_update_bot() {
 # lazarus bot up - Запустить контейнер бота (если не запущен)
 bot_up() {
     echo -e "${GREEN}${BOLD}[BOT UP]${RESET} Проверка контейнера бота..."
-    
-    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
-        ensure_bot_path || {
-            print_message "ERROR" "Путь к боту не найден"
-            return 1
-        }
+    # Целимся в РЕАЛЬНЫЙ бот (не панель) даже в panel/both-режиме.
+    if ! bind_bot_runtime_or_fail "запуск бота"; then
+        return 1
     fi
-    
+
     cd "$BOT_PATH" || return 1
     
     # Проверяем статус контейнера
@@ -4406,22 +4461,13 @@ bot_up() {
 
 # lazarus bot down - Остановить контейнер бота
 bot_down() {
-    # Defense-in-depth: в panel-режиме BOT_PATH=/opt/remnawave → `compose down` положил бы
-    # саму панель (downtime прода). CLI уже гейтит, дублируем у источника.
-    if [[ "$BACKUP_TARGET" == "panel" ]]; then
-        print_message "ERROR" "Остановка контейнера недоступна в режиме panel — операция отклонена."
-        log_message "ERROR" "bot_down blocked: BACKUP_TARGET=panel"
+    # Defense-in-depth: `compose down` в /opt/remnawave положил бы саму панель. bind_bot_runtime
+    # привязывает РЕАЛЬНЫЙ бот и жёстко отказывает, если путь совпал с панелью.
+    if ! bind_bot_runtime_or_fail "остановка бота"; then
         return 2
     fi
     echo -e "${YELLOW}${BOLD}[BOT DOWN]${RESET} Остановка контейнера бота..."
 
-    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
-        ensure_bot_path || {
-            print_message "ERROR" "Путь к боту не найден"
-            return 1
-        }
-    fi
-    
     cd "$BOT_PATH" || return 1
     
     # Проверяем запущен ли
@@ -4447,16 +4493,13 @@ bot_status() {
     echo -e "${CYAN}${BOLD}  Статус бота${RESET}"
     echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════${RESET}"
     echo ""
-    
-    if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
-        ensure_bot_path || {
-            print_message "ERROR" "Путь к боту не найден"
-            return 1
-        }
+    # Целимся в РЕАЛЬНЫЙ бот (не панель) даже в panel/both-режиме.
+    if ! bind_bot_runtime_or_fail "статус бота"; then
+        return 1
     fi
-    
+
     cd "$BOT_PATH" || return 1
-    
+
     # Версия бота
     local bot_ver=$(get_current_bot_version 2>/dev/null)
     echo -e "Версия бота:     ${CYAN}${bot_ver:-не определена}${RESET}"
@@ -4529,10 +4572,9 @@ bot_status() {
 # Главная функция обновления бота
 update_bot() {
     debug_log "UPDATE" "=== Starting update_bot() ==="
-    # Defense-in-depth: в panel-режиме обновление «бота» = перезапись контейнера remnawave.
-    if [[ "$BACKUP_TARGET" == "panel" ]]; then
-        print_message "ERROR" "Обновление бота недоступно в режиме panel — операция отклонена."
-        log_message "ERROR" "update_bot blocked: BACKUP_TARGET=panel"
+    # Привязка к РЕАЛЬНОМУ боту (не панель) до любых операций — работает и в panel/both-режиме
+    # на смешанном сервере; на панели без бота — отказ. Гарантирует BOT_PATH != panel.
+    if ! bind_bot_runtime_or_fail "обновление бота"; then
         return 2
     fi
     clear_screen
@@ -4545,8 +4587,8 @@ update_bot() {
     debug_log "UPDATE" "[STAGE 1] Checking bot path..."
     local bot_path_ok=false
     
-    # Сначала проверяем текущий BOT_PATH
-    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" && ( -f "$BOT_PATH/docker-compose.yml" || -f "$BOT_PATH/compose.yaml" ) ]]; then
+    # Сначала проверяем текущий BOT_PATH (№12: _compose_in — все 4 имени compose)
+    if [[ -n "$BOT_PATH" && -d "$BOT_PATH" ]] && _compose_in "$BOT_PATH" > /dev/null 2>&1; then
         bot_path_ok=true
         debug_log "UPDATE" "Bot path OK: $BOT_PATH"
     fi
@@ -4556,8 +4598,8 @@ update_bot() {
         debug_log "UPDATE" "Bot path not configured, starting search..."
         print_message "INFO" "Путь к боту не настроен. Запускаем поиск..."
         
-        # Проверяем путь по умолчанию из документации
-        if [[ -d "$DEFAULT_BOT_PATH" && ( -f "$DEFAULT_BOT_PATH/docker-compose.yml" || -f "$DEFAULT_BOT_PATH/compose.yaml" ) ]]; then
+        # Проверяем путь по умолчанию из документации (№12: все 4 имени compose)
+        if [[ -d "$DEFAULT_BOT_PATH" ]] && _compose_in "$DEFAULT_BOT_PATH" > /dev/null 2>&1; then
             debug_log "UPDATE" "Found bot at default path: $DEFAULT_BOT_PATH"
             print_message "SUCCESS" "Найден бот в $DEFAULT_BOT_PATH"
             BOT_PATH="$DEFAULT_BOT_PATH"
@@ -4779,9 +4821,8 @@ update_bot() {
                                     ensure_license_key_in_env
                                 fi
                                 if [[ "$has_mid" == "false" ]]; then
-                                    local _cf=""
-                                    [[ -f "$BOT_PATH/compose.yaml" ]] && _cf="$BOT_PATH/compose.yaml"
-                                    [[ -f "$BOT_PATH/docker-compose.yml" ]] && _cf="$BOT_PATH/docker-compose.yml"
+                                    local _cf
+                                    _cf=$(_compose_in "$BOT_PATH" || echo "")   # №12
                                     [[ -n "$_cf" ]] && ensure_machine_id_volume "$_cf"
                                 fi
                             fi
@@ -4868,9 +4909,8 @@ update_bot() {
                                 ensure_license_key_in_env
                             fi
                             if [[ "$has_mid" == "false" ]]; then
-                                local _cf=""
-                                [[ -f "$BOT_PATH/compose.yaml" ]] && _cf="$BOT_PATH/compose.yaml"
-                                [[ -f "$BOT_PATH/docker-compose.yml" ]] && _cf="$BOT_PATH/docker-compose.yml"
+                                local _cf
+                                _cf=$(_compose_in "$BOT_PATH" || echo "")   # №12
                                 [[ -n "$_cf" ]] && ensure_machine_id_volume "$_cf"
                             fi
                         fi
@@ -5135,9 +5175,8 @@ update_bot() {
     echo ""
     echo -e "${CYAN}${BOLD}═══ ОБНОВЛЕНИЕ КОНФИГУРАЦИИ ═══${RESET}"
     
-    local compose_file=""
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
+    local compose_file
+    compose_file=$(_compose_in "$BOT_PATH" || echo "")   # №12: все 4 имени
     debug_log "COMPOSE" "Compose file: $compose_file"
     
     if [[ -z "$compose_file" ]]; then
@@ -5373,7 +5412,12 @@ detect_bot_installation() {
         return 0
     fi
     print_message "INFO" "Запуск интеллектуального поиска..."
+    # label-fallback (догадки по чужим compose-проектам) — только когда живой оператор ВЫБИРАЕТ
+    # из списка; cron/auto-confirm авто-применяют первого кандидата и не должны его видеть.
+    local _sv_fb="${SCAN_ALLOW_LABEL_FALLBACK:-0}"
+    [[ "$IS_INTERACTIVE" == "true" && "$AUTO_CONFIRM" != "true" ]] && SCAN_ALLOW_LABEL_FALLBACK=1
     scan_system_for_bot
+    SCAN_ALLOW_LABEL_FALLBACK="$_sv_fb"
     if [[ ${#FOUND_PATHS[@]} -gt 1 ]]; then
         # H4 audit fix: в неинтерактивном режиме (cron) — берём первый кандидат
         # вместо подвешивания на read. Логируем выбор для аудита.
@@ -5386,10 +5430,14 @@ detect_bot_installation() {
             save_config; print_message "SUCCESS" "Настройки сохранены автоматически."; return 0
         fi
         echo ""; print_message "WARN" "Найдено несколько установок. Выберите нужную:"
+        # №18: кандидаты из label-fallback — ДОГАДКА (найдены не по ключевым словам,
+        # а по любому не-панельному compose-проекту с БД) — честно помечаем в списке.
+        local _fb_mark=""
+        [[ "${FOUND_VIA_FALLBACK:-0}" == "1" ]] && _fb_mark=" ${YELLOW}[догадка по labels]${RESET}"
         local idx=1
         for path in "${FOUND_PATHS[@]}"; do
             local bot="${FOUND_BOTS[$((idx-1))]}"
-            echo -e "  $idx. ${BOLD}$path${RESET} ${bot:+(bot: $bot)}"
+            echo -e "  $idx. ${BOLD}$path${RESET} ${bot:+(bot: $bot)}${_fb_mark}"
             idx=$((idx + 1))
         done
         echo "  0. Отмена"
@@ -5412,7 +5460,12 @@ detect_bot_installation() {
             [[ -n "$FOUND_DB" ]] && DB_CONTAINER_NAME="$FOUND_DB"
             save_config; print_message "SUCCESS" "Настройки применены автоматически: $FOUND_PATH"; return 0
         fi
-        echo ""; print_message "SUCCESS" "Обнаружена установка!"
+        # №18: single-кандидат из label-fallback — не «установка», а ВОЗМОЖНЫЙ проект (догадка).
+        if [[ "${FOUND_VIA_FALLBACK:-0}" == "1" ]]; then
+            echo ""; print_message "WARN" "Найден ВОЗМОЖНЫЙ проект бота (догадка по compose-labels, не по ключевым словам):"
+        else
+            echo ""; print_message "SUCCESS" "Обнаружена установка!"
+        fi
         echo -e "   Путь:      ${BOLD}$FOUND_PATH${RESET}"
         [[ -n "$FOUND_BOT" ]] && echo -e "   Бот:       ${BOLD}$FOUND_BOT${RESET}"
         [[ -n "$FOUND_DB" ]]  && echo -e "   БД:        ${BOLD}$FOUND_DB${RESET}"
@@ -5491,14 +5544,25 @@ check_config_mismatch() {
 ensure_bot_path() {
     debug_log "CONFIG" "=== ensure_bot_path ==="
     debug_log "CONFIG" "Current: BOT_PATH=$BOT_PATH, BOT=$BOT_CONTAINER_NAME, DB=$DB_CONTAINER_NAME"
-    
+
+    # BOOTSTRAP (миграция на чистый сервер): цель panel, путь ДЕКЛАРИРУЕТ панель (compose из
+    # архива), контейнеров ещё нет — их поднимет compose up внутри restore. Принимаем без
+    # детекта/промптов имён (иначе миграция вклинивала бы интерактивные вопросы посреди restore).
+    if [[ "$BACKUP_TARGET" == "panel" && -n "$BOT_PATH" && -d "$BOT_PATH" ]] \
+       && _compose_declares_panel "$BOT_PATH" \
+       && ! docker inspect "$DB_CONTAINER_NAME" > /dev/null 2> "$SILENT_LOG"; then
+        debug_log "CONFIG" "ensure_bot_path: panel bootstrap (panel compose present, containers absent) — accept"
+        return 0
+    fi
+
     if [[ -z "$BOT_CONTAINER_NAME" || -z "$DB_CONTAINER_NAME" ]]; then
         debug_log "CONFIG" "Container names empty, starting detection"
         echo ""; print_message "WARN" "Настройки контейнеров пусты."
         # WRONG-TARGET fix: load_or_create_config перечитывает BACKUP_TARGET/SECONDARY с диска (=primary).
         # В both-режиме это затёрло бы ЦЕЛЬ активного прохода → бэкап не той цели. Сохраняем/возвращаем.
-        local _et="$BACKUP_TARGET" _es="$BACKUP_SECONDARY"
-        detect_bot_installation; load_or_create_config; BACKUP_TARGET="$_et"; BACKUP_SECONDARY="$_es"; resolve_backup_target
+        # PANEL_PATH тоже: миграция с --path задаёт его in-memory, перечитка ретаргетила бы restore.
+        local _et="$BACKUP_TARGET" _es="$BACKUP_SECONDARY" _ep="$PANEL_PATH"
+        detect_bot_installation; load_or_create_config; BACKUP_TARGET="$_et"; BACKUP_SECONDARY="$_es"; PANEL_PATH="$_ep"; resolve_backup_target
     fi
 
     # Принимаем все 4 канонических имени compose (как get_compose_file/detect_panel_root) — иначе
@@ -5520,10 +5584,11 @@ ensure_bot_path() {
     if [[ "$path_valid" == "false" || "$container_valid" == "false" || "$db_valid" == "false" ]]; then
         debug_log "CONFIG" "Some validations failed, attempting auto-detection"
         if [[ "$path_valid" == "false" ]]; then
-            # WRONG-TARGET fix (см. выше): сохраняем цель активного прохода через load_or_create_config.
-            local _et2="$BACKUP_TARGET" _es2="$BACKUP_SECONDARY"
-            detect_bot_installation; load_or_create_config; BACKUP_TARGET="$_et2"; BACKUP_SECONDARY="$_es2"; resolve_backup_target
-            if [[ -n "$BOT_PATH" ]]; then path_valid=true; fi
+            # WRONG-TARGET fix (см. выше): сохраняем цель активного прохода (+PANEL_PATH) через load_or_create_config.
+            local _et2="$BACKUP_TARGET" _es2="$BACKUP_SECONDARY" _ep2="$PANEL_PATH"
+            detect_bot_installation; load_or_create_config; BACKUP_TARGET="$_et2"; BACKUP_SECONDARY="$_es2"; PANEL_PATH="$_ep2"; resolve_backup_target
+            # path_valid — только при реальном compose-файле (раньше «непустой BOT_PATH» считался валидным).
+            if [[ -n "$BOT_PATH" ]] && _compose_in "$BOT_PATH" > /dev/null 2>&1; then path_valid=true; fi
             if [[ -n "$BOT_CONTAINER_NAME" ]]; then container_valid=true; fi
             if [[ -n "$DB_CONTAINER_NAME" ]]; then db_valid=true; fi
             debug_log "CONFIG" "After detection: path=$path_valid, container=$container_valid, db=$db_valid"
@@ -5647,6 +5712,10 @@ load_config_file() {
             DB_NAME) DB_NAME="$val" ;;
             BACKUP_TARGET) BACKUP_TARGET="$val" ;;
             BACKUP_SECONDARY) BACKUP_SECONDARY="$val" ;;
+            UI_MODE)
+                # Режим меню: enum standard|expert. Мусор → expert (полное меню — безопасный
+                # backward-compat дефолт: ничего не скрывает от оператора).
+                case "$val" in standard|expert) UI_MODE="$val" ;; *) UI_MODE="expert" ;; esac ;;
             PANEL_TRANSPORT) PANEL_TRANSPORT="$val" ;;
             PANEL_SSH_HOST) PANEL_SSH_HOST="$val" ;;
             PANEL_SSH_PORT) PANEL_SSH_PORT="$val" ;;
@@ -5687,6 +5756,7 @@ load_config_file() {
             S3_ACCESS_KEY) S3_ACCESS_KEY="$val" ;;
             S3_SECRET_KEY) S3_SECRET_KEY="$val" ;;
             S3_REGION) S3_REGION="$val" ;;
+            S3_RETENTION_DAYS) S3_RETENTION_DAYS="$val" ;;
             BACKUP_PASSWORD) BACKUP_PASSWORD="$val" ;;
             BACKUP_PASSWORD_FILE) BACKUP_PASSWORD_FILE="$val" ;;
             DISK_WARN_PERCENT) DISK_WARN_PERCENT="$val" ;;
@@ -5714,6 +5784,15 @@ env_escape() {
     val="${val//$'\n'/}"
     val="${val//$'\r'/}"
     echo "$val"
+}
+
+# _cfg_if_nondefault KEY VAL_ESC DEFAULT: копит строку KEY="VAL" в _ADV_LINES (локал save_config,
+# dynamic scope) ТОЛЬКО если значение отличается от дефолта — щадящий config.env: новичок видит
+# короткий файл, отсутствующий ключ = дефолт (load_or_create_config это уже терпит).
+# Дефолты передаёт save_config — они ОБЯЗАНЫ совпадать с глобальными декларациями в начале файла.
+_cfg_if_nondefault() {
+    [[ "$2" == "$3" ]] && return 0
+    _ADV_LINES+="${1}=\"${2}\""$'\n'
 }
 
 write_password_file() {
@@ -5808,6 +5887,15 @@ read_password_file() {
     return 0
 }
 
+# №5: единый предикат «шифрование РЕАЛЬНО готово». Голое `-f $BACKUP_PASSWORD_FILE` давало
+# зелёный статус при пустом/нечитаемом файле (вне INSTALL_DIR, ENOSPC-огрызок) — фактические
+# бэкапы при этом шли plaintext. Готово = пароль в памяти ЛИБО файл пароля успешно читается
+# (side effect: read_password_file загружает пароль в BACKUP_PASSWORD — то же, что при старте).
+_encryption_ready() {
+    [[ -n "$BACKUP_PASSWORD" ]] && return 0
+    read_password_file
+}
+
 save_config() {
     debug_log "CONFIG" "=== save_config ==="
     # Both-режим: во время прогона обеих целей рабочие переменные (BOT_PATH и пр.) временно
@@ -5847,6 +5935,15 @@ save_config() {
         _sv_dbcont="$DB_CONTAINER_NAME"; _sv_dbuser="$DB_USER"
         _sv_dbname="${DB_NAME:-}"; _sv_maxfile="$MAX_FILE_SIZE_MB"
     fi
+    # Финальный предохранитель: панельная идентичность НИКОГДА не попадает в bot-поля config.env.
+    # ТОЛЬКО в panel-режиме (единственный, где panel-resolve затирает рабочие bot-переменные) — иначе
+    # на bot-ONLY сервере легитимный бот с именем remnawave-telegram-shop* заанулился бы (регрессия).
+    # Совпадение — по ТОЧНОЙ панельной идентичности (_is_panel_container), не по широкому remnawave*.
+    if [[ "$BACKUP_TARGET" == "panel" ]]; then
+        _is_panel_container "$_sv_botcont" && _sv_botcont=""
+        _is_panel_container "$_sv_dbcont" && _sv_dbcont=""
+        { [[ -n "$_sv_botpath" ]] && _same_path "$_sv_botpath" "$(_panel_root_now)"; } && _sv_botpath=""
+    fi
     BOT_PATH_ESC=$(env_escape "$_sv_botpath")
     DB_USER_ESC=$(env_escape "$_sv_dbuser")
     local DB_NAME_ESC; DB_NAME_ESC=$(env_escape "$_sv_dbname")
@@ -5875,6 +5972,7 @@ save_config() {
     S3_ACCESS_KEY_ESC=$(env_escape "$S3_ACCESS_KEY")
     S3_SECRET_KEY_ESC=$(env_escape "$S3_SECRET_KEY")
     S3_REGION_ESC=$(env_escape "$S3_REGION")
+    local S3_RETENTION_DAYS_ESC; S3_RETENTION_DAYS_ESC=$(env_escape "${S3_RETENTION_DAYS:-0}")
     BACKUP_PASSWORD_FILE_ESC=$(env_escape "$BACKUP_PASSWORD_FILE")
     DISK_WARN_PERCENT_ESC=$(env_escape "$DISK_WARN_PERCENT")
     DISK_CRITICAL_PERCENT_ESC=$(env_escape "$DISK_CRITICAL_PERCENT")
@@ -5888,8 +5986,17 @@ save_config() {
     COMPRESSION_ESC=$(env_escape "$COMPRESSION")
     BOT_RELEASE_URL_BASE_ESC=$(env_escape "$BOT_RELEASE_URL_BASE")
     local BACKUP_TARGET_ESC BACKUP_SECONDARY_ESC PANEL_PATH_ESC PANEL_DB_CONTAINER_ESC PANEL_DB_NAME_ESC PANEL_DB_SERVICE_ESC PANEL_EXTRA_PATHS_ESC
-    BACKUP_TARGET_ESC=$(env_escape "$BACKUP_TARGET")
-    BACKUP_SECONDARY_ESC=$(env_escape "${BACKUP_SECONDARY:-}")
+    # Во время активного bind (bot-команда форсит BACKUP_TARGET=bot) на диск пишем ИСХОДНУЮ цель,
+    # а не транзиентный bot-only — иначе save в этот момент навсегда демотнул бы both→bot.
+    local _persist_target="$BACKUP_TARGET" _persist_secondary="${BACKUP_SECONDARY:-}"
+    if [[ "${_BOTRT_FORCED:-0}" == "1" ]]; then
+        _persist_target="$_BOTRT_PREV_TARGET"; _persist_secondary="$_BOTRT_PREV_SECONDARY"
+    fi
+    BACKUP_TARGET_ESC=$(env_escape "$_persist_target")
+    BACKUP_SECONDARY_ESC=$(env_escape "$_persist_secondary")
+    # Режим меню — CORE-ключ (пишется всегда): standard выбирается первым запуском, и потеря
+    # ключа молча вернула бы новичку полное эксперт-меню.
+    local UI_MODE_ESC; UI_MODE_ESC=$(env_escape "$UI_MODE")
     PANEL_PATH_ESC=$(env_escape "$PANEL_PATH")
     PANEL_DB_CONTAINER_ESC=$(env_escape "$PANEL_DB_CONTAINER")
     PANEL_DB_NAME_ESC=$(env_escape "${PANEL_DB_NAME:-}")
@@ -5907,70 +6014,93 @@ save_config() {
     BOT_SSH_PORT_ESC=$(env_escape "${BOT_SSH_PORT:-22}"); BOT_SSH_USER_ESC=$(env_escape "${BOT_SSH_USER:-root}")
     BOT_SSH_KEY_ESC=$(env_escape "${BOT_SSH_KEY:-}")
 
+    # Щадящая запись: ОСНОВНОЕ — всегда, остальное — только НЕдефолтное (_cfg_if_nondefault
+    # копит в _ADV_LINES). Дефолты ниже = глобальные декларации в начале файла (менять в lockstep!).
+    local _ADV_LINES=""
+    _cfg_if_nondefault "TG_MESSAGE_THREAD_ID" "$TG_MESSAGE_THREAD_ID_ESC" ""
+    _cfg_if_nondefault "BOT_PATH" "$BOT_PATH_ESC" ""
+    _cfg_if_nondefault "DB_USER" "$DB_USER_ESC" "postgres"
+    _cfg_if_nondefault "DB_NAME" "$DB_NAME_ESC" ""
+    _cfg_if_nondefault "MAX_BACKUPS_COUNT" "$MAX_BACKUPS_COUNT_ESC" "100"
+    _cfg_if_nondefault "BOT_CONTAINER_NAME" "$BOT_CONTAINER_NAME_ESC" ""
+    _cfg_if_nondefault "DB_CONTAINER_NAME" "$DB_CONTAINER_NAME_ESC" ""
+    _cfg_if_nondefault "IGNORE_MISMATCH" "$IGNORE_MISMATCH_ESC" "false"
+    _cfg_if_nondefault "EXCLUDE_DIRS" "$EXCLUDE_DIRS_ESC" ""
+    _cfg_if_nondefault "MAX_FILE_SIZE_MB" "$MAX_FILE_SIZE_MB_ESC" "1"
+    _cfg_if_nondefault "REMOTE_STORAGE_URL" "$REMOTE_STORAGE_URL_ESC" ""
+    _cfg_if_nondefault "REMOTE_STORAGE_USER" "$REMOTE_STORAGE_USER_ESC" ""
+    _cfg_if_nondefault "REMOTE_STORAGE_PASS" "$REMOTE_STORAGE_PASS_ESC" ""
+    _cfg_if_nondefault "SEND_TO_REMOTE" "$SEND_TO_REMOTE_ESC" "true"
+    _cfg_if_nondefault "MAX_BACKUP_SIZE_MB" "$MAX_BACKUP_SIZE_MB_ESC" "0"
+    _cfg_if_nondefault "S3_ENDPOINT" "$S3_ENDPOINT_ESC" ""
+    _cfg_if_nondefault "S3_BUCKET" "$S3_BUCKET_ESC" ""
+    _cfg_if_nondefault "S3_PATH" "$S3_PATH_ESC" ""
+    _cfg_if_nondefault "S3_ACCESS_KEY" "$S3_ACCESS_KEY_ESC" ""
+    _cfg_if_nondefault "S3_SECRET_KEY" "$S3_SECRET_KEY_ESC" ""
+    _cfg_if_nondefault "S3_RETENTION_DAYS" "$S3_RETENTION_DAYS_ESC" "0"
+    _cfg_if_nondefault "S3_REGION" "$S3_REGION_ESC" "us-east-1"
+    _cfg_if_nondefault "DISK_WARN_PERCENT" "$DISK_WARN_PERCENT_ESC" "90"
+    _cfg_if_nondefault "DISK_CRITICAL_PERCENT" "$DISK_CRITICAL_PERCENT_ESC" "95"
+    _cfg_if_nondefault "DELETE_LOCAL_AFTER_REMOTE_UPLOAD" "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC" "false"
+    _cfg_if_nondefault "BACKUP_LOG_FILES" "$BACKUP_LOG_FILES_ESC" "ask"
+    _cfg_if_nondefault "PG_DUMP_TIMEOUT_SEC" "$PG_DUMP_TIMEOUT_SEC_ESC" "3600"
+    _cfg_if_nondefault "TAR_TIMEOUT_SEC" "$TAR_TIMEOUT_SEC_ESC" "3600"
+    _cfg_if_nondefault "ENCRYPT_TIMEOUT_SEC" "$ENCRYPT_TIMEOUT_SEC_ESC" "1800"
+    _cfg_if_nondefault "RESTORE_TIMEOUT_SEC" "$RESTORE_TIMEOUT_SEC_ESC" "3600"
+    _cfg_if_nondefault "BOT_RELEASE_URL_BASE" "$BOT_RELEASE_URL_BASE_ESC" "https://releases.example.com"
+    _cfg_if_nondefault "PANEL_TRANSPORT" "$PANEL_TRANSPORT_ESC" "local"
+    _cfg_if_nondefault "PANEL_SSH_HOST" "$PANEL_SSH_HOST_ESC" ""
+    _cfg_if_nondefault "PANEL_SSH_PORT" "$PANEL_SSH_PORT_ESC" "22"
+    _cfg_if_nondefault "PANEL_SSH_USER" "$PANEL_SSH_USER_ESC" "root"
+    _cfg_if_nondefault "PANEL_SSH_KEY" "$PANEL_SSH_KEY_ESC" ""
+    _cfg_if_nondefault "BOT_TRANSPORT" "$BOT_TRANSPORT_ESC" "local"
+    _cfg_if_nondefault "BOT_SSH_HOST" "$BOT_SSH_HOST_ESC" ""
+    _cfg_if_nondefault "BOT_SSH_PORT" "$BOT_SSH_PORT_ESC" "22"
+    _cfg_if_nondefault "BOT_SSH_USER" "$BOT_SSH_USER_ESC" "root"
+    _cfg_if_nondefault "BOT_SSH_KEY" "$BOT_SSH_KEY_ESC" ""
+    _cfg_if_nondefault "PANEL_PATH" "$PANEL_PATH_ESC" "/opt/remnawave"
+    _cfg_if_nondefault "PANEL_DB_CONTAINER" "$PANEL_DB_CONTAINER_ESC" "remnawave-db"
+    _cfg_if_nondefault "PANEL_DB_NAME" "$PANEL_DB_NAME_ESC" ""
+    _cfg_if_nondefault "PANEL_DB_SERVICE" "$PANEL_DB_SERVICE_ESC" "remnawave-db"
+    _cfg_if_nondefault "PANEL_EXTRA_PATHS" "$PANEL_EXTRA_PATHS_ESC" ""
+    _cfg_if_nondefault "PANEL_BILLING_DB_CONTAINER" "$PANEL_BILLING_DB_CONTAINER_ESC" "infra-billing-db"
+    _cfg_if_nondefault "PANEL_BILLING_BACKUP" "$PANEL_BILLING_BACKUP_ESC" "auto"
+
+    # BACKUP_PASSWORD="" обязан остаться в файле — легаси-миграция пароля в BACKUP_PASSWORD_FILE.
+    # №1: если миграция ПРОВАЛИЛАСЬ (_LEGACY_PWD_UNMIGRATED=1) — пишем реальное значение,
+    # чтобы пароль пережил рестарт (файла нет, память умрёт с процессом). При успешной
+    # миграции пишем "" как раньше — иначе read_password_file на следующем старте загрузил бы
+    # пароль обратно в BACKUP_PASSWORD и запись значения ОТКАТИЛА бы миграцию (пароль в 2 местах).
+    local _pwd_line='BACKUP_PASSWORD=""'
+    if [[ "${_LEGACY_PWD_UNMIGRATED:-0}" == "1" && -n "$BACKUP_PASSWORD" ]]; then
+        _pwd_line="BACKUP_PASSWORD=\"$(env_escape "$BACKUP_PASSWORD")\""
+    fi
     cat > "$CONFIG_FILE" <<EOF
+# LAZARUS — конфигурация. Отсутствующий ключ = значение по умолчанию.
+# Полный справочник: CONFIG_REFERENCE.md · Настройки удобнее менять через меню lazarus
 BOT_TOKEN="$BOT_TOKEN_ESC"
 CHAT_ID="$CHAT_ID_ESC"
-TG_MESSAGE_THREAD_ID="$TG_MESSAGE_THREAD_ID_ESC"
-BOT_PATH="$BOT_PATH_ESC"
-DB_USER="$DB_USER_ESC"
-DB_NAME="$DB_NAME_ESC"
+BACKUP_TARGET="$BACKUP_TARGET_ESC"
+BACKUP_SECONDARY="$BACKUP_SECONDARY_ESC"
+UI_MODE="$UI_MODE_ESC"
 SCHEDULE_FULL="$SCHEDULE_FULL_ESC"
 SCHEDULE_DB="$SCHEDULE_DB_ESC"
 SCHEDULE_FILES="$SCHEDULE_FILES_ESC"
-MAX_BACKUPS_COUNT="$MAX_BACKUPS_COUNT_ESC"
-BOT_CONTAINER_NAME="$BOT_CONTAINER_NAME_ESC"
-DB_CONTAINER_NAME="$DB_CONTAINER_NAME_ESC"
-IGNORE_MISMATCH="$IGNORE_MISMATCH_ESC"
-EXCLUDE_DIRS="$EXCLUDE_DIRS_ESC"
-MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB_ESC"
-REMOTE_STORAGE_TYPE="$REMOTE_STORAGE_TYPE_ESC"
-REMOTE_STORAGE_URL="$REMOTE_STORAGE_URL_ESC"
-REMOTE_STORAGE_USER="$REMOTE_STORAGE_USER_ESC"
-REMOTE_STORAGE_PASS="$REMOTE_STORAGE_PASS_ESC"
-BACKUP_PASSWORD=""
-BACKUP_PASSWORD_FILE="$BACKUP_PASSWORD_FILE_ESC"
-SEND_TO_TELEGRAM="$SEND_TO_TELEGRAM_ESC"
-TG_SEND_FILE="$TG_SEND_FILE_ESC"
-SEND_TO_REMOTE="$SEND_TO_REMOTE_ESC"
 DELETE_MODE="$DELETE_MODE_ESC"
 RETENTION_DAYS="$RETENTION_DAYS_ESC"
-MAX_BACKUP_SIZE_MB="$MAX_BACKUP_SIZE_MB_ESC"
-S3_ENDPOINT="$S3_ENDPOINT_ESC"
-S3_BUCKET="$S3_BUCKET_ESC"
-S3_PATH="$S3_PATH_ESC"
-S3_ACCESS_KEY="$S3_ACCESS_KEY_ESC"
-S3_SECRET_KEY="$S3_SECRET_KEY_ESC"
-S3_REGION="$S3_REGION_ESC"
-DISK_WARN_PERCENT="$DISK_WARN_PERCENT_ESC"
-DISK_CRITICAL_PERCENT="$DISK_CRITICAL_PERCENT_ESC"
-DELETE_LOCAL_AFTER_REMOTE_UPLOAD="$DELETE_LOCAL_AFTER_REMOTE_UPLOAD_ESC"
-BACKUP_LOG_FILES="$BACKUP_LOG_FILES_ESC"
-PG_DUMP_TIMEOUT_SEC="$PG_DUMP_TIMEOUT_SEC_ESC"
-TAR_TIMEOUT_SEC="$TAR_TIMEOUT_SEC_ESC"
-ENCRYPT_TIMEOUT_SEC="$ENCRYPT_TIMEOUT_SEC_ESC"
-RESTORE_TIMEOUT_SEC="$RESTORE_TIMEOUT_SEC_ESC"
 COMPRESSION="$COMPRESSION_ESC"
-BOT_RELEASE_URL_BASE="$BOT_RELEASE_URL_BASE_ESC"
-BACKUP_TARGET="$BACKUP_TARGET_ESC"
-BACKUP_SECONDARY="$BACKUP_SECONDARY_ESC"
-PANEL_TRANSPORT="$PANEL_TRANSPORT_ESC"
-PANEL_SSH_HOST="$PANEL_SSH_HOST_ESC"
-PANEL_SSH_PORT="$PANEL_SSH_PORT_ESC"
-PANEL_SSH_USER="$PANEL_SSH_USER_ESC"
-PANEL_SSH_KEY="$PANEL_SSH_KEY_ESC"
-BOT_TRANSPORT="$BOT_TRANSPORT_ESC"
-BOT_SSH_HOST="$BOT_SSH_HOST_ESC"
-BOT_SSH_PORT="$BOT_SSH_PORT_ESC"
-BOT_SSH_USER="$BOT_SSH_USER_ESC"
-BOT_SSH_KEY="$BOT_SSH_KEY_ESC"
-PANEL_PATH="$PANEL_PATH_ESC"
-PANEL_DB_CONTAINER="$PANEL_DB_CONTAINER_ESC"
-PANEL_DB_NAME="$PANEL_DB_NAME_ESC"
-PANEL_DB_SERVICE="$PANEL_DB_SERVICE_ESC"
-PANEL_EXTRA_PATHS="$PANEL_EXTRA_PATHS_ESC"
-PANEL_BILLING_DB_CONTAINER="$PANEL_BILLING_DB_CONTAINER_ESC"
-PANEL_BILLING_BACKUP="$PANEL_BILLING_BACKUP_ESC"
+REMOTE_STORAGE_TYPE="$REMOTE_STORAGE_TYPE_ESC"
+SEND_TO_TELEGRAM="$SEND_TO_TELEGRAM_ESC"
+TG_SEND_FILE="$TG_SEND_FILE_ESC"
+$_pwd_line
+BACKUP_PASSWORD_FILE="$BACKUP_PASSWORD_FILE_ESC"
 EOF
+    if [[ -n "$_ADV_LINES" ]]; then
+        {
+            echo "# — ниже только то, что отличается от умолчаний —"
+            printf '%s' "$_ADV_LINES"
+        } >> "$CONFIG_FILE"
+    fi
     chmod 600 "$CONFIG_FILE"
     debug_log "CONFIG" "Config saved, chmod 600 applied"
     debug_log "CONFIG" "BOT_PATH=$BOT_PATH"
@@ -6009,6 +6139,9 @@ load_or_create_config() {
     if [[ -z "$PANEL_DB_CONTAINER" ]]; then PANEL_DB_CONTAINER="remnawave-db"; fi
     if [[ -z "$PANEL_DB_SERVICE" ]]; then PANEL_DB_SERVICE="remnawave-db"; fi
     if [[ -z "$IGNORE_MISMATCH" ]]; then IGNORE_MISMATCH="false"; fi
+    # №8 heal: пустой DB_USER на диске (наследие bind-порчи прошлых версий) → дефолт postgres,
+    # симметрично heal'ам PANEL_DB_CONTAINER/MAX_BACKUPS_COUNT. Иначе порча тянулась бы в _CANON_DB_USER.
+    if [[ -z "$DB_USER" ]]; then DB_USER="postgres"; fi
     # ROT-4/CFG-5/SHELL-1/SHELL-2/SHELL-4 fix: численные ключи валидируем как
     # ^[0-9]+$ (не только -z). Раньше hand-edited "500MB"/"abc"/"0.5" сохранялись
     # дословно → bash-арифметика трактовала их как 0 → size-rotation сносила ВСЁ,
@@ -6034,6 +6167,11 @@ load_or_create_config() {
     [[ "${TAR_TIMEOUT_SEC:-}"     =~ ^[0-9]+$ ]] || TAR_TIMEOUT_SEC="3600"
     [[ "${ENCRYPT_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || ENCRYPT_TIMEOUT_SEC="1800"
     [[ "${RESTORE_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || RESTORE_TIMEOUT_SEC="3600"
+    # №19: PANEL_EXTRA_PATHS зарезервирован (RESERVED) и пока НИГДЕ не потребляется —
+    # честно предупреждаем, чтобы оператор не считал, что пути уже входят в бэкап.
+    if [[ -n "${PANEL_EXTRA_PATHS:-}" ]]; then
+        log_message "WARN" "PANEL_EXTRA_PATHS задан, но зарезервирован и пока ИГНОРИРУЕТСЯ — эти пути НЕ попадут в бэкап"
+    fi
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -6041,14 +6179,42 @@ load_or_create_config() {
     # (если BACKUP_PASSWORD пустой). Защита от чтения другими юзерами на multi-user серверах.
     chmod 700 "$BACKUP_DIR" 2> "$SILENT_LOG" || true
 
-    local updated=false
-    
     # Telegram настройки опциональны - НЕ требуем их ввода при старте
     # Уведомление об отсутствии настроек будет показано в главном меню
     if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
         debug_log "CONFIG" "Telegram settings not configured (optional)"
     fi
-    
+
+    # Миграция пароля из старого config.env в отдельный файл (chmod 600).
+    # №1/№7: блок стоит ВЫШЕ detect_bot_installation — авто-save внутри detect записал бы
+    # BACKUP_PASSWORD="" в config.env ДО миграции и легаси-пароль был бы потерян навсегда.
+    # Собственный save_config миграции ОТЛОЖЕН (_pwd_migration_save): выполняется только
+    # ПОСЛЕ канонического снимка _CANON_* — иначе panel-ветка save_config при пустом снимке
+    # стирала bot-поля из config.env.
+    # Если write провалится — оставляем BACKUP_PASSWORD в памяти (шифрование текущей сессии
+    # работает), взводим _LEGACY_PWD_UNMIGRATED (save_config сохранит пароль в config.env,
+    # №1) и говорим об этом ВСЛУХ; в следующий запуск попробуем миграцию снова.
+    local _pwd_migration_save=0
+    if [[ -n "$BACKUP_PASSWORD" ]]; then
+        debug_log "CONFIG" "Migrating BACKUP_PASSWORD to file"
+        if write_password_file "$BACKUP_PASSWORD"; then
+            BACKUP_PASSWORD=""
+            _pwd_migration_save=1
+        else
+            _LEGACY_PWD_UNMIGRATED=1
+            print_message "ERROR" "Миграция пароля в $BACKUP_PASSWORD_FILE провалилась — пароль остаётся в config.env (менее безопасно). Повторим при следующем запуске."
+            log_message "ERROR" "Password migration to $BACKUP_PASSWORD_FILE failed — keeping BACKUP_PASSWORD in config.env"
+        fi
+    fi
+    # Загружаем пароль из файла (если есть). №5: файл есть, но не читается — говорим ВСЛУХ,
+    # иначе оператор уверен в шифровании, а бэкапы уходят plaintext.
+    if [[ -z "$BACKUP_PASSWORD" ]]; then
+        if ! read_password_file && [[ -f "$BACKUP_PASSWORD_FILE" ]]; then
+            print_message "WARN" "Файл пароля существует, но НЕ читается (пуст/вне $INSTALL_DIR) — бэкапы пойдут БЕЗ шифрования."
+            log_message "WARN" "Password file present but unreadable: $BACKUP_PASSWORD_FILE"
+        fi
+    fi
+
     # Первый интерактивный запуск: выбрать ЦЕЛЬ (панель — основная, бот — вторичная).
     # Ставит BACKUP_TARGET до bot-discovery, чтобы на панели не запускался лишний скан.
     if [[ "$_LZ_FIRST_RUN" == "true" && "$IS_INTERACTIVE" == "true" ]]; then
@@ -6062,28 +6228,6 @@ load_or_create_config() {
         debug_log "CONFIG" "Bot installation not configured, starting detection"
         detect_bot_installation
     fi
-
-    # Миграция пароля из старого config.env в отдельный файл (chmod 600).
-    # Если write провалится — оставляем BACKUP_PASSWORD в памяти как есть,
-    # чтобы шифрование текущей сессии работало; в следующий запуск опять попробуем.
-    if [[ -n "$BACKUP_PASSWORD" ]]; then
-        debug_log "CONFIG" "Migrating BACKUP_PASSWORD to file"
-        if write_password_file "$BACKUP_PASSWORD"; then
-            BACKUP_PASSWORD=""
-            updated=true
-        else
-            debug_log "CONFIG" "Migration failed — keeping BACKUP_PASSWORD in memory only"
-        fi
-    fi
-    # Загружаем пароль из файла (если есть)
-    if [[ -z "$BACKUP_PASSWORD" ]]; then
-        read_password_file || true
-    fi
-    
-    if $updated; then
-        debug_log "CONFIG" "Config updated, saving..."
-        save_config
-    fi
     # Канонический снимок BOT-side рабочих переменных ДО любого resolve-клоббера. Нужен
     # диспетчеру both-режима: panel-resolve затирает BOT_PATH/контейнеры/DB_NAME/MAX_FILE_SIZE_MB,
     # а для второго прохода (бот) их надо вернуть из чистого источника, не полагаясь на диск
@@ -6092,14 +6236,78 @@ load_or_create_config() {
     # во время прохода) НЕ должны пересоздавать снимок — иначе он захватил бы состояние активного
     # прохода (panel-затёртое) и отравил бы второй проход/heal. Дальше снимок ведут правки настроек
     # и refresh при включении «обе» (опция 27).
+    local _healed_bot=0 _sanitized_bot=0
     if [[ -z "${_CANON_SNAPSHOT_TAKEN:-}" ]]; then
-        _CANON_BOT_PATH="$BOT_PATH"; _CANON_BOT_CONTAINER="$BOT_CONTAINER_NAME"
-        _CANON_DB_CONTAINER="$DB_CONTAINER_NAME"; _CANON_DB_SERVICE="$DB_SERVICE_NAME"
-        _CANON_DB_NAME="$DB_NAME"; _CANON_DB_USER="$DB_USER"; _CANON_MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB"
+        local _snap_path="$BOT_PATH" _snap_app="$BOT_CONTAINER_NAME" _snap_db="$DB_CONTAINER_NAME"
+        local _snap_svc="$DB_SERVICE_NAME" _snap_dbname="$DB_NAME" _snap_dbuser="$DB_USER"
+        # Heal: панельная идентичность, просочившаяся в bot-поля (напр. на смешанном сервере
+        # предыдущий panel-запуск сохранил BOT_CONTAINER_NAME=remnawave / BOT_PATH=/opt/remnawave),
+        # — это порча; зануляем, чтобы снимок не отравил both-проход и bot-команды. _sanitized_bot
+        # взводим, если реально что-то вычистили (для персиста даже когда бот не нашёлся).
+        _is_panel_container "$_snap_app" && { _snap_app=""; _sanitized_bot=1; }
+        local _panel_r; _panel_r=$(_panel_root_now)
+        { [[ -n "$_snap_path" ]] && _same_path "$_snap_path" "$_panel_r"; } && { _snap_path=""; _sanitized_bot=1; }
+        # Смешанный сервер (panel-primary ИЛИ «обе»): если bot-идентичность пуста/битая — находим
+        # РЕАЛЬНЫЙ бот (напр. /opt/rwp-shop) панель-независимым резолвером и берём его в снимок.
+        if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "bot" ]] \
+           && [[ -z "$_snap_path" || -z "$_snap_app" ]]; then
+            if resolve_bot_runtime; then
+                _snap_path="$RB_PATH"; _snap_app="$RB_APP"; _snap_db="$RB_DB"
+                _snap_svc=""; _snap_dbname=""; _snap_dbuser=""
+                _healed_bot=1
+                debug_log "CONFIG" "Snapshot healed via resolve_bot_runtime: path=$_snap_path app=$_snap_app db=$_snap_db"
+            fi
+        fi
+        _CANON_BOT_PATH="$_snap_path"; _CANON_BOT_CONTAINER="$_snap_app"
+        _CANON_DB_CONTAINER="$_snap_db"; _CANON_DB_SERVICE="$_snap_svc"
+        _CANON_DB_NAME="$_snap_dbname"; _CANON_DB_USER="$_snap_dbuser"; _CANON_MAX_FILE_SIZE_MB="$MAX_FILE_SIZE_MB"
         _CANON_SNAPSHOT_TAKEN=1
-        debug_log "CONFIG" "Canonical bot-config snapshot taken (path=$_CANON_BOT_PATH db=$_CANON_DB_CONTAINER)"
+        debug_log "CONFIG" "Canonical bot-config snapshot taken (path=$_CANON_BOT_PATH app=$_CANON_BOT_CONTAINER db=$_CANON_DB_CONTAINER)"
     else
         debug_log "CONFIG" "Canonical snapshot already taken — skip re-snapshot (recovery re-entry)"
+    fi
+    # Персистим ОДИН раз, если (а) нашли реальный бот, ЛИБО (б) реально вычистили панельную порчу из
+    # bot-полей (даже если бот не нашёлся — иначе битый BOT_CONTAINER_NAME=remnawave/BOT_PATH=/opt/remnawave
+    # остались бы на диске и перечитывались/сбивали с толку при триаже каждый запуск), ЛИБО
+    # (в) №1/№7: отложенный save успешной миграции пароля (стирает легаси-строку из config.env) —
+    # именно ЗДЕСЬ, после снимка _CANON_*, чтобы panel-ветка save_config не занулила bot-поля.
+    # save_config сам (panel-режим) чистит bot-поля предохранителем, поэтому панель не затирается.
+    if [[ "$_healed_bot" == "1" || "$_sanitized_bot" == "1" || "$_pwd_migration_save" == "1" ]]; then
+        debug_log "CONFIG" "Persisting config (healed=$_healed_bot sanitized=$_sanitized_bot pwd_migrated=$_pwd_migration_save)"
+        save_config
+    fi
+    # PANEL-HEAL (имя-независимая самонастройка): пользователь может не знать, где стоит панель
+    # и как называются контейнеры — живой сервер (образы+labels+DATABASE_URL) знает точнее конфига.
+    # Правим ТОЛЬКО битые значения (путь без панельного compose / отсутствующий контейнер БД);
+    # валидный конфиг не трогаем. Персист один раз.
+    if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]]; then
+        # Прогрев кэшей В РОДИТЕЛЬСКОМ шелле (все $(...)-вызовы идут в сабшеллах и кэш бы не жил)
+        _live_panel_dir > /dev/null 2>&1; _panel_db_service > /dev/null 2>&1; _billing_db_service > /dev/null 2>&1
+        # + имя app-контейнера панели (кастомные имена: resolve подставит его вместо 'remnawave')
+        if [[ -z "$DISC_PANEL_APP" ]]; then
+            local _pa; _pa=$(_app_by_image 'remnawave/backend' 2>/dev/null) && DISC_PANEL_APP="${_pa%%|*}"
+        fi
+        local _ph_changed=0 _lpd_h
+        if ! _compose_declares_panel "$PANEL_PATH" 2>/dev/null; then
+            # Адоптим live-каталог только если он САМ декларирует панель (exited-останки/пустышки — нет)
+            if _lpd_h=$(_live_panel_dir) && [[ "$PANEL_PATH" != "$_lpd_h" ]] && _compose_declares_panel "$_lpd_h"; then
+                debug_log "CONFIG" "panel-heal: PANEL_PATH '$PANEL_PATH' → live '$_lpd_h'"
+                PANEL_PATH="$_lpd_h"; _ph_changed=1
+            fi
+        fi
+        if [[ -z "$PANEL_DB_CONTAINER" ]] || ! timeout 15 docker inspect "$PANEL_DB_CONTAINER" > /dev/null 2> "$SILENT_LOG"; then
+            discover_stacks
+            if [[ -n "$DISC_PANEL_DB" && "$PANEL_DB_CONTAINER" != "$DISC_PANEL_DB" ]]; then
+                debug_log "CONFIG" "panel-heal: PANEL_DB_CONTAINER '${PANEL_DB_CONTAINER:-<empty>}' → discovered '$DISC_PANEL_DB' (svc=$DISC_PANEL_DB_SVC)"
+                PANEL_DB_CONTAINER="$DISC_PANEL_DB"
+                PANEL_DB_SERVICE="${DISC_PANEL_DB_SVC:-$DISC_PANEL_DB}"
+                _ph_changed=1
+            fi
+        fi
+        if [[ "$_ph_changed" == "1" ]]; then
+            debug_log "CONFIG" "Persisting healed panel identity to config"
+            save_config
+        fi
     fi
     debug_log "CONFIG" "=== load_or_create_config completed ==="
 }
@@ -6118,8 +6326,9 @@ resolve_backup_target() {
         DB_SERVICE_NAME="$PANEL_DB_SERVICE"
         DEFAULT_BOT_PATH="$PANEL_PATH"
         DEFAULT_DB_CONTAINER="$PANEL_DB_CONTAINER"
-        BOT_CONTAINER_NAME="remnawave"      # panel app-контейнер (стандартное имя)
-        DEFAULT_BOT_CONTAINER="remnawave"
+        # panel app-контейнер: обнаруженное имя (кастомные имена ок), иначе стандартное
+        BOT_CONTAINER_NAME="${DISC_PANEL_APP:-remnawave}"
+        DEFAULT_BOT_CONTAINER="${DISC_PANEL_APP:-remnawave}"
         KEYWORDS=("${PANEL_KEYWORDS[@]}")
         [[ -n "${PANEL_DB_NAME:-}" ]] && DB_NAME="$PANEL_DB_NAME"
         # Панель бэкапим ЦЕЛИКОМ: per-file size-limit отключаем (0 = без лимита), иначе
@@ -6136,7 +6345,7 @@ resolve_backup_target() {
         DEFAULT_BOT_PATH="/opt/private-remnawave-telegram-shop-bot"
         DEFAULT_BOT_CONTAINER="rwp_shop"
         DEFAULT_DB_CONTAINER="rwp_shop_db"
-        KEYWORDS=("rwp_shop" "telegram-shop" "shop-bot" "shopbot")
+        KEYWORDS=("${BOT_KEYWORDS_DEFAULT[@]}")
         # NB: здесь восстанавливаем ТОЛЬКО хардкод-константы. Конфиг-переменные, которые panel-ветка
         # тоже трогает (MAX_FILE_SIZE_MB→0, DB_NAME→PANEL_DB_NAME), НЕЛЬЗЯ сбрасывать тут: для обычного
         # bot-запуска это затёрло бы пользовательские значения. Их «панельный» остаток обязан снять
@@ -6162,6 +6371,9 @@ _build_target_ssh() {
         _user="${BOT_SSH_USER:-root}"; _key="${BOT_SSH_KEY:-}"
     fi
     [[ "$_tr" != "ssh" || -z "$_host" ]] && { echo ""; return 0; }
+    # Парольный режим (SSH_PASSWORD_MODE=1, только panel_migrate_in): ключ игнорируется целиком —
+    # ни в префикс, ни в проверку существования файла.
+    [[ "${SSH_PASSWORD_MODE:-0}" == "1" ]] && _key=""
     # AUDIT v2: значения ниже собираются в строку _cmd, которую вызыватели word-split'ят
     # (`$_ssh "cmd"`). Whitelist по каждому полю блокирует инъекцию опций/команд (напр.
     # `-oProxyCommand=...`, `; rm -rf /`) и пробелы, ломающие путь к ключу. Ключ обязан существовать.
@@ -6178,9 +6390,17 @@ _build_target_ssh() {
     fi
     # user@host: если host уже содержит '@', не дублируем user.
     local _dest="$_host"; [[ "$_host" != *"@"* && -n "$_user" ]] && _dest="${_user}@${_host}"
-    local _cmd="ssh -p ${_port:-22}"
-    [[ -n "$_key" ]] && _cmd="$_cmd -i $_key"
-    _cmd="$_cmd -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new $_dest"
+    local _cmd
+    if [[ "${SSH_PASSWORD_MODE:-0}" == "1" ]]; then
+        # sshpass -e читает пароль из env SSHPASS (экспортирует panel_migrate_in) — в argv/ps
+        # пароль не попадает. BatchMode=yes запретил бы password-auth, поэтому его тут НЕТ.
+        _cmd="sshpass -e ssh -p ${_port:-22} -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1"
+        _cmd="$_cmd -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new $_dest"
+    else
+        _cmd="ssh -p ${_port:-22}"
+        [[ -n "$_key" ]] && _cmd="$_cmd -i $_key"
+        _cmd="$_cmd -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new $_dest"
+    fi
     echo "$_cmd"
 }
 
@@ -6193,15 +6413,797 @@ _shq() { local _q="${1//\'/\'\\\'\'}"; printf "'%s'" "$_q"; }
 # (офф-инсталлятор / eGames / Distilium). Эхо первого найденного с compose-файлом; пусто
 # если нет. Кандидаты: текущий PANEL_PATH, /opt/remnawave, /root/remnawave, /opt/stacks/remnawave.
 detect_panel_root() {
+    # ANTI-CYCLE (CRIT-фикс): кандидат — панель ТОЛЬКО если его compose реально декларирует
+    # панель (_compose_declares_panel), а не «любой каталог с compose-файлом». Иначе misconfig
+    # PANEL_PATH=/opt/rwp-shop самоподтверждался бы («панель равна сама себе») и все дальнейшие
+    # path/role-гарды identity-слоя строились бы на заражённом корне.
     local _d
     for _d in "${PANEL_PATH:-}" /opt/remnawave /root/remnawave /opt/stacks/remnawave; do
         [[ -z "$_d" || ! -d "$_d" ]] && continue
-        if [[ -f "$_d/docker-compose.yml" || -f "$_d/docker-compose.yaml" \
-              || -f "$_d/compose.yml" || -f "$_d/compose.yaml" ]]; then
+        if _compose_declares_panel "$_d"; then
             echo "$_d"; return 0
         fi
     done
     return 1
+}
+
+# =============================================================================
+# BOT RUNTIME RESOLVER — панель-независимый поиск РЕАЛЬНОГО бота
+# -----------------------------------------------------------------------------
+# На смешанном сервере (бот + панель на одной машине) strangler-резолв затирает
+# рабочий BOT_PATH панельным (/opt/remnawave). Bot-команды (up/down/status/logs/
+# upgrade) обязаны находить НАСТОЯЩУЮ установку бота независимо от BACKUP_TARGET и
+# НИКОГДА не действовать на панель. Эти помощники дают такой поиск + жёсткий guard.
+# Заполняют RB_PATH / RB_APP / RB_DB.
+# =============================================================================
+RB_PATH=""; RB_APP=""; RB_DB=""
+# Форс-состояние bind_bot_runtime_or_fail: при активном форсе (=1) save_config пишет ПРЕЖНЮЮ цель,
+# а unbind_bot_runtime восстанавливает both-контекст (см. bind/unbind ниже).
+_BOTRT_FORCED=0; _BOTRT_PREV_TARGET=""; _BOTRT_PREV_SECONDARY=""
+# Полный путь ПОСЛЕДНЕГО успешно созданного архива (ставит _backup_remote_target) — детерминированная
+# передача вызывателю (migrate) вместо гоночного поиска по mtime.
+LAZ_LAST_BACKUP_FILE=""
+# Парольный SSH-режим (миграция панели без ключей): 1 = _build_target_ssh строит префикс
+# `sshpass -e ssh ...` — пароль ТОЛЬКО в env SSHPASS (не в argv/ps/логах). Ставит исключительно
+# panel_migrate_in (интерактивный выбор); сбрасывается в _mig_restore_env и RETURN-trap'е.
+SSH_PASSWORD_MODE=0
+# label-fallback скана: разрешён только интерактивному выбору; FOUND_VIA_FALLBACK=1 помечает догадки
+SCAN_ALLOW_LABEL_FALLBACK=0; FOUND_VIA_FALLBACK=0
+
+# _compose_declares_panel <dir>: rc=0, если compose в каталоге ДЕКЛАРИРУЕТ панель — образ
+# remnawave/backend ЛИБО container_name: remnawave-db. НЕ subscription-page (на живом сервере
+# subscription-page живёт в проекте БОТА — включение ложно классифицировало бы каталог бота).
+# НЕ голый сервис-ключ (неотличим от depends_on-маппинга). Единственный контент-признак панели.
+_compose_declares_panel() {
+    local _d="$1" _cf
+    _cf=$(_compose_in "$_d") || return 1
+    grep -qE 'image:[[:space:]]*[^[:space:]]*remnawave/backend|container_name:[[:space:]]*remnawave-db([[:space:]]|$)' "$_cf" 2> "$SILENT_LOG"
+}
+
+# _live_panel_dir: working_dir ЖИВОГО контейнера remnawave/backend (docker labels) — единственный
+# конфиг-независимый источник «где панель». Кэш на процесс ("-" = проверено, панели нет).
+# rc=1, если живой панели нет / docker недоступен.
+_LPD_CACHE=""
+_live_panel_dir() {
+    if [[ -z "$_LPD_CACHE" ]]; then
+        local _d
+        # RUNNING приоритетно: exited-останки теста (docker compose up в /root/test) не должны
+        # затенять живую панель — иначе ложные отказы гарда и неверный PANEL-HEAL.
+        _d=$(timeout 15 docker ps -a --format '{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project.working_dir"}}' 2> "$SILENT_LOG" \
+            | awk -F'|' '$1 ~ /remnawave\/backend/ && $3 != "" { if ($2=="running") {print $3; found=1; exit}; if (!alt) alt=$3 } END { if (!found && alt) print alt }')
+        if [[ -n "$_d" && -d "$_d" ]]; then
+            _LPD_CACHE="$_d"
+        elif timeout 10 docker info > /dev/null 2>&1; then
+            _LPD_CACHE="-"   # docker жив, панели нет — честный негатив
+        else
+            _LPD_CACHE=""    # docker лежит — НЕ кэшируем, следующая проба перепроверит
+        fi
+    fi
+    [[ -z "$_LPD_CACHE" || "$_LPD_CACHE" == "-" ]] && return 1
+    echo "$_LPD_CACHE"
+}
+
+# Корень панели «сейчас»: (1) живой контейнер remnawave/backend (конфиг-независим),
+# (2) контент-валидированный detect, (3) конфиг-дефолт (fresh-server: панели ещё нет).
+_panel_root_now() {
+    _live_panel_dir 2>/dev/null && return 0
+    detect_panel_root 2>/dev/null || echo "${PANEL_PATH:-/opt/remnawave}"
+}
+
+# _is_db_image <image>: rc=0 если образ — БД-семейство (единый паттерн для role/discover/billing).
+_is_db_image() {
+    case "$1" in
+        postgres*|*"/postgres"*|postgis*|*timescale*|*pgvector*) return 0 ;;
+    esac
+    return 1
+}
+
+# _db_host_of_app <app-container>: ХОСТ БД из DATABASE_URL приложения (= compose-сервис его БД).
+# ИМЯ-НЕЗАВИСИМЫЙ источник: как бы пользователь ни назвал контейнеры, приложение само знает,
+# к какой БД подключено. СЕКРЕТЫ НЕ ПЕЧАТАЕМ: наружу выходит только hostname (после '@', до ':/').
+_db_host_of_app() {
+    local _n="$1" _url _h
+    [[ -z "$_n" ]] && return 1
+    _url=$(timeout 15 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$_n" 2> "$SILENT_LOG" \
+        | grep -m1 -E '^(DATABASE_URL|POSTGRES_URL|DB_URL)=')
+    [[ -z "$_url" ]] && return 1
+    # RFC3986-аккуратно: сначала authority (между :// и первым /), потом ПОСЛЕДНИЙ '@' —
+    # пароль может содержать '@'; ни один байт userinfo не должен попасть наружу/в кэш.
+    _h="${_url#*://}"; [[ "$_h" == "$_url" ]] && return 1
+    _h="${_h%%/*}"; _h="${_h%%\?*}"
+    [[ "$_h" == *@* ]] || return 1
+    _h="${_h##*@}"; _h="${_h%%:*}"
+    [[ -z "$_h" ]] && return 1
+    echo "$_h"
+}
+
+# _app_by_image <regex>: "container|dir" ПЕРВОГО контейнера с образом по regex, RUNNING приоритетно
+# (exited-останки эксперимента не должны затенять живой стек). rc=1 — нет / docker недоступен.
+_app_by_image() {
+    local _re="$1" _out
+    _out=$(timeout 15 docker ps -a --format '{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project.working_dir"}}' 2> "$SILENT_LOG" \
+        | awk -F'|' -v re="$_re" '$2 ~ re { if ($3=="running") {print $1"|"$4; found=1; exit} ; if (!alt) alt=$1"|"$4 } END { if (!found && alt) print alt }')
+    [[ -z "$_out" ]] && return 1
+    echo "$_out"
+}
+
+# Кэш-резолверы "svc|app_dir" БД панели/биллинга (DATABASE_URL приложения + проект приложения —
+# сервис-матч ОБЯЗАН быть скоуплен проектом, иначе коллизия имён сервисов ('db' есть у всех)
+# классифицировала бы чужую БД). "-" = проверено, не определить. НЕ кэшируем при лежащем docker.
+# ВАЖНО: кэши наполняются только в родительском шелле — load_or_create_config греет их напрямую;
+# $(...)-вызовы наследуют прогретые значения.
+_PANEL_DBSVC_CACHE=""; _BILL_DBSVC_CACHE=""
+_svc_resolver_common() { # $1=image-regex, echo "svc|dir" | "-"
+    local _appdir _app _dir _svc
+    if ! _appdir=$(_app_by_image "$1"); then
+        # различаем «нет приложения» и «docker лежит» — второе НЕ кэшируем (перепроба)
+        timeout 10 docker info > /dev/null 2>&1 || { echo ""; return 1; }
+        echo "-"; return 0
+    fi
+    _app="${_appdir%%|*}"; _dir="${_appdir#*|}"
+    _svc=$(_db_host_of_app "$_app") || { echo "-"; return 0; }
+    echo "${_svc}|${_dir}"
+}
+_panel_db_service() {
+    [[ -z "$_PANEL_DBSVC_CACHE" ]] && _PANEL_DBSVC_CACHE=$(_svc_resolver_common 'remnawave/backend')
+    [[ -z "$_PANEL_DBSVC_CACHE" || "$_PANEL_DBSVC_CACHE" == "-" ]] && return 1
+    echo "${_PANEL_DBSVC_CACHE%%|*}"
+}
+_panel_app_dir() {
+    [[ -z "$_PANEL_DBSVC_CACHE" ]] && _PANEL_DBSVC_CACHE=$(_svc_resolver_common 'remnawave/backend')
+    [[ -z "$_PANEL_DBSVC_CACHE" || "$_PANEL_DBSVC_CACHE" == "-" || "$_PANEL_DBSVC_CACHE" != *"|"* ]] && return 1
+    echo "${_PANEL_DBSVC_CACHE#*|}"
+}
+_billing_db_service() {
+    [[ -z "$_BILL_DBSVC_CACHE" ]] && _BILL_DBSVC_CACHE=$(_svc_resolver_common 'mishkatik/infra-billing')
+    [[ -z "$_BILL_DBSVC_CACHE" || "$_BILL_DBSVC_CACHE" == "-" ]] && return 1
+    echo "${_BILL_DBSVC_CACHE%%|*}"
+}
+_billing_app_dir() {
+    [[ -z "$_BILL_DBSVC_CACHE" ]] && _BILL_DBSVC_CACHE=$(_svc_resolver_common 'mishkatik/infra-billing')
+    [[ -z "$_BILL_DBSVC_CACHE" || "$_BILL_DBSVC_CACHE" == "-" || "$_BILL_DBSVC_CACHE" != *"|"* ]] && return 1
+    echo "${_BILL_DBSVC_CACHE#*|}"
+}
+
+# 0, если ИМЯ контейнера — ПАНЕЛЬНОЕ (точные имена стека Remnawave, а не любой remnawave*-префикс).
+# Важно: легитимный бот upstream может называться remnawave-telegram-shop* — он НЕ панель и не должен
+# заанулиться (регрессия из-за широкого `== remnawave*`). Совпадение только по точным панельным именам.
+_is_panel_container() {
+    local _n="$1"; [[ -z "$_n" ]] && return 1
+    case "$_n" in
+        remnawave|remnawave-db|remnawave-redis|remnawave-nginx|remnawave-subscription-page|remnawave-telegram-mini-app) return 0 ;;
+    esac
+    [[ -n "${PANEL_DB_CONTAINER:-}" && "$_n" == "$PANEL_DB_CONTAINER" ]] && return 0
+    # Обнаруженные (имя-независимые) панельные контейнеры — кастомные имена тоже панель
+    [[ -n "${DISC_PANEL_APP:-}" && "$_n" == "$DISC_PANEL_APP" ]] && return 0
+    [[ -n "${DISC_PANEL_DB:-}" && "$_n" == "$DISC_PANEL_DB" ]] && return 0
+    # Живая роль (образ+проект): ловит любое имя; absent/unknown → не панель (sanitize не деструктивен)
+    case "$(_container_role "$_n" 2>/dev/null)" in
+        panel-app|panel-db|panel-svc) return 0 ;;
+    esac
+    return 1
+}
+
+# 0, если два пути указывают на один каталог (через realpath, устойчиво к симлинкам/слешам).
+_same_path() {
+    local a b
+    a=$(readlink -f "$1" 2>/dev/null || echo "$1")
+    b=$(readlink -f "$2" 2>/dev/null || echo "$2")
+    [[ -n "$a" && "$a" == "$b" ]]
+}
+
+# Эхо первого compose-файла в каталоге $1 (все 4 канонических имени); rc=1 если нет.
+_compose_in() {
+    local d="$1" f
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        [[ -f "$d/$f" ]] && { echo "$d/$f"; return 0; }
+    done
+    return 1
+}
+
+# 0, если каталог $1 — ПАНЕЛЬ: либо его compose ДЕКЛАРИРУЕТ панель (контент — главный признак,
+# анти-цикл), либо совпадает с panel-root (нужен для fresh-server, где compose ещё не приехал;
+# после ANTI-CYCLE-фикса detect_panel_root корень контент-валидирован либо live, конфиг-фолбэк
+# срабатывает только когда панели нет нигде — тогда same_path безопасно-консервативен).
+_dir_is_panel() {
+    local d="$1" p; [[ -z "$d" ]] && return 1
+    _compose_declares_panel "$d" && return 0
+    p=$(_panel_root_now)
+    _same_path "$d" "$p" && return 0
+    return 1
+}
+
+# 0, если каталог $1 — валидная НЕ-панельная установка (есть compose и это не панель).
+_dir_is_bot() {
+    local d="$1"; [[ -z "$d" || ! -d "$d" ]] && return 1
+    _compose_in "$d" > /dev/null || return 1
+    _dir_is_panel "$d" && return 1
+    return 0
+}
+
+# resolve_bot_runtime: находит РЕАЛЬНЫЙ бот (путь+app+db) → RB_PATH/RB_APP/RB_DB. rc=1 если бота нет.
+# Порядок: (1) текущий BOT_PATH если бот-валиден и не панель; (2) docker-скан по бот-ключам
+# (KEYWORDS мог быть панельным — временно форсим бот-набор); (3) статические кандидаты (ОБЕ формы
+# rwp-shop/rwp_shop — на живом сервере каталог = /opt/rwp-shop с дефисом). Панельные пути отсеиваются.
+resolve_bot_runtime() {
+    RB_PATH=""; RB_APP=""; RB_DB=""
+    local _panel; _panel=$(_panel_root_now)
+
+    if _dir_is_bot "$BOT_PATH" && ! _same_path "$BOT_PATH" "$_panel"; then
+        RB_PATH="$BOT_PATH"
+        _is_panel_container "$BOT_CONTAINER_NAME" || RB_APP="$BOT_CONTAINER_NAME"
+    fi
+
+    if [[ -z "$RB_PATH" ]]; then
+        # scan_system_for_bot затирает и KEYWORDS, и FOUND_* — снимаем/возвращаем ОБА набора, иначе
+        # резолвер оставил бы вызывателю свои scan-результаты (latent foot-gun для будущих читателей FOUND_*).
+        local _sv_kw=("${KEYWORDS[@]}")
+        local _sv_fp=("${FOUND_PATHS[@]}") _sv_fb=("${FOUND_BOTS[@]}")
+        local _sv_fpath="${FOUND_PATH:-}" _sv_fbot="${FOUND_BOT:-}" _sv_fdb="${FOUND_DB:-}"
+        KEYWORDS=("${BOT_KEYWORDS_DEFAULT[@]}")
+        scan_system_for_bot
+        local _i
+        for _i in "${!FOUND_PATHS[@]}"; do
+            if _dir_is_bot "${FOUND_PATHS[$_i]}" && ! _same_path "${FOUND_PATHS[$_i]}" "$_panel"; then
+                RB_PATH="${FOUND_PATHS[$_i]}"; RB_APP="${FOUND_BOTS[$_i]}"; break
+            fi
+        done
+        KEYWORDS=("${_sv_kw[@]}")
+        FOUND_PATHS=("${_sv_fp[@]}"); FOUND_BOTS=("${_sv_fb[@]}")
+        FOUND_PATH="$_sv_fpath"; FOUND_BOT="$_sv_fbot"; FOUND_DB="$_sv_fdb"
+    fi
+
+    if [[ -z "$RB_PATH" ]]; then
+        local _d
+        for _d in /opt/rwp-shop /opt/rwp_shop /opt/private-remnawave-telegram-shop-bot \
+                  /opt/remnawave-telegram-shop /root/rwp-shop /root/rwp_shop; do
+            if _dir_is_bot "$_d" && ! _same_path "$_d" "$_panel"; then RB_PATH="$_d"; break; fi
+        done
+    fi
+
+    [[ -z "$RB_PATH" ]] && { debug_log "BOTRT" "real bot not found (panel=$_panel)"; return 1; }
+
+    # DB-контейнер бота определяем ПЕРВЫМ — чтобы затем явно исключить его при выборе app (иначе под
+    # Compose v2 default-именами '<proj>-db-1' end-anchor '-db$' не срабатывал и db мог стать app).
+    RB_DB=$(find_db_container_for_path "$RB_PATH" 2> "$SILENT_LOG")
+    [[ -z "$RB_DB" ]] && ! _is_panel_container "$DB_CONTAINER_NAME" && RB_DB="$DB_CONTAINER_NAME"
+    # app-контейнер: если пуст/панельный — берём НЕ-инфраструктурный сервис из compose ps.
+    # DB-токен по границам слова (ловит и 'x_db', 'x-db', 'x-db-1'); плюс явное исключение RB_DB.
+    if [[ -z "$RB_APP" ]] || _is_panel_container "$RB_APP"; then
+        local _rbdb_re="${RB_DB:-__none__}"
+        RB_APP=$( cd "$RB_PATH" 2> "$SILENT_LOG" && \
+            docker compose ps --format '{{.Name}}' 2> "$SILENT_LOG" \
+            | grep -vxF "$_rbdb_re" \
+            | grep -viE 'remnawave|postgres|(^|[-_])db([-_]|$)|redis|nginx|forecast|kb_db|xray|checker|subscription|mini-app|proxy' \
+            | head -1 )
+        [[ -z "$RB_APP" ]] && RB_APP="rwp_shop"
+    fi
+    debug_log "BOTRT" "resolved real bot: path=$RB_PATH app=$RB_APP db=$RB_DB (panel=$_panel)"
+    return 0
+}
+
+# bind_bot_runtime_or_fail <label>: привязывает рабочие переменные к РЕАЛЬНОМУ боту для bot-команды.
+# rc=0 — привязано (BACKUP_TARGET форсится в bot на время команды, DB_NAME/USER сбрасываются под
+# ре-деривацию из .env бота); rc=1 — бота нет или он совпал с панелью (жёсткий отказ, панель не трогаем).
+bind_bot_runtime_or_fail() {
+    local _action="${1:-операция}"
+    if ! resolve_bot_runtime; then
+        print_message "ERROR" "Установка бота не найдена на этом сервере — «$_action» отклонена."
+        echo "  Это сервер панели без бота? Для панели: lazarus backup db | full | restore." >&2
+        echo "  Если бот есть — укажите путь: Настройки → «Что бэкапить», либо BOT_PATH в config.env." >&2
+        log_message "ERROR" "bind_bot_runtime: real bot not found ($_action)"
+        return 1
+    fi
+    local _panel; _panel=$(_panel_root_now)
+    if _same_path "$RB_PATH" "$_panel" || _dir_is_panel "$RB_PATH"; then
+        print_message "ERROR" "Отказ: путь бота совпал с панелью ($RB_PATH) — «$_action» заблокирована."
+        log_message "ERROR" "bind_bot_runtime: resolved path == panel ($RB_PATH) — refuse"
+        return 1
+    fi
+    # Запоминаем ПРЕЖНЮЮ цель до форса — чтобы (а) долгоживущий вызыватель (интерактивное меню)
+    # мог восстановить both-контекст через unbind_bot_runtime, (б) save_config во время активного
+    # bind писал на диск ИСХОДНУЮ цель (panel+bot), а не транзиентный bot-only (иначе один «Обновить
+    # бота» из меню в both-режиме молча выкинул бы панель из последующих бэкапов — HIGH-регрессия).
+    _BOTRT_FORCED=1
+    _BOTRT_PREV_TARGET="$BACKUP_TARGET"; _BOTRT_PREV_SECONDARY="$BACKUP_SECONDARY"
+    # Форсим bot-контекст на время команды: get_db_name/get_db_user пойдут в bot-ветку и перечитают
+    # POSTGRES_DB/USER из .env бота (в panel-режиме они бы вернули PANEL_DB_NAME).
+    BACKUP_TARGET="bot"; BACKUP_SECONDARY=""; BACKUP_PREFIX="lazarus"
+    BOT_PATH="$RB_PATH"; BOT_CONTAINER_NAME="$RB_APP"; DB_CONTAINER_NAME="$RB_DB"
+    # №8: снимок DB-полей ДО зануления — unbind_bot_runtime обязан их вернуть, иначе
+    # последующий save_config персистил бы DB_USER=""/DB_NAME="" (потеря overrides).
+    _BOTRT_PREV_DB_SERVICE="$DB_SERVICE_NAME"; _BOTRT_PREV_DB_NAME="$DB_NAME"; _BOTRT_PREV_DB_USER="$DB_USER"
+    DB_SERVICE_NAME=""; DB_NAME=""; DB_USER=""
+    KEYWORDS=("${BOT_KEYWORDS_DEFAULT[@]}")
+    DEFAULT_BOT_CONTAINER="rwp_shop"; DEFAULT_DB_CONTAINER="rwp_shop_db"
+    debug_log "BOTRT" "bound bot runtime for '$_action': path=$BOT_PATH app=$BOT_CONTAINER_NAME db=$DB_CONTAINER_NAME (prev target=$_BOTRT_PREV_TARGET/$_BOTRT_PREV_SECONDARY)"
+    return 0
+}
+
+# unbind_bot_runtime: снимает форс bind'а — восстанавливает ПРЕЖНИЕ BACKUP_TARGET/SECONDARY и
+# перерезолвит рабочие переменные. Обязателен для ДОЛГОЖИВУЩИХ вызывателей (интерактивное меню),
+# иначе bot-контекст утечёт в следующие итерации. Для одноразового CLI (процесс завершается) — no-op.
+# Идемпотентно: если bind не форсил (нет бота / отказ) — ничего не делает.
+unbind_bot_runtime() {
+    [[ "${_BOTRT_FORCED:-0}" != "1" ]] && return 0
+    BACKUP_TARGET="$_BOTRT_PREV_TARGET"; BACKUP_SECONDARY="$_BOTRT_PREV_SECONDARY"
+    # №8: возвращаем DB-поля, занулённые bind'ом (снимок _BOTRT_PREV_DB_*) — ДО resolve,
+    # чтобы panel-ветка могла штатно переопределить DB_NAME из PANEL_DB_NAME поверх.
+    DB_SERVICE_NAME="${_BOTRT_PREV_DB_SERVICE:-}"; DB_NAME="${_BOTRT_PREV_DB_NAME:-}"; DB_USER="${_BOTRT_PREV_DB_USER:-}"
+    [[ -z "$DB_USER" ]] && DB_USER="postgres"
+    _BOTRT_FORCED=0
+    resolve_backup_target
+    debug_log "BOTRT" "unbound bot runtime: restored target=$BACKUP_TARGET/$BACKUP_SECONDARY"
+    return 0
+}
+
+# =============================================================================
+# STACK IDENTITY LAYER — роли контейнеров и защита от чужого стека
+# -----------------------------------------------------------------------------
+# На смешанном сервере живут ТРИ стека: панель (/opt/remnawave: remnawave + remnawave-db +
+# redis/nginx), infra-billing (infra-billing + infra-billing-db, в проекте панели) и бот
+# (/opt/rwp-shop: rwp_shop + rwp_shop_db). Ошибка конфига (напр. DB_CONTAINER_NAME=remnawave-db
+# при цели bot) не должна приводить к DROP/rsync/volume rm по ЧУЖОМУ стеку. Роль определяем по
+# ОБРАЗУ и compose-проекту (labels), а не по именам из конфига — конфиг может врать.
+# =============================================================================
+
+# _container_role <name>: echo роль контейнера:
+#   absent | panel-app | panel-db | panel-svc | billing-app | billing-db | external
+# billing проверяется ДО panel-project (infra-billing-db тоже живёт в проекте панели) и по
+# ПАТТЕРНУ имени/сервиса (не по равенству конфиг-переменной — иначе циклическая логика:
+# misconfig PANEL_BILLING_DB_CONTAINER=remnawave-db классифицировался бы как billing).
+_container_role() {
+    local _n="$1"
+    [[ -z "$_n" ]] && { echo "absent"; return 1; }
+    local _ins
+    _ins=$(timeout 15 docker inspect --format '{{.Config.Image}}|{{ index .Config.Labels "com.docker.compose.project.working_dir" }}|{{ index .Config.Labels "com.docker.compose.service" }}' "$_n" 2> "$SILENT_LOG")
+    if [[ -z "$_ins" ]]; then
+        # Различаем «контейнера нет» (absent — допустимо для fresh/migrate) и «docker
+        # недоступен/завис» (unknown — гарды обязаны fail-closed, роль НЕ подтверждена).
+        if timeout 10 docker info > /dev/null 2>&1; then echo "absent"; return 1; fi
+        echo "unknown"; return 2
+    fi
+    local _img="${_ins%%|*}" _rest="${_ins#*|}"
+    local _dir="${_rest%%|*}" _svc="${_rest#*|}"
+    case "$_img" in
+        *remnawave/backend*)        echo "panel-app";   return 0 ;;
+        *mishkatik/infra-billing*)  echo "billing-app"; return 0 ;;
+    esac
+    # ИМЯ-НЕЗАВИСИМО (authoritative): compose-сервис БД, к которому реально подключено
+    # приложение (DATABASE_URL), СКОУПЛЕННЫЙ проектом приложения — сервис 'db' есть у всех
+    # проектов, без проверки working_dir коллизия имён классифицировала бы ЧУЖУЮ БД.
+    if _is_db_image "$_img" && [[ -n "$_svc" && -n "$_dir" ]]; then
+        local _bsvc _psvc _bdir _pdir
+        _bsvc=$(_billing_db_service 2>/dev/null) || _bsvc=""
+        _psvc=$(_panel_db_service 2>/dev/null) || _psvc=""
+        _bdir=$(_billing_app_dir 2>/dev/null) || _bdir=""
+        _pdir=$(_panel_app_dir 2>/dev/null) || _pdir=""
+        if [[ -n "$_bsvc" && "$_svc" == "$_bsvc" ]] && { [[ -z "$_bdir" ]] || _same_path "$_dir" "$_bdir"; }; then
+            echo "billing-db"; return 0
+        fi
+        if [[ -n "$_psvc" && "$_svc" == "$_psvc" ]] && { [[ -z "$_pdir" ]] || _same_path "$_dir" "$_pdir"; }; then
+            echo "panel-db"; return 0
+        fi
+    fi
+    # billing-db (fallback): по паттерну имени/сервиса + БД-образ
+    if [[ "$_n" == *billing* || "$_svc" == *billing* ]]; then
+        _is_db_image "$_img" && { echo "billing-db"; return 0; }
+    fi
+    # ANTI-CYCLE: корень панели — live-first (_panel_root_now предпочитает labels живого
+    # remnawave/backend), конфиг-фолбэк только когда панели нет нигде.
+    local _proot; _proot=$(_panel_root_now)
+    if [[ -n "$_dir" ]] && _same_path "$_dir" "$_proot"; then
+        if _is_db_image "$_img"; then echo "panel-db"; else echo "panel-svc"; fi
+        return 0
+    fi
+    echo "external"; return 0
+}
+
+# discover_stacks: одно сканирование docker ps -a → обнаруженные стеки в DISC_*-глобалы.
+# Панель/billing — по образам; бот — панель-независимым резолвером. Read-only.
+DISC_PANEL_DIR=""; DISC_PANEL_APP=""; DISC_PANEL_DB=""; DISC_PANEL_DB_SVC=""
+DISC_BILLING_APP=""; DISC_BILLING_DB=""
+DISC_BOT_DIR=""; DISC_BOT_APP=""; DISC_BOT_DB=""
+discover_stacks() {
+    DISC_PANEL_DIR=""; DISC_PANEL_APP=""; DISC_PANEL_DB=""; DISC_PANEL_DB_SVC=""
+    DISC_BILLING_APP=""; DISC_BILLING_DB=""
+    DISC_BOT_DIR=""; DISC_BOT_APP=""; DISC_BOT_DB=""
+    # Свежая топология — сбрасываем процессные кэши (контейнеры могли смениться mid-process)
+    _LPD_CACHE=""; _PANEL_DBSVC_CACHE=""; _BILL_DBSVC_CACHE=""
+    local _n _img _dir _svc
+    local _all; _all=$(timeout 20 docker ps -a --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.service"}}' 2> "$SILENT_LOG")
+    while IFS='|' read -r _n _img _dir _svc; do
+        [[ -z "$_n" ]] && continue
+        case "$_img" in
+            *remnawave/backend*)
+                DISC_PANEL_APP="$_n"
+                [[ -n "$_dir" && -d "$_dir" ]] && DISC_PANEL_DIR="$_dir" ;;
+            *mishkatik/infra-billing*) DISC_BILLING_APP="$_n" ;;
+        esac
+    done <<< "$_all"
+    # БД панели/биллинга — ИМЯ-НЕЗАВИСИМО: compose-сервис из DATABASE_URL приложения (кастомные
+    # имена контейнеров не мешают). Fallback: billing по паттерну имени, панельная — по проекту.
+    local _psvc _bsvc _pdir_a _bdir_a
+    _psvc=$(_panel_db_service 2>/dev/null) || _psvc=""
+    _bsvc=$(_billing_db_service 2>/dev/null) || _bsvc=""
+    _pdir_a=$(_panel_app_dir 2>/dev/null) || _pdir_a=""
+    _bdir_a=$(_billing_app_dir 2>/dev/null) || _bdir_a=""
+    local _proot="${DISC_PANEL_DIR:-$(_panel_root_now)}"
+    while IFS='|' read -r _n _img _dir _svc; do
+        [[ -z "$_n" ]] && continue
+        _is_db_image "$_img" || continue
+        # сервис-матч СКОУПЛЕН проектом приложения (коллизия имён сервисов 'db' между проектами)
+        if [[ -n "$_bsvc" && "$_svc" == "$_bsvc" ]] && { [[ -z "$_bdir_a" ]] || _same_path "$_dir" "$_bdir_a"; }; then
+            [[ -z "$DISC_BILLING_DB" ]] && DISC_BILLING_DB="$_n"
+        elif [[ -n "$_psvc" && "$_svc" == "$_psvc" ]] && { [[ -z "$_pdir_a" ]] || _same_path "$_dir" "$_pdir_a"; }; then
+            [[ -z "$DISC_PANEL_DB" ]] && { DISC_PANEL_DB="$_n"; DISC_PANEL_DB_SVC="$_svc"; }
+        fi
+    done <<< "$_all"
+    while IFS='|' read -r _n _img _dir _svc; do
+        [[ -z "$_n" ]] && continue
+        _is_db_image "$_img" || continue
+        # fallback-эвристики — только если authoritative не дал ответа
+        if [[ -z "$DISC_BILLING_DB" && "$_n" == *billing* ]]; then DISC_BILLING_DB="$_n"; fi
+        # dir-fallback панельной БД — только при РЕАЛЬНОМ признаке панели (живой app или
+        # panel-декларирующий compose), не по голому конфиг-эху PANEL_PATH
+        if [[ -z "$DISC_PANEL_DB" && "$_n" != *billing* && -n "$_dir" ]] && _same_path "$_dir" "$_proot" \
+           && { [[ -n "$DISC_PANEL_APP" ]] || _compose_declares_panel "$_proot"; }; then
+            [[ "$_n" != "$DISC_BILLING_DB" ]] && { DISC_PANEL_DB="$_n"; DISC_PANEL_DB_SVC="${_svc:-$_n}"; }
+        fi
+    done <<< "$_all"
+    # Бот — существующим панель-независимым резолвером (не мутирует рабочие переменные)
+    if resolve_bot_runtime; then
+        DISC_BOT_DIR="$RB_PATH"; DISC_BOT_APP="$RB_APP"; DISC_BOT_DB="$RB_DB"
+    fi
+    debug_log "DISCOVER" "panel: dir=$DISC_PANEL_DIR app=$DISC_PANEL_APP db=$DISC_PANEL_DB | billing: app=$DISC_BILLING_APP db=$DISC_BILLING_DB | bot: dir=$DISC_BOT_DIR app=$DISC_BOT_APP db=$DISC_BOT_DB"
+    return 0
+}
+
+# assert_target_identity <операция>: ЖЁСТКИЙ гард перед деструктивной операцией — рабочие
+# переменные активной цели обязаны указывать на СВОЙ стек. Любое пересечение (bot→панель,
+# panel→бот, main-db↔billing-db) = отказ с понятной ошибкой, а не выполнение по чужому стеку.
+# absent-контейнер допускается для panel (fresh server / миграция: контейнер поднимут позже).
+assert_target_identity() {
+    local _op="${1:-операция}" _role
+    _role=$(_container_role "$DB_CONTAINER_NAME")
+    # FAIL-CLOSED: docker недоступен/завис → роль НЕ подтверждена. Пропускать деструктив
+    # по неверифицированной цели нельзя (absent ≠ unknown: absent — контейнера нет, это ок
+    # для fresh/migrate; unknown — проверка не выполнилась).
+    if [[ "$_role" == "unknown" ]]; then
+        print_message "ERROR" "ГАРД ($_op): docker недоступен — идентичность цели НЕ подтверждена. Отказ."
+        log_message "ERROR" "identity guard ($_op): docker unavailable (role=unknown) — fail-closed"
+        return 1
+    fi
+    if [[ "$BACKUP_TARGET" == "panel" ]]; then
+        # ANTI-CYCLE (positive-проверка): существующий compose по пути цели обязан САМ
+        # декларировать панель. Старый чек (_dir_is_bot) был тавтологией: «панель равна сама
+        # себе» через PANEL_PATH-заражённый корень. Пустой/несуществующий каталог — ок (fresh).
+        if [[ -d "$BOT_PATH" ]] && _compose_in "$BOT_PATH" > /dev/null && ! _compose_declares_panel "$BOT_PATH"; then
+            print_message "ERROR" "ГАРД ($_op): compose по пути '$BOT_PATH' НЕ декларирует панель (чужой стек). Отказ."
+            log_message "ERROR" "identity guard ($_op): panel target but compose at '$BOT_PATH' is not the panel"
+            return 1
+        fi
+        # Live-кросс-чек: если ЖИВАЯ панель (labels remnawave/backend) существует и стоит в
+        # ДРУГОМ каталоге — конфиг врёт, отказ (единственный конфиг-независимый источник).
+        local _lpd
+        if _lpd=$(_live_panel_dir) && ! _same_path "$BOT_PATH" "$_lpd"; then
+            print_message "ERROR" "ГАРД ($_op): живая панель в '$_lpd', а цель настроена на '$BOT_PATH'. Отказ."
+            log_message "ERROR" "identity guard ($_op): live panel at '$_lpd' but target path '$BOT_PATH'"
+            return 1
+        fi
+        case "$_role" in
+            billing-db|billing-app)
+                print_message "ERROR" "ГАРД ($_op): '$DB_CONTAINER_NAME' — это infra-billing, НЕ главная БД панели. Отказ."
+                log_message "ERROR" "identity guard ($_op): panel target but DB container role=$_role"
+                return 1 ;;
+            panel-app|panel-svc)
+                print_message "ERROR" "ГАРД ($_op): '$DB_CONTAINER_NAME' — не postgres панели (role=$_role). Отказ."
+                log_message "ERROR" "identity guard ($_op): panel target but DB container role=$_role"
+                return 1 ;;
+            external)
+                print_message "ERROR" "ГАРД ($_op): '$DB_CONTAINER_NAME' не принадлежит проекту панели. Отказ."
+                log_message "ERROR" "identity guard ($_op): panel target but DB container is external"
+                return 1 ;;
+        esac
+        # panel-db | absent → ок
+    else
+        # Цель bot: путь и контейнеры НЕ должны быть панелью/биллингом
+        if _dir_is_panel "$BOT_PATH"; then
+            print_message "ERROR" "ГАРД ($_op): путь цели '$BOT_PATH' — это ПАНЕЛЬ. Отказ."
+            log_message "ERROR" "identity guard ($_op): bot target but path is the panel"
+            return 1
+        fi
+        # Live-кросс-чек: путь бота не должен совпасть с каталогом ЖИВОЙ панели.
+        local _lpd
+        if _lpd=$(_live_panel_dir) && _same_path "$BOT_PATH" "$_lpd"; then
+            print_message "ERROR" "ГАРД ($_op): путь цели '$BOT_PATH' — каталог живой ПАНЕЛИ. Отказ."
+            log_message "ERROR" "identity guard ($_op): bot target path == live panel dir"
+            return 1
+        fi
+        case "$_role" in
+            panel-db|panel-app|panel-svc)
+                print_message "ERROR" "ГАРД ($_op): контейнер '$DB_CONTAINER_NAME' принадлежит ПАНЕЛИ (role=$_role). Отказ."
+                log_message "ERROR" "identity guard ($_op): bot target but DB container role=$_role"
+                return 1 ;;
+            billing-db|billing-app)
+                print_message "ERROR" "ГАРД ($_op): контейнер '$DB_CONTAINER_NAME' — это infra-billing. Отказ."
+                log_message "ERROR" "identity guard ($_op): bot target but DB container role=$_role"
+                return 1 ;;
+        esac
+        local _approle; _approle=$(_container_role "$BOT_CONTAINER_NAME")
+        case "$_approle" in
+            unknown)
+                print_message "ERROR" "ГАРД ($_op): docker недоступен — идентичность app-контейнера НЕ подтверждена. Отказ."
+                log_message "ERROR" "identity guard ($_op): app container role=unknown — fail-closed"
+                return 1 ;;
+            panel-app|panel-db|panel-svc|billing-app|billing-db)
+                print_message "ERROR" "ГАРД ($_op): app-контейнер '$BOT_CONTAINER_NAME' принадлежит панели/биллингу (role=$_approle). Отказ."
+                log_message "ERROR" "identity guard ($_op): bot target but app container role=$_approle"
+                return 1 ;;
+        esac
+    fi
+    debug_log "GUARD" "identity OK ($_op): target=$BACKUP_TARGET path=$BOT_PATH db=$DB_CONTAINER_NAME role=$_role"
+    return 0
+}
+
+# =============================================================================
+# PANEL MIGRATION — перенос Remnawave-панели со СТАРОГО сервера на ЭТОТ (pull-режим)
+# -----------------------------------------------------------------------------
+# Запускается на НОВОМ сервере. Источник трогается ТОЛЬКО read-only (pg_dump/tar по SSH) —
+# старая панель продолжает работать до ручного cutover'а. Поток:
+#   preflight(локально+удалённо) → pull full-бэкап (dir+db+globals+billing) → verify →
+#   restore локально → post-проверки → чеклист cutover (DNS/NetBird/CertWarden — вручную).
+# =============================================================================
+panel_migrate_in() {
+    # Гигиена пароля: SSHPASS и парольный режим живут ТОЛЬКО внутри этой функции —
+    # RETURN-trap зачищает их на ЛЮБОМ return-пути (в т.ч. ранние отказы/отмены).
+    trap 'unset SSHPASS; SSH_PASSWORD_MODE=0' RETURN
+    # --- 0. Только интерактивно: миграция — операторская операция ---
+    if [[ "$IS_INTERACTIVE" != "true" ]]; then
+        print_message "ERROR" "migrate panel доступен только интерактивно (не для cron/--yes)."
+        return 2
+    fi
+    # --dry-run несовместим: шаги 1-6 (SSH, pull) выполнились бы реально, а restore тихо
+    # пропустился — миграция отрапортовала бы успех без восстановления.
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        print_message "ERROR" "migrate panel несовместим с --dry-run."
+        return 2
+    fi
+    # --- 1. Аргументы: --from user@host [--port N] [--key /path] [--path /opt/remnawave] ---
+    local _from="" _port="22" _key="" _rdir=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) _from="$2"; shift 2 ;;
+            --port) _port="$2"; shift 2 ;;
+            --key)  _key="$2";  shift 2 ;;
+            --path) _rdir="$2"; shift 2 ;;
+            *) print_message "ERROR" "Неизвестный аргумент: $1"; return 2 ;;
+        esac
+    done
+    clear_screen
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}${BOLD}  Перенос Remnawave-панели НА ЭТОТ сервер${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+    echo -e "${GRAY}Источник трогается только read-only; старая панель продолжает работать.${RESET}"
+    echo ""
+    if [[ -z "$_from" ]]; then
+        safe_read -erp "Старый сервер (user@host, напр. root@1.2.3.4): " _from
+        [[ -z "$_from" ]] && { print_message "ERROR" "Источник не задан."; return 2; }
+        safe_read -erp "SSH-порт (Enter = 22): " _port; _port="${_port:-22}"
+        # Новичкам ключи не нужны: парольный режим через sshpass -e (пароль только в env,
+        # НИКОГДА не печатается, не логируется и не попадает в argv).
+        local _auth=""
+        safe_read -erp "Как подключиться к старому серверу? 1 = пароль root (просто, Enter) · 2 = SSH-ключ: " _auth
+        if [[ -z "$_auth" || "$_auth" == "1" ]]; then
+            if ! command -v sshpass > "$SILENT_LOG" 2>&1; then
+                print_message "WARN" "Для парольного режима нужен пакет sshpass (не установлен)."
+                local _inst=""
+                safe_read -erp "Установить sshpass сейчас? (y/N): " _inst
+                if [[ "$_inst" =~ ^[YyДд]$ ]]; then
+                    if command -v apt-get > "$SILENT_LOG" 2>&1; then
+                        apt-get install -y sshpass || { print_message "ERROR" "Установка sshpass провалилась."; return 1; }
+                    elif command -v dnf > "$SILENT_LOG" 2>&1; then
+                        dnf install -y sshpass || { print_message "ERROR" "Установка sshpass провалилась."; return 1; }
+                    else
+                        print_message "ERROR" "Не найден apt-get/dnf — установите sshpass вручную и повторите."
+                        return 1
+                    fi
+                else
+                    print_message "INFO" "Отменено. Установите sshpass или выберите SSH-ключ (вариант 2)."
+                    return 1
+                fi
+            fi
+            local _pw=""
+            safe_read -srp "root-пароль старого сервера (ввод скрыт): " _pw; echo ""
+            [[ -z "$_pw" ]] && { print_message "ERROR" "Пустой пароль — отмена."; return 2; }
+            export SSHPASS="$_pw"; _pw=""
+            SSH_PASSWORD_MODE=1
+            _key=""
+        else
+            safe_read -erp "SSH-ключ (путь, Enter = агент/дефолт): " _key
+        fi
+    fi
+
+    # --- 2. Локальный preflight ---
+    if ! docker info > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "Docker недоступен на ЭТОМ сервере — установите/запустите docker."
+        return 1
+    fi
+    discover_stacks
+    # Гейт ПЕРЕНОС — по ЛЮБОМУ свидетельству локальной панели: живой/остановленный контейнер
+    # ИЛИ панель «на диске без контейнеров» (после down/prune контейнеров нет, а файлы/volume
+    # целы — прежний контейнер-only триггер молча пропускал именно этот сценарий).
+    local _ow_confirmed=0 _lp_dir_disk=""
+    _lp_dir_disk=$(detect_panel_root 2>/dev/null || true)
+    if [[ -n "$DISC_PANEL_APP" || -n "$DISC_PANEL_DB" || -n "$_lp_dir_disk" ]]; then
+        local _lp_st=""
+        [[ -n "$DISC_PANEL_APP" ]] && _lp_st=$(timeout 15 docker inspect --format '{{.State.Status}}' "$DISC_PANEL_APP" 2> "$SILENT_LOG")
+        print_message "WARN" "На ЭТОМ сервере уже есть панель: контейнер '${DISC_PANEL_APP:-нет}' (${_lp_st:-—}), каталог '${DISC_PANEL_DIR:-${_lp_dir_disk:-?}}'."
+        echo -e "${RED}${BOLD}Миграция ПЕРЕЗАПИШЕТ локальную панель (файлы + БД).${RESET}"
+        local _ow=""
+        safe_read -erp "Для перезаписи введите слово ПЕРЕНОС: " _ow
+        if [[ "$_ow" != "ПЕРЕНОС" ]]; then
+            print_message "INFO" "Отменено — локальная панель не тронута."
+            return 1
+        fi
+        _ow_confirmed=1
+    fi
+
+    # --- 3. SSH к источнику (whitelist-валидация внутри _build_target_ssh) ---
+    local _sv_tr="$PANEL_TRANSPORT" _sv_h="$PANEL_SSH_HOST" _sv_p="$PANEL_SSH_PORT" _sv_u="$PANEL_SSH_USER" _sv_k="$PANEL_SSH_KEY"
+    local _sv_ppath="$PANEL_PATH" _sv_target="$BACKUP_TARGET" _sv_sec="$BACKUP_SECONDARY"
+    PANEL_TRANSPORT="ssh"
+    PANEL_SSH_HOST="${_from#*@}"; PANEL_SSH_USER="${_from%%@*}"
+    [[ "$_from" != *"@"* ]] && { PANEL_SSH_HOST="$_from"; PANEL_SSH_USER="root"; }
+    PANEL_SSH_PORT="$_port"; PANEL_SSH_KEY="$_key"
+    # Возврат окружения после миграции/отказа (bash-функции глобальны — определяем тут для читаемости).
+    # Парольный режим гасим ПЕРВЫМ (до resolve → _build_target_ssh); RETURN-trap дублирует зачистку.
+    _mig_restore_env() { SSH_PASSWORD_MODE=0; unset SSHPASS; PANEL_TRANSPORT="$_sv_tr"; PANEL_SSH_HOST="$_sv_h"; PANEL_SSH_PORT="$_sv_p"; PANEL_SSH_USER="$_sv_u"; PANEL_SSH_KEY="$_sv_k"; PANEL_PATH="$_sv_ppath"; BACKUP_TARGET="$_sv_target"; BACKUP_SECONDARY="$_sv_sec"; resolve_backup_target; }
+    local _ssh; _ssh=$(_build_target_ssh "panel")
+    if [[ -z "$_ssh" ]]; then
+        print_message "ERROR" "Не удалось построить SSH-подключение (host/port/key не прошли валидацию)."
+        _mig_restore_env; return 1
+    fi
+    print_message "INFO" "Проверка SSH-доступа к источнику..."
+    if ! timeout 25 $_ssh "true" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "SSH к '$_from:$_port' не работает (пароль/ключ/порт/файрвол)."
+        _mig_restore_env; return 1
+    fi
+
+    # --- 4. Удалённый preflight (read-only) ---
+    if [[ -z "$_rdir" ]]; then
+        # ИМЯ/ПУТЬ-НЕЗАВИСИМО: источник сам знает, где панель — labels контейнера с образом
+        # remnawave/backend (пользователю не нужно знать каталог установки).
+        _rdir=$(timeout 25 $_ssh "docker ps -a --format '{{.Image}}|{{.Label \"com.docker.compose.project.working_dir\"}}'" 2> "$SILENT_LOG" \
+            | awk -F'|' '$1 ~ /remnawave\/backend/ && $2 != "" {print $2; exit}')
+        [[ -n "$_rdir" ]] && print_message "INFO" "Панель на источнике обнаружена автоматически: $_rdir"
+    fi
+    if [[ -z "$_rdir" ]]; then
+        local _d
+        for _d in /opt/remnawave /root/remnawave /opt/stacks/remnawave; do
+            # №12 (remote-вариант _compose_in): все 4 канонических имени compose
+            if timeout 20 $_ssh "test -f $_d/docker-compose.yml || test -f $_d/docker-compose.yaml || test -f $_d/compose.yml || test -f $_d/compose.yaml" 2> "$SILENT_LOG"; then
+                _rdir="$_d"; break
+            fi
+        done
+    fi
+    if [[ -z "$_rdir" ]]; then
+        print_message "ERROR" "Каталог панели на источнике не найден (labels + канонические пути). Задайте --path."
+        _mig_restore_env; return 1
+    fi
+    local _rdb_st
+    _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' ${PANEL_DB_CONTAINER:-remnawave-db}" 2> "$SILENT_LOG")
+    if [[ "$_rdb_st" != "running" ]]; then
+        print_message "ERROR" "БД панели на источнике не запущена (${PANEL_DB_CONTAINER:-remnawave-db}: ${_rdb_st:-absent}) — дамп невозможен."
+        _mig_restore_env; return 1
+    fi
+    local _rsize_mb _lfree_mb
+    _rsize_mb=$(timeout 30 $_ssh "du -sm $_rdir 2>/dev/null | cut -f1" 2> "$SILENT_LOG"); _rsize_mb="${_rsize_mb:-0}"
+    _lfree_mb=$(df -Pm "$BACKUP_DIR" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}'); _lfree_mb="${_lfree_mb:-0}"
+    echo ""
+    echo -e "  Источник:        ${CYAN}$_from:$_port${RESET} → $_rdir (~${_rsize_mb} MB файлов + БД)"
+    echo -e "  Локальный диск:  ${_lfree_mb} MB свободно в $BACKUP_DIR"
+    if [[ "$_lfree_mb" -gt 0 && "$_rsize_mb" -gt 0 && "$_lfree_mb" -lt $(( _rsize_mb * 3 )) ]]; then
+        print_message "WARN" "Мало места: нужно ~3x размера панели (архив + распаковка + запас)."
+        local _dsk=""; safe_read -erp "Продолжить всё равно? (y/N): " _dsk
+        [[ "$_dsk" =~ ^[YyДд]$ ]] || { _mig_restore_env; return 1; }
+    fi
+    # Второй гейт — по ФАКТИЧЕСКОМУ каталогу назначения: restore пишет именно в $_rdir, а не в
+    # обнаруженный ранее каталог (они могут различаться). Непустой $_rdir = перезапись содержимого.
+    if [[ "$_ow_confirmed" == "0" && -d "$_rdir" && -n "$(ls -A "$_rdir" 2>/dev/null)" ]]; then
+        echo -e "${RED}${BOLD}Каталог назначения '$_rdir' НЕ пуст — restore перезапишет его содержимое (rsync --delete).${RESET}"
+        local _ow2=""
+        safe_read -erp "Для перезаписи введите слово ПЕРЕНОС: " _ow2
+        if [[ "$_ow2" != "ПЕРЕНОС" ]]; then
+            print_message "INFO" "Отменено — '$_rdir' не тронут."
+            _mig_restore_env; return 1
+        fi
+    fi
+    echo ""
+    local _go=""
+    safe_read -erp "Начать перенос? (y/N): " _go
+    [[ "$_go" =~ ^[YyДд]$ ]] || { print_message "INFO" "Отменено."; _mig_restore_env; return 1; }
+
+    # --- 5. Pull full-бэкап панели с источника (read-only на источнике) ---
+    BACKUP_TARGET="panel"; BACKUP_SECONDARY=""
+    PANEL_PATH="$_rdir"
+    resolve_backup_target
+    print_message "INFO" "Тяну полный бэкап панели с источника (dir + БД + globals + billing)..."
+    # Маркер старта — детерминированный fallback вместо гоночного mtime-окна «-15 minutes»
+    # (медленный upload/TG выбивал архив из окна; параллельный крон-архив был бы «новее»).
+    local _mig_mark; _mig_mark=$(mktemp "${TMPDIR:-/var/tmp}/lazarus_mig_mark.XXXXXX" 2> "$SILENT_LOG") || _mig_mark=""
+    LAZ_LAST_BACKUP_FILE=""
+    if ! _backup_remote_target "full"; then
+        print_message "ERROR" "Удалённый бэкап панели провалился — перенос прерван, ничего не изменено."
+        [[ -n "$_mig_mark" ]] && rm -f "$_mig_mark"
+        _mig_restore_env; return 1
+    fi
+    local _arc="$LAZ_LAST_BACKUP_FILE"
+    if [[ -z "$_arc" || ! -f "$_arc" ]]; then
+        # fallback: строго новее маркера старта (не wall-clock)
+        [[ -n "$_mig_mark" ]] && _arc=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "lazarus_panel_full_*" -newer "$_mig_mark" -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -d' ' -f2-)
+    fi
+    [[ -n "$_mig_mark" ]] && rm -f "$_mig_mark"
+    if [[ -z "$_arc" || ! -f "$_arc" ]]; then
+        print_message "ERROR" "Свежий архив lazarus_panel_full_* не найден после бэкапа — перенос прерван."
+        _mig_restore_env; return 1
+    fi
+    print_message "SUCCESS" "Архив получен: $(basename "$_arc") ($(du -m "$_arc" | cut -f1) MB)"
+
+    # --- 6. Verify (незашифрованный: список tar; зашифрованный проверит restore при расшифровке) ---
+    if [[ "$_arc" == *.tar.gz ]] && ! tar -tzf "$_arc" > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "Архив повреждён (tar -t fail) — перенос прерван."
+        _mig_restore_env; return 1
+    fi
+
+    # --- 7. Restore ЛОКАЛЬНО (тот же путь, что на источнике) ---
+    PANEL_TRANSPORT="local"; PANEL_SSH_HOST=""; TARGET_SSH=""
+    PANEL_PATH="$_rdir"
+    resolve_backup_target
+    mkdir -p "$PANEL_PATH"
+    # .env панели ОБЯЗАН переехать (секреты/подключения) — включаем на время restore.
+    local _sv_env="$RESTORE_INCLUDE_ENV"; RESTORE_INCLUDE_ENV="true"
+    print_message "INFO" "Восстановление панели в $PANEL_PATH..."
+    local _rrc=0
+    execute_restore "full" "$_arc" || _rrc=$?
+    RESTORE_INCLUDE_ENV="$_sv_env"
+    if [[ $_rrc -eq 3 ]]; then
+        print_message "INFO" "Restore отменён/пропущен оператором — перенос НЕ выполнен. Источник не тронут."
+        _mig_restore_env; return 1
+    elif [[ $_rrc -ne 0 ]]; then
+        print_message "ERROR" "Restore завершился с ошибкой (rc=$_rrc) — проверьте вывод выше. Источник НЕ тронут."
+        _mig_restore_env; return 1
+    fi
+
+    # --- 8. Пост-проверки ---
+    echo ""
+    print_message "INFO" "Пост-проверки..."
+    ( cd "$PANEL_PATH" && docker compose ps --format '  {{.Name}}\t{{.Status}}' 2> "$SILENT_LOG" ) || true
+    local _pgok="✗"
+    if timeout 15 docker exec "${PANEL_DB_CONTAINER:-remnawave-db}" pg_isready > "$SILENT_LOG" 2>&1; then _pgok="✓"; fi
+    echo -e "  pg_isready: $_pgok"
+
+    # --- 9. Чеклист cutover (вручную!) ---
+    echo ""
+    echo -e "${YELLOW}${BOLD}═══ CUTOVER-ЧЕКЛИСТ (вручную, старую панель пока НЕ выключать) ═══${RESET}"
+    echo "  1. Проверьте вход в панель и данные (пользователи/ноды/подписки) на ЭТОМ сервере."
+    echo "  2. NetBird: подключите этот сервер в overlay (ноды overlay-IP, порт 2222)."
+    echo "  3. CertWarden client: перенастройте на этот сервер (сертификаты)."
+    echo "  4. DNS (Cloudflare): example.com → IP этого сервера. TTL/proxy учесть."
+    echo "  5. Вебхуки/интеграции: бот, billing.example.com, subs.example.com."
+    echo "  6. Только после проверки всего — останавливайте панель на старом сервере."
+    echo "  7. lazarus: PANEL_PATH зафиксирован на '$_rdir' (проверьте 'lazarus stacks' + тестовый бэкап)."
+    echo "  Runbook: .github/PANEL_MIGRATION_RUNBOOK.md"
+    log_message "INFO" "panel migrate-in completed from $_from:$_port ($_rdir), archive=$(basename "$_arc")"
+    _mig_restore_env
+    # Персист ФАКТИЧЕСКОГО расположения панели: панель теперь живёт ЗДЕСЬ ($_rdir, local) —
+    # иначе следующий panel-бэкап целился бы в старый конфиг-путь (пустой/чужой каталог).
+    # BACKUP_TARGET/SECONDARY не трогаем — цель бэкапа выбирает владелец, не миграция.
+    PANEL_PATH="$_rdir"; PANEL_TRANSPORT="local"; PANEL_SSH_HOST=""
+    resolve_backup_target
+    save_config
+    print_message "SUCCESS" "Конфиг обновлён: PANEL_PATH=$_rdir (local). Панель перенесена."
+    return 0
 }
 
 # --- INFRA-BILLING sidecar (mishkatik/infra-billing в стеке панели) ---
@@ -6212,13 +7214,78 @@ detect_panel_root() {
 _billing_sidecar_active() {
     local _ssh="${1:-}"
     [[ "$BACKUP_TARGET" != "panel" ]] && return 1
-    [[ "$PANEL_BILLING_BACKUP" == "false" || -z "$PANEL_BILLING_DB_CONTAINER" ]] && return 1
+    [[ "$PANEL_BILLING_BACKUP" == "false" ]] && return 1
     local _st=""
     if [[ -n "$_ssh" ]]; then
-        # PANEL-AUDIT: timeout и на удалённой проверке (SSH-команда без timeout могла виснуть вечно).
-        local _bc_q; _bc_q=$(_shq "$PANEL_BILLING_DB_CONTAINER")
-        _st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' $_bc_q" 2> "$SILENT_LOG")
+        # --- REMOTE: тот же контракт, что локально — auto-discover (только при ПУСТОМ конфиге)
+        # + role-гард по образу/имени. Раньше проверялся лишь State.Status: misconfig на
+        # источнике дампил бы ГЛАВНУЮ БД под именем billing_* (яд для будущего restore).
+        if [[ -z "$PANEL_BILLING_DB_CONTAINER" ]]; then
+            local _rcand
+            _rcand=$(timeout 20 $_ssh "docker ps -a --format '{{.Names}}|{{.Image}}'" 2> "$SILENT_LOG" \
+                | awk -F'|' '$1 ~ /billing/ && $2 ~ /^postgres|\/postgres|^postgis|timescale|pgvector/ {print $1; exit}')
+            if [[ -n "$_rcand" ]]; then
+                debug_log "BILLING" "remote auto-discovered billing container: $_rcand"
+                PANEL_BILLING_DB_CONTAINER="$_rcand"
+            else
+                if [[ "$PANEL_BILLING_BACKUP" == "true" ]]; then
+                    print_message "ERROR" "PANEL_BILLING_BACKUP=true, но billing-контейнер на источнике не найден — бэкап прерван."
+                    log_message "ERROR" "billing required but not found on remote — fail backup"
+                    return 2
+                fi
+                return 1
+            fi
+        fi
+        local _bc_q _rmeta _rimg _rsvc
+        _bc_q=$(_shq "$PANEL_BILLING_DB_CONTAINER")
+        _rmeta=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}|{{.Config.Image}}|{{index .Config.Labels \"com.docker.compose.service\"}}' $_bc_q" 2> "$SILENT_LOG")
+        _st="${_rmeta%%|*}"; _rimg="${_rmeta#*|}"; _rsvc="${_rimg#*|}"; _rimg="${_rimg%%|*}"
+        if [[ -n "$_rmeta" ]]; then
+            # role-гард удалённо: имя/сервис содержит billing И образ — БД-семейство
+            if ! { [[ "$PANEL_BILLING_DB_CONTAINER" == *billing* || "$_rsvc" == *billing* ]] && _is_db_image "$_rimg"; }; then
+                print_message "ERROR" "ГАРД: удалённый '$PANEL_BILLING_DB_CONTAINER' (image=$_rimg) — не billing-db. Sidecar отключён. Подсказка: имя/сервис контейнера должны содержать 'billing'."
+                log_message "ERROR" "remote billing guard: not a billing-db (img=$_rimg svc=$_rsvc) — refusing"
+                [[ "$PANEL_BILLING_BACKUP" == "true" ]] && return 2
+                return 1
+            fi
+        fi
     else
+        # --- LOCAL. АВТО-ОБНАРУЖЕНИЕ строго при ПУСТОМ конфиге и строго в ПРОЕКТЕ ПАНЕЛИ
+        # (label working_dir == panel-root): «настроен-но-absent» НЕ ретаргетим — окно
+        # пересоздания контейнера не должно молча подменять финансовую цель; чужой '*billing*'
+        # контейнер из ДРУГОГО проекта не должен подхватываться вовсе.
+        if [[ -z "$PANEL_BILLING_DB_CONTAINER" ]]; then
+            local _cand="" _cn _ci _cd _proot
+            _proot=$(_panel_root_now)
+            while IFS='|' read -r _cn _ci _cd; do
+                [[ -z "$_cn" || "$_cn" != *billing* ]] && continue
+                _is_db_image "$_ci" || continue
+                [[ -n "$_cd" ]] && _same_path "$_cd" "$_proot" || continue
+                _cand="$_cn"; break
+            done < <(timeout 15 docker ps -a --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project.working_dir"}}' 2> "$SILENT_LOG")
+            if [[ -n "$_cand" ]]; then
+                debug_log "BILLING" "auto-discovered billing container (panel project): $_cand"
+                PANEL_BILLING_DB_CONTAINER="$_cand"
+            else
+                if [[ "$PANEL_BILLING_BACKUP" == "true" ]]; then
+                    print_message "ERROR" "PANEL_BILLING_BACKUP=true, но billing-контейнер не задан и не обнаружен — бэкап прерван."
+                    log_message "ERROR" "billing required but empty/undiscovered — fail backup"
+                    return 2
+                fi
+                return 1
+            fi
+        fi
+        # ГАРД: контейнер обязан быть billing-db. Misconfig (remnawave-db/rwp_shop_db в этой
+        # переменной) дал бы дамп ГЛАВНОЙ БД под именем billing_* → при restore импорт чужих
+        # данных в биллинг. Требуемый режим (true) — провал бэкапа, auto — пропуск с ERROR.
+        # unknown (docker недоступен) — тоже отказ: роль не подтверждена.
+        local _brole; _brole=$(_container_role "$PANEL_BILLING_DB_CONTAINER")
+        if [[ "$_brole" != "billing-db" && "$_brole" != "absent" ]]; then
+            print_message "ERROR" "ГАРД: PANEL_BILLING_DB_CONTAINER='$PANEL_BILLING_DB_CONTAINER' имеет роль '$_brole', а не billing-db — sidecar отключён. Подсказка: имя/сервис должны содержать 'billing'${DISC_BILLING_DB:+; обнаружен кандидат: $DISC_BILLING_DB}."
+            log_message "ERROR" "billing guard: container role=$_brole (not billing-db) — refusing sidecar"
+            [[ "$PANEL_BILLING_BACKUP" == "true" ]] && return 2
+            return 1
+        fi
         _st=$(timeout 15 docker inspect --format '{{.State.Status}}' "$PANEL_BILLING_DB_CONTAINER" 2> "$SILENT_LOG")
     fi
     [[ "$_st" == "running" ]] && return 0
@@ -6244,16 +7311,66 @@ _billing_db_creds() {
     printf '%s %s' "$_u" "$_d"
 }
 
+# _firstrun_intent: экран намерения на ПЕРВОМ запуске — «зачем вы здесь?». Новичок нередко
+# ставит LAZARUS ради ПЕРЕНОСА панели со старого сервера, а не ради бэкапов — ведём за ручку
+# с первого экрана. Результат кладёт в глобал _FIRSTRUN_INTENT ("1" бэкапы | "2" перенос);
+# echo-возврат не годится — clear_screen/prompt ушли бы в command substitution.
+# M21-паттерн: принимаем только 1/2/Enter, мусор → повтор экрана.
+_firstrun_intent() {
+    _FIRSTRUN_INTENT="1"
+    local _ans
+    while true; do
+        clear_screen
+        echo -e "${GREEN}${BOLD}Что вы хотите сделать?${RESET}"
+        echo ""
+        echo -e " 1. Настроить БЭКАПЫ на этом сервере ${GREEN}(Enter, рекомендуется)${RESET}"
+        echo -e " 2. ПЕРЕНЕСТИ панель со СТАРОГО сервера на этот ${GRAY}(мастер спросит IP и root-пароль)${RESET}"
+        echo ""
+        safe_read -erp "Выбор (Enter = 1): " _ans
+        [[ -z "$_ans" ]] && _ans="1"
+        case "$_ans" in
+            1|2) _FIRSTRUN_INTENT="$_ans"; return 0 ;;
+            *) print_message "ERROR" "Введите 1, 2 или Enter"; sleep 1 ;;
+        esac
+    done
+}
+
 # select_backup_target_firstrun: на ПЕРВОМ интерактивном запуске (нет config.env) спрашивает
 # что бэкапить. Панель — ОСНОВНАЯ цель (замена Distilium), бот — вторичная. Детектит панель по
 # каноническим путям + контейнеру remnawave-db. Ставит BACKUP_TARGET (+ PANEL_PATH) и сохраняет.
 # Backward-compat: для существующих установок (config.env есть) НЕ вызывается — цель берётся из файла.
 select_backup_target_firstrun() {
+    # Экран намерения: выбор 2 → мастер переноса панели (panel_migrate_in БЕЗ аргументов сам
+    # спросит хост/root-пароль). Успех = панель уже на ЭТОМ сервере и PANEL_PATH персистнут
+    # миграцией → выбор цели не нужен, сразу к защите (бэкапы после переноса).
+    # Провал/отмена (rc≠0) → обычная настройка ниже.
+    _firstrun_intent
+    if [[ "$_FIRSTRUN_INTENT" == "2" ]]; then
+        if panel_migrate_in; then
+            BACKUP_TARGET="panel"; BACKUP_SECONDARY=""
+            # Первый запуск = Стандартный режим меню (дефолт глобала expert — только
+            # backward-compat старых установок без ключа в конфиге).
+            UI_MODE="standard"
+            save_config
+            echo -e "${GRAY}Меню — в Стандартном режиме (базовые бэкапы). Эксперт-режим: пункт 77 в главном меню.${RESET}"
+            _quickstart_protect
+            return 0
+        fi
+        print_message "WARN" "Перенос не выполнен — продолжаем обычную настройку."
+        sleep 1
+    fi
     local _panel_dir _panel_db="false"
     _panel_dir=$(detect_panel_root || true)
-    docker inspect "${PANEL_DB_CONTAINER:-remnawave-db}" > "$SILENT_LOG" 2>&1 && _panel_db="true"
+    timeout 15 docker inspect "${PANEL_DB_CONTAINER:-remnawave-db}" > "$SILENT_LOG" 2>&1 && _panel_db="true"
     # H15/M22: фактический каталог панели, который реально будет бэкапиться (а не голый /opt/remnawave).
     local _panel_eff="${_panel_dir:-${PANEL_PATH:-/opt/remnawave}}"
+    local _panel_present="false"; { [[ -n "$_panel_dir" ]] || [[ "$_panel_db" == "true" ]]; } && _panel_present="true"
+    # Авто-детект РЕАЛЬНОГО бота (панель-независимо; напр. /opt/rwp-shop). Если найден И панель тоже —
+    # дефолтом предлагаем «обе», чтобы одним прогоном бэкапить и панель, и бота.
+    local _bot_dir="" _bot_present="false"
+    if resolve_bot_runtime; then _bot_dir="$RB_PATH"; _bot_present="true"; fi
+    local _both_default="false"
+    [[ "$_panel_present" == "true" && "$_bot_present" == "true" ]] && _both_default="true"
 
     while true; do
         clear_screen
@@ -6262,19 +7379,31 @@ select_backup_target_firstrun() {
         local _phint=""
         if [[ -n "$_panel_dir" ]]; then _phint=" ${GRAY}(найдено: $_panel_dir)${RESET}"
         elif [[ "$_panel_db" == "true" ]]; then _phint=" ${GRAY}(контейнер ${PANEL_DB_CONTAINER:-remnawave-db} запущен; путь по умолчанию)${RESET}"; fi
-        echo -e " 1. ${CYAN}${BOLD}Remnawave Panel${RESET} ${GREEN}(рекомендуется)${RESET}$_phint"
+        local _bhint=""; [[ -n "$_bot_dir" ]] && _bhint=" ${GRAY}(найдено: $_bot_dir)${RESET}"
+        # Дефолт по факту наличия: обе → 3, только бот → 2, иначе → 1. Рекомендация подсвечивает дефолт.
+        local _def_num="1" _def_label="Enter = 1, Панель"
+        if [[ "$_both_default" == "true" ]]; then _def_num="3"; _def_label="Enter = 3, Обе"
+        elif [[ "$_bot_present" == "true" && "$_panel_present" == "false" ]]; then _def_num="2"; _def_label="Enter = 2, Бот"; fi
+        local _rec1="" _rec2="" _rec3=""
+        case "$_def_num" in
+            1) _rec1=" ${GREEN}(рекомендуется)${RESET}" ;;
+            2) _rec2=" ${GREEN}(рекомендуется)${RESET}" ;;
+            3) _rec3=" ${GREEN}(рекомендуется)${RESET}" ;;
+        esac
+        echo -e " 1. ${CYAN}${BOLD}Remnawave Panel${RESET}$_rec1$_phint"
         echo -e "    ${GRAY}бэкап ${_panel_eff} + дамп БД + роли (globals) + infra-billing (если найден)${RESET}"
-        echo -e " 2. Telegram-бот rwp_shop ${GRAY}(вторичная цель)${RESET}"
-        echo -e " 3. Панель + Бот ${GRAY}(обе цели)${RESET}"
+        echo -e " 2. Telegram-бот rwp_shop ${GRAY}(вторичная цель)${RESET}$_rec2$_bhint"
+        echo -e " 3. ${CYAN}${BOLD}Панель + Бот${RESET} ${GRAY}(обе цели, один прогон)${RESET}$_rec3"
         echo ""
         local _choice
-        safe_read -erp "Выбор (Enter = 1, Панель): " _choice
-        # M21: принимаем только 1/2/3/Enter; опечатку отвергаем, а не «молча панель».
+        safe_read -erp "Выбор ($_def_label): " _choice
+        [[ -z "$_choice" ]] && _choice="$_def_num"
+        # M21: принимаем только 1/2/3; опечатку отвергаем, а не «молча панель».
         case "$_choice" in
-            ""|1) BACKUP_TARGET="panel"; BACKUP_SECONDARY=""; print_message "SUCCESS" "Цель бэкапа: Remnawave Panel" ;;
-            2)    BACKUP_TARGET="bot";   BACKUP_SECONDARY=""; print_message "INFO" "Цель бэкапа: Telegram-бот (rwp_shop)" ;;
-            3)    BACKUP_TARGET="panel"; BACKUP_SECONDARY="bot"; print_message "SUCCESS" "Цели: Панель + Бот" ;;
-            *)    print_message "ERROR" "Введите 1, 2, 3 или Enter"; sleep 1; continue ;;
+            1) BACKUP_TARGET="panel"; BACKUP_SECONDARY=""; print_message "SUCCESS" "Цель бэкапа: Remnawave Panel" ;;
+            2) BACKUP_TARGET="bot";   BACKUP_SECONDARY=""; print_message "INFO" "Цель бэкапа: Telegram-бот (rwp_shop)" ;;
+            3) BACKUP_TARGET="panel"; BACKUP_SECONDARY="bot"; print_message "SUCCESS" "Цели: Панель + Бот" ;;
+            *) print_message "ERROR" "Введите 1, 2, 3 или Enter"; sleep 1; continue ;;
         esac
         break
     done
@@ -6283,11 +7412,31 @@ select_backup_target_firstrun() {
         PANEL_PATH="$_panel_dir"
         debug_log "TARGET" "First-run: panel root = $PANEL_PATH"
     fi
-    # M20: both-режим — сразу спрашиваем, где находится бот (локально/SSH), иначе вторичная цель пуста.
-    if [[ "$BACKUP_SECONDARY" == "bot" ]]; then
+    # Имя-независимое автозаполнение контейнера БД панели (кастомные имена ок): пользователю
+    # не нужно знать/вводить имена — берём обнаруженное (DATABASE_URL-authoritative).
+    if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]]; then
+        discover_stacks
+        if [[ -n "$DISC_PANEL_DB" ]]; then
+            PANEL_DB_CONTAINER="$DISC_PANEL_DB"
+            PANEL_DB_SERVICE="${DISC_PANEL_DB_SVC:-$DISC_PANEL_DB}"
+            debug_log "TARGET" "First-run: panel db autofilled = $PANEL_DB_CONTAINER (svc=$PANEL_DB_SERVICE)"
+        fi
+    fi
+    # Если бот входит в цели и мы его уже нашли — предзаполняем идентичность (локально), чтобы
+    # both-проход не пересканировал и _ask_target_location имел валидный дефолт.
+    if [[ "$BACKUP_SECONDARY" == "bot" || "$BACKUP_TARGET" == "bot" ]] && [[ -n "$_bot_dir" ]]; then
+        BOT_PATH="$_bot_dir"; BOT_CONTAINER_NAME="$RB_APP"; DB_CONTAINER_NAME="$RB_DB"
+        _CANON_BOT_PATH="$_bot_dir"; _CANON_BOT_CONTAINER="$RB_APP"; _CANON_DB_CONTAINER="$RB_DB"
+        debug_log "TARGET" "First-run: prefilled bot identity path=$_bot_dir app=$RB_APP db=$RB_DB"
+    fi
+    # M20: both-режим — если бот НЕ найден локально, спрашиваем где он (локально/SSH), иначе цель пуста.
+    if [[ "$BACKUP_SECONDARY" == "bot" && -z "$_bot_dir" ]]; then
         _ask_target_location "bot"
     fi
+    # Первый запуск = Стандартный режим меню (короткое главное меню). Полное — пункт 77.
+    UI_MODE="standard"
     save_config
+    echo -e "${GRAY}Меню — в Стандартном режиме (базовые бэкапы). Эксперт-режим: пункт 77 в главном меню.${RESET}"
     # Друже­любный first-run: сразу предлагаем настроить защиту (шифр/авто/off-site). Шаги пропускаемы.
     _quickstart_protect
 }
@@ -7044,6 +8193,61 @@ _s3_verify_uploaded() {
     return 0
 }
 
+# _s3_rotate_old [days] — удаляет из S3/R2 СВОИ архивы старше N дней (S3_RETENTION_DAYS, 0=выкл).
+# ЖЁСТКИЙ скоуп: только ключи вида lazarus(_panel)?_(db|files|full|inc)_* внутри S3_PATH — чужие
+# объекты бакета не трогаются НИКОГДА. Новейший архив КАЖДОГО семейства (бот/панель) не удаляется
+# даже если старше N дней (offsite не может стать пустым из-за сбитых часов/долгого простоя).
+# DRY_RUN=true — только печать. NB: list-objects-v2 отдаёт до 1000 ключей — для наших объёмов ок.
+_s3_rotate_old() {
+    local _days="${1:-${S3_RETENTION_DAYS:-0}}"
+    [[ "$REMOTE_STORAGE_TYPE" != "s3" || -z "$S3_BUCKET" ]] && return 0
+    [[ ! "$_days" =~ ^[0-9]+$ || "$_days" -eq 0 ]] && return 0
+    local _opts=()
+    [[ -n "$S3_ENDPOINT" ]] && _opts+=(--endpoint-url "$S3_ENDPOINT")
+    [[ -n "$S3_REGION" ]] && _opts+=(--region "$S3_REGION")
+    local _pfx="${S3_PATH#/}"; _pfx="${_pfx%/}"; [[ -n "$_pfx" ]] && _pfx="${_pfx}/"
+    local _list
+    _list=$(_s3_aws_run s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$_pfx" \
+        --query 'Contents[].[Key,LastModified]' --output text "${_opts[@]}" 2> "$SILENT_LOG") || {
+        debug_log "S3ROT" "list-objects failed — ротация пропущена (upload не задет)"
+        return 1
+    }
+    [[ -z "$_list" || "$_list" == "None" ]] && return 0
+    local _cutoff; _cutoff=$(date -d "-${_days} days" +%s 2> "$SILENT_LOG") || return 1
+    # Новейший ключ каждого семейства — неприкосновенен (сортировка по LastModified ISO8601)
+    local _newest_bot _newest_panel
+    _newest_bot=$(printf '%s\n' "$_list" | awk -F'\t' -v p="$_pfx" \
+        'index($1, p"lazarus_")==1 && index($1, p"lazarus_panel_")!=1 {print $2"\t"$1}' | sort -r | head -1 | cut -f2)
+    _newest_panel=$(printf '%s\n' "$_list" | awk -F'\t' -v p="$_pfx" \
+        'index($1, p"lazarus_panel_")==1 {print $2"\t"$1}' | sort -r | head -1 | cut -f2)
+    local _key _lm _epoch _rel _deleted=0 _failed=0
+    while IFS=$'\t' read -r _key _lm; do
+        [[ -z "$_key" || -z "$_lm" ]] && continue
+        # №16: зона удаления = зона защиты. Только ПЛОСКИЕ ключи непосредственно в S3_PATH
+        # (newest-protection выше считается именно по ним, awk index()==1). Раньше фильтр шёл
+        # по basename на любой глубине → вложенные <pfx>sub/lazarus_* (архивы других серверов,
+        # legacy-подпапки) удалялись БЕЗ защиты новейшего. Теперь они не трогаются вовсе.
+        _rel="${_key#"$_pfx"}"
+        [[ "$_rel" == */* ]] && continue
+        [[ "$_rel" =~ ^lazarus(_panel)?_(db|files|full|inc)_ ]] || continue
+        [[ "$_key" == "$_newest_bot" || "$_key" == "$_newest_panel" ]] && continue
+        _epoch=$(date -d "$_lm" +%s 2> "$SILENT_LOG") || continue
+        (( _epoch >= _cutoff )) && continue
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            echo "  [DRY-RUN] удалил бы: $_key ($_lm)"
+        elif _s3_aws_run s3api delete-object --bucket "$S3_BUCKET" --key "$_key" "${_opts[@]}" > "$SILENT_LOG" 2>&1; then
+            _deleted=$((_deleted + 1)); debug_log "S3ROT" "deleted: $_key ($_lm)"
+        else
+            _failed=$((_failed + 1)); debug_log "S3ROT" "delete FAILED: $_key"
+        fi
+    done <<< "$_list"
+    if [[ $_deleted -gt 0 || $_failed -gt 0 ]]; then
+        print_message "INFO" "S3-ротация: удалено ${_deleted} архив(ов) старше ${_days}д.${_failed:+ }$([[ $_failed -gt 0 ]] && echo "(ошибок: $_failed)")"
+        log_message "INFO" "s3 rotation: deleted=$_deleted failed=$_failed older than ${_days}d"
+    fi
+    return 0
+}
+
 upload_to_remote() {
     if [[ "$SEND_TO_REMOTE" != "true" ]]; then 
         debug_log "REMOTE" "Remote upload disabled (SEND_TO_REMOTE=$SEND_TO_REMOTE)"
@@ -7234,6 +8438,9 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
                     debug_log "REMOTE" "S3 upload SUCCESS + verify OK"
                     REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: OK'
                     log_message "SUCCESS" "Uploaded $filename to S3 ($s3_dest), size=$file_size verified"
+                    # Remote-ротация ПОСЛЕ подтверждённой доставки нового архива (S3_RETENTION_DAYS,
+                    # 0=выкл). Сбой ротации не влияет на статус upload'а.
+                    _s3_rotate_old >&2 || true
                     return 0
                     ;;
                 1)
@@ -7917,6 +9124,12 @@ rotate_backups_by_count() {
     
     local count=${#files[@]}
     local diff=$((count - MAX_BACKUPS_COUNT))
+    # №10 floor (defense-in-depth поверх heal MAX_BACKUPS_COUNT>=1 в load_or_create_config):
+    # diff никогда не съедает НОВЕЙШИЙ архив (последний в ls -1tr) — даже при limit=0/мусоре.
+    if [[ $diff -ge $count && $count -gt 0 ]]; then
+        diff=$((count - 1))
+        log_message "WARN" "Count rotation ($PREFIX): limit would delete ALL — newest kept (floor)"
+    fi
     debug_log "ROTATION" "Found $count files, limit=$MAX_BACKUPS_COUNT, to_delete=$diff"
     
     if [[ $diff -gt 0 ]]; then
@@ -7998,6 +9211,24 @@ rotate_backups_by_age() {
     fi
     find_args+=( -print0 )
     while IFS= read -r -d $'\0' f; do files+=("$f"); done < <(find "${find_args[@]}" 2> "$SILENT_LOG")
+
+    # №10 floor (симметрия rotate_backups_by_size/_s3_rotate_old): новейший СУЩЕСТВУЮЩИЙ архив
+    # категории НЕ удаляем, даже если он старше retention — иначе `lazarus --yes cleanup` при
+    # сбитых часах/долгом простое снёс бы ВСЕ бэкапы цели (ноль копий).
+    local _newest_keep
+    _newest_keep=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( \
+        -name "${PREFIX}_*.tar.gz"      -o -name "${PREFIX}_*.tar.gz.enc" \
+        -o -name "${PREFIX}_*.tar.zst"  -o -name "${PREFIX}_*.tar.zst.enc" \) \
+        -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -d' ' -f2-)
+    if [[ -n "$_newest_keep" ]]; then
+        local _flt=() _ff
+        for _ff in "${files[@]}"; do [[ "$_ff" == "$_newest_keep" ]] || _flt+=("$_ff"); done
+        if [[ ${#_flt[@]} -ne ${#files[@]} ]]; then
+            echo -e "${YELLOW}  Все архивы категории '$LABEL' старше ${DAYS}д — новейший сохранён: $(basename "$_newest_keep") (защита от полной очистки).${RESET}"
+            log_message "WARN" "Age rotation ($PREFIX): all archives older than ${DAYS}d — newest kept (floor): $(basename "$_newest_keep")"
+        fi
+        files=("${_flt[@]}")
+    fi
 
     local count=${#files[@]}
     debug_log "ROTATION" "Found $count files older than $DAYS days"
@@ -8161,9 +9392,18 @@ rotate_backups_by_size() {
     # NAMESPACE FLOOR (both-режим): size-rotation меряет весь BACKUP_DIR (общий лимит диска),
     # но НЕ должна удалять НОВЕЙШИЙ бэкап КАЖДОЙ цели (bot=lazarus_*, panel=lazarus_panel_*).
     # Иначе прогон ротации одной цели мог снести единственную копию ДРУГОЙ. Считаем по namespace.
+    # №3: floor считаем по ТЕМ ЖЕ 4 архивным паттернам, что и files[] — голое `lazarus_*`
+    # матчило и legacy `.version`-сайдкары: сайдкар с более поздним mtime становился «новейшим»,
+    # реальный новейший АРХИВ выпадал из-под защиты и мог быть удалён (единственная копия бота).
     local _newest_bot _newest_panel
-    _newest_bot=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "lazarus_*" ! -name "lazarus_panel_*" -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -d' ' -f2-)
-    _newest_panel=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "lazarus_panel_*" -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -d' ' -f2-)
+    _newest_bot=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( \
+                -name "lazarus_*.tar.gz"      -o -name "lazarus_*.tar.gz.enc" \
+                -o -name "lazarus_*.tar.zst"  -o -name "lazarus_*.tar.zst.enc" \) \
+                ! -name "lazarus_panel_*" -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -d' ' -f2-)
+    _newest_panel=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( \
+                -name "lazarus_panel_*.tar.gz"      -o -name "lazarus_panel_*.tar.gz.enc" \
+                -o -name "lazarus_panel_*.tar.zst"  -o -name "lazarus_panel_*.tar.zst.enc" \) \
+                -printf '%T@ %p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -d' ' -f2-)
     debug_log "SIZE" "Per-namespace floor: bot=$(basename "${_newest_bot:-none}") panel=$(basename "${_newest_panel:-none}")"
 
     # ROT-5 floor: НИКОГДА не удаляем новейший бэкап (последний в sort -n по mtime),
@@ -8693,6 +9933,57 @@ recreate_cron_from_schedule() {
 
 # --- БЭКАП ---
 
+# №15: интерактивный гейт пустого пароля — общий для create_backup И _backup_remote_target
+# (раньше жил только в create_backup: remote-бэкап молча уходил plaintext'ом в S3/TG).
+# rc=0 — продолжаем (пароль есть / оператор явно согласился без шифрования / установил новый);
+# rc=1 — отмена/ошибка (caller обязан снять свой lock и выйти). В неинтерактиве — no-op.
+_ensure_encryption_or_confirm() {
+    [[ -n "$BACKUP_PASSWORD" || "$IS_INTERACTIVE" != "true" ]] && return 0
+    clear_screen
+    echo -e "${RED}${BOLD}ВНИМАНИЕ: Пароль шифрования не установлен!${RESET}"
+    echo "Файл бэкапа не будет зашифрован. Данные могут быть доступны третьим лицам."
+    echo ""
+    echo " 1. Продолжить без шифрования"
+    echo " 2. Установить пароль сейчас"
+    echo " 0. Отмена"
+    echo ""
+    local enc_choice np np_confirm _dummy
+    safe_read -erp "Ваш выбор: " enc_choice
+    case $enc_choice in
+        1) return 0 ;;
+        2)
+            # Двойной ввод с подтверждением + явный feedback.
+            safe_read -s -erp "Введите пароль шифрования: " np
+            echo ""
+            if [[ -z "$np" ]]; then
+                print_message "ERROR" "✗ Пустой пароль. Бэкап отменён."
+                safe_read -rp "Enter — закрыть " _dummy
+                return 1
+            fi
+            safe_read -s -erp "Повторите пароль для подтверждения: " np_confirm
+            echo ""
+            if [[ "$np" != "$np_confirm" ]]; then
+                print_message "ERROR" "✗ Пароли НЕ совпадают. Бэкап отменён."
+                safe_read -rp "Enter — закрыть " _dummy
+                return 1
+            fi
+            # write_password_file валидирует путь/newline/chmod — отказ означает,
+            # что пароль НЕ сохранён, БД-бэкап без шифрования не должен идти,
+            # если пользователь его явно запросил.
+            if ! write_password_file "$np"; then
+                print_message "ERROR" "Не удалось сохранить пароль. Бэкап отменён."
+                safe_read -rp "Enter — закрыть " _dummy
+                return 1
+            fi
+            BACKUP_PASSWORD="$np"
+            save_config
+            print_message "SUCCESS" "✓ Пароль установлен (${#np} символов). Продолжаем бэкап..."
+            return 0
+            ;;
+        *) print_message "INFO" "Бэкап отменён."; return 1 ;;
+    esac
+}
+
 create_backup() {
     local TYPE="$1"
     debug_log "BACKUP" "=== Starting backup: type=$TYPE ==="
@@ -8721,7 +10012,16 @@ create_backup() {
     # только на возврате самой create_backup. Двойной release безопасен (release_lock
     # глушит ошибки на уже закрытом FD). Существующие явные release_lock оставлены.
     trap '[[ "$LOCK_ACQUIRED" == "true" ]] && release_lock' RETURN
-    
+
+    # === ГАРД ИДЕНТИЧНОСТИ ЦЕЛИ ===
+    # Бэкап read-only, но АРХИВ С ЧУЖИМ СОДЕРЖИМЫМ (напр. дамп панели под именем lazarus_* бота
+    # из-за misconfig) — мина при будущем restore. Positive-mismatch = отказ; отсутствующий
+    # контейнер (absent) пропускаем — ниже его обработают существующие проверки/детект.
+    if ! assert_target_identity "backup"; then
+        print_message "ERROR" "Бэкап прерван: конфигурация цели указывает на ЧУЖОЙ стек (см. выше)."
+        return 1
+    fi
+
     # === ПРОВЕРКА ДИСКА ===
     # Два слоя защиты:
     #   1) Процентный (DISK_WARN_PERCENT / DISK_CRITICAL_PERCENT) — нужно для больших дисков
@@ -8840,51 +10140,10 @@ create_backup() {
         fi
     fi
     
-    if [[ -z "$BACKUP_PASSWORD" && "$IS_INTERACTIVE" == "true" ]]; then
-        clear_screen
-        echo -e "${RED}${BOLD}ВНИМАНИЕ: Пароль шифрования не установлен!${RESET}"
-        echo "Файл бэкапа не будет зашифрован. Данные могут быть доступны третьим лицам."
-        echo ""
-        echo " 1. Продолжить без шифрования"
-        echo " 2. Установить пароль сейчас"
-        echo " 0. Отмена"
-        echo ""
-        safe_read -erp "Ваш выбор: " enc_choice
-        case $enc_choice in
-            1) ;;
-            2)
-                # Двойной ввод с подтверждением + явный feedback.
-                safe_read -s -erp "Введите пароль шифрования: " np
-                echo ""
-                if [[ -z "$np" ]]; then
-                    print_message "ERROR" "✗ Пустой пароль. Бэкап отменён."
-                    safe_read -rp "Enter — закрыть " _dummy
-                    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
-                    return 1
-                fi
-                safe_read -s -erp "Повторите пароль для подтверждения: " np_confirm
-                echo ""
-                if [[ "$np" != "$np_confirm" ]]; then
-                    print_message "ERROR" "✗ Пароли НЕ совпадают. Бэкап отменён."
-                    safe_read -rp "Enter — закрыть " _dummy
-                    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
-                    return 1
-                fi
-                # write_password_file валидирует путь/newline/chmod — отказ означает,
-                # что пароль НЕ сохранён, БД-бэкап без шифрования не должен идти,
-                # если пользователь его явно запросил.
-                if ! write_password_file "$np"; then
-                    print_message "ERROR" "Не удалось сохранить пароль. Бэкап отменён."
-                    safe_read -rp "Enter — закрыть " _dummy
-                    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
-                    return 1
-                fi
-                BACKUP_PASSWORD="$np"
-                save_config
-                print_message "SUCCESS" "✓ Пароль установлен (${#np} символов). Продолжаем бэкап..."
-                ;;
-            *) print_message "INFO" "Бэкап отменён."; [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock; return 1 ;;
-        esac
+    # №15: интерактивный гейт пустого пароля вынесен в хелпер (общий с _backup_remote_target).
+    if ! _ensure_encryption_or_confirm; then
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
     fi
 
     # === ВОПРОС ПРО ЛОГИ (если ещё не настроено и есть файловая часть бэкапа) ===
@@ -9072,8 +10331,8 @@ create_backup() {
                 local _bill_state=0
                 _billing_sidecar_active ""; _bill_state=$?   # PANEL-AUDIT: явный local-режим (без ssh)
                 if [[ $_bill_state -eq 2 ]]; then
-                    print_message "ERROR" "infra-billing обязателен (PANEL_BILLING_BACKUP=true), но контейнер ${PANEL_BILLING_DB_CONTAINER} не запущен — бэкап прерван."
-                    log_message "ERROR" "billing sidecar required but container not running"
+                    print_message "ERROR" "infra-billing обязателен (PANEL_BILLING_BACKUP=true), но контейнер '${PANEL_BILLING_DB_CONTAINER:-<не задан/не найден>}' недоступен или не прошёл role-гард — бэкап прерван."
+                    log_message "ERROR" "billing sidecar required but unavailable/refused"
                     HAS_ERROR=1
                 elif [[ $_bill_state -eq 0 ]]; then
                     FILE_BILLING="billing_${TIMESTAMP}.sql.${_ext}"
@@ -9308,6 +10567,7 @@ create_backup() {
         # combine можно делать (то же что и в `full` ниже).
         [[ $_tar_rc -le 1 ]] && {
             local _first_rc=$_tar_rc
+            _warn_links_in_archive "$BACKUP_DIR/$FILE_DIR"   # №11: ссылки видны сразу при бэкапе
             # Combine: + manifest.txt если был сгенерирован
             local _combine_inputs=("$FILE_VERSION" "$FILE_DIR")
             [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
@@ -9331,6 +10591,7 @@ create_backup() {
         # rc=1 = warning (файл изменился во время чтения), archive валиден → combine OK.
         [[ $_tar_rc -le 1 ]] && {
             local _first_rc=$_tar_rc
+            _warn_links_in_archive "$BACKUP_DIR/$FILE_DIR"   # №11: ссылки видны сразу при бэкапе
             local _combine_inputs=("$FILE_VERSION" "$FILE_DB" "$FILE_DIR")
             [[ -n "$FILE_GLOBALS" && -f "$BACKUP_DIR/$FILE_GLOBALS" ]] && _combine_inputs+=("$FILE_GLOBALS")
             [[ -n "$FILE_BILLING" && -f "$BACKUP_DIR/$FILE_BILLING" ]] && _combine_inputs+=("$FILE_BILLING")
@@ -9806,6 +11067,12 @@ _backup_remote_target() {
         return 1
     fi
 
+    # №15: тот же интерактивный гейт пустого пароля, что и у локального create_backup —
+    # remote-архив содержит дамп чужой БД и уходит в S3/TG, молчать нельзя. lock снимет RETURN-trap.
+    if ! _ensure_encryption_or_confirm; then
+        return 1
+    fi
+
     local TIMESTAMP; TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
     local _ext; _ext=$(_compress_ext)
     local _comp_pipe; case "$(_compress_current)" in zstd) _comp_pipe="zstd -9 -q" ;; *) _comp_pipe="gzip -9" ;; esac
@@ -9865,9 +11132,13 @@ _backup_remote_target() {
                 local _rbill_state=0
                 _billing_sidecar_active "$_ssh"; _rbill_state=$?
                 if [[ $_rbill_state -eq 2 ]]; then
-                    print_message "ERROR" "infra-billing обязателен (PANEL_BILLING_BACKUP=true), но контейнер не запущен на удалённом — бэкап прерван."
-                    log_message "ERROR" "remote billing sidecar required but container not running"
+                    print_message "ERROR" "infra-billing обязателен (PANEL_BILLING_BACKUP=true), но контейнер '${PANEL_BILLING_DB_CONTAINER:-<не задан/не найден>}' на удалённом недоступен или не прошёл role-гард — бэкап прерван."
+                    log_message "ERROR" "remote billing sidecar required but unavailable/refused"
                     HAS_ERROR=1
+                elif [[ $_rbill_state -eq 1 && "$PANEL_BILLING_BACKUP" != "false" ]]; then
+                    # ЯВНЫЙ warn (не debug-only): при миграции/remote-бэкапе оператор должен видеть,
+                    # что биллинг НЕ вошёл в архив, а не узнать об этом при restore.
+                    print_message "WARN" "infra-billing на источнике не найден/не запущен — биллинг НЕ входит в архив."
                 elif [[ $_rbill_state -eq 0 ]]; then
                     FILE_BILLING="billing_${TIMESTAMP}.sql.${_ext}"
                     local _rb_creds _rb_u _rb_d
@@ -9954,7 +11225,10 @@ _backup_remote_target() {
     fi
 
     # --- Шифрование (encrypt-then-MAC) — ТОЛЬКО локально. Те же гарантии, что в create_backup. ---
+    # №15: в неинтерактиве (cron) пустой пароль помечаем явным «NO PASSWORD» (не нейтральным
+    # Unencrypted) — маркер виден в логе/TG-отчёте и не выглядит осознанным выбором.
     local ENC_STATUS="🔓 Unencrypted"
+    [[ -z "$BACKUP_PASSWORD" ]] && ENC_STATUS="⚠️ NO PASSWORD"
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         print_message "INFO" "Шифрование удалённого архива..."
         if _hmac_envelope_create "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
@@ -9997,6 +11271,10 @@ _backup_remote_target() {
     fi
     print_message "SUCCESS" "Удалённый бэкап создан и валиден: $FILE_FINAL ($SIZE)"
     log_message "SUCCESS" "remote backup: $FILE_FINAL (type=$TYPE, size=$SIZE, enc=$ENC_STATUS)"
+    # Детерминированная передача имени вызывателю (panel_migrate_in): mtime-окно с find было
+    # гонкой в обе стороны (upload/TG >15мин → «архив не найден»; параллельный локальный крон-архив
+    # новее → restore не тех данных).
+    LAZ_LAST_BACKUP_FILE="$BACKUP_DIR/$FILE_FINAL"
 
     # --- Ротация (только после успешного verify) ---
     local _rk="${BACKUP_PREFIX}_$TYPE"
@@ -10289,6 +11567,30 @@ create_incremental_backup() {
     fi
     debug_log "INC" "Base full: $(basename "$_last_full")"
 
+    # №2 гейт (зеркальный проверке «.enc-base без пароля» ниже): пароль ЗАДАН, а последний
+    # full НЕ зашифрован → зашифрованный inc поверх plain base создался бы успешно, но был бы
+    # НЕВОССТАНОВИМ (_find_base_for_inc для .enc-inc принимает только .enc-base — orphan by design).
+    if [[ -n "$BACKUP_PASSWORD" && "$_last_full" != *.enc ]]; then
+        if [[ "$IS_INTERACTIVE" == "true" ]]; then
+            print_message "ERROR" "Последний full НЕ зашифрован, а шифрование включено — inc-цепочка была бы невосстановима."
+            echo -e "  ${GRAY}Сделайте новый (зашифрованный) full: lazarus backup full — и inc пойдут от него.${RESET}"
+            log_message "ERROR" "Incremental refused: encryption enabled but base full is plaintext ($(basename "$_last_full"))"
+            return 1
+        fi
+        # Cron/неинтерактив: не молчим и не фейлимся вечно — авто-переключаемся на ПОЛНЫЙ бэкап
+        # (он создаст свежий .enc-base, следующие inc пойдут от него). WARN в лог + TG.
+        print_message "WARN" "Последний full не зашифрован, а шифрование включено — inc невосстановим. Авто-переключение на ПОЛНЫЙ бэкап."
+        log_message "WARN" "Incremental auto-switched to FULL: encryption enabled but base full is plaintext ($(basename "$_last_full"))"
+        send_telegram_alert "WARN" "Incremental → Full (авто)" \
+            "🔐 Шифрование включено, а последний full не зашифрован — inc был бы невосстановим.
+📦 Вместо inc выполнен полный бэкап (новый шифрованный base)." "" || true
+        # Свой lock отдаём ДО вызова create_backup (он берёт собственный); флаг снимаем,
+        # чтобы RETURN-trap не отпустил чужую блокировку повторно.
+        release_lock; LOCK_ACQUIRED="false"
+        create_backup "full"
+        return $?
+    fi
+
     # Extract base timestamp из имени (lazarus_full_<ts>__vX.tar...)
     local _base_filename _base_ts
     _base_filename=$(basename "$_last_full")
@@ -10556,10 +11858,10 @@ normalize_path() {
 }
 
 get_compose_file() {
-    local compose_file=""
-    [[ -f "$BOT_PATH/compose.yaml" ]] && compose_file="$BOT_PATH/compose.yaml"
-    [[ -f "$BOT_PATH/docker-compose.yml" ]] && compose_file="$BOT_PATH/docker-compose.yml"
-    echo "$compose_file"
+    # №12: обёртка над _compose_in — все 4 канонических имени compose (раньше покрывались
+    # только 2 из 4 → assert_safe_bot_path ложно отказывал на compose.yml/docker-compose.yaml).
+    # Приоритет тот же: docker-compose.yml первым. Пустой вывод = не найден (как раньше).
+    _compose_in "$BOT_PATH" || echo ""
 }
 
 is_forbidden_bot_path() {
@@ -10604,7 +11906,7 @@ assert_safe_bot_path() {
     local compose_file
     compose_file=$(get_compose_file)
     if [[ -z "$compose_file" ]]; then
-        print_message "ERROR" "В BOT_PATH не найден compose.yaml или docker-compose.yml"
+        print_message "ERROR" "В BOT_PATH не найден compose-файл (docker-compose.yml/.yaml, compose.yml/.yaml)"
         return 1
     fi
 
@@ -10623,7 +11925,10 @@ assert_safe_bot_path() {
         fi
     done
     if [[ "$bot_ok" == false && -n "$BOT_CONTAINER_NAME" ]]; then
-        if echo "$services" | grep -q "$BOT_CONTAINER_NAME"; then
+        # ТОЧНОЕ совпадение сервиса (-qx), не подстрока: неякорный grep пропускал panel-restore в
+        # каталог БОТА — BOT_CONTAINER_NAME='remnawave' матчился ВНУТРИ сервиса
+        # 'remnawave-subscription-page' (живёт в проекте бота), и «similarity-гейт» проходил.
+        if echo "$services" | grep -qx "$BOT_CONTAINER_NAME"; then
             bot_ok=true
         fi
     fi
@@ -10800,6 +12105,44 @@ confirm_drop_volume() {
     return 1
 }
 
+# №11: проверка цели symlink/hardlink из tar-листинга. rc=0 — БЕЗОПАСНАЯ ссылка
+# (relative, разрешение НЕ выходит выше корня архива); rc=1 — опасная (absolute target
+# или `..`-выход за корень). Глубина считается по слешам: сегменты dirname(запись) дают
+# стартовую глубину, каждый `..` цели — минус уровень; уход ниже 0 = escape.
+# $1 — путь записи в архиве ("." для hardlink: у tar его цель задана ОТ КОРНЯ архива,
+# у symlink — от каталога записи). $2 — цель ссылки.
+_tar_link_target_safe() {
+    local _entry_path="$1" _target="$2"
+    [[ -z "$_target" ]] && return 1
+    [[ "$_target" == /* ]] && return 1          # absolute target — всегда отказ
+    local _dir _depth=0 _seg
+    _dir=$(dirname "$_entry_path")
+    if [[ "$_dir" != "." && "$_dir" != "/" ]]; then
+        local _IFS_sv="$IFS"; IFS='/'
+        for _seg in $_dir; do
+            case "$_seg" in
+                ""|".") ;;
+                "..") IFS="$_IFS_sv"; return 1 ;;   # `..` в самом пути записи — не наш кейс, отказ
+                *) _depth=$((_depth + 1)) ;;
+            esac
+        done
+        IFS="$_IFS_sv"
+    fi
+    local _IFS_sv2="$IFS"; IFS='/'
+    for _seg in $_target; do
+        case "$_seg" in
+            ""|".") ;;
+            "..")
+                _depth=$((_depth - 1))
+                if [[ $_depth -lt 0 ]]; then IFS="$_IFS_sv2"; return 1; fi   # вышли выше корня
+                ;;
+            *) _depth=$((_depth + 1)) ;;
+        esac
+    done
+    IFS="$_IFS_sv2"
+    return 0
+}
+
 validate_tar_safety() {
     local archive="$1"
     local list_file="$2"
@@ -10844,13 +12187,78 @@ validate_tar_safety() {
         return 1
     fi
 
-    # Symlink / hardlink / device-files (c, b) — все запрещены
     # File type chars в `tar -tvf`: -=regular, d=dir, l=symlink, h=hardlink, c=char-dev, b=block-dev, s=socket, p=fifo
-    if tar $_tv_args "$archive" 2> "$SILENT_LOG" | awk '{print substr($1,1,1)}' | grep -Eq '^[lhcbsp]'; then
-        print_message "ERROR" "Архив содержит ссылки/устройства (symlink/hardlink/dev/socket/fifo), восстановление запрещено"
+    # №11 (деградация вместо тотального отказа): устройства/сокеты/fifo (c/b/s/p) — запрещены
+    # ВСЕГДА; symlink/hardlink допускаются, но ТОЛЬКО безопасные (relative, in-tree, см.
+    # _tar_link_target_safe) — absolute target или `..`-выход за корень = отказ. Раньше ЛЮБАЯ
+    # ссылка блокировала restore целиком → legacy-бэкапы с симлинками были невосстановимы.
+    # Extraction и так идёт в изолированный STAGE_DIR (+ rsync --safe-links) — второй рубеж.
+    local _tv_file="${list_file}.tv"
+    if ! tar $_tv_args "$archive" > "$_tv_file" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Архив поврежден (verbose-листинг не читается): $archive"
+        rm -f "$_tv_file"
         return 1
     fi
+    if grep -Eq '^[cbsp]' "$_tv_file"; then
+        print_message "ERROR" "Архив содержит устройства/сокеты/fifo (c/b/s/p), восстановление запрещено"
+        rm -f "$_tv_file"
+        return 1
+    fi
+    local _lnk_line _rest _entry _target _lnk_count=0
+    while IFS= read -r _lnk_line; do
+        # Имя+цель = всё после 5 служебных полей GNU tar (perms owner size date time).
+        # Схлопывание повторных пробелов в имени не влияет на подсчёт глубины (важны слеши).
+        _rest=$(printf '%s\n' "$_lnk_line" | awk '{for(i=6;i<=NF;i++) printf "%s%s",$i,(i<NF?" ":""); print ""}')
+        if [[ "${_lnk_line:0:1}" == "l" ]]; then
+            # symlink: `path -> target`; больше одного ' -> ' = инъекция разделителя в имени — отказ
+            [[ "$_rest" == *" -> "* ]] || { print_message "ERROR" "Symlink без цели в листинге — отказ"; rm -f "$_tv_file"; return 1; }
+            _entry="${_rest%% -> *}"; _target="${_rest#* -> }"
+            [[ "$_target" == *" -> "* ]] && { print_message "ERROR" "Подозрительное имя symlink (двойной ' -> ') — отказ"; rm -f "$_tv_file"; return 1; }
+            if ! _tar_link_target_safe "$_entry" "$_target"; then
+                print_message "ERROR" "Архив содержит НЕбезопасный symlink ($_entry -> $_target): absolute/выход за корень — восстановление запрещено"
+                rm -f "$_tv_file"
+                return 1
+            fi
+        else
+            # hardlink: `path link to target`; цель — от КОРНЯ архива (entry="." для глубины 0)
+            [[ "$_rest" == *" link to "* ]] || { print_message "ERROR" "Hardlink без цели в листинге — отказ"; rm -f "$_tv_file"; return 1; }
+            _entry="${_rest%% link to *}"; _target="${_rest#* link to }"
+            [[ "$_target" == *" link to "* ]] && { print_message "ERROR" "Подозрительное имя hardlink (двойной ' link to ') — отказ"; rm -f "$_tv_file"; return 1; }
+            if ! _tar_link_target_safe "." "$_target"; then
+                print_message "ERROR" "Архив содержит НЕбезопасный hardlink ($_entry -> $_target) — восстановление запрещено"
+                rm -f "$_tv_file"
+                return 1
+            fi
+        fi
+        _lnk_count=$((_lnk_count + 1))
+    done < <(grep -E '^[lh]' "$_tv_file")
+    rm -f "$_tv_file"
+    if [[ $_lnk_count -gt 0 ]]; then
+        print_message "WARN" "В архиве $_lnk_count symlink/hardlink (все безопасные, in-tree) — допущены к восстановлению."
+        log_message "WARN" "validate_tar_safety: $_lnk_count safe in-tree links allowed in $(basename "$archive")"
+    fi
 
+    return 0
+}
+
+# №11 (create-side, симметрия restore): считает symlink/hardlink в свежесозданном dir-архиве
+# и предупреждает оператора СРАЗУ при бэкапе (restore пропустит только безопасные in-tree
+# ссылки, опасные — откажет) — а не в момент аварии. Статус бэкапа не меняет (rc всегда 0).
+_warn_links_in_archive() {
+    local _arc="$1"
+    [[ -f "$_arc" ]] || return 0
+    local _fmt _tv
+    _fmt=$(_compress_detect_format "$_arc")
+    case "$_fmt" in
+        zstd) _tv="--use-compress-program=zstd -tvf" ;;
+        *)    _tv="-tvf" ;;
+    esac
+    local _n
+    _n=$(tar $_tv "$_arc" 2> "$SILENT_LOG" | grep -c '^[lh]') || _n=0
+    if [[ "${_n:-0}" -gt 0 ]]; then
+        print_message "WARN" "В архив попало $_n symlink/hardlink — restore допустит только безопасные (relative, in-tree); проверьте их заранее."
+        log_message "WARN" "backup archive contains $_n links: $(basename "$_arc")"
+    fi
     return 0
 }
 
@@ -10973,6 +12381,40 @@ assert_safe_db_target() {
         real_bot=$(normalize_path "$BOT_PATH")
         if [[ "$real_work" != "$real_bot" ]]; then
             print_message "ERROR" "Контейнер БД '$container' принадлежит проекту '$real_work', а не '$real_bot'"
+            return 1
+        fi
+    fi
+
+    # 2b) РОЛЬ контейнера соответствует цели. Проверка working_dir выше проходит, даже если
+    # ОБА поля конфига указывают на чужой стек (напр. BOT_PATH=/opt/remnawave +
+    # DB_CONTAINER_NAME=remnawave-db при цели bot) — роль по образу/проекту ловит и этот случай.
+    local _role; _role=$(_container_role "$container")
+    if [[ "$_role" == "unknown" ]]; then
+        print_message "ERROR" "ГАРД: docker недоступен — роль '$container' НЕ подтверждена. Отказ."
+        log_message "ERROR" "assert_safe_db_target: role=unknown — fail-closed"
+        return 1
+    fi
+    if [[ "$BACKUP_TARGET" == "panel" ]]; then
+        case "$_role" in
+            billing-db|billing-app|panel-app|panel-svc|external)
+                print_message "ERROR" "ГАРД: '$container' (role=$_role) — не главная postgres-БД панели. Отказ."
+                log_message "ERROR" "assert_safe_db_target: panel target but role=$_role"
+                return 1 ;;
+        esac
+    else
+        case "$_role" in
+            panel-db|panel-app|panel-svc|billing-db|billing-app)
+                print_message "ERROR" "ГАРД: '$container' (role=$_role) принадлежит панели/биллингу — это НЕ БД бота. Отказ."
+                log_message "ERROR" "assert_safe_db_target: bot target but role=$_role"
+                return 1 ;;
+        esac
+        # 2c) WHITELIST: если compose цели САМ определяет свой БД-контейнер — контейнер обязан
+        # совпасть. Блэклист ролей пропускал «соседей» проекта (напр. rwp_shop_kb_db, pgvector в
+        # том же каталоге): DROP SCHEMA ушёл бы во вторичную БД вместо основной.
+        local _exp; _exp=$(find_db_container_for_path "$BOT_PATH" 2> "$SILENT_LOG")
+        if [[ -n "$_exp" && "$_exp" != "$container" ]]; then
+            print_message "ERROR" "ГАРД: БД проекта '$BOT_PATH' — '$_exp', а настроен '$container'. Отказ."
+            log_message "ERROR" "assert_safe_db_target: compose-derived db '$_exp' != configured '$container'"
             return 1
         fi
     fi
@@ -11135,7 +12577,13 @@ execute_restore() {
     fi
     echo ""; print_message "WARN" "ВНИМАНИЕ: Текущие данные будут перезаписаны!"
     if [[ "$IS_INTERACTIVE" == true ]]; then
-        read -erp "Продолжить? (y/n): " confirm; [[ "$confirm" != "y" ]] && return
+        # rc=3 = «отменено оператором»: bare return наследовал rc=0 успешного [[ ]] — вызыватель
+        # (panel_migrate_in) считал отменённый restore УСПЕХОМ и печатал cutover-чеклист.
+        read -erp "Продолжить? (y/n): " confirm
+        if [[ "$confirm" != "y" ]]; then
+            print_message "INFO" "Restore отменён пользователем."
+            return 3
+        fi
     fi
 
     # КРИТИЧНО: TMP_DIR создаём через mktemp в /var/tmp (НЕ в BACKUP_DIR — там mode 0755
@@ -11152,6 +12600,9 @@ execute_restore() {
     register_sensitive_tmp "$TMP_DIR"
     debug_log "RESTORE" "Temp dir: $TMP_DIR (mode $(stat -c '%a' "$TMP_DIR" 2>/dev/null))"
 
+    # №4/№9: function-scope хранилище проверенного пароля (заполняет цикл расшифровки ниже,
+    # потребляет inc-chain; для не-.enc файлов остаётся пустым).
+    local _verified_pass=""
     local WORK_FILE="$FILE"
     if [[ "$FILE" == *".enc" ]]; then
         # Pre-flight: проверка openssl версии (PBKDF2 требует ≥1.1.0).
@@ -11199,9 +12650,22 @@ execute_restore() {
         local _dec_attempt=0
         local _dec_max=3
         local _dec_ok=false
+        # №4/№9: проверенный (успешно расшифровавший) пароль сохраняем в _verified_pass ДО
+        # зануления decrypt_pass — он нужен ниже для _resolve_incremental_chain (fresh-сервер:
+        # BACKUP_PASSWORD пуст, без этого restore зашифрованного inc был невозможен). Wipe — после chain.
         while [[ $_dec_attempt -lt $_dec_max ]]; do
             local decrypt_pass=""
-            read -s -erp "Пароль (попытка $((_dec_attempt + 1))/${_dec_max}): " decrypt_pass; echo ""
+            # №14: EOF/провал ввода (non-interactive restore .enc, закрытый stdin) раньше крутил
+            # цикл вечно (read мгновенно фейлился, «пустой пароль — попытка не засчитана»).
+            if ! read -s -erp "Пароль (попытка $((_dec_attempt + 1))/${_dec_max}): " decrypt_pass; then
+                echo ""
+                print_message "ERROR" "Ввод пароля недоступен (EOF/non-interactive) — восстановление отменено."
+                log_message "ERROR" "Password read failed (EOF) in execute_restore"
+                rm -rf "$TMP_DIR"
+                unregister_sensitive_tmp "$TMP_DIR"
+                return 1
+            fi
+            echo ""
             if [[ -z "$decrypt_pass" ]]; then
                 print_message "WARN" "Пустой пароль — попробуйте снова (попытка не засчитана)."
                 continue
@@ -11211,7 +12675,6 @@ execute_restore() {
 
             _hmac_envelope_decrypt "$FILE" "$DECRYPTED_FILE" "$decrypt_pass"
             local dec_res=$?
-            decrypt_pass=""
             debug_log "RESTORE" "Decryption attempt $_dec_attempt: rc=$dec_res"
 
             case $dec_res in
@@ -11219,11 +12682,13 @@ execute_restore() {
                     # v2: MAC уже проверен. v1: дополнительный gzip -t (см. ниже).
                     if [[ "$_archive_format" == "v2" ]]; then
                         # Sanity: для v2 MAC уже гарантирует целостность.
+                        _verified_pass="$decrypt_pass"; decrypt_pass=""
                         _dec_ok=true
                         break
                     fi
                     # v1: без MAC, нужен gzip -t как раньше.
                     if gzip -t "$DECRYPTED_FILE" 2> "$SILENT_LOG"; then
+                        _verified_pass="$decrypt_pass"; decrypt_pass=""
                         _dec_ok=true
                         break
                     fi
@@ -11246,6 +12711,8 @@ execute_restore() {
                     rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
                     ;;
             esac
+            # Неуспешная попытка — пароль затираем перед следующим вводом.
+            decrypt_pass=""
         done
         if [[ "$_dec_ok" != "true" ]]; then
             print_message "ERROR" "Расшифровка не удалась после $_dec_max попыток. Восстановление отменено."
@@ -11265,14 +12732,16 @@ execute_restore() {
     # Результат: WORK_FILE подменяется на merged-tar, дальше restore идёт как обычно.
     if [[ "$(basename "$FILE")" =~ ^lazarus_inc_ ]]; then
         print_message "INFO" "Обнаружен incremental backup — разрешаю chain..."
-        # Для chain нужен пароль (если базовый full зашифрован). Возьмём из BACKUP_PASSWORD
-        # ИЛИ из decrypt_pass (если пользователь вводил для inc).
-        local _chain_pwd="${decrypt_pass:-$BACKUP_PASSWORD}"
+        # №4/№9: для chain нужен пароль (если базовый full зашифрован). Берём ПРОВЕРЕННЫЙ
+        # пароль оператора (_verified_pass — decrypt_pass к этому моменту всегда затёрт)
+        # ИЛИ BACKUP_PASSWORD из конфига. Раньше стоял мёртвый ${decrypt_pass:-...} →
+        # на fresh-сервере (пустой BACKUP_PASSWORD) restore .enc-inc был невозможен.
+        local _chain_pwd="${_verified_pass:-$BACKUP_PASSWORD}"
         local _merged
         _merged=$(_resolve_incremental_chain "$FILE" "$TMP_DIR" "$_chain_pwd")
         local _chain_rc=$?
-        # Очистим decrypt_pass из памяти (был использован в chain)
-        decrypt_pass=""
+        # Wipe: пароль больше не нужен (chain отработал) — чистим ОБЕ копии.
+        decrypt_pass=""; _verified_pass=""; _chain_pwd=""
         if [[ $_chain_rc -ne 0 || -z "$_merged" || ! -f "$_merged" ]]; then
             print_message "ERROR" "Restore-chain failed (rc=$_chain_rc)"
             rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
@@ -11328,9 +12797,14 @@ execute_restore() {
         rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
     fi
 
+    # ГАРД ИДЕНТИЧНОСТИ — ВСЕ режимы (db_only тоже идёт к DROP SCHEMA/import и раньше миновал
+    # проверку целиком: она жила только в full/files_only-блоке). unknown = fail-closed.
+    if ! assert_target_identity "restore"; then
+        print_message "ERROR" "Restore прерван ДО любых действий (identity guard)."
+        rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
+    fi
+
     if [[ "$MODE" == "full" || "$MODE" == "files_only" ]]; then
-        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return 1; fi
-        if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return 1; fi
         if ! require_rsync; then rm -rf "$TMP_DIR"; return 1; fi
         if [[ -z "$DIR_ARC" || ! -f "$DIR_ARC" ]]; then
             print_message "ERROR" "Архив с файлами не найден."
@@ -11353,6 +12827,24 @@ execute_restore() {
         local ROOT_DIR
         ROOT_DIR=$(get_restore_stage_root "$STAGE_DIR") || { rm -rf "$TMP_DIR"; return 1; }
 
+        # BOOTSTRAP (миграция на ЧИСТЫЙ сервер): у цели нет compose, а архив его принёс —
+        # предпосеваем compose+.env, иначе legacy-гейты ниже (assert_safe_bot_path, get_db_name)
+        # требуют уже существующую панель и миграция на пустой каталог не может завершиться.
+        if [[ "$BACKUP_TARGET" == "panel" ]] && ! _compose_in "$BOT_PATH" > /dev/null 2>&1; then
+            if _compose_in "$ROOT_DIR" > /dev/null 2>&1; then
+                mkdir -p "$BOT_PATH"
+                local _bsf
+                for _bsf in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env; do
+                    [[ -f "$ROOT_DIR/$_bsf" ]] && cp -f "$ROOT_DIR/$_bsf" "$BOT_PATH/$_bsf"
+                done
+                print_message "INFO" "Bootstrap: compose/.env предпосеяны в $BOT_PATH из архива (чистый сервер)."
+                log_message "INFO" "restore bootstrap: seeded compose/.env into empty $BOT_PATH"
+            fi
+        fi
+        # Гейты пути — ПОСЛЕ bootstrap-предпосева (иначе fresh-сервер всегда падал тут).
+        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return 1; fi
+        if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return 1; fi
+
         print_message "INFO" "План синхронизации (dry-run):"
         local PLAN_FILE="$TMP_DIR/restore_plan.txt"
         restore_rsync_preview "$ROOT_DIR" "$BOT_PATH" > "$PLAN_FILE" 2>&1 || true
@@ -11370,7 +12862,9 @@ execute_restore() {
         if [[ "$DRY_RUN" == "true" ]]; then
             print_message "INFO" "DRY-RUN: восстановление пропущено"
             rm -rf "$TMP_DIR"
-            return
+            # rc=3 «пропущено» — bare return давал rc=0, и вызыватель (миграция) принял бы
+            # НЕвыполненный restore за успех.
+            return 3
         fi
 
         # === PRE-DESTRUCTION SAFETY (full mode) — RST-1/RST-8/CMP-1 fix ===
@@ -11431,9 +12925,35 @@ execute_restore() {
             fi
         fi
 
+        # ГАРД ИДЕНТИЧНОСТИ: до compose down / rsync --delete / volume rm убеждаемся, что путь и
+        # контейнеры цели указывают на СВОЙ стек (bot≠панель≠billing). Ошибка конфига = отказ.
+        if ! assert_target_identity "restore"; then
+            print_message "ERROR" "Restore прерван ДО разрушительных действий (identity guard)."
+            rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
+        fi
+
+        # Принадлежность DB-контейнера проверяем ДО down: `compose down` УДАЛЯЕТ контейнеры,
+        # после него docker inspect их не находит — прежний пост-rsync гейт по построению не мог
+        # пройти никогда. absent (fresh/migrate) — пропускаем, контейнеры поднимет compose up ниже.
+        local _pre_role; _pre_role=$(_container_role "$DB_CONTAINER_NAME")
+        if [[ "$_pre_role" != "absent" ]] && ! assert_db_container_matches_bot; then
+            print_message "ERROR" "Контейнер БД не соответствует BOT_PATH — restore прерван ДО остановки контейнеров."
+            rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
+        fi
+
         print_message "INFO" "Остановка контейнеров..."
         debug_log "RESTORE" "Stopping containers in $BOT_PATH"
-        cd "$BOT_PATH" && docker compose down 2> "$SILENT_LOG"
+        cd "$BOT_PATH" || {
+            print_message "ERROR" "cd $BOT_PATH провалился — restore прерван."
+            rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
+        }
+        # rc down проверяем: при лежащем docker down «проваливается молча», а rsync --delete ниже
+        # переписал бы файлы ЖИВОГО стека (rsync докера не требует).
+        if ! docker compose down 2> "$SILENT_LOG"; then
+            print_message "ERROR" "docker compose down провалился (docker недоступен?) — restore прерван ДО rsync."
+            log_message "ERROR" "restore: compose down failed — aborting before rsync"
+            rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
+        fi
 
         print_message "INFO" "Синхронизация файлов..."
         # AUDIT fix: раньше rc rsync игнорировался — частичная/проваленная синхронизация шла дальше
@@ -11447,10 +12967,12 @@ execute_restore() {
         fi
 
         if [[ "$MODE" == "full" ]]; then
-            # AUDIT fix: контейнеры уже down + файлы синхронизированы — bare return оставлял бота
-            # offline. Поднимаем контейнеры обратно и возвращаем явный fail.
-            if ! assert_db_container_matches_bot; then
-                print_message "ERROR" "Контейнер БД не соответствует BOT_PATH — restore прерван."
+            # Контейнеры уже УДАЛЕНЫ compose down — live-inspect тут невозможен по построению
+            # (принадлежность проверена ДО down). Валидируем по НОВОМУ compose (после rsync):
+            # сервис БД обязан быть объявлен; пустой DB_SERVICE_NAME — пропуск (up поднимет всё).
+            if [[ -n "${DB_SERVICE_NAME:-}" ]] \
+               && ! ( cd "$BOT_PATH" && docker compose config --services 2> "$SILENT_LOG" | grep -qx "$DB_SERVICE_NAME" ); then
+                print_message "ERROR" "Сервис БД '$DB_SERVICE_NAME' не объявлен в восстановленном compose — restore прерван."
                 ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
                 rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
             fi
@@ -11476,8 +12998,9 @@ execute_restore() {
             fi
 
             print_message "INFO" "Запуск БД..."
-            debug_log "RESTORE" "Running: docker compose up -d $DB_SERVICE_NAME"
-            docker compose up -d "$DB_SERVICE_NAME"
+            debug_log "RESTORE" "Running: docker compose up -d ${DB_SERVICE_NAME:-<all>}"
+            # Пустой DB_SERVICE_NAME → поднимаем весь проект (quoted "" дал бы 'no such service').
+            docker compose up -d ${DB_SERVICE_NAME:+"$DB_SERVICE_NAME"}
             sleep 5
         fi
     fi
@@ -11614,6 +13137,16 @@ execute_restore() {
         else
             print_message "WARN" "Дамп infra-billing в архиве есть, но non-interactive restore его пропускает (запустите restore из меню)."
             log_message "WARN" "billing dump present, skipped in non-interactive restore"
+        fi
+        if [[ "$_bl_do" == "true" ]]; then
+            # ГАРД ИДЕНТИЧНОСТИ: импорт биллинга разрушителен (DROP SCHEMA). Misconfig
+            # PANEL_BILLING_DB_CONTAINER=remnawave-db уничтожил бы ГЛАВНУЮ БД панели данными биллинга.
+            local _bl_role; _bl_role=$(_container_role "$PANEL_BILLING_DB_CONTAINER")
+            if [[ "$_bl_role" != "billing-db" ]]; then
+                print_message "ERROR" "ГАРД: '$PANEL_BILLING_DB_CONTAINER' имеет роль '$_bl_role', а не billing-db — импорт биллинга ОТКЛОНЁН."
+                log_message "ERROR" "billing restore guard: role=$_bl_role — refusing import"
+                _bl_do="false"
+            fi
         fi
         if [[ "$_bl_do" == "true" ]]; then
             # Готовность контейнера: full-mode только что поднял стек — ждём pg_isready (3 попытки).
@@ -12270,7 +13803,11 @@ disable_all_cron_tasks() {
 }
 
 menu_settings() {
-    local _sview=""
+    # Опциональный аргумент — открыть сразу конкретный раздел (standard-меню зовёт
+    # `menu_settings telegram`). В прямом режиме «0/Enter» из раздела выходит из настроек
+    # целиком — список разделов (эксперт-навигацию) в Стандартном режиме не показываем.
+    local _sview="${1:-}"
+    local _sdirect=""; [[ -n "$_sview" ]] && _sdirect="1"
     while true; do
         clear_screen; echo -e "${GREEN}${BOLD}Настройки${RESET}"
         # Двухуровневая навигация: сначала раздел, потом его параметры — чтобы не показывать всё сразу.
@@ -12286,6 +13823,7 @@ menu_settings() {
             echo " 5. Ротация и диск       (сколько хранить, пороги)"
             echo " 6. Компрессия и логи"
             echo " 7. Сменить цель         (панель / бот / обе)"
+            echo " 8. Режим меню           (Эксперт → Стандартный, короткое главное меню)"
             echo ""
             echo " 0. Назад"
             echo ""
@@ -12294,15 +13832,21 @@ menu_settings() {
                 1) _sview=general ;; 2) _sview=telegram ;; 3) _sview=storage ;;
                 4) _sview=security ;; 5) _sview=rotation ;; 6) _sview=misc ;;
                 7) menu_backup_target ;;
+                8) # Переключатель в Стандартный режим — обратно: пункт 77 главного меню.
+                   UI_MODE="standard"; save_config
+                   print_message "SUCCESS" "Стандартный режим включён (вернуться: пункт 77 в главном меню)"
+                   sleep 1; return ;;
                 0|"") return ;;
-                *) print_message "ERROR" "Введите 1–7 или 0"; sleep 1 ;;
+                *) print_message "ERROR" "Введите 1–8 или 0"; sleep 1 ;;
             esac
             continue
         fi
 
         local MASKED_TOKEN="${BOT_TOKEN:0:5}.......${BOT_TOKEN: -2}"; [[ ${#BOT_TOKEN} -lt 10 ]] && MASKED_TOKEN="*******"
-        # Шифрование включено, если пароль в памяти ИЛИ в файле (тот же критерий, что у «Готовности»).
-        local PASS_MASK="Нет"; [[ -n "$BACKUP_PASSWORD" || -f "$BACKUP_PASSWORD_FILE" ]] && PASS_MASK="********"
+        # №5: тот же критерий, что у «Готовности» — пароль реально читается, не голое -f.
+        local PASS_MASK="Нет"
+        if _encryption_ready; then PASS_MASK="********"
+        elif [[ -f "$BACKUP_PASSWORD_FILE" ]]; then PASS_MASK="ФАЙЛ НЕЧИТАЕМ"; fi
         
         # Маскируем Chat ID (показываем только первые 4 и последние 3 символа)
         local MASKED_CHAT_ID="-"
@@ -12485,7 +14029,8 @@ menu_settings() {
         echo -e "\n 0. Назад к разделам"
         echo ""
         safe_read -erp "Выбор: " s
-        [[ -z "$s" ]] && { _sview=""; continue; }
+        # В прямом режиме (standard-меню) «назад» = выход из настроек, разделы не светим.
+        [[ -z "$s" ]] && { [[ -n "$_sdirect" ]] && return; _sview=""; continue; }
 
         case $s in
             1) read -erp "Новый путь (только локально; для SSH — раздел 7): " np
@@ -12495,6 +14040,12 @@ menu_settings() {
                        print_message "ERROR" "SSH-пути здесь не поддерживаются — удалённую цель настройте в разделе 7 (Сменить цель)."; sleep 1.5; continue
                    fi
                    if [[ -d "$np" ]]; then
+                       # Валидация НА ВХОДЕ (identity-слой): панельный путь обязан декларировать
+                       # панель (или быть пустым каталогом — fresh); каталог с ЧУЖИМ compose = отказ.
+                       if [[ "$BACKUP_TARGET" == "panel" ]] && _compose_in "$np" > /dev/null 2>&1 && ! _compose_declares_panel "$np"; then
+                           print_message "ERROR" "'$np' содержит НЕ-панельный compose (похоже на другой стек) — не сохранено."
+                           sleep 1.5; continue
+                       fi
                        if [[ "$BACKUP_TARGET" == "panel" ]]; then PANEL_PATH="$np"; else BOT_PATH="$np"; _CANON_BOT_PATH="$np"; fi
                        save_config; resolve_backup_target; print_message "SUCCESS" "Сохранено"
                    else print_message "ERROR" "Локальная папка не найдена (для удалённой цели — раздел 7)."; fi
@@ -12506,7 +14057,17 @@ menu_settings() {
                     nc="${nc:-$PANEL_DB_CONTAINER}"
                     # Канон Remnawave: container == compose-service (оба remnawave-db). Держим в синхроне,
                     # иначе volume-lookup на restore промахнётся. Кастомный service — правка config вручную.
-                    if [[ -n "$nc" ]]; then PANEL_DB_CONTAINER="$nc"; PANEL_DB_SERVICE="$nc"; save_config; resolve_backup_target; print_message "SUCCESS" "Сохранено (контейнер БД и compose-service)"; fi
+                    # Валидация НА ВХОДЕ: существующий контейнер с ЧУЖОЙ ролью (бот/биллинг) = отказ.
+                    if [[ -n "$nc" ]]; then
+                        local _ncr; _ncr=$(_container_role "$nc")
+                        case "$_ncr" in
+                            billing-db|billing-app|external|panel-app)
+                                print_message "ERROR" "'$nc' имеет роль '$_ncr' — это НЕ главная postgres-БД панели. Не сохранено."
+                                sleep 1.5 ;;
+                            *)
+                                PANEL_DB_CONTAINER="$nc"; PANEL_DB_SERVICE="$nc"; save_config; resolve_backup_target; print_message "SUCCESS" "Сохранено (контейнер БД и compose-service)" ;;
+                        esac
+                    fi
                 else
                     scan_system_for_bot
                     local def_cont="${FOUND_BOT:-$BOT_CONTAINER_NAME}"
@@ -12918,7 +14479,7 @@ menu_settings() {
             27) # Цель и серверы — единый пошаговый мастер (что бэкапить + где). Доступно как раздел 7.
                 menu_backup_target ;;
 
-            0) _sview=""; continue ;;   # назад к списку разделов
+            0) [[ -n "$_sdirect" ]] && return; _sview=""; continue ;;   # назад к списку разделов (direct — выход)
         esac
         [[ -n "$s" ]] && sleep 0.5
     done
@@ -13146,7 +14707,8 @@ _cron_inactive() {
 # чтобы не дёргать crontab повторно). Без аргумента — считаем сами (first-run/quickstart).
 _protection_needed() {
     local _ci="${1:-}"; [[ -z "$_ci" ]] && { _cron_inactive && _ci=true || _ci=false; }
-    [[ -z "$BACKUP_PASSWORD" && ! -f "$BACKUP_PASSWORD_FILE" ]] && return 0
+    # №5: не голое -f, а реальная читаемость пароля (нечитаемый файл = защиты НЕТ).
+    _encryption_ready || return 0
     [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]] && return 0
     [[ "$_ci" == "true" ]] && return 0
     return 1
@@ -13157,8 +14719,11 @@ _protection_needed() {
 _readiness_line() {
     local _enc _stor _cron _ci="${1:-}"
     [[ -z "$_ci" ]] && { _cron_inactive && _ci=true || _ci=false; }
-    if [[ -n "$BACKUP_PASSWORD" || -f "$BACKUP_PASSWORD_FILE" ]]; then
+    # №5: три состояния — реально читается / файл есть но НЕЧИТАЕМ / выключено.
+    if _encryption_ready; then
         _enc="${GREEN}шифр${RESET}"
+    elif [[ -f "$BACKUP_PASSWORD_FILE" ]]; then
+        _enc="${RED}файл пароля НЕЧИТАЕМ${RESET}"
     else
         _enc="${RED}шифрование ВЫКЛ${RESET}"
     fi
@@ -13193,9 +14758,10 @@ _quickstart_protect() {
     # [1/3] Шифрование архивов
     echo ""
     echo -e "${CYAN}${BOLD}[1/3] Шифрование архивов (AES-256)${RESET}"
-    if [[ -n "$BACKUP_PASSWORD" || -f "$BACKUP_PASSWORD_FILE" ]]; then
+    if _encryption_ready; then   # №5: не голое -f — реальная читаемость пароля
         echo -e "  ${GREEN}✓ уже включено${RESET}"
     else
+        [[ -f "$BACKUP_PASSWORD_FILE" ]] && echo -e "  ${YELLOW}⚠ файл пароля существует, но НЕ читается — задайте пароль заново${RESET}"
         echo -e "  ${GRAY}Без пароля дамп БД (PII, токены) хранится в открытом виде.${RESET}"
         local _p1 _p2
         safe_read -s -erp "Пароль шифрования (Enter — пропустить): " _p1; echo ""
@@ -13719,8 +15285,11 @@ diag_command() {
             _bot_ver=$(get_raw_bot_version 2>/dev/null)
             echo "  Bot version: ${_bot_ver:-<не определена>}"
         fi
-        [[ -f "$BOT_PATH/docker-compose.yml" ]] && echo "  compose:     docker-compose.yml ✓"
-        [[ -f "$BOT_PATH/compose.yaml" ]] && echo "  compose:     compose.yaml ✓"
+        # №12: показываем реальный compose-файл из всех 4 канонических имён
+        local _diag_cf
+        if _diag_cf=$(_compose_in "$BOT_PATH" 2>/dev/null); then
+            echo "  compose:     $(basename "$_diag_cf") ✓"
+        fi
         [[ -f "$BOT_PATH/.env" ]] && echo "  .env:        ✓ ($(wc -l < "$BOT_PATH/.env" 2>/dev/null) lines)" || echo "  .env:        ✗"
     fi
     echo ""
@@ -14154,12 +15723,46 @@ case "$1" in
     check_update|update|self-update) check_for_updates ;;
     skipped|skip-list) show_skipped_report ;;
     upgrade)
-        if [[ "$BACKUP_TARGET" == "panel" ]]; then
-            echo -e "${RED}Обновление бота недоступно в режиме panel (BACKUP_TARGET=panel).${RESET}" >&2
-            echo "Установка настроена на бэкап Remnawave-панели — 'upgrade' отключён, чтобы не перезаписать контейнер remnawave." >&2
-            exit 2
-        fi
+        # Алиас 'bot upgrade'. auto_update_bot сам привязывается к РЕАЛЬНОМУ боту (bind_bot_runtime_or_fail)
+        # и отказывает, если бота нет / путь совпал с панелью — поэтому на смешанном сервере работает так же,
+        # как 'bot upgrade' (прежний общий panel-гейт снят, он делал алиас несогласованным с каноном).
         auto_update_bot "$2" "$3" ;;
+    stacks)
+        # Обнаруженные стеки этого сервера (read-only): панель / infra-billing / бот — по образам
+        # и compose-проектам, независимо от конфига.
+        discover_stacks
+        echo -e "${CYAN}${BOLD}Обнаруженные стеки:${RESET}"
+        echo -e "  Панель:        ${DISC_PANEL_DIR:-—}  app=${DISC_PANEL_APP:-—}  db=${DISC_PANEL_DB:-—}"
+        echo -e "  infra-billing: app=${DISC_BILLING_APP:-—}  db=${DISC_BILLING_DB:-—}"
+        echo -e "  Бот:           ${DISC_BOT_DIR:-—}  app=${DISC_BOT_APP:-—}  db=${DISC_BOT_DB:-—}"
+        echo ""
+        echo -e "${GRAY}Конфиг (активная цель $BACKUP_TARGET): path=$BOT_PATH db=$DB_CONTAINER_NAME${RESET}"
+        # Подсветка расхождений конфиг ↔ реальность (не правим, только показываем)
+        if [[ "$BACKUP_TARGET" == "panel" && -n "$DISC_PANEL_DB" && "$DB_CONTAINER_NAME" != "$DISC_PANEL_DB" ]]; then
+            echo -e "${YELLOW}  ⚠ Конфиг БД панели ('$DB_CONTAINER_NAME') ≠ обнаруженной ('$DISC_PANEL_DB')${RESET}"
+        fi
+        if [[ -n "$DISC_BOT_DIR" && -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" == "bot" ]]; then
+            [[ "$_CANON_BOT_PATH" != "$DISC_BOT_DIR" && -n "$_CANON_BOT_PATH" ]] \
+                && echo -e "${YELLOW}  ⚠ Конфиг бота ('$_CANON_BOT_PATH') ≠ обнаруженному ('$DISC_BOT_DIR')${RESET}"
+        fi
+        ;;
+    migrate)
+        case "$2" in
+            panel)
+                shift 2
+                panel_migrate_in "$@" ;;
+            *)
+                echo "Использование: lazarus migrate panel [--from user@host] [--port 22] [--key /path] [--path /opt/remnawave]"
+                echo ""
+                echo "Переносит Remnawave-панель со СТАРОГО сервера на ЭТОТ (запускать на новом)."
+                echo "SSH-ключ НЕ обязателен — без --from мастер спросит хост и позволит просто"
+                echo "ввести root-пароль старого сервера (нужен пакет sshpass, предложит поставить)."
+                echo "Источник читается по SSH (read-only) — старая панель продолжает работать до cutover."
+                echo "Тянет: каталог панели + дамп БД + роли (globals) + infra-billing."
+                echo "Runbook: .github/PANEL_MIGRATION_RUNBOOK.md"
+                ;;
+        esac
+        ;;
     migrate-v2|migrate_v2)
         # Конверсия v1 (Salted__) backup'ов в v2 (LAZ2 + HMAC).
         # Безопасно — оригинал удаляется только после успешной верификации v2.
@@ -14221,17 +15824,15 @@ case "$1" in
         echo "  backup files  | -B -f       Только файлы"
         echo "  backup list   | -B -l       Список бэкапов"
         echo ""
-        # M29: в режиме panel команды бота отключены — не предлагаем их.
-        if [[ "$BACKUP_TARGET" == "panel" ]]; then
-            echo "Управление ботом: недоступно в режиме panel (BACKUP_TARGET=panel)."
-        else
-            echo "Управление ботом (см. lazarus bot --help):"
-            echo "  bot status    | -b -s       Статус контейнера"
-            echo "  bot up                      Запустить контейнеры бота"
-            echo "  bot down                    Остановить контейнеры бота"
-            echo "  bot upgrade   | -b -u [KEY] Обновить бота (опц. LICENSE_KEY)"
-            echo "  upgrade [KEY]               Алиас 'bot upgrade' (обновляет БОТА, не скрипт!)"
-        fi
+        # №13: panel-гейт снят (диспетчер bot|-b работает через bind_bot_runtime_or_fail
+        # в ЛЮБОМ режиме) — help обязан показывать bot-команды всегда, иначе противоречие.
+        echo "Управление ботом (см. lazarus bot --help):"
+        echo "  bot status    | -b -s       Статус контейнера"
+        echo "  bot up                      Запустить контейнеры бота"
+        echo "  bot down                    Остановить контейнеры бота"
+        echo "  bot upgrade   | -b -u [KEY] Обновить бота (опц. LICENSE_KEY)"
+        echo "  upgrade [KEY]               Алиас 'bot upgrade' (обновляет БОТА, не скрипт!)"
+        echo "  (работают при наличии ЛОКАЛЬНОГО бота: авто-поиск, отказ если найдена только панель)"
         echo ""
         echo "S3 хранилище (см. lazarus s3 --help):"
         echo "  s3 test       | -S -t       Проверить подключение"
@@ -14252,6 +15853,11 @@ case "$1" in
         echo "  update | check_update       Обновить САМ СКРИПТ lazarus (не бота!)"
         echo "  'update' = скрипт · 'upgrade' = бот — РАЗНЫЕ цели, не перепутать."
         echo ""
+        echo "Сервер и миграция:"
+        echo "  stacks                      Обнаруженные стеки (панель / infra-billing / бот)"
+        echo "  migrate panel [--from u@host] Перенос панели со старого сервера НА этот (см. runbook);"
+        echo "                              SSH-ключ НЕ обязателен — можно ввести root-пароль старого сервера"
+        echo ""
         echo "Примеры:"
         echo "  lazarus                              # интерактивное меню"
         echo "  lazarus --yes backup db              # cron-режим: бэкап БД"
@@ -14260,12 +15866,9 @@ case "$1" in
         echo "  lazarus --dry-run cleanup            # предпросмотр очистки"
         ;;
     bot|-b)
-        if [[ "$BACKUP_TARGET" == "panel" ]]; then
-            echo -e "${RED}Команды управления ботом недоступны в режиме panel (BACKUP_TARGET=panel).${RESET}" >&2
-            echo "BOT_PATH указывает на /opt/remnawave — 'bot down/up/upgrade' остановили/перезаписали бы саму панель." >&2
-            echo "Для бэкапа панели: lazarus backup db | full | restore." >&2
-            exit 2
-        fi
+        # На смешанном сервере (бот+панель) bot-команды работают: каждая через
+        # bind_bot_runtime_or_fail привязывается к РЕАЛЬНОМУ боту (напр. /opt/rwp-shop) и
+        # жёстко отказывает, если бота нет или путь совпал с панелью. Общий panel-гейт снят.
         case "$2" in
             up)                 bot_up ;;
             down)               bot_down ;;
@@ -14371,6 +15974,21 @@ case "$1" in
                 )
                 exit $?
                 ;;
+            rotate|-r)
+                # Ручная remote-ротация: lazarus s3 rotate [days] (--dry-run уважается).
+                # Без аргумента — S3_RETENTION_DAYS из конфига.
+                if [[ "$REMOTE_STORAGE_TYPE" != "s3" ]]; then
+                    echo -e "${RED}S3 не настроен!${RESET}"; exit 1
+                fi
+                _s3_rot_days="${3:-${S3_RETENTION_DAYS:-0}}"
+                if [[ ! "$_s3_rot_days" =~ ^[0-9]+$ || "$_s3_rot_days" -eq 0 ]]; then
+                    echo "Ротация выключена (S3_RETENTION_DAYS=0). Использование: lazarus s3 rotate <days>"
+                    exit 1
+                fi
+                echo "S3-ротация: удаление lazarus-архивов старше ${_s3_rot_days}д. из s3://${S3_BUCKET}/${S3_PATH#/}"
+                [[ "$DRY_RUN" == "true" ]] && echo "(режим DRY-RUN — только показ)"
+                _s3_rotate_old "$_s3_rot_days"
+                ;;
             *)
                 echo "Использование: lazarus s3 <команда>"
                 echo "           или: lazarus -S <команда>"
@@ -14379,6 +15997,7 @@ case "$1" in
                 echo "  test,   -t      - Проверить подключение к S3"
                 echo "  list,   -l      - Список файлов в bucket"
                 echo "  upload, -u      - Загрузить файл в S3"
+                echo "  rotate [N], -r  - Удалить свои архивы старше N дней (или S3_RETENTION_DAYS)"
                 echo ""
                 echo "Примеры:"
                 echo "  lazarus s3 test"
@@ -14400,7 +16019,8 @@ case "$1" in
         if [[ -z "$BOT_PATH" || ! -d "$BOT_PATH" ]]; then
             # Пробуем стандартные пути
             for _try_path in "$DEFAULT_BOT_PATH" "/opt/rwp_shop" "/opt/remnawave-telegram-shop"; do
-                if [[ -d "$_try_path" && ( -f "$_try_path/docker-compose.yml" || -f "$_try_path/compose.yaml" ) ]]; then
+                # №12: _compose_in — все 4 канонических имени compose
+                if [[ -d "$_try_path" ]] && _compose_in "$_try_path" > /dev/null 2>&1; then
                     BOT_PATH="$_try_path"
                     break
                 fi
@@ -14443,9 +16063,7 @@ case "$1" in
                             ensure_license_key_in_env
                         fi
                         if [[ "$_has_mid" == "false" ]]; then
-                            _compose_file=""
-                            [[ -f "$BOT_PATH/compose.yaml" ]] && _compose_file="$BOT_PATH/compose.yaml"
-                            [[ -f "$BOT_PATH/docker-compose.yml" ]] && _compose_file="$BOT_PATH/docker-compose.yml"
+                            _compose_file=$(_compose_in "$BOT_PATH" || echo "")   # №12
                             [[ -n "$_compose_file" ]] && ensure_machine_id_volume "$_compose_file"
                         fi
                     fi
@@ -14488,9 +16106,14 @@ case "$1" in
             _readiness_line "$NO_CRITICAL_BACKUP"
             echo ""
 
-            # Уведомление о доступном обновлении скрипта
+            # Уведомление о доступном обновлении скрипта. В Стандартном режиме пункта 8 нет —
+            # честно указываем путь через эксперт-меню, иначе подсказка врала бы.
             if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
-                echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 8)${RESET}"
+                if [[ "$UI_MODE" == "standard" ]]; then
+                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (Эксперт-режим: 77 → пункт 8)${RESET}"
+                else
+                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 8)${RESET}"
+                fi
             fi
             # Уведомление о pending v1→v2 миграции
             if [[ -f "$INSTALL_DIR/.v2_migration_pending" ]]; then
@@ -14547,6 +16170,35 @@ case "$1" in
                 echo -e "${YELLOW}${BOLD} Быстрая настройка защиты — введите Q${RESET}"
                 echo ""
             fi
+            # === СТАНДАРТНЫЙ РЕЖИМ: короткое меню для новичков (дашборд выше — общий) ===
+            # Только базовые операции; цели/both/хранилище/обновления/uninstall — в эксперт-режиме (77).
+            if [[ "$UI_MODE" == "standard" ]]; then
+                echo " --- ДЕЙСТВИЯ ---"
+                echo " 1. Сделать бэкап сейчас"
+                echo " 2. Восстановить из бэкапа"
+                echo " 3. Расписание бэкапов"
+                echo " 4. Telegram-уведомления"
+                echo " 5. Очистить старые бэкапы $CLEANUP_LABEL"
+                echo -e " 77. ${CYAN}Эксперт-режим${RESET} ${GRAY}(все настройки: цели, хранилище, обновления)${RESET}"
+                echo " 0. Выход"
+                echo ""
+                safe_read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
+                case $opt in
+                    q|Q) _quickstart_protect ;;
+                    1) menu_manual_backup ;;
+                    2) menu_restore ;;
+                    3) menu_automation ;;
+                    4) menu_settings telegram ;;   # сразу раздел Telegram, без эксперт-навигации
+                    5) cleanup_old_backups ;;
+                    77) UI_MODE="expert"; save_config
+                        print_message "SUCCESS" "Эксперт-режим включён (вернуться: Настройки → Режим меню)"
+                        sleep 1 ;;
+                    0) exit 0 ;;
+                    *) print_message "ERROR" "Неверный пункт меню"; sleep 1 ;;
+                esac
+                continue
+            fi
+
             echo " --- ДЕЙСТВИЯ ---"
             echo " 1. Сделать бэкап сейчас"
             echo -e " 2. ${CYAN}${BOLD}Что бэкапить${RESET} — цели и серверы (панель / бот / обе)"
@@ -14554,8 +16206,10 @@ case "$1" in
             echo " 4. Восстановить из бэкапа"
             echo " 5. Настройки (Telegram / хранилище / шифрование / ротация)"
             echo " 6. Удалить старые бэкапы $CLEANUP_LABEL"
-            # «Обновить бота» — только когда бэкапим ТОЛЬКО локального бота (иначе update перезаписал бы панель).
-            [[ "$BACKUP_TARGET" == "bot" && -z "$BACKUP_SECONDARY" && "$BOT_TRANSPORT" != "ssh" ]] && echo -e " 7. ${CYAN}Обновить бота${RESET}"
+            # «Обновить бота» — при локальном bot-транспорте, НЕЗАВИСИМО от цели бэкапа (№13):
+            # update_bot сам привязывается к РЕАЛЬНОМУ боту через bind_bot_runtime_or_fail и
+            # жёстко откажет, если бота нет / путь совпал с панелью.
+            [[ "$BOT_TRANSPORT" != "ssh" ]] && echo -e " 7. ${CYAN}Обновить бота${RESET}"
             if [[ -n "$UPDATE_AVAILABLE" ]]; then
                 echo -e " 8. ${CYAN}${BOLD}Обновления скрипта [NEW!]${RESET}"
             else
@@ -14573,7 +16227,7 @@ case "$1" in
                 4) menu_restore ;;
                 5) menu_settings ;;
                 6) cleanup_old_backups ;;
-                7) if [[ "$BACKUP_TARGET" == "bot" && -z "$BACKUP_SECONDARY" && "$BOT_TRANSPORT" != "ssh" ]]; then update_bot; else print_message "WARN" "Обновление бота доступно только когда цель — локальный бот"; sleep 1; fi ;;
+                7) if [[ "$BOT_TRANSPORT" != "ssh" ]]; then update_bot; unbind_bot_runtime; else print_message "WARN" "Обновление бота недоступно для удалённого (SSH) бота"; sleep 1; fi ;;
                 8) check_for_updates ;;
                 666) uninstall_script ;;
                 0) exit 0 ;;

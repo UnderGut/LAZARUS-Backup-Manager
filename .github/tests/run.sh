@@ -9,23 +9,20 @@ if [[ ! -f "$SCRIPT" ]]; then
   exit 1
 fi
 
-run_test() {
-  local name="$1"
+# Glob-цикл вместо ручного списка: раньше run.sh запускал 11 из 29 тестов и «зелёный локальный
+# прогон» не исполнял ни одной проверки identity/guard-слоя — дрейф с ci.yml исключён навсегда.
+fail=0
+for t in "$ROOT_DIR"/.github/tests/test_*.sh; do
+  name=$(basename "$t" .sh); name="${name#test_}"; name="${name//_/ }"
   echo "[TEST] $name"
-  shift
-  "$@"
-}
+  if ! bash "$t"; then
+    echo "[FAIL] $name"
+    fail=1
+  fi
+done
 
-run_test "restore safety"        "$ROOT_DIR/.github/tests/test_restore_safety.sh"
-run_test "password validation"   "$ROOT_DIR/.github/tests/test_password_validation.sh"
-run_test "skipped report"        "$ROOT_DIR/.github/tests/test_skipped_report.sh"
-run_test "version compare"       "$ROOT_DIR/.github/tests/test_version_compare.sh"
-run_test "hmac envelope"         "$ROOT_DIR/.github/tests/test_hmac_envelope.sh"
-run_test "s3 helpers"            "$ROOT_DIR/.github/tests/test_s3_helpers.sh"
-run_test "timeout helpers"       "$ROOT_DIR/.github/tests/test_timeout_helpers.sh"
-run_test "exclude_dirs split"    "$ROOT_DIR/.github/tests/test_exclude_dirs_split.sh"
-run_test "skipped print0"        "$ROOT_DIR/.github/tests/test_skipped_print0.sh"
-run_test "telegram alert"        "$ROOT_DIR/.github/tests/test_telegram_alert.sh"
-run_test "compression helpers"   "$ROOT_DIR/.github/tests/test_compression_helpers.sh"
-
+if [[ $fail -ne 0 ]]; then
+  echo "SOME TESTS FAILED"
+  exit 1
+fi
 echo "All tests passed"

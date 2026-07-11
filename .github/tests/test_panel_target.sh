@@ -13,7 +13,11 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 debug_log() { :; }
 
 FUNCS="$TMP_DIR/funcs.sh"
-sed -n '/^resolve_backup_target() {$/,/^}$/p' "$SCRIPT" > "$FUNCS"
+# №20: resolve_backup_target берёт бот-набор из константы — тянем её вместе с функцией.
+{
+    grep '^BOT_KEYWORDS_DEFAULT=(' "$SCRIPT"
+    sed -n '/^resolve_backup_target() {$/,/^}$/p' "$SCRIPT"
+} > "$FUNCS"
 # shellcheck disable=SC1090
 source "$FUNCS"
 

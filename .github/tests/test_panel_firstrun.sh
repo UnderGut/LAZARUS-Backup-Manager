@@ -20,19 +20,28 @@ export LAZARUS_LIB=true
 source "$SCRIPT" >/dev/null 2>&1 || { echo "FAIL: could not source script as lib"; exit 1; }
 SILENT_LOG="$TMP_DIR/silent.log"
 
-# --- 1) detect_panel_root finds a dir with docker-compose.yml via PANEL_PATH ---
+# --- 1) detect_panel_root finds a dir with a PANEL-declaring docker-compose.yml via PANEL_PATH ---
+# ANTI-CYCLE contract: compose обязан ДЕКЛАРИРОВАТЬ панель (image remnawave/backend или
+# container_name remnawave-db), голого файла больше недостаточно.
 PANEL_DIR="$TMP_DIR/opt/remnawave"; mkdir -p "$PANEL_DIR"
-: > "$PANEL_DIR/docker-compose.yml"
+printf 'services:\n  remnawave:\n    image: remnawave/backend:2\n' > "$PANEL_DIR/docker-compose.yml"
 PANEL_PATH="$PANEL_DIR"
 got=$(detect_panel_root || true)
 [[ "$got" == "$PANEL_DIR" ]] && ok || bad "detect via PANEL_PATH (docker-compose.yml): got '$got'"
 
 # --- 2) compose.yaml / compose.yml variants are recognised ---
 PANEL_DIR2="$TMP_DIR/root/remnawave"; mkdir -p "$PANEL_DIR2"
-: > "$PANEL_DIR2/compose.yaml"
+printf 'services:\n  db:\n    container_name: remnawave-db\n' > "$PANEL_DIR2/compose.yaml"
 PANEL_PATH="$PANEL_DIR2"
 got=$(detect_panel_root || true)
 [[ "$got" == "$PANEL_DIR2" ]] && ok || bad "detect via PANEL_PATH (compose.yaml): got '$got'"
+
+# --- 2b) ANTI-CYCLE: каталог с НЕ-панельным compose НЕ детектится как панель ---
+FOREIGN_DIR="$TMP_DIR/opt/foreign"; mkdir -p "$FOREIGN_DIR"
+printf 'services:\n  app:\n    image: nginx:latest\n' > "$FOREIGN_DIR/docker-compose.yml"
+PANEL_PATH="$FOREIGN_DIR"
+got=$(detect_panel_root 2>/dev/null || true)
+[[ "$got" != "$FOREIGN_DIR" ]] && ok || bad "non-panel compose must NOT be detected as panel"
 
 # --- 3) a dir WITHOUT any compose file is NOT returned ---
 EMPTY_DIR="$TMP_DIR/empty/remnawave"; mkdir -p "$EMPTY_DIR"

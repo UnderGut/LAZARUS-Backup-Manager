@@ -6,7 +6,7 @@
 #   H2  bot row in both-mode must use the canon DB container, not the panel-clobbered one
 #   _readiness_line / _protection_needed flags
 #   _transport_of
-#   M29 help hides bot-management in panel mode
+#   (M29 help-gate снят фиксом №13 — bot-команды видны в help всегда)
 # Counters n_ok/n_err (never PASS= — the secret-scrubber rewrites it on disk).
 
 set -uo pipefail
@@ -25,6 +25,9 @@ export LAZARUS_LIB=true
 source "$SCRIPT" >/dev/null 2>&1 || { echo "FAIL: could not source script as lib"; exit 1; }
 SILENT_LOG="$TMP_DIR/silent.log"; DEBUG_MODE=false; DRY_RUN=false; IS_INTERACTIVE=false
 BACKUP_DIR="$TMP_DIR/bk"; mkdir -p "$BACKUP_DIR"
+# №5: «шифр» теперь = пароль РЕАЛЬНО читается (_encryption_ready), а read_password_file
+# отвергает файл вне INSTALL_DIR — кладём фикстуру внутрь INSTALL_DIR, как в проде.
+INSTALL_DIR="$TMP_DIR"
 BACKUP_PASSWORD_FILE="$TMP_DIR/.password"
 
 # --- 1) H1: SSH-цель НЕ показывает зелёную «✓» без проверки связи ---

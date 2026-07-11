@@ -29,6 +29,9 @@ docker() {
         "inspect --format {{.State.Status}} "*) echo "$_MOCK_STATE"; [[ -n "$_MOCK_STATE" ]] ;;
         *"printenv POSTGRES_USER"*) [[ -n "$_MOCK_USER" ]] && echo "$_MOCK_USER" ;;
         *"printenv POSTGRES_DB"*)   [[ -n "$_MOCK_DB" ]] && echo "$_MOCK_DB" ;;
+        # STACK-IDENTITY: _container_role инспектирует image|working_dir|service — отдаём
+        # billing-мету (postgres + billing-имя → роль billing-db), иначе role-гард отключил бы sidecar.
+        *"{{.Config.Image}}"*) echo "postgres:18.4|/opt/remnawave|infra-billing-db" ;;
         inspect*) return 0 ;;
         *) return 0 ;;
     esac
@@ -65,6 +68,9 @@ _MOCK_USER="infra"; _MOCK_DB="infra_billing"
 mock_ssh() {
     echo x >> "$TMP_DIR/ssh_calls"
     case "$1" in
+        # Комбинированный inspect (status|image|service) — role-гард remote-ветки требует
+        # billing-имя/сервис + БД-образ.
+        *"State.Status}}|{{.Config.Image"*) echo "running|postgres:18.4|infra-billing-db" ;;
         *"inspect --format"*) echo "running" ;;
         *"printenv POSTGRES_USER"*) echo "remoteuser" ;;
         *"printenv POSTGRES_DB"*)   echo "remotedb" ;;

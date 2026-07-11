@@ -28,6 +28,10 @@ FUNCS="$TMP_DIR/funcs.sh"
     sed -n '/^_delete_orphan_inc_for_full() {$/,/^}$/p' "$SCRIPT"
     echo ""
     sed -n '/^rotate_backups_by_size() {$/,/^}$/p' "$SCRIPT"
+    echo ""
+    sed -n '/^rotate_backups_by_age() {$/,/^}$/p' "$SCRIPT"
+    echo ""
+    sed -n '/^rotate_backups_by_count() {$/,/^}$/p' "$SCRIPT"
 } > "$FUNCS"
 # shellcheck disable=SC1090
 source "$FUNCS"
@@ -81,6 +85,41 @@ orphans=$(find "$BACKUP_DIR" -name "lazarus_inc_*__base_${base_ts}__*" | wc -l)
 [[ "$orphans" -eq 0 ]] && ok || bad "T4 orphan incs not cascaded: $orphans remain"
 # newest full still present (floor)
 [[ -f "$BACKUP_DIR/lazarus_full_2026-06-10_10_00_00__v1.tar.zst.enc" ]] && ok || bad "T4 newest full should survive"
+
+# T5 (№3): legacy .version sidecar must NOT bypass the namespace floor.
+# The sidecar matches bare 'lazarus_*' and is the newest file by mtime; before the fix it
+# became _newest_bot, leaving the REAL newest bot archive unprotected -> deleted (only copy).
+reset
+mk "lazarus_full_2026-06-01_10_00_00.tar.zst.enc" 2 6                    # only bot archive (old)
+echo v > "$BACKUP_DIR/lazarus_full_2026-06-01_10_00_00.tar.zst.enc.version"
+touch -d "@$(( $(date +%s) + 60 ))" "$BACKUP_DIR/lazarus_full_2026-06-01_10_00_00.tar.zst.enc.version"
+mk "lazarus_panel_full_2026-06-09_10_00_00.tar.zst.enc" 2 1
+mk "lazarus_panel_full_2026-06-10_10_00_00.tar.zst.enc" 2 0
+MAX_BACKUP_SIZE_MB="5"
+rotate_backups_by_size "true" >/dev/null 2>&1
+[[ -f "$BACKUP_DIR/lazarus_full_2026-06-01_10_00_00.tar.zst.enc" ]] && ok \
+    || bad "T5 (№3) .version sidecar bypassed floor: only bot archive was deleted"
+
+# T6 (№10): age rotation floor — ALL archives older than retention -> newest still kept.
+reset
+mk "lazarus_full_2026-05-01_10_00_00.tar.zst.enc" 1 10
+mk "lazarus_full_2026-05-02_10_00_00.tar.zst.enc" 1 9
+mk "lazarus_full_2026-05-03_10_00_00.tar.zst.enc" 1 8
+RETENTION_DAYS="7"
+rotate_backups_by_age "lazarus_full" "Полные" "$RETENTION_DAYS" "true" >/dev/null 2>&1
+[[ "$(count_backups)" -eq 1 ]] && ok || bad "T6 (№10) age floor: expected 1 kept, got $(count_backups)"
+[[ -f "$BACKUP_DIR/lazarus_full_2026-05-03_10_00_00.tar.zst.enc" ]] && ok \
+    || bad "T6 (№10) age floor: newest must be the survivor"
+
+# T7 (№10): count rotation floor — garbage/zero limit must never delete the newest.
+reset
+mk "lazarus_full_2026-05-01_10_00_00.tar.zst.enc" 1 5
+mk "lazarus_full_2026-05-02_10_00_00.tar.zst.enc" 1 4
+mk "lazarus_full_2026-05-03_10_00_00.tar.zst.enc" 1 0
+MAX_BACKUPS_COUNT="0"   # bypasses load-time heal on purpose (defense-in-depth path)
+rotate_backups_by_count "lazarus_full" "Полные" "true" >/dev/null 2>&1
+[[ "$(count_backups)" -eq 1 && -f "$BACKUP_DIR/lazarus_full_2026-05-03_10_00_00.tar.zst.enc" ]] && ok \
+    || bad "T7 (№10) count floor: newest must survive limit=0, remaining=$(count_backups)"
 
 echo "---"
 echo "ok=$n_ok err=$n_err"

@@ -3,10 +3,14 @@
 # Verifies that:
 #   1. Safe archives pass validation.
 #   2. Archives with absolute or '..' path components are rejected.
-#   3. Archives containing symlinks / hardlinks are rejected.
+#   3. №11 degrade: SAFE relative in-tree symlink/hardlink are ALLOWED (legacy backups
+#      with symlinks stay restorable), while absolute-target / '..'-escaping links and
+#      device/socket/fifo entries are still rejected.
 #
-# The function is extracted via sed and sourced into the test shell so the
+# The functions are extracted via sed and sourced into the test shell so the
 # real production logic is exercised (no re-implementation drift).
+# Link fixtures are crafted with python tarfile (works without FS symlink support,
+# e.g. git-bash on Windows); skipped if python is unavailable.
 
 set -euo pipefail
 
@@ -19,13 +23,18 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 SILENT_LOG="$TMP_DIR/silent.log"
 : > "$SILENT_LOG"
 print_message() { :; }
+log_message() { :; }
 export SILENT_LOG
 
-# Extract the validate_tar_safety function body and source it
+# Extract validate_tar_safety + its №11 helper and source them
 FUNC_FILE="$TMP_DIR/validate_tar_safety.sh"
-sed -n '/^validate_tar_safety() {$/,/^}$/p' "$SCRIPT" > "$FUNC_FILE"
-if ! [[ -s "$FUNC_FILE" ]]; then
-    echo "FAIL: could not extract validate_tar_safety from $SCRIPT" >&2
+{
+    sed -n '/^_tar_link_target_safe() {$/,/^}$/p' "$SCRIPT"
+    echo ""
+    sed -n '/^validate_tar_safety() {$/,/^}$/p' "$SCRIPT"
+} > "$FUNC_FILE"
+if ! [[ -s "$FUNC_FILE" ]] || ! grep -q '_tar_link_target_safe()' "$FUNC_FILE"; then
+    echo "FAIL: could not extract validate_tar_safety/_tar_link_target_safe from $SCRIPT" >&2
     exit 1
 fi
 # shellcheck disable=SC1090
@@ -33,9 +42,10 @@ source "$FUNC_FILE"
 
 assert_pass() {
     local archive="$1"
+    local reason="${2:-}"
     local list="$TMP_DIR/list.$RANDOM"
     if ! validate_tar_safety "$archive" "$list"; then
-        echo "FAIL: expected $archive to pass validation" >&2
+        echo "FAIL: expected $archive to pass validation ${reason:+($reason)}" >&2
         exit 1
     fi
 }
@@ -70,18 +80,67 @@ ABS_TGZ="$TMP_DIR/abs.tgz"
 tar -C "$TMP_DIR" --transform 's,^safe,/etc/safe,' -czf "$ABS_TGZ" safe -P
 assert_fail "$ABS_TGZ" "absolute path"
 
-# --- Fixture 4: archive with symlink ---
-# Skip on platforms where 'ln -s' silently falls back to a regular file copy
-# (e.g. git-bash on Windows without dev-mode/admin). On Linux CI this runs.
-SYM_DIR="$TMP_DIR/symdir"
-mkdir -p "$SYM_DIR"
-echo "ok" > "$SYM_DIR/real.txt"
-ln -s real.txt "$SYM_DIR/link.txt" 2>/dev/null || true
-if [[ -L "$SYM_DIR/link.txt" ]]; then
-    SYM_TGZ="$TMP_DIR/sym.tgz"
-    tar -C "$TMP_DIR" -czf "$SYM_TGZ" symdir
-    assert_fail "$SYM_TGZ" "symlink present"
-    echo "  restore safety: 4 fixtures OK"
-else
-    echo "  restore safety: 3 fixtures OK (symlink test skipped: no symlink support)"
+# --- Fixtures 4-9 (№11): links crafted via python tarfile (no FS symlink needed) ---
+PY=$(command -v python3 || command -v python || true)
+if [[ -z "$PY" ]]; then
+    echo "  restore safety: 3 fixtures OK (link fixtures skipped: no python)"
+    exit 0
 fi
+
+mk_link_tar() {
+    # $1 = outfile, $2 = kind
+    "$PY" - "$1" "$2" <<'PYEOF'
+import tarfile, io, sys
+out, kind = sys.argv[1], sys.argv[2]
+tf = tarfile.open(out, "w:gz", format=tarfile.GNU_FORMAT)
+data = b"x"
+ti = tarfile.TarInfo("root/real.txt"); ti.size = len(data)
+tf.addfile(ti, io.BytesIO(data))
+def link(name, target, typ):
+    t = tarfile.TarInfo(name); t.type = typ; t.linkname = target
+    tf.addfile(t)
+if kind == "safe_sym":    # relative, in-tree: root/link.txt -> real.txt
+    link("root/link.txt", "real.txt", tarfile.SYMTYPE)
+elif kind == "dotdot_intree_sym":  # '..' but resolves INSIDE the tree: root/sub/l -> ../real.txt
+    t = tarfile.TarInfo("root/sub/l.txt"); t.type = tarfile.SYMTYPE; t.linkname = "../real.txt"
+    tf.addfile(t)
+elif kind == "abs_sym":   # absolute target — must be rejected
+    link("root/link.txt", "/etc/passwd", tarfile.SYMTYPE)
+elif kind == "esc_sym":   # '..' escaping above archive root — must be rejected
+    link("root/link.txt", "../../evil", tarfile.SYMTYPE)
+elif kind == "safe_hard": # hardlink target is archive-root-relative and in-tree
+    link("root/link.txt", "root/real.txt", tarfile.LNKTYPE)
+elif kind == "esc_hard":  # hardlink escaping the root — must be rejected
+    # NB: LEADING '../' is stripped by GNU tar itself on list/extract, so use an
+    # embedded '..' escape which tar preserves verbatim in the listing.
+    link("root/link.txt", "root/../../outside", tarfile.LNKTYPE)
+elif kind == "chardev":   # char device — always rejected
+    t = tarfile.TarInfo("root/dev0"); t.type = tarfile.CHRTYPE
+    t.devmajor = 1; t.devminor = 3
+    tf.addfile(t)
+tf.close()
+PYEOF
+}
+
+mk_link_tar "$TMP_DIR/safe_sym.tgz" safe_sym
+assert_pass "$TMP_DIR/safe_sym.tgz" "№11: safe in-tree symlink must be allowed"
+
+mk_link_tar "$TMP_DIR/dotdot_intree_sym.tgz" dotdot_intree_sym
+assert_pass "$TMP_DIR/dotdot_intree_sym.tgz" "№11: '..' resolving in-tree must be allowed"
+
+mk_link_tar "$TMP_DIR/abs_sym.tgz" abs_sym
+assert_fail "$TMP_DIR/abs_sym.tgz" "№11: absolute symlink target"
+
+mk_link_tar "$TMP_DIR/esc_sym.tgz" esc_sym
+assert_fail "$TMP_DIR/esc_sym.tgz" "№11: '..'-escaping symlink target"
+
+mk_link_tar "$TMP_DIR/safe_hard.tgz" safe_hard
+assert_pass "$TMP_DIR/safe_hard.tgz" "№11: safe in-tree hardlink must be allowed"
+
+mk_link_tar "$TMP_DIR/esc_hard.tgz" esc_hard
+assert_fail "$TMP_DIR/esc_hard.tgz" "№11: escaping hardlink target"
+
+mk_link_tar "$TMP_DIR/chardev.tgz" chardev
+assert_fail "$TMP_DIR/chardev.tgz" "№11: char device still rejected"
+
+echo "  restore safety: 10 fixtures OK (incl. №11 link degrade)"
