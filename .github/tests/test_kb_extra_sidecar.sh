@@ -108,9 +108,11 @@ grep -qE '_CRITICAL_SECTION=1   # опасное окно импорта KB' "$S
 grep -qE '8\. Доп\. компоненты' "$SCRIPT" && ok || bad "категории настроек должны содержать раздел 8 «Доп. компоненты»"
 grep -qE '8\) _sview=addons' "$SCRIPT" && ok || bad "выбор 8 должен открывать _sview=addons"
 grep -qE '_sview" == "addons"' "$SCRIPT" && ok || bad "должен существовать рендер раздела addons"
-# 6b) пункт 14 (KB) — зеркальный обработчик п.13 (billing), с гардом «бот среди целей»
-grep -qE '14\) # KB ИИ-саппорта' "$SCRIPT" && ok || bad "должен быть обработчик 14 (KB: режим+контейнер)"
-grep -qE 'BOT_KB_BACKUP="false" ;;' "$SCRIPT" && ok || bad "обработчик 14 должен уметь выключать KB"
+# 6b) пункт 14 (KB) — зеркальный обработчик п.13 (billing), с гардом «бот среди целей».
+# Тумблер ДА⇄НЕТ: включение и выключение без под-меню.
+grep -qE '14\) # KB ИИ-саппорта' "$SCRIPT" && ok || bad "должен быть обработчик 14 (KB-тумблер)"
+grep -qE 'BOT_KB_BACKUP="false"$' "$SCRIPT" && ok || bad "тумблер 14 должен уметь выключать KB"
+grep -qE 'BOT_KB_BACKUP="auto"$' "$SCRIPT" && ok || bad "тумблер 14 должен уметь включать KB (auto)"
 # 6c) billing больше НЕ живёт строкой в разделе general (переехал в addons)
 _gen_start=$(grep -n '_sview" == "general"' "$SCRIPT" | head -1 | cut -d: -f1)
 _gen_end=$(grep -n '# /general' "$SCRIPT" | head -1 | cut -d: -f1)
@@ -119,15 +121,13 @@ sed -n "${_gen_start},${_gen_end}p" "$SCRIPT" | grep -q 'Infra-billing БД' \
 # 6d) first-run: явный вопрос про обнаруженные доп. компоненты (Y/n), отказ = false
 grep -qE 'бэкапить вместе с панелью\? \(Y/n\)' "$SCRIPT" && ok || bad "first-run должен спрашивать про infra-billing"
 grep -qE 'бэкапить вместе с ботом\? \(Y/n\)' "$SCRIPT" && ok || bad "first-run должен спрашивать про KB"
-# 6e) при «выкл» имя контейнера НЕ спрашивается (вопрос — только внутри гейта != false)
-_q13=$(grep -n 'Контейнер БД биллинга (Enter' "$SCRIPT" | head -1 | cut -d: -f1)
-_g13=$(grep -n 'if \[\[ "\$PANEL_BILLING_BACKUP" != "false" \]\]; then' "$SCRIPT" | head -1 | cut -d: -f1)
-[[ -n "$_q13" && -n "$_g13" && "$_g13" -lt "$_q13" && $((_q13 - _g13)) -le 3 ]] && ok \
-    || bad "вопрос про контейнер биллинга должен быть внутри гейта PANEL_BILLING_BACKUP != false"
-_q14=$(grep -n 'Контейнер БД KB (Enter' "$SCRIPT" | head -1 | cut -d: -f1)
-_g14=$(grep -n 'if \[\[ "\$BOT_KB_BACKUP" != "false" \]\]; then' "$SCRIPT" | head -1 | cut -d: -f1)
-[[ -n "$_q14" && -n "$_g14" && "$_g14" -lt "$_q14" && $((_q14 - _g14)) -le 3 ]] && ok \
-    || bad "вопрос про контейнер KB должен быть внутри гейта BOT_KB_BACKUP != false"
+# 6e) тумблер НЕ задаёт вопросов: ни про контейнер, ни под-меню режимов (13/14 = один нажим).
+grep -q 'Контейнер БД биллинга (Enter' "$SCRIPT" \
+    && bad "тумблер 13 не должен спрашивать имя контейнера" || ok
+grep -q 'Контейнер БД KB (Enter' "$SCRIPT" \
+    && bad "тумблер 14 не должен спрашивать имя контейнера" || ok
+grep -q 'Да, всегда — строгий' "$SCRIPT" \
+    && bad "под-меню режимов должно быть убрано (строгий — только ключ config.env)" || ok
 
 echo "---"
 echo "ok=$n_ok err=$n_err"

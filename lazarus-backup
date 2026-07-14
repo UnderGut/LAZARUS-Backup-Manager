@@ -14555,27 +14555,20 @@ menu_settings() {
         echo -e "  Необязательные базы рядом с панелью и ботом — бэкапить их или нет, решаете вы."
         echo ""
         local _bb_disp _kb_disp
-        case "$PANEL_BILLING_BACKUP" in
-            false) _bb_disp="${RED}✗ нет      ${RESET}" ;;
-            true)  _bb_disp="${GREEN}✓ строгий  ${RESET}" ;;
-            *)     _bb_disp="${GREEN}✓ авто     ${RESET}" ;;
-        esac
-        case "$BOT_KB_BACKUP" in
-            false) _kb_disp="${RED}✗ нет      ${RESET}" ;;
-            true)  _kb_disp="${GREEN}✓ строгий  ${RESET}" ;;
-            *)     _kb_disp="${GREEN}✓ авто     ${RESET}" ;;
-        esac
+        # ✓ ДА покрывает auto и true (строгий — ручной ключ config.env, тумблером не показываем).
+        if [[ "$PANEL_BILLING_BACKUP" == "false" ]]; then _bb_disp="${RED}✗ НЕТ${RESET}"; else _bb_disp="${GREEN}✓ ДА ${RESET}"; fi
+        if [[ "$BOT_KB_BACKUP" == "false" ]]; then _kb_disp="${RED}✗ НЕТ${RESET}"; else _kb_disp="${GREEN}✓ ДА ${RESET}"; fi
         local _bb_ctx="панели" _kb_ctx="бота"
         [[ "$BACKUP_TARGET" != "panel" && "$BACKUP_SECONDARY" != "panel" ]] && _bb_ctx="— (панель не бэкапится)"
         [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]] && _kb_ctx="— (бот не бэкапится)"
         # Кириллицу printf %-Ns ровнять нельзя (считает байты) — колонку «Компонент» паддим руками,
         # контейнер (docker-имена всегда ASCII) — через printf.
-        echo -e "   ${GRAY}№    Компонент          Контейнер            Бэкапим      Идёт в бэкап${RESET}"
-        echo -e "  ${GRAY}$(_hrule '─' 76)${RESET}"
-        printf '  13.  Infra-billing БД   %-20s ' "${PANEL_BILLING_DB_CONTAINER:-—}"; echo -e "${_bb_disp}  ${GRAY}${_bb_ctx}${RESET}"
-        printf '  14.  KB ИИ-саппорта     %-20s ' "${BOT_KB_DB_CONTAINER:-—}"; echo -e "${_kb_disp}  ${GRAY}${_kb_ctx}${RESET}"
+        echo -e "   ${GRAY}№    Компонент          Контейнер            Бэкапим    Идёт в бэкап${RESET}"
+        echo -e "  ${GRAY}$(_hrule '─' 72)${RESET}"
+        printf '  13.  Infra-billing БД   %-20s ' "${PANEL_BILLING_DB_CONTAINER:-—}"; echo -e "${_bb_disp}      ${GRAY}${_bb_ctx}${RESET}"
+        printf '  14.  KB ИИ-саппорта     %-20s ' "${BOT_KB_DB_CONTAINER:-—}"; echo -e "${_kb_disp}      ${GRAY}${_kb_ctx}${RESET}"
         echo ""
-        echo -e "  ${GRAY}«авто» — бэкапим, когда контейнер запущен · «строгий» — без него бэкап падает с ошибкой.${RESET}"
+        echo -e "  ${GRAY}13 / 14 — переключить ДА⇄НЕТ. «ДА» бэкапит, когда контейнер запущен.${RESET}"
         fi  # /addons
 
         echo -e "\n 0. Назад к разделам"
@@ -14731,57 +14724,36 @@ menu_settings() {
                 
             12) test_telegram_connection ;;
 
-            13) # infra-billing sidecar: режим бэкапа + имя контейнера БД биллинга
+            13) # infra-billing: простой тумблер ✓ ДА / ✗ НЕТ (без меню и вопросов).
+                # «ДА» = auto (бэкапим, когда контейнер запущен). Строгий режим (true) и имя
+                # контейнера — ручные ключи config.env для экспертов (см. CONFIG_REFERENCE.md);
+                # тумблер значение true не затирает молча: ДА⇄НЕТ работает поверх auto/true.
                 if [[ "$BACKUP_TARGET" != "panel" && "$BACKUP_SECONDARY" != "panel" ]]; then
                     print_message "INFO" "Infra-billing относится к бэкапу панели (панель не среди целей)."; sleep 1.5; continue
                 fi
-                echo "Бэкапить базу биллинга (infra-billing)?"
-                echo " 1. Да, когда контейнер запущен — авто (рекомендуется)"
-                echo " 2. Да, всегда — строгий: если контейнер выключен, бэкап панели завершится ОШИБКОЙ"
-                echo " 3. Нет — не бэкапить"
-                local _bb_choice
-                safe_read -erp "Выбор (1/2/3, Enter — не менять): " _bb_choice
-                case "$_bb_choice" in
-                    1) PANEL_BILLING_BACKUP="auto" ;;
-                    2) PANEL_BILLING_BACKUP="true" ;;
-                    3) PANEL_BILLING_BACKUP="false" ;;
-                esac
-                # Имя контейнера спрашиваем только когда компонент ВКЛючён — при «выкл» оно не нужно.
-                if [[ "$PANEL_BILLING_BACKUP" != "false" ]]; then
-                    local _bb_cont
-                    safe_read -erp "Контейнер БД биллинга (Enter = '${PANEL_BILLING_DB_CONTAINER:-infra-billing-db}'): " _bb_cont
-                    [[ -n "$_bb_cont" ]] && PANEL_BILLING_DB_CONTAINER="$_bb_cont"
+                if [[ "$PANEL_BILLING_BACKUP" == "false" ]]; then
+                    PANEL_BILLING_BACKUP="auto"
                     [[ -z "$PANEL_BILLING_DB_CONTAINER" ]] && PANEL_BILLING_DB_CONTAINER="infra-billing-db"
-                    save_config; print_message "SUCCESS" "Сохранено: ${PANEL_BILLING_DB_CONTAINER} · режим ${PANEL_BILLING_BACKUP}"
+                    save_config; print_message "SUCCESS" "Infra-billing: ✓ ДА — попадёт в бэкап панели (когда контейнер запущен)"
                 else
-                    save_config; print_message "SUCCESS" "Infra-billing: не бэкапим (выкл)"
-                fi ;;
+                    PANEL_BILLING_BACKUP="false"
+                    save_config; print_message "SUCCESS" "Infra-billing: ✗ НЕТ — не бэкапим"
+                fi
+                sleep 1 ;;
 
-            14) # KB ИИ-саппорта: режим бэкапа + имя контейнера БД KB (зеркально п.13)
+            14) # KB ИИ-саппорта: простой тумблер ✓ ДА / ✗ НЕТ (зеркально п.13)
                 if [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]]; then
                     print_message "INFO" "KB относится к бэкапу бота (бот не среди целей)."; sleep 1.5; continue
                 fi
-                echo "Бэкапить базу знаний ИИ-саппорта (KB)?"
-                echo " 1. Да, когда контейнер запущен — авто (рекомендуется)"
-                echo " 2. Да, всегда — строгий: если контейнер выключен, бэкап бота завершится ОШИБКОЙ"
-                echo " 3. Нет — не бэкапить"
-                local _kb_choice
-                safe_read -erp "Выбор (1/2/3, Enter — не менять): " _kb_choice
-                case "$_kb_choice" in
-                    1) BOT_KB_BACKUP="auto" ;;
-                    2) BOT_KB_BACKUP="true" ;;
-                    3) BOT_KB_BACKUP="false" ;;
-                esac
-                # Имя контейнера спрашиваем только когда компонент ВКЛючён — при «выкл» оно не нужно.
-                if [[ "$BOT_KB_BACKUP" != "false" ]]; then
-                    local _kb_cont
-                    safe_read -erp "Контейнер БД KB (Enter = '${BOT_KB_DB_CONTAINER:-rwp_shop_kb_db}'): " _kb_cont
-                    [[ -n "$_kb_cont" ]] && BOT_KB_DB_CONTAINER="$_kb_cont"
+                if [[ "$BOT_KB_BACKUP" == "false" ]]; then
+                    BOT_KB_BACKUP="auto"
                     [[ -z "$BOT_KB_DB_CONTAINER" ]] && BOT_KB_DB_CONTAINER="rwp_shop_kb_db"
-                    save_config; print_message "SUCCESS" "Сохранено: ${BOT_KB_DB_CONTAINER} · режим ${BOT_KB_BACKUP}"
+                    save_config; print_message "SUCCESS" "KB: ✓ ДА — попадёт в бэкап бота (когда контейнер запущен)"
                 else
-                    save_config; print_message "SUCCESS" "KB: не бэкапим (выкл)"
-                fi ;;
+                    BOT_KB_BACKUP="false"
+                    save_config; print_message "SUCCESS" "KB: ✗ НЕТ — не бэкапим"
+                fi
+                sleep 1 ;;
 
             17) configure_remote_storage ;;
             
