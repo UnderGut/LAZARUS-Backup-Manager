@@ -103,6 +103,23 @@ grep -qE 'kb restore guard: collides with main db' "$SCRIPT" && ok || bad "KB-re
 # KB-импорт обёрнут в критическую секцию (Ctrl+C-защита)
 grep -qE '_CRITICAL_SECTION=1   # опасное окно импорта KB' "$SCRIPT" && ok || bad "KB-импорт должен ставить _CRITICAL_SECTION=1"
 
+# === 6) «Доп. компоненты» — вторичность billing/KB (панель → бот → опционально это) ===
+# 6a) отдельный раздел 8 в категориях настроек + view addons
+grep -qE '8\. Доп\. компоненты' "$SCRIPT" && ok || bad "категории настроек должны содержать раздел 8 «Доп. компоненты»"
+grep -qE '8\) _sview=addons' "$SCRIPT" && ok || bad "выбор 8 должен открывать _sview=addons"
+grep -qE '_sview" == "addons"' "$SCRIPT" && ok || bad "должен существовать рендер раздела addons"
+# 6b) пункт 14 (KB) — зеркальный обработчик п.13 (billing), с гардом «бот среди целей»
+grep -qE '14\) # KB ИИ-саппорта' "$SCRIPT" && ok || bad "должен быть обработчик 14 (KB: режим+контейнер)"
+grep -qE 'BOT_KB_BACKUP="false" ;;' "$SCRIPT" && ok || bad "обработчик 14 должен уметь выключать KB"
+# 6c) billing больше НЕ живёт строкой в разделе general (переехал в addons)
+_gen_start=$(grep -n '_sview" == "general"' "$SCRIPT" | head -1 | cut -d: -f1)
+_gen_end=$(grep -n '# /general' "$SCRIPT" | head -1 | cut -d: -f1)
+sed -n "${_gen_start},${_gen_end}p" "$SCRIPT" | grep -q 'Infra-billing БД' \
+    && bad "billing-строка должна переехать из general в addons" || ok
+# 6d) first-run: явный вопрос про обнаруженные доп. компоненты (Y/n), отказ = false
+grep -qE 'бэкапить вместе с панелью\? \(Y/n\)' "$SCRIPT" && ok || bad "first-run должен спрашивать про infra-billing"
+grep -qE 'бэкапить вместе с ботом\? \(Y/n\)' "$SCRIPT" && ok || bad "first-run должен спрашивать про KB"
+
 echo "---"
 echo "ok=$n_ok err=$n_err"
 [[ $n_err -eq 0 ]] || exit 1

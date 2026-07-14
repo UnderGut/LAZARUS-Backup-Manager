@@ -7514,6 +7514,33 @@ select_backup_target_firstrun() {
     if [[ "$BACKUP_SECONDARY" == "bot" && -z "$_bot_dir" ]]; then
         _ask_target_location "bot"
     fi
+    # Доп. компоненты — ВТОРИЧНЫ (приоритет: панель → бот → потом это). Спрашиваем только про
+    # ОБНАРУЖЕННЫЕ необязательные базы: infra-billing (компонент панели) и KB ИИ-саппорта
+    # (компонент бота). Enter = да (данные безопаснее бэкапить); «n» = выкл. Всегда можно
+    # передумать: Настройки → Доп. компоненты (раздел 8).
+    if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]] && [[ -n "${DISC_BILLING_DB:-}" ]]; then
+        echo ""
+        local _ad_b
+        safe_read -erp "Обнаружен infra-billing (${DISC_BILLING_DB}) — бэкапить вместе с панелью? (Y/n): " _ad_b
+        if [[ "$_ad_b" =~ ^[NnНн] ]]; then
+            PANEL_BILLING_BACKUP="false"
+            print_message "INFO" "Infra-billing НЕ бэкапим (вернуть: Настройки → Доп. компоненты)"
+        else
+            PANEL_BILLING_BACKUP="auto"; PANEL_BILLING_DB_CONTAINER="$DISC_BILLING_DB"
+        fi
+    fi
+    if [[ "$BACKUP_TARGET" == "bot" || "$BACKUP_SECONDARY" == "bot" ]] && [[ -n "$BOT_KB_DB_CONTAINER" ]] \
+       && [[ "$(timeout 10 docker inspect --format '{{.State.Status}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")" == "running" ]]; then
+        echo ""
+        local _ad_k
+        safe_read -erp "Обнаружена БД ИИ-саппорта (${BOT_KB_DB_CONTAINER}) — бэкапить вместе с ботом? (Y/n): " _ad_k
+        if [[ "$_ad_k" =~ ^[NnНн] ]]; then
+            BOT_KB_BACKUP="false"
+            print_message "INFO" "KB НЕ бэкапим (вернуть: Настройки → Доп. компоненты)"
+        else
+            BOT_KB_BACKUP="auto"
+        fi
+    fi
     # Первый запуск = Простой режим меню (короткое главное меню). Полное — пункт 99.
     UI_MODE="standard"
     save_config
@@ -14216,6 +14243,7 @@ menu_settings() {
             echo " 5. Ротация и диск       (сколько хранить, пороги)"
             echo " 6. Компрессия и логи"
             echo " 7. Сменить — что бэкапить (панель / бот / обе)"
+            echo " 8. Доп. компоненты      (infra-billing · KB ИИ-саппорта)"
             echo ""
             echo " 0. Назад"
             echo -e "${GRAY} (переключение Простой/Расширенный режим — пункт 99 в главном меню)${RESET}"
@@ -14225,8 +14253,9 @@ menu_settings() {
                 1) _sview=general ;; 2) _sview=telegram ;; 3) _sview=storage ;;
                 4) _sview=security ;; 5) _sview=rotation ;; 6) _sview=misc ;;
                 7) menu_backup_target ;;
+                8) _sview=addons ;;
                 0|"") return ;;
-                *) print_message "ERROR" "Введите 1–7 или 0"; sleep 1 ;;
+                *) print_message "ERROR" "Введите 1–8 или 0"; sleep 1 ;;
             esac
             continue
         fi
@@ -14293,16 +14322,6 @@ menu_settings() {
         elif [[ "$BACKUP_SECONDARY" == "bot" ]]; then
             echo -e "   6.  Лимит на файл (бот)  ${GRAY}${_CANON_MAX_FILE_SIZE_MB:-1} MB${RESET}"
         fi
-        # infra-billing: sidecar панельного бэкапа (актуален, когда панель среди целей).
-        if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]]; then
-            local _bb_disp
-            case "$PANEL_BILLING_BACKUP" in
-                false) _bb_disp="выкл" ;;
-                true)  _bb_disp="обязателен" ;;
-                *)     _bb_disp="авто" ;;
-            esac
-            echo -e "  13.  Infra-billing БД     ${GRAY}${PANEL_BILLING_DB_CONTAINER:-не задан} · ${_bb_disp}${RESET}"
-        fi
         # M2/M9: both-режим — вторая цель read-only, одной строкой (правка — раздел 7).
         if [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]]; then
             if [[ "$BACKUP_SECONDARY" == "panel" ]]; then
@@ -14312,7 +14331,7 @@ menu_settings() {
             fi
         fi
         echo ""
-        echo -e "  ${GRAY}Лимит на файл — пропуск крупных файлов бота. Сменить цель — раздел 7.${RESET}"
+        echo -e "  ${GRAY}Лимит на файл — пропуск крупных файлов бота. Сменить цель — раздел 7. Доп. компоненты — раздел 8.${RESET}"
         fi  # /general
         if [[ "$_sview" == "telegram" ]]; then
         echo -e "  ${GRAY}── Telegram ──${RESET}"
@@ -14413,6 +14432,32 @@ menu_settings() {
         esac
         echo -e "  26.  Компрессия           $_compress_disp $_zstd_note"
         fi  # /misc
+        if [[ "$_sview" == "addons" ]]; then
+        # Доп. компоненты — НЕОБЯЗАТЕЛЬНЫЕ базы рядом с основными целями. Приоритет юзера:
+        # панель → бот → (опционально) биллинг/KB. Каждый компонент: авто / обязателен / выкл.
+        echo -e "  ${GRAY}── Доп. компоненты ──${RESET}"
+        echo -e "  Необязательные базы рядом с панелью и ботом — бэкапить их или нет, решаете вы."
+        echo ""
+        local _bb_disp _kb_disp
+        case "$PANEL_BILLING_BACKUP" in
+            false) _bb_disp="${RED}✗ выкл${RESET}" ;;
+            true)  _bb_disp="${GREEN}✓ обязателен${RESET}" ;;
+            *)     _bb_disp="${GREEN}✓ авто${RESET}" ;;
+        esac
+        case "$BOT_KB_BACKUP" in
+            false) _kb_disp="${RED}✗ выкл${RESET}" ;;
+            true)  _kb_disp="${GREEN}✓ обязателен${RESET}" ;;
+            *)     _kb_disp="${GREEN}✓ авто${RESET}" ;;
+        esac
+        local _bb_ctx="" _kb_ctx=""
+        [[ "$BACKUP_TARGET" != "panel" && "$BACKUP_SECONDARY" != "panel" ]] && _bb_ctx=" ${GRAY}(панель не среди целей)${RESET}"
+        [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]] && _kb_ctx=" ${GRAY}(бот не среди целей)${RESET}"
+        echo -e "  13.  Infra-billing БД     ${GRAY}${PANEL_BILLING_DB_CONTAINER:-не задан}${RESET} · ${_bb_disp}${_bb_ctx}"
+        echo -e "  14.  KB ИИ-саппорта       ${GRAY}${BOT_KB_DB_CONTAINER:-не задан}${RESET} · ${_kb_disp}${_kb_ctx}"
+        echo ""
+        echo -e "  ${GRAY}Infra-billing идёт в бэкап панели, KB — в бэкап бота. Режим «авто» бэкапит,${RESET}"
+        echo -e "  ${GRAY}только если контейнер запущен; «обязателен» роняет бэкап при его отсутствии.${RESET}"
+        fi  # /addons
 
         echo -e "\n 0. Назад к разделам"
         echo ""
@@ -14587,6 +14632,27 @@ menu_settings() {
                 [[ -n "$_bb_cont" ]] && PANEL_BILLING_DB_CONTAINER="$_bb_cont"
                 [[ -z "$PANEL_BILLING_DB_CONTAINER" ]] && PANEL_BILLING_DB_CONTAINER="infra-billing-db"
                 save_config; print_message "SUCCESS" "Сохранено: ${PANEL_BILLING_DB_CONTAINER} · режим ${PANEL_BILLING_BACKUP}" ;;
+
+            14) # KB ИИ-саппорта: режим бэкапа + имя контейнера БД KB (зеркально п.13)
+                if [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]]; then
+                    print_message "INFO" "KB относится к бэкапу бота (бот не среди целей)."; sleep 1.5; continue
+                fi
+                echo "Режим бэкапа KB ИИ-саппорта:"
+                echo " 1. авто — бэкапить, если контейнер запущен (рекомендуется)"
+                echo " 2. обязателен — контейнер не запущен = провал бэкапа бота"
+                echo " 3. выкл — не бэкапить БД KB"
+                local _kb_choice
+                safe_read -erp "Выбор (1/2/3, Enter — не менять): " _kb_choice
+                case "$_kb_choice" in
+                    1) BOT_KB_BACKUP="auto" ;;
+                    2) BOT_KB_BACKUP="true" ;;
+                    3) BOT_KB_BACKUP="false" ;;
+                esac
+                local _kb_cont
+                safe_read -erp "Контейнер БД KB (Enter = '${BOT_KB_DB_CONTAINER:-rwp_shop_kb_db}'): " _kb_cont
+                [[ -n "$_kb_cont" ]] && BOT_KB_DB_CONTAINER="$_kb_cont"
+                [[ -z "$BOT_KB_DB_CONTAINER" ]] && BOT_KB_DB_CONTAINER="rwp_shop_kb_db"
+                save_config; print_message "SUCCESS" "Сохранено: ${BOT_KB_DB_CONTAINER} · режим ${BOT_KB_BACKUP}" ;;
 
             17) configure_remote_storage ;;
             
