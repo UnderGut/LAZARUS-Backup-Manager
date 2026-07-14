@@ -7131,6 +7131,33 @@ panel_migrate_in() {
         print_message "ERROR" "Каталог панели на источнике не найден (labels + канонические пути). Задайте --path."
         _mig_restore_env; return 1
     fi
+    # --- eGames-совместимость: НОДА на том же сервере, что и панель ---
+    # Скрипт eGames (remnawave-reverse-proxy) в варианте «панель+нода» кладёт сервис remnanode
+    # (image remnawave/node, network_mode: host, порт 2222) В ТОТ ЖЕ compose /opt/remnawave и
+    # регистрирует ноду адресом 172.30.0.1 (gateway docker-сети = сам хост). Отдельная установка
+    # ноды — /opt/remnanode (свой compose). От раскладки зависит судьба ноды при переносе.
+    local _mig_node_dir="" _MIG_NODE_STATE=""
+    _mig_node_dir=$(timeout 20 $_ssh "docker ps -a --format '{{.Image}}|{{.Label \"com.docker.compose.project.working_dir\"}}'" 2> "$SILENT_LOG" \
+        | awk -F'|' '$1 ~ /remnawave\/node/ {print ($2 == "" ? "?" : $2); exit}')
+    if [[ -n "$_mig_node_dir" ]]; then
+        echo ""
+        if [[ "$_mig_node_dir" == "$_rdir" ]]; then
+            _MIG_NODE_STATE="colocated"
+            print_message "WARN" "На источнике вместе с панелью работает НОДА (в том же каталоге — установка типа eGames «панель+нода»)."
+            echo -e "  ${GRAY}Нода ПЕРЕЕДЕТ вместе с панелью: её сервис и ключ лежат в тех же файлах,${RESET}"
+            echo -e "  ${GRAY}а адрес 172.30.0.1 на новом сервере снова укажет на самого себя.${RESET}"
+            echo -e "  ${GRAY}После переноса: DNS домена ноды (selfsteal) → новый IP + проверьте, что нода online.${RESET}"
+            echo -e "  ${GRAY}Совет: панель+нода на одном сервере — не лучшая практика; после переноса ноду стоит вынести отдельно.${RESET}"
+        else
+            _MIG_NODE_STATE="separate"
+            print_message "WARN" "На сервере-источнике есть нода в ОТДЕЛЬНОМ каталоге (${_mig_node_dir}) — перенос панели её НЕ переносит."
+            echo -e "  ${GRAY}Нода останется работать на старом сервере. Если в панели она записана ЛОКАЛЬНЫМ адресом${RESET}"
+            echo -e "  ${GRAY}(172.x / 127.x / localhost) — после переноса панель её ПОТЕРЯЕТ: вынесите ноду или${RESET}"
+            echo -e "  ${GRAY}смените адрес ноды в панели на публичный IP старого сервера.${RESET}"
+        fi
+    else
+        _MIG_NODE_STATE=""
+    fi
     local _rdb_st
     _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' ${PANEL_DB_CONTAINER:-remnawave-db}" 2> "$SILENT_LOG")
     if [[ "$_rdb_st" != "running" ]]; then
@@ -7223,17 +7250,24 @@ panel_migrate_in() {
     if timeout 15 docker exec "${PANEL_DB_CONTAINER:-remnawave-db}" pg_isready > "$SILENT_LOG" 2>&1; then _pgok="✓"; fi
     echo -e "  pg_isready: $_pgok"
 
-    # --- 9. Чеклист cutover (вручную!) ---
+    # --- 9. Чеклист cutover (вручную!) — универсальный: официальная установка и eGames ---
     echo ""
-    echo -e "${YELLOW}${BOLD}═══ CUTOVER-ЧЕКЛИСТ (вручную, старую панель пока НЕ выключать) ═══${RESET}"
-    echo "  1. Проверьте вход в панель и данные (пользователи/ноды/подписки) на ЭТОМ сервере."
-    echo "  2. NetBird: подключите этот сервер в overlay (ноды overlay-IP, порт 2222)."
-    echo "  3. CertWarden client: перенастройте на этот сервер (сертификаты)."
-    echo "  4. DNS (Cloudflare): example.com → IP этого сервера. TTL/proxy учесть."
-    echo "  5. Вебхуки/интеграции: бот, billing.example.com, subs.example.com."
-    echo "  6. Только после проверки всего — останавливайте панель на старом сервере."
+    echo -e "${YELLOW}${BOLD}═══ ЧТО СДЕЛАТЬ ПОСЛЕ ПЕРЕНОСА (старую панель пока НЕ выключать) ═══${RESET}"
+    echo "  1. Откройте панель на ЭТОМ сервере, проверьте данные (пользователи / ноды / подписки)."
+    echo "  2. DNS: домен панели и домен подписок → IP ЭТОГО сервера (у Cloudflare учтите proxy/TTL)."
+    echo "  3. Ноды: в панели все должны стать online (файрвол нод должен пускать НОВЫЙ IP панели)."
+    if [[ "${_MIG_NODE_STATE:-}" == "colocated" ]]; then
+        echo "     • Нода переехала вместе с панелью: DNS её домена (selfsteal) → новый IP."
+        echo "       Если нода offline — проверьте файрвол: панель ходит на 172.30.0.1:2222."
+    elif [[ "${_MIG_NODE_STATE:-}" == "separate" ]]; then
+        echo "     • Нода осталась на СТАРОМ сервере: если была записана локальным адресом —"
+        echo "       смените адрес в панели на публичный IP старого сервера (или вынесите ноду)."
+    fi
+    echo "  4. Сертификаты: если выпуск шёл на старом сервере (acme/CertWarden) — перенастройте сюда."
+    echo "  5. Вебхуки и интеграции (бот, платёжные callbacks) → новый адрес панели."
+    echo "  6. Только когда всё проверено — останавливайте панель на старом сервере."
     echo "  7. lazarus: PANEL_PATH зафиксирован на '$_rdir' (проверьте 'lazarus stacks' + тестовый бэкап)."
-    echo "  Runbook: .github/PANEL_MIGRATION_RUNBOOK.md"
+    echo "  Подробный runbook: .github/PANEL_MIGRATION_RUNBOOK.md"
     log_message "INFO" "panel migrate-in completed from $_from:$_port ($_rdir), archive=$(basename "$_arc")"
     _mig_restore_env
     # Персист ФАКТИЧЕСКОГО расположения панели: панель теперь живёт ЗДЕСЬ ($_rdir, local) —
@@ -14516,29 +14550,32 @@ menu_settings() {
         fi  # /misc
         if [[ "$_sview" == "addons" ]]; then
         # Доп. компоненты — НЕОБЯЗАТЕЛЬНЫЕ базы рядом с основными целями. Приоритет юзера:
-        # панель → бот → (опционально) биллинг/KB. Каждый компонент: авто / обязателен / выкл.
+        # панель → бот → (опционально) биллинг/KB. Компактная таблица: всё видно одним взглядом.
         echo -e "  ${GRAY}── Доп. компоненты ──${RESET}"
         echo -e "  Необязательные базы рядом с панелью и ботом — бэкапить их или нет, решаете вы."
         echo ""
         local _bb_disp _kb_disp
         case "$PANEL_BILLING_BACKUP" in
-            false) _bb_disp="${RED}✗ выкл${RESET}" ;;
-            true)  _bb_disp="${GREEN}✓ обязателен${RESET}" ;;
-            *)     _bb_disp="${GREEN}✓ авто${RESET}" ;;
+            false) _bb_disp="${RED}✗ нет      ${RESET}" ;;
+            true)  _bb_disp="${GREEN}✓ строгий  ${RESET}" ;;
+            *)     _bb_disp="${GREEN}✓ авто     ${RESET}" ;;
         esac
         case "$BOT_KB_BACKUP" in
-            false) _kb_disp="${RED}✗ выкл${RESET}" ;;
-            true)  _kb_disp="${GREEN}✓ обязателен${RESET}" ;;
-            *)     _kb_disp="${GREEN}✓ авто${RESET}" ;;
+            false) _kb_disp="${RED}✗ нет      ${RESET}" ;;
+            true)  _kb_disp="${GREEN}✓ строгий  ${RESET}" ;;
+            *)     _kb_disp="${GREEN}✓ авто     ${RESET}" ;;
         esac
-        local _bb_ctx="" _kb_ctx=""
-        [[ "$BACKUP_TARGET" != "panel" && "$BACKUP_SECONDARY" != "panel" ]] && _bb_ctx=" ${GRAY}(панель не среди целей)${RESET}"
-        [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]] && _kb_ctx=" ${GRAY}(бот не среди целей)${RESET}"
-        echo -e "  13.  Infra-billing БД     ${GRAY}${PANEL_BILLING_DB_CONTAINER:-не задан}${RESET} · ${_bb_disp}${_bb_ctx}"
-        echo -e "  14.  KB ИИ-саппорта       ${GRAY}${BOT_KB_DB_CONTAINER:-не задан}${RESET} · ${_kb_disp}${_kb_ctx}"
+        local _bb_ctx="панели" _kb_ctx="бота"
+        [[ "$BACKUP_TARGET" != "panel" && "$BACKUP_SECONDARY" != "panel" ]] && _bb_ctx="— (панель не бэкапится)"
+        [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]] && _kb_ctx="— (бот не бэкапится)"
+        # Кириллицу printf %-Ns ровнять нельзя (считает байты) — колонку «Компонент» паддим руками,
+        # контейнер (docker-имена всегда ASCII) — через printf.
+        echo -e "   ${GRAY}№    Компонент          Контейнер            Бэкапим      Идёт в бэкап${RESET}"
+        echo -e "  ${GRAY}$(_hrule '─' 76)${RESET}"
+        printf '  13.  Infra-billing БД   %-20s ' "${PANEL_BILLING_DB_CONTAINER:-—}"; echo -e "${_bb_disp}  ${GRAY}${_bb_ctx}${RESET}"
+        printf '  14.  KB ИИ-саппорта     %-20s ' "${BOT_KB_DB_CONTAINER:-—}"; echo -e "${_kb_disp}  ${GRAY}${_kb_ctx}${RESET}"
         echo ""
-        echo -e "  ${GRAY}Infra-billing идёт в бэкап панели, KB — в бэкап бота. Режим «авто» бэкапит,${RESET}"
-        echo -e "  ${GRAY}только если контейнер запущен; «обязателен» роняет бэкап при его отсутствии.${RESET}"
+        echo -e "  ${GRAY}«авто» — бэкапим, когда контейнер запущен · «строгий» — без него бэкап падает с ошибкой.${RESET}"
         fi  # /addons
 
         echo -e "\n 0. Назад к разделам"
@@ -14698,10 +14735,10 @@ menu_settings() {
                 if [[ "$BACKUP_TARGET" != "panel" && "$BACKUP_SECONDARY" != "panel" ]]; then
                     print_message "INFO" "Infra-billing относится к бэкапу панели (панель не среди целей)."; sleep 1.5; continue
                 fi
-                echo "Режим бэкапа infra-billing:"
-                echo " 1. авто — бэкапить, если контейнер запущен (рекомендуется)"
-                echo " 2. обязателен — контейнер не запущен = провал бэкапа панели"
-                echo " 3. выкл — не бэкапить БД биллинга"
+                echo "Бэкапить базу биллинга (infra-billing)?"
+                echo " 1. Да, когда контейнер запущен — авто (рекомендуется)"
+                echo " 2. Да, всегда — строгий: если контейнер выключен, бэкап панели завершится ОШИБКОЙ"
+                echo " 3. Нет — не бэкапить"
                 local _bb_choice
                 safe_read -erp "Выбор (1/2/3, Enter — не менять): " _bb_choice
                 case "$_bb_choice" in
@@ -14724,10 +14761,10 @@ menu_settings() {
                 if [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]]; then
                     print_message "INFO" "KB относится к бэкапу бота (бот не среди целей)."; sleep 1.5; continue
                 fi
-                echo "Режим бэкапа KB ИИ-саппорта:"
-                echo " 1. авто — бэкапить, если контейнер запущен (рекомендуется)"
-                echo " 2. обязателен — контейнер не запущен = провал бэкапа бота"
-                echo " 3. выкл — не бэкапить БД KB"
+                echo "Бэкапить базу знаний ИИ-саппорта (KB)?"
+                echo " 1. Да, когда контейнер запущен — авто (рекомендуется)"
+                echo " 2. Да, всегда — строгий: если контейнер выключен, бэкап бота завершится ОШИБКОЙ"
+                echo " 3. Нет — не бэкапить"
                 local _kb_choice
                 safe_read -erp "Выбор (1/2/3, Enter — не менять): " _kb_choice
                 case "$_kb_choice" in
