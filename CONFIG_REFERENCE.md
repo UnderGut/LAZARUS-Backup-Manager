@@ -33,7 +33,7 @@
 | `PANEL_DB_CONTAINER` | `remnawave-db` | postgres-контейнер панели |
 | `PANEL_DB_SERVICE` | `remnawave-db` | compose-сервис БД (volume-lookup при restore) |
 | `PANEL_DB_NAME` | из `.env` панели | override имени БД |
-| `PANEL_EXTRA_PATHS` | — | ЗАРЕЗЕРВИРОВАНО (пока не активно) |
+| `PANEL_EXTRA_PATHS` | — | Доп. АБСОЛЮТНЫЕ пути ВНЕ `PANEL_PATH` (разделитель пробел/`;`/`,`), напр. `/opt/certwarden/certwarden-data /var/lib/remnawave/configs`. Пакуются в `extra_*.tar` внутри **full/files**-бэкапа панели. Restore: интерактивно, безопасно (validate + STAGE + `rsync --safe-links` только по этому allowlist) |
 
 ### infra-billing (сайдкар панели)
 
@@ -44,6 +44,16 @@
 
 Финансовая БД дампится как `billing_*.sql.*` внутри panel-архивов; креды берутся из env
 контейнера. Restore предлагает импорт интерактивно, со своей точкой отката.
+
+### KB ИИ-саппорта (сайдкар бота)
+
+| Ключ | Default | Описание |
+|---|---|---|
+| `BOT_KB_DB_CONTAINER` | `rwp_shop_kb_db` | контейнер БД knowledge-base (pgvector); пусто = выкл. Гард: не должен совпадать с главной БД бота/панели/billing |
+| `BOT_KB_BACKUP` | `auto` | `auto` = дампить если запущен, иначе пропуск · `true` = обязателен · `false` = выкл |
+
+БД KB (`knowledge`) дампится как `kb_*.sql.*` внутри **bot**-архивов (db + full), креды из env
+контейнера. Restore предлагает импорт интерактивно, со snapshot-откатом и гардом цели.
 
 ## Бот (BACKUP_TARGET=bot)
 

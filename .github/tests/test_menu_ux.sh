@@ -65,7 +65,7 @@ BACKUP_PASSWORD=""; rm -f "$BACKUP_PASSWORD_FILE"
 REMOTE_STORAGE_TYPE="off"; SEND_TO_REMOTE="false"
 get_cron_status() { echo "Выкл"; }   # cron не настроен
 rl=$(_readiness_line)
-[[ "$rl" == *"шифрование ВЫКЛ"* && "$rl" == *"только локально"* && "$rl" == *"авто ВЫКЛ"* ]] && ok || bad "readiness all-off: $rl"
+[[ "$rl" == *"✗ шифрование"* && "$rl" == *"только локально"* && "$rl" == *"✗ авто-бэкап"* ]] && ok || bad "readiness all-off: $rl"
 _protection_needed && ok || bad "_protection_needed must be true when all off"
 
 # --- 5) всё настроено → зелёная готовность + защита не нужна ---
@@ -80,7 +80,7 @@ _protection_needed && bad "_protection_needed must be false when all configured"
 unset NO_CRITICAL_BACKUP
 get_cron_status() { echo "Выкл"; }
 rl=$(_readiness_line)
-[[ "$rl" == *"авто ВЫКЛ"* ]] && ok || bad "regression: unset NO_CRITICAL_BACKUP must NOT show green авто: $rl"
+[[ "$rl" == *"✗ авто-бэкап"* ]] && ok || bad "regression: unset NO_CRITICAL_BACKUP must NOT show green авто: $rl"
 
 # --- 6) _target_loc_label ssh/local ---
 BOT_TRANSPORT="ssh"; BOT_SSH_HOST="1.2.3.4"; BOT_SSH_USER="root"

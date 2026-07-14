@@ -218,7 +218,7 @@ _rc14=$?
     exit 0
 ) && ok || bad "№5 _encryption_ready states"
 # №5 static: UI-точки больше не проверяют голый -f как «включено»
-grep -q 'файл пароля НЕЧИТАЕМ' "$SCRIPT" && ok || bad "№5 readiness line lacks unreadable-file state"
+grep -q 'пароль НЕЧИТАЕМ' "$SCRIPT" && ok || bad "№5 readiness line lacks unreadable-file state"
 
 # =============================================================================
 # №6 — пароль не в argv (static)
@@ -326,9 +326,11 @@ grep -q 'get_bot_version_display' "$SCRIPT" \
 grep -q 'догадка по labels' "$SCRIPT" && ok || bad "№18 label-fallback UI mark missing"
 grep -q 'догадка по compose-labels' "$SCRIPT" && ok || bad "№18 single-candidate guess wording missing"
 
-# №19: PANEL_EXTRA_PATHS — предупреждение о неактивности
-grep -q 'PANEL_EXTRA_PATHS задан, но зарезервирован' "$SCRIPT" && ok \
-    || bad "№19 reserved-key warning missing"
+# №19: PANEL_EXTRA_PATHS теперь АКТИВЕН (extra-sidecar), RESERVED-заглушка удалена.
+grep -q 'PANEL_EXTRA_PATHS задан, но зарезервирован' "$SCRIPT" \
+    && bad "№19 RESERVED-заглушка PANEL_EXTRA_PATHS должна быть удалена (фича активирована)" || ok
+grep -qE 'tar \$_tar_compress_args -cf "\$BACKUP_DIR/\$FILE_EXTRA" -C / ' "$SCRIPT" && ok \
+    || bad "№19 PANEL_EXTRA_PATHS должен потребляться (extra-sidecar tar -C /)"
 
 echo "---"
 echo "ok=$n_ok err=$n_err"

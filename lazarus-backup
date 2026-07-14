@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="5.7.0"
+VERSION="5.8.0"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -167,7 +167,7 @@ BACKUP_TARGET="bot"
 # standard — короткое меню для новичков (бэкап/восстановление/расписание/TG/очистка);
 # ставится на первом запуске. expert — полное меню. Дефолт expert = backward-compat:
 # у существующих установок ключа в конфиге нет → всё выглядит как раньше.
-# Переключение: пункт 77 главного меню (standard → expert) и Настройки → раздел 8 (обратно).
+# Переключение: пункт 99 главного меню в ОБОИХ режимах (standard↔expert).
 UI_MODE="expert"
 # Результат экрана намерения первого запуска ("1" настроить бэкапы | "2" перенос панели).
 # Глобал, а не echo-возврат: _firstrun_intent рисует экран (clear_screen/prompt) — в
@@ -206,14 +206,19 @@ PANEL_PATH="/opt/remnawave"       # также встречается /root/remn
 PANEL_DB_CONTAINER="remnawave-db"
 PANEL_DB_NAME=""                  # опц. override; иначе POSTGRES_DB из $PANEL_PATH/.env (дефолт postgres)
 PANEL_DB_SERVICE="remnawave-db"   # compose-сервис БД (для поиска volume на restore)
-PANEL_EXTRA_PATHS=""              # RESERVED (пока не активно): всё ВНУТРИ PANEL_PATH уже в бэкапе;
-                                  # ключ — для каталогов ВНЕ него, будет отдельным sidecar позже
+PANEL_EXTRA_PATHS=""              # доп. АБСОЛЮТНЫЕ пути ВНЕ PANEL_PATH (разделитель: пробел/;/,),
+                                  # попадают отдельным sidecar (extra_*.tar) в FULL-бэкап панели.
+                                  # Прим.: "/opt/certwarden/certwarden-data /var/lib/remnawave/configs"
 # infra-billing (mishkatik/infra-billing): standalone-биллинг в стеке панели — ОТДЕЛЬНЫЙ postgres.
 # Финансовые данные. Его БД дампится sidecar'ом в panel-бэкап (billing_*.sql.*); файлы
 # (.env-infra-billing, compose) уже входят в files-бэкап панели, т.к. лежат в PANEL_PATH.
 PANEL_BILLING_DB_CONTAINER="infra-billing-db"  # контейнер БД infra-billing (пусто = выключить)
 PANEL_BILLING_BACKUP="auto"       # auto: контейнер запущен → бэкапим, нет → тихо пропускаем;
                                   # true: обязателен (нет контейнера = провал бэкапа); false: выкл
+# KB ИИ-саппорта (rwp_shop_kb_db, отдельный pgvector в стеке бота). Его БД (knowledge) дампится
+# sidecar'ом в BOT-бэкап (kb_*.sql.*). Режим как у billing.
+BOT_KB_DB_CONTAINER="rwp_shop_kb_db"  # контейнер БД KB (пусто = выключить)
+BOT_KB_BACKUP="auto"              # auto: запущен → бэкапим, нет → пропуск; true: обязателен; false: выкл
 # Ключевые слова для поиска контейнера панели (инверсия bot-исключений в scan)
 PANEL_KEYWORDS=("remnawave")
 
@@ -291,20 +296,27 @@ cleanup_on_exit() {
 # setsid-обёртки на каждый critical-call (отдельная задача).
 _INT_FLAG=0
 _INT_LAST_TS=0
+# =1 ТОЛЬКО в опасном окне (импорт/откат БД при restore). Тогда Ctrl+C требует подтверждения
+# вторым нажатием — чтобы случайный Ctrl+C не оборвал восстановление на полудампе.
+# Везде ещё (меню, промпты, бэкап на temp-файлах) одиночный Ctrl+C = сразу чистый выход.
+# safe_read сбрасывает флаг на КАЖДОМ интерактивном вводе (промпт = не критическая секция).
+_CRITICAL_SECTION=0
 DOUBLE_CTRLC_WINDOW=3   # сек.
 
 _lazarus_int_handler() {
+    if [[ "${_CRITICAL_SECTION:-0}" != 1 ]]; then
+        printf '\n\033[90mВыход.\033[0m\n'
+        exit 130
+    fi
     local _now
     _now=$(date +%s)
     if [[ $_INT_FLAG -eq 1 && $((_now - _INT_LAST_TS)) -le $DOUBLE_CTRLC_WINDOW ]]; then
-        # Второй Ctrl+C в окне → реально выходим
-        printf '\n\033[31m\033[1m[INFO] Повторный Ctrl+C — прерываем скрипт\033[0m\n'
+        printf '\n\033[31m\033[1m[INFO] Повторный Ctrl+C — прерываю (БД может остаться неконсистентной)\033[0m\n'
         exit 130
     fi
     _INT_FLAG=1
     _INT_LAST_TS=$_now
-    printf '\n\033[33m\033[1m[WARN] Получен Ctrl+C — нажмите ещё раз в течение %s сек для выхода\033[0m\n' "$DOUBLE_CTRLC_WINDOW"
-    printf '\033[90m       (если этого не сделать, операция продолжится)\033[0m\n'
+    printf '\n\033[33m\033[1m[WARN] Идёт восстановление БД — Ctrl+C ещё раз в течение %s сек прервёт его (опасно)\033[0m\n' "$DOUBLE_CTRLC_WINDOW"
 }
 
 # CSC-4 fix: TERM (systemctl stop / kill) НЕ должен попадать в double-confirm — там
@@ -323,6 +335,8 @@ trap _lazarus_term_handler TERM
 # как пустой ответ → отмена. EOF (Ctrl+D) и прочие ошибки пропускаются дальше.
 # Использовать ВМЕСТО `read` в местах где пустой ввод имеет деструктивный смысл.
 safe_read() {
+    # Любой интерактивный ввод = мы НЕ в атомарном импорте БД → Ctrl+C здесь должен сразу выходить.
+    _CRITICAL_SECTION=0
     while true; do
         builtin read "$@"
         local _rc=$?
@@ -343,6 +357,25 @@ else
 fi
 
 # --- ФУНКЦИИ ИНТЕРФЕЙСА ---
+
+# Единый стиль рамок/баннеров. Ширина фиксирована — выравнивание без ${#}/локали.
+LZ_BOX_W=49
+# _hrule <символ> <длина> — строка из повторённого символа (работает с UTF-8 box-drawing).
+_hrule() {
+    local ch="${1:-─}" n="${2:-$LZ_BOX_W}" out="" i
+    for ((i=0; i<n; i++)); do out+="$ch"; done
+    printf '%s' "$out"
+}
+# _banner <видимая_длина_текста> <раскрашенный_текст> — двойная рамка ╔═╗ с заголовком.
+# Длину видимого текста передаём числом (константа), чтобы не зависеть от подсчёта ${#}.
+_banner() {
+    local vlen="$1" text="$2" pad bar
+    bar=$(_hrule '═' "$LZ_BOX_W")
+    pad=$(( LZ_BOX_W - 2 - vlen )); (( pad < 0 )) && pad=0
+    echo -e "${GREEN}${BOLD}╔${bar}╗${RESET}"
+    printf '%b%*s%b\n' "${GREEN}${BOLD}║${RESET}  ${text}" "$pad" '' "${GREEN}${BOLD}║${RESET}"
+    echo -e "${GREEN}${BOLD}╚${bar}╝${RESET}"
+}
 
 # Очистка экрана (пропускается в debug режиме)
 clear_screen() {
@@ -5340,7 +5373,7 @@ update_bot() {
         
         echo -e "${YELLOW}Для отката:${RESET}"
         if [[ -n "$rollback_backup" ]]; then
-            echo "  1. Восстановите из бэкапа (главное меню → пункт 4)"
+            echo "  1. Восстановите из бэкапа (главное меню → пункт 2)"
             echo "  2. Или вручную: docker compose down && mv ${compose_file}.pre-update.bak $compose_file && docker compose up -d"
         fi
         echo ""
@@ -5733,6 +5766,8 @@ load_config_file() {
             PANEL_EXTRA_PATHS) PANEL_EXTRA_PATHS="$val" ;;
             PANEL_BILLING_DB_CONTAINER) PANEL_BILLING_DB_CONTAINER="$val" ;;
             PANEL_BILLING_BACKUP) PANEL_BILLING_BACKUP="$val" ;;
+            BOT_KB_DB_CONTAINER) BOT_KB_DB_CONTAINER="$val" ;;
+            BOT_KB_BACKUP) BOT_KB_BACKUP="$val" ;;
             IGNORE_MISMATCH) IGNORE_MISMATCH="$val" ;;
             EXCLUDE_DIRS) EXCLUDE_DIRS="$val" ;;
             MAX_FILE_SIZE_MB) MAX_FILE_SIZE_MB="$val" ;;
@@ -6002,9 +6037,11 @@ save_config() {
     PANEL_DB_NAME_ESC=$(env_escape "${PANEL_DB_NAME:-}")
     PANEL_DB_SERVICE_ESC=$(env_escape "$PANEL_DB_SERVICE")
     PANEL_EXTRA_PATHS_ESC=$(env_escape "${PANEL_EXTRA_PATHS:-}")
-    local PANEL_BILLING_DB_CONTAINER_ESC PANEL_BILLING_BACKUP_ESC
+    local PANEL_BILLING_DB_CONTAINER_ESC PANEL_BILLING_BACKUP_ESC BOT_KB_DB_CONTAINER_ESC BOT_KB_BACKUP_ESC
     PANEL_BILLING_DB_CONTAINER_ESC=$(env_escape "${PANEL_BILLING_DB_CONTAINER:-}")
     PANEL_BILLING_BACKUP_ESC=$(env_escape "${PANEL_BILLING_BACKUP:-auto}")
+    BOT_KB_DB_CONTAINER_ESC=$(env_escape "${BOT_KB_DB_CONTAINER:-}")
+    BOT_KB_BACKUP_ESC=$(env_escape "${BOT_KB_BACKUP:-auto}")
     local PANEL_TRANSPORT_ESC PANEL_SSH_HOST_ESC PANEL_SSH_PORT_ESC PANEL_SSH_USER_ESC PANEL_SSH_KEY_ESC
     local BOT_TRANSPORT_ESC BOT_SSH_HOST_ESC BOT_SSH_PORT_ESC BOT_SSH_USER_ESC BOT_SSH_KEY_ESC
     PANEL_TRANSPORT_ESC=$(env_escape "${PANEL_TRANSPORT:-local}"); PANEL_SSH_HOST_ESC=$(env_escape "${PANEL_SSH_HOST:-}")
@@ -6065,6 +6102,8 @@ save_config() {
     _cfg_if_nondefault "PANEL_EXTRA_PATHS" "$PANEL_EXTRA_PATHS_ESC" ""
     _cfg_if_nondefault "PANEL_BILLING_DB_CONTAINER" "$PANEL_BILLING_DB_CONTAINER_ESC" "infra-billing-db"
     _cfg_if_nondefault "PANEL_BILLING_BACKUP" "$PANEL_BILLING_BACKUP_ESC" "auto"
+    _cfg_if_nondefault "BOT_KB_DB_CONTAINER" "$BOT_KB_DB_CONTAINER_ESC" "rwp_shop_kb_db"
+    _cfg_if_nondefault "BOT_KB_BACKUP" "$BOT_KB_BACKUP_ESC" "auto"
 
     # BACKUP_PASSWORD="" обязан остаться в файле — легаси-миграция пароля в BACKUP_PASSWORD_FILE.
     # №1: если миграция ПРОВАЛИЛАСЬ (_LEGACY_PWD_UNMIGRATED=1) — пишем реальное значение,
@@ -6167,11 +6206,6 @@ load_or_create_config() {
     [[ "${TAR_TIMEOUT_SEC:-}"     =~ ^[0-9]+$ ]] || TAR_TIMEOUT_SEC="3600"
     [[ "${ENCRYPT_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || ENCRYPT_TIMEOUT_SEC="1800"
     [[ "${RESTORE_TIMEOUT_SEC:-}" =~ ^[0-9]+$ ]] || RESTORE_TIMEOUT_SEC="3600"
-    # №19: PANEL_EXTRA_PATHS зарезервирован (RESERVED) и пока НИГДЕ не потребляется —
-    # честно предупреждаем, чтобы оператор не считал, что пути уже входят в бэкап.
-    if [[ -n "${PANEL_EXTRA_PATHS:-}" ]]; then
-        log_message "WARN" "PANEL_EXTRA_PATHS задан, но зарезервирован и пока ИГНОРИРУЕТСЯ — эти пути НЕ попадут в бэкап"
-    fi
     debug_log "CONFIG" "Defaults applied: MAX_BACKUPS=$MAX_BACKUPS_COUNT, DELETE_MODE=$DELETE_MODE"
     debug_log "CONFIG" "Creating backup dir: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
@@ -7311,6 +7345,53 @@ _billing_db_creds() {
     printf '%s %s' "$_u" "$_d"
 }
 
+# --- KB-sidecar (knowledge-base ИИ-саппорта: rwp_shop_kb_db, отдельный pgvector в стеке бота) ---
+# _kb_sidecar_active: активен ли KB-sidecar для BOT-бэкапа. Только ЛОКАЛЬНО (бот на этом сервере).
+# rc=0 — бэкапим; rc=1 — выкл/не найден/не запущен (auto: тихий skip); rc=2 — BOT_KB_BACKUP=true,
+# но недоступен/не прошёл гард → caller ОБЯЗАН провалить бэкап бота.
+# Проще billing: без remote и без авто-дискавери; гард «контейнер ≠ главная БД бота/панели/billing».
+_kb_sidecar_active() {
+    [[ "$BACKUP_TARGET" != "bot" ]] && return 1
+    [[ "$BOT_KB_BACKUP" == "false" ]] && return 1
+    [[ -z "$BOT_KB_DB_CONTAINER" ]] && { [[ "$BOT_KB_BACKUP" == "true" ]] && return 2; return 1; }
+    # Удалённый бот (ssh) — KB-sidecar не поддержан (docker удалённый).
+    if [[ "$(_transport_of bot)" == "ssh" ]]; then
+        [[ "$BOT_KB_BACKUP" == "true" ]] && { print_message "ERROR" "BOT_KB_BACKUP=true, но бот удалённый (ssh) — KB-sidecar не поддержан."; return 2; }
+        return 1
+    fi
+    # ГАРД: KB-контейнер НЕ должен совпадать с главной БД (бот/панель/billing) — иначе дамп чужой
+    # БД под именем kb_* и импорт при restore в неверную цель. DB_CONTAINER_NAME здесь = БД бота
+    # (в bot-контексте resolve_backup_target уже проставил её).
+    if [[ "$BOT_KB_DB_CONTAINER" == "$DB_CONTAINER_NAME" || "$BOT_KB_DB_CONTAINER" == "$PANEL_DB_CONTAINER" || "$BOT_KB_DB_CONTAINER" == "$PANEL_BILLING_DB_CONTAINER" ]]; then
+        print_message "ERROR" "ГАРД: BOT_KB_DB_CONTAINER='$BOT_KB_DB_CONTAINER' совпадает с главной БД (бот/панель/billing) — KB-sidecar отключён."
+        log_message "ERROR" "kb guard: container collides with main db — refusing"
+        [[ "$BOT_KB_BACKUP" == "true" ]] && return 2
+        return 1
+    fi
+    local _img _st
+    _img=$(timeout 15 docker inspect --format '{{.Config.Image}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
+    if [[ -n "$_img" ]] && ! _is_db_image "$_img"; then
+        print_message "ERROR" "ГАРД: '$BOT_KB_DB_CONTAINER' (image=$_img) — не БД-образ — KB-sidecar отключён."
+        log_message "ERROR" "kb guard: not a db image ($_img) — refusing"
+        [[ "$BOT_KB_BACKUP" == "true" ]] && return 2
+        return 1
+    fi
+    _st=$(timeout 15 docker inspect --format '{{.State.Status}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
+    [[ "$_st" == "running" ]] && return 0
+    [[ "$BOT_KB_BACKUP" == "true" ]] && return 2
+    debug_log "KB" "kb container '$BOT_KB_DB_CONTAINER' not running (state='${_st:-absent}') — auto-skip"
+    return 1
+}
+
+# _kb_db_creds: echo "user db" контейнера KB (rwp_shop_kb_db: POSTGRES_USER=kb, POSTGRES_DB=knowledge).
+_kb_db_creds() {
+    local _u _d
+    _u=$(timeout 15 docker exec "$BOT_KB_DB_CONTAINER" printenv POSTGRES_USER 2> "$SILENT_LOG")
+    _d=$(timeout 15 docker exec "$BOT_KB_DB_CONTAINER" printenv POSTGRES_DB 2> "$SILENT_LOG")
+    _u="${_u:-postgres}"; _d="${_d:-$_u}"
+    printf '%s %s' "$_u" "$_d"
+}
+
 # _firstrun_intent: экран намерения на ПЕРВОМ запуске — «зачем вы здесь?». Новичок нередко
 # ставит LAZARUS ради ПЕРЕНОСА панели со старого сервера, а не ради бэкапов — ведём за ручку
 # с первого экрана. Результат кладёт в глобал _FIRSTRUN_INTENT ("1" бэкапы | "2" перенос);
@@ -7352,7 +7433,7 @@ select_backup_target_firstrun() {
             # backward-compat старых установок без ключа в конфиге).
             UI_MODE="standard"
             save_config
-            echo -e "${GRAY}Меню — в Стандартном режиме (базовые бэкапы). Эксперт-режим: пункт 77 в главном меню.${RESET}"
+            echo -e "${GRAY}Меню — в Простом режиме (базовые бэкапы). Все функции: пункт 99 «Расширенный режим».${RESET}"
             _quickstart_protect
             return 0
         fi
@@ -7433,10 +7514,10 @@ select_backup_target_firstrun() {
     if [[ "$BACKUP_SECONDARY" == "bot" && -z "$_bot_dir" ]]; then
         _ask_target_location "bot"
     fi
-    # Первый запуск = Стандартный режим меню (короткое главное меню). Полное — пункт 77.
+    # Первый запуск = Простой режим меню (короткое главное меню). Полное — пункт 99.
     UI_MODE="standard"
     save_config
-    echo -e "${GRAY}Меню — в Стандартном режиме (базовые бэкапы). Эксперт-режим: пункт 77 в главном меню.${RESET}"
+    echo -e "${GRAY}Меню — в Простом режиме (базовые бэкапы). Все функции: пункт 99 «Расширенный режим».${RESET}"
     # Друже­любный first-run: сразу предлагаем настроить защиту (шифр/авто/off-site). Шаги пропускаемы.
     _quickstart_protect
 }
@@ -9743,6 +9824,19 @@ uninstall_script() {
 # --- ПРОВЕРКА CRON ЗАДАЧ ---
 
 # Проверяет реальное состояние cron-задач и возвращает статус
+# _cron_every_n_min: единая валидация интервала «каждые N минут» для мастера и меню.
+# Вход $1 = введённый интервал. Успех (1..59): ставит _CRON_MIN_N (нормализованное число,
+# ведущие нули срезаны через 10# — иначе на Debian-bash '08'/'09' = октальная ошибка, а в cron
+# '*/08' грязно) и _CRON_MIN_SPEC="*/N * * * *", rc=0. Иначе очищает обе и rc=1.
+_cron_every_n_min() {
+    _CRON_MIN_N=""; _CRON_MIN_SPEC=""
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    local _n=$((10#$1))
+    [[ "$_n" -ge 1 && "$_n" -le 59 ]] || return 1
+    _CRON_MIN_N="$_n"; _CRON_MIN_SPEC="*/$_n * * * *"
+    return 0
+}
+
 get_cron_status() {
     local JOB_TYPE="$1"  # full, db, files
     local JOB_ID="# LAZARUS-JOB-${JOB_TYPE^^}"
@@ -10182,6 +10276,10 @@ create_backup() {
     # Panel: sidecar БД infra-billing (отдельный postgres в стеке панели). Имя ставится
     # только если сайдкар активен (_billing_sidecar_active) в момент дампа.
     local FILE_BILLING=""
+    # Bot: sidecar БД KB ИИ-саппорта (kb_*.sql.*), ставится если _kb_sidecar_active в момент дампа.
+    local FILE_KB=""
+    # Panel: sidecar доп. путей ВНЕ PANEL_PATH (extra_*.tar) — только в full/files-бэкапе.
+    local FILE_EXTRA=""
     local FILE_VERSION="bot_version.txt"
     local FILE_FINAL=""
     local HAS_ERROR=0
@@ -10372,6 +10470,49 @@ create_backup() {
                         debug_log "DB" "billing dump SUCCESS (${_bill_bytes}b, content-verified)"
                     fi
                 fi
+                # KB-sidecar: БД knowledge-base ИИ-саппорта (rwp_shop_kb_db, отдельный pgvector в
+                # стеке бота). Активен только при BACKUP_TARGET==bot. auto: провал дампа → WARN+skip
+                # (KB воспроизводима переэмбеддингом); true: провал → бэкап бота прерван.
+                local _kb_state=0
+                _kb_sidecar_active; _kb_state=$?
+                if [[ $_kb_state -eq 2 ]]; then
+                    print_message "ERROR" "KB-БД обязательна (BOT_KB_BACKUP=true), но '${BOT_KB_DB_CONTAINER:-<не задан>}' недоступна/не прошла гард — бэкап прерван."
+                    log_message "ERROR" "kb sidecar required but unavailable/refused"
+                    HAS_ERROR=1
+                elif [[ $_kb_state -eq 0 ]]; then
+                    FILE_KB="kb_${TIMESTAMP}.sql.${_ext}"
+                    local _kb_creds _kb_u _kb_d
+                    _kb_creds=$(_kb_db_creds)
+                    _kb_u="${_kb_creds%% *}"; _kb_d="${_kb_creds##* }"
+                    print_message "INFO" "Дамп KB (${BOT_KB_DB_CONTAINER}, db=${_kb_d})..."
+                    _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-kb" \
+                        'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
+                        "$BOT_KB_DB_CONTAINER" "$_kb_u" "$_kb_d" "$SILENT_LOG" "$BACKUP_DIR/$FILE_KB" "$_compress_pipe_cmd"
+                    local _kb_rc=$?
+                    local _kb_bytes=0
+                    [[ -f "$BACKUP_DIR/$FILE_KB" ]] && _kb_bytes=$(stat -c%s "$BACKUP_DIR/$FILE_KB" 2>/dev/null || echo 0)
+                    local _kb_ok=true _kb_dec
+                    _kb_dec=$(_decompress_cmd_for "$(_compress_current)")
+                    if [[ $_kb_rc -ne 0 || "$_kb_bytes" -lt 100 ]]; then
+                        _kb_ok=false
+                    elif ! $_kb_dec "$BACKUP_DIR/$FILE_KB" 2> "$SILENT_LOG" | grep -qE 'CREATE TABLE|COPY |INSERT INTO|CREATE SCHEMA|CREATE EXTENSION'; then
+                        _kb_ok=false
+                        log_message "ERROR" "kb dump has no pg_dump structural markers (corrupt/partial?)"
+                    fi
+                    if [[ "$_kb_ok" != "true" ]]; then
+                        rm -f "$BACKUP_DIR/$FILE_KB"; FILE_KB=""
+                        if [[ "$BOT_KB_BACKUP" == "true" ]]; then
+                            print_message "ERROR" "Дамп KB невалиден (rc=$_kb_rc, ${_kb_bytes}b) — бэкап бота прерван."
+                            log_message "ERROR" "kb pg_dump invalid (rc=$_kb_rc, ${_kb_bytes}b)"
+                            HAS_ERROR=1
+                        else
+                            print_message "WARN" "Дамп KB не удался (rc=$_kb_rc, ${_kb_bytes}b) — пропускаю (BOT_KB_BACKUP=auto)."
+                            log_message "WARN" "kb dump failed, auto-skip (rc=$_kb_rc, ${_kb_bytes}b)"
+                        fi
+                    else
+                        debug_log "DB" "kb dump SUCCESS (${_kb_bytes}b, content-verified)"
+                    fi
+                fi
             fi
         fi
     fi
@@ -10380,6 +10521,7 @@ create_backup() {
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION"
         [[ -n "$FILE_GLOBALS" ]] && rm -f "$BACKUP_DIR/$FILE_GLOBALS"
         [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
+        [[ -n "$FILE_KB" ]] && rm -f "$BACKUP_DIR/$FILE_KB"
         [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
@@ -10518,6 +10660,37 @@ create_backup() {
     local _tar_compress_args
     _tar_compress_args=$(_tar_create_args)
 
+    # PANEL_EXTRA_PATHS sidecar: доп. АБСОЛЮТНЫЕ каталоги ВНЕ PANEL_PATH (certwarden-data,
+    # /var/lib/remnawave/configs и т.п.) — только в FULL/FILES-бэкапе панели. tar относительно /
+    # (strip leading '/'), несуществующие пути пропускаем с WARN. Кладётся в combine-архив ниже.
+    if [[ ( "$TYPE" == "full" || "$TYPE" == "files_only" ) && "$BACKUP_TARGET" == "panel" && -n "${PANEL_EXTRA_PATHS:-}" ]]; then
+        local -a _extra_rel=()
+        local _ep
+        for _ep in $(printf '%s' "$PANEL_EXTRA_PATHS" | tr ',;' '  '); do
+            [[ -z "$_ep" ]] && continue
+            if [[ ! -e "$_ep" ]]; then
+                print_message "WARN" "PANEL_EXTRA_PATHS: путь не найден, пропущен — $_ep"
+                log_message "WARN" "extra path missing: $_ep"
+                continue
+            fi
+            _extra_rel+=("${_ep#/}")   # относительно / (strip leading slash)
+        done
+        if [[ ${#_extra_rel[@]} -gt 0 ]]; then
+            FILE_EXTRA="extra_${TIMESTAMP}.tar.${_ext}"
+            print_message "INFO" "Архивация доп. путей (${#_extra_rel[@]}) в extra-sidecar..."
+            _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-extra" \
+                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_EXTRA" -C / "${_extra_rel[@]}" 2> "$_tar_err"
+            local _ex_rc=$?
+            if [[ $_ex_rc -ge 2 || ! -s "$BACKUP_DIR/$FILE_EXTRA" ]]; then
+                print_message "WARN" "extra-sidecar не создан (rc=$_ex_rc) — доп. пути НЕ вошли в архив."
+                log_message "WARN" "extra sidecar tar failed (rc=$_ex_rc)"
+                rm -f "$BACKUP_DIR/$FILE_EXTRA"; FILE_EXTRA=""
+            else
+                debug_log "TAR" "extra sidecar OK: $FILE_EXTRA (${#_extra_rel[@]} paths)"
+            fi
+        fi
+    fi
+
     # Manifest для full/files backup'ов — позволит создавать incremental позже.
     # Для db_only manifest не нужен (там нет файлов).
     # Manifest идёт ВНУТРИ tar как `manifest.txt` рядом с bot_version.txt.
@@ -10545,12 +10718,14 @@ create_backup() {
         local _db_inputs=("$FILE_VERSION" "$FILE_DB")
         [[ -n "$FILE_GLOBALS" && -f "$BACKUP_DIR/$FILE_GLOBALS" ]] && _db_inputs+=("$FILE_GLOBALS")
         [[ -n "$FILE_BILLING" && -f "$BACKUP_DIR/$FILE_BILLING" ]] && _db_inputs+=("$FILE_BILLING")
+        [[ -n "$FILE_KB" && -f "$BACKUP_DIR/$FILE_KB" ]] && _db_inputs+=("$FILE_KB")
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-db" \
             tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_db_inputs[@]}" 2> "$_tar_err"
         _tar_rc=$?
         rm -f "$BACKUP_DIR/$FILE_DB"
         [[ -n "$FILE_GLOBALS" ]] && rm -f "$BACKUP_DIR/$FILE_GLOBALS"
         [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
+        [[ -n "$FILE_KB" ]] && rm -f "$BACKUP_DIR/$FILE_KB"
     elif [[ "$TYPE" == "files_only" ]]; then
         FILE_FINAL="${BACKUP_PREFIX}_files_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
         local FILE_DIR="bot_files_${TIMESTAMP}.tar.${_ext}"
@@ -10570,6 +10745,7 @@ create_backup() {
             _warn_links_in_archive "$BACKUP_DIR/$FILE_DIR"   # №11: ссылки видны сразу при бэкапе
             # Combine: + manifest.txt если был сгенерирован
             local _combine_inputs=("$FILE_VERSION" "$FILE_DIR")
+            [[ -n "$FILE_EXTRA" && -f "$BACKUP_DIR/$FILE_EXTRA" ]] && _combine_inputs+=("$FILE_EXTRA")
             [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files-combine" \
                 tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
@@ -10578,6 +10754,7 @@ create_backup() {
             [[ $_tar_rc -eq 0 && $_first_rc -eq 1 ]] && _tar_rc=1
         }
         rm -f "$BACKUP_DIR/$FILE_DIR"
+        [[ -n "$FILE_EXTRA" ]] && rm -f "$BACKUP_DIR/$FILE_EXTRA"
         [[ -n "$FILE_MANIFEST" ]] && rm -f "$BACKUP_DIR/$FILE_MANIFEST"
     else
         FILE_FINAL="${BACKUP_PREFIX}_full_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
@@ -10595,6 +10772,8 @@ create_backup() {
             local _combine_inputs=("$FILE_VERSION" "$FILE_DB" "$FILE_DIR")
             [[ -n "$FILE_GLOBALS" && -f "$BACKUP_DIR/$FILE_GLOBALS" ]] && _combine_inputs+=("$FILE_GLOBALS")
             [[ -n "$FILE_BILLING" && -f "$BACKUP_DIR/$FILE_BILLING" ]] && _combine_inputs+=("$FILE_BILLING")
+            [[ -n "$FILE_KB" && -f "$BACKUP_DIR/$FILE_KB" ]] && _combine_inputs+=("$FILE_KB")
+            [[ -n "$FILE_EXTRA" && -f "$BACKUP_DIR/$FILE_EXTRA" ]] && _combine_inputs+=("$FILE_EXTRA")
             [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full-combine" \
                 tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
@@ -10606,6 +10785,8 @@ create_backup() {
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR"
         [[ -n "$FILE_GLOBALS" ]] && rm -f "$BACKUP_DIR/$FILE_GLOBALS"
         [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
+        [[ -n "$FILE_KB" ]] && rm -f "$BACKUP_DIR/$FILE_KB"
+        [[ -n "$FILE_EXTRA" ]] && rm -f "$BACKUP_DIR/$FILE_EXTRA"
         [[ -n "$FILE_MANIFEST" ]] && rm -f "$BACKUP_DIR/$FILE_MANIFEST"
     fi
 
@@ -12760,6 +12941,8 @@ execute_restore() {
     local DIR_ARC=""
     local GLOBALS_DUMP=""   # panel: sidecar ролей/глобалов (pg_dumpall --globals-only)
     local BILLING_DUMP=""   # panel: sidecar БД infra-billing (billing_*.sql.*)
+    local KB_DUMP=""        # bot: sidecar БД KB ИИ-саппорта (kb_*.sql.*)
+    local EXTRA_ARC=""      # panel: sidecar доп. путей ВНЕ PANEL_PATH (extra_*.tar.*)
 
     if [[ "$MODE" == "files_only" ]]; then
         DIR_ARC="$WORK_FILE"
@@ -12784,6 +12967,10 @@ execute_restore() {
         GLOBALS_DUMP=$(find "$TMP_DIR" \( -name "globals_*.sql.gz" -o -name "globals_*.sql.zst" \) | head -1)
         # Panel sidecar (опционально): billing_*.sql.* — БД infra-billing.
         BILLING_DUMP=$(find "$TMP_DIR" \( -name "billing_*.sql.gz" -o -name "billing_*.sql.zst" \) | head -1)
+        # Bot sidecar (опционально): kb_*.sql.* — БД KB ИИ-саппорта.
+        KB_DUMP=$(find "$TMP_DIR" \( -name "kb_*.sql.gz" -o -name "kb_*.sql.zst" \) | head -1)
+        # Panel sidecar (опционально): extra_*.tar.* — доп. пути ВНЕ PANEL_PATH.
+        EXTRA_ARC=$(find "$TMP_DIR" \( -name "extra_*.tar.gz" -o -name "extra_*.tar.zst" \) | head -1)
     fi
 
     debug_log "RESTORE" "DB_DUMP: $DB_DUMP"
@@ -13068,6 +13255,7 @@ execute_restore() {
             print_message "WARN" "DROP SCHEMA пропущен. Импорт может завершиться с ошибками из-за существующих таблиц."
         fi
 
+        _CRITICAL_SECTION=1   # опасное окно: DROP уже сделан, идёт импорт — Ctrl+C только через подтверждение
         print_message "INFO" "Импорт данных (user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME)..."
         debug_log "RESTORE" "Running: zcat $DB_DUMP | docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER $ACTUAL_DB_NAME -v ON_ERROR_STOP=1"
         # -v ON_ERROR_STOP=1: psql останавливается на первой ошибке (FK violation,
@@ -13112,8 +13300,10 @@ execute_restore() {
             # Поднимаем контейнеры, чтобы бот не остался offline после провала restore.
             ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
             rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+            _CRITICAL_SECTION=0
             return 1
         fi
+        _CRITICAL_SECTION=0   # импорт завершён — окно закрыто
         debug_log "RESTORE" "DB import complete (psql exit 0)"
     fi
 
@@ -13172,6 +13362,7 @@ execute_restore() {
                     print_message "WARN" "Snapshot биллинга не снялся — отката НЕ будет."
                     _bl_snap=""
                 fi
+                _CRITICAL_SECTION=1   # опасное окно импорта billing — Ctrl+C только через подтверждение
                 print_message "INFO" "Импорт infra-billing (db=$_bl_d)..."
                 docker exec -i "$PANEL_BILLING_DB_CONTAINER" psql -U "$_bl_u" -d "$_bl_d" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
                 local _bl_fmt _bl_dec
@@ -13202,6 +13393,147 @@ execute_restore() {
                     fi
                 fi
             fi
+        fi
+    fi
+
+    # === KB restore (bot sidecar) ===
+    # Бот уже восстановлен. KB — отдельный контейнер (pgvector), отдельная точка отката.
+    # Интерактив: явное согласие. Non-interactive: пропуск с WARN.
+    if [[ -n "$KB_DUMP" && -f "$KB_DUMP" && "$MODE" != "files_only" && "$BACKUP_TARGET" == "bot" ]]; then
+        local _kb_do="false"
+        if [[ "$IS_INTERACTIVE" == true ]]; then
+            echo ""
+            print_message "WARN" "В архиве найден дамп KB — восстановление ПЕРЕЗАПИШЕТ текущую БД KB (${BOT_KB_DB_CONTAINER})."
+            local _kb_ans=""
+            safe_read -rp "Восстановить KB? (y/N): " _kb_ans
+            [[ "$_kb_ans" =~ ^[YyДд]$ ]] && _kb_do="true"
+        else
+            print_message "WARN" "Дамп KB в архиве есть, но non-interactive restore его пропускает (запустите restore из меню)."
+            log_message "WARN" "kb dump present, skipped in non-interactive restore"
+        fi
+        if [[ "$_kb_do" == "true" ]]; then
+            # ГАРД: импорт KB разрушителен (DROP SCHEMA). Контейнер НЕ должен быть главной БД
+            # (бот/панель/billing) и обязан быть БД-образом — иначе KB-дамп затрёт чужую БД.
+            if [[ -z "$BOT_KB_DB_CONTAINER" || "$BOT_KB_DB_CONTAINER" == "$DB_CONTAINER_NAME" || "$BOT_KB_DB_CONTAINER" == "$PANEL_DB_CONTAINER" || "$BOT_KB_DB_CONTAINER" == "$PANEL_BILLING_DB_CONTAINER" ]]; then
+                print_message "ERROR" "ГАРД: BOT_KB_DB_CONTAINER='$BOT_KB_DB_CONTAINER' пуст или совпадает с главной БД — импорт KB ОТКЛОНЁН."
+                log_message "ERROR" "kb restore guard: collides with main db — refusing"
+                _kb_do="false"
+            else
+                local _kb_rimg; _kb_rimg=$(timeout 15 docker inspect --format '{{.Config.Image}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
+                if [[ -n "$_kb_rimg" ]] && ! _is_db_image "$_kb_rimg"; then
+                    print_message "ERROR" "ГАРД: '$BOT_KB_DB_CONTAINER' (image=$_kb_rimg) — не БД-образ — импорт KB ОТКЛОНЁН."
+                    log_message "ERROR" "kb restore guard: not a db image ($_kb_rimg)"
+                    _kb_do="false"
+                fi
+            fi
+        fi
+        if [[ "$_kb_do" == "true" ]]; then
+            local _kb_creds _kb_u _kb_d _kb_ready=false _kb_try
+            _kb_creds=$(_kb_db_creds)
+            _kb_u="${_kb_creds%% *}"; _kb_d="${_kb_creds##* }"
+            for _kb_try in 1 2 3; do
+                if timeout 10 docker exec "$BOT_KB_DB_CONTAINER" pg_isready -U "$_kb_u" -d "$_kb_d" > "$SILENT_LOG" 2>&1; then
+                    _kb_ready=true; break
+                fi
+                sleep 3
+            done
+            if [[ "$_kb_ready" != "true" ]]; then
+                print_message "ERROR" "БД KB не готова (pg_isready x3) — импорт KB пропущен (бот уже восстановлен)."
+                log_message "ERROR" "kb restore skipped: container/db not ready"
+            else
+                print_message "INFO" "Snapshot живой БД KB (точка отката)..."
+                local _kb_snap _kb_snap_rc
+                _kb_snap=$(_make_live_db_snapshot "$BOT_KB_DB_CONTAINER" "$_kb_u" "$_kb_d" "$BACKUP_DIR")
+                _kb_snap_rc=$?
+                if [[ $_kb_snap_rc -eq 1 ]]; then
+                    print_message "WARN" "Snapshot KB не снялся — отката НЕ будет."
+                    _kb_snap=""
+                fi
+                _CRITICAL_SECTION=1   # опасное окно импорта KB — Ctrl+C только через подтверждение
+                print_message "INFO" "Импорт KB (db=$_kb_d)..."
+                docker exec -i "$BOT_KB_DB_CONTAINER" psql -U "$_kb_u" -d "$_kb_d" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+                local _kb_fmt _kb_dec
+                _kb_fmt=$(_compress_detect_format "$KB_DUMP")
+                _kb_dec=$(_decompress_cmd_for "$_kb_fmt")
+                if _run_pipe_with_timeout "$RESTORE_TIMEOUT_SEC" "psql-kb" \
+                        '$6 "$1" | docker exec -i "$2" psql -U "$3" -d "$4" -v ON_ERROR_STOP=1 > "$5" 2>&1' \
+                        "$KB_DUMP" "$BOT_KB_DB_CONTAINER" "$_kb_u" "$_kb_d" "$SILENT_LOG" "$_kb_dec"; then
+                    print_message "SUCCESS" "KB восстановлен."
+                    log_message "SUCCESS" "kb restore OK (db=$_kb_d)"
+                    [[ -n "$_kb_snap" && -f "$_kb_snap" ]] && rm -f "$_kb_snap"
+                else
+                    print_message "ERROR" "Импорт KB провалился."
+                    log_message "ERROR" "kb restore psql failed"
+                    if [[ -n "$_kb_snap" && -f "$_kb_snap" ]] && gzip -t "$_kb_snap" 2> "$SILENT_LOG"; then
+                        print_message "WARN" "Автооткат KB из snapshot: $_kb_snap"
+                        docker exec -i "$BOT_KB_DB_CONTAINER" psql -U "$_kb_u" -d "$_kb_d" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+                        if _run_pipe_with_timeout "$RESTORE_TIMEOUT_SEC" "psql-kb-rollback" \
+                                'gzip -dc "$5" | docker exec -i "$1" psql -U "$2" -d "$3" -v ON_ERROR_STOP=1 > "$4" 2>&1' \
+                                "$BOT_KB_DB_CONTAINER" "$_kb_u" "$_kb_d" "$SILENT_LOG" "$_kb_snap"; then
+                            print_message "SUCCESS" "Откат KB выполнен — БД KB как до restore."
+                        else
+                            print_message "ERROR" "Откат KB не удался. Snapshot сохранён: $_kb_snap — восстановите вручную."
+                            log_message "ERROR" "kb rollback FAILED, snapshot kept: $_kb_snap"
+                        fi
+                    else
+                        print_message "ERROR" "Точки отката KB нет — восстановите вручную (бот при этом восстановлен успешно)."
+                    fi
+                fi
+                _CRITICAL_SECTION=0
+            fi
+        fi
+    fi
+
+    # === EXTRA-PATHS restore (panel sidecar) ===
+    # Доп. каталоги ВНЕ PANEL_PATH (certwarden-data, notifications). БЕЗОПАСНО: НЕ извлекаем чужой
+    # архив прямо в / (member вида etc/cron.d/* = root-RCE при подделке на remote-хранилище). Как
+    # основной dir-restore: (1) validate_tar_safety ловит abs/../unsafe-links; (2) распаковка в
+    # изолированный STAGE; (3) в / копируем ТОЛЬКО пути из PANEL_EXTRA_PATHS (allowlist) через
+    # rsync --safe-links. Члены вне allowlist остаются в STAGE и в / не попадают.
+    if [[ -n "$EXTRA_ARC" && -f "$EXTRA_ARC" && "$BACKUP_TARGET" == "panel" ]]; then
+        if [[ "$IS_INTERACTIVE" == true ]]; then
+            echo ""
+            print_message "WARN" "В архиве есть доп. пути (extra-sidecar). Восстановление ПЕРЕЗАПИШЕТ файлы вне PANEL_PATH (напр. certwarden-data)."
+            local _ex_ans=""
+            safe_read -rp "Восстановить доп. пути (из PANEL_EXTRA_PATHS) в исходные места? (y/N): " _ex_ans
+            if [[ "$_ex_ans" =~ ^[YyДд]$ ]]; then
+                local _ex_list="$TMP_DIR/extra_list.txt" _ex_stage="$TMP_DIR/extra_stage"
+                if ! validate_tar_safety "$EXTRA_ARC" "$_ex_list"; then
+                    print_message "ERROR" "extra-sidecar не прошёл проверку безопасности (validate_tar_safety) — восстановление отклонено."
+                    log_message "ERROR" "extra tar failed validate_tar_safety — refusing extract"
+                else
+                    mkdir -p "$_ex_stage"
+                    local _ex_fmt _ex_args
+                    _ex_fmt=$(_compress_detect_format "$EXTRA_ARC")
+                    _ex_args=$(_tar_extract_args_for "$_ex_fmt")
+                    if tar $_ex_args -xf "$EXTRA_ARC" -C "$_ex_stage" --no-same-owner --no-same-permissions 2> "$SILENT_LOG"; then
+                        local _ex_ok=0 _ex_p _ex_rel
+                        for _ex_p in $(printf '%s' "$PANEL_EXTRA_PATHS" | tr ',;' '  '); do
+                            [[ -z "$_ex_p" ]] && continue
+                            _ex_rel="${_ex_p#/}"
+                            if [[ -e "$_ex_stage/$_ex_rel" ]]; then
+                                mkdir -p "$(dirname "/$_ex_rel")"
+                                # rsync только конкретного allowlist-пути; --safe-links режет симлинки наружу.
+                                if rsync -a --safe-links "$_ex_stage/$_ex_rel" "$(dirname "/$_ex_rel")/" 2> "$SILENT_LOG"; then
+                                    _ex_ok=$((_ex_ok + 1))
+                                else
+                                    print_message "WARN" "Не удалось восстановить путь: /$_ex_rel"
+                                fi
+                            else
+                                print_message "WARN" "Путь отсутствует в extra-архиве: /$_ex_rel"
+                            fi
+                        done
+                        print_message "SUCCESS" "Доп. пути восстановлены (${_ex_ok}) — только из PANEL_EXTRA_PATHS (allowlist)."
+                        log_message "SUCCESS" "extra paths restored via allowlist ($_ex_ok paths)"
+                    else
+                        print_message "ERROR" "Распаковка extra-sidecar в STAGE не удалась."
+                        log_message "ERROR" "extra sidecar stage extract failed"
+                    fi
+                fi
+            fi
+        else
+            print_message "WARN" "Доп. пути (extra-sidecar) в архиве есть — non-interactive restore их пропускает."
+            log_message "WARN" "extra sidecar present, skipped in non-interactive restore"
         fi
     fi
 
@@ -13375,8 +13707,8 @@ menu_list_backups() {
                     echo -e "      ${GRAY}${fsize}\t${fname}${RESET}"
                     _shown=$((_shown + 1))
                 done
-                # M17: восстановление — пункт 4 главного меню (не 3).
-                [[ $n -gt 3 ]] && echo -e "      ${GRAY}... ещё $((n - 3)) (Восстановить — пункт 4)${RESET}"
+                # M17: восстановление — пункт 2 главного меню.
+                [[ $n -gt 3 ]] && echo -e "      ${GRAY}... ещё $((n - 3)) (Восстановить — пункт 2)${RESET}"
             fi
         done
         [[ "$_multi" -eq 1 ]] && echo ""
@@ -13494,7 +13826,7 @@ _show_top_in_archive() {
         fi
     fi
     echo ""
-    echo -e "${GRAY}Чтобы исключить — Настройки → Цель и пути (исключения / лимит файла)${RESET}"
+    echo -e "${GRAY}Чтобы исключить — Настройки → Что бэкапим и пути (исключения / лимит файла)${RESET}"
     echo ""
     safe_read -rp "Enter — назад " _dummy
 }
@@ -13675,13 +14007,13 @@ setup_cron_task() {
                return
            fi
            DISPLAY_TIME="Свое: $times_input" ;;
-        5) 
+        5)
            echo ""
            echo "Введите интервал в минутах (1-59):"
            read -erp "> " interval
-           if [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] && [ "$interval" -lt 60 ]; then
-               NEW_CRON_LINES="*/$interval * * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
-               DISPLAY_TIME="Каждые $interval мин"
+           if _cron_every_n_min "$interval"; then
+               NEW_CRON_LINES="$_CRON_MIN_SPEC $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+               DISPLAY_TIME="Каждые $_CRON_MIN_N мин"
            else print_message "ERROR" "Введите число от 1 до 59."; sleep 1; return; fi ;;
         0) 
            if [[ "$CURRENT_STATUS" != "Выкл" ]]; then
@@ -13719,7 +14051,51 @@ setup_cron_task() {
     print_message "SUCCESS" "Расписание обновлено!"; sleep 1
 }
 
+# menu_automation_simple: один вопрос вместо полного меню расписаний (UI_MODE=standard).
+# Включает/выключает ТОЛЬКО ежедневный полный авто-бэкап в 04:00 тем же механизмом,
+# что и setup_cron_task «Ежедневно 04:00» (cron-строка 0 4 * * * … # LAZARUS-JOB-FULL +
+# sync_cron_with_config) — cron-формат идентичен, парсер get_cron_status его понимает.
+menu_automation_simple() {
+    local CRON_FULL; CRON_FULL=$(get_cron_status "full")
+    clear_screen
+    echo -e "${GREEN}${BOLD}Авто-бэкап${RESET}"
+    echo ""
+    if [[ "$CRON_FULL" == "Выкл" ]]; then
+        echo -e "  Ежедневный полный авто-бэкап: ${YELLOW}ВЫКЛ${RESET}"
+        echo ""
+        read -erp "Включить ежедневный полный авто-бэкап? [Y/n] " _a
+        [[ "$_a" =~ ^[Nn]$ ]] && return
+        # ensure_bot_path — как в setup_cron_task для локальной full-цели (SSH-цель не проверяем).
+        if [[ "$(_transport_of "$BACKUP_TARGET")" != "ssh" ]] && ! ensure_bot_path; then return; fi
+        local JOB_CMD="$SYMLINK_PATH backup_full"; local JOB_ID="# LAZARUS-JOB-FULL"
+        local NEW_CRON_LINE="0 4 * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
+        # printf вместо echo -e (не портим backslash'и чужих задач); проверяем rc crontab.
+        local CURRENT_CRON; CURRENT_CRON=$(crontab -l 2> "$SILENT_LOG" | grep -v "$JOB_ID")
+        if printf '%s\n%s\n' "$CURRENT_CRON" "$NEW_CRON_LINE" | crontab -; then
+            sync_cron_with_config
+            log_message "INFO" "Cron task updated (simple): full -> Ежедневно 04:00"
+            print_message "SUCCESS" "Ежедневный авто-бэкап включён (04:00)."; sleep 1
+        else
+            print_message "ERROR" "crontab отклонил запись — расписание НЕ изменено."
+            log_message "ERROR" "crontab write failed (menu_automation_simple)"
+            sleep 1
+        fi
+    else
+        echo -e "  Ежедневный полный авто-бэкап: ${GREEN}${CRON_FULL}${RESET}"
+        echo ""
+        read -erp "Выключить авто-бэкап? [y/N] " _a
+        [[ "$_a" =~ ^[Yy]$ ]] || return
+        # disable_all_cron_tasks сам спрашивает подтверждение и чистит все LAZARUS-задачи.
+        disable_all_cron_tasks
+    fi
+}
+
 menu_automation() {
+    # Стандартный режим: один вопрос вместо полного меню расписаний.
+    if [[ "$UI_MODE" == "standard" ]]; then
+        menu_automation_simple
+        return
+    fi
     while true; do
         # Получаем актуальные статусы из cron
         local CRON_FULL=$(get_cron_status "full")
@@ -13814,30 +14190,43 @@ menu_settings() {
         if [[ -z "$_sview" ]]; then
             local _ts="Telegram-бот"; [[ "$BACKUP_TARGET" == panel ]] && _ts="Remnawave Panel"
             [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && _ts+=" + $([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот)"
-            echo -e "${GRAY}Цель: ${CYAN}${_ts}${RESET}"
+            echo -e "${GRAY}Бэкапим: ${CYAN}${_ts}${RESET}"
             echo ""
-            echo " 1. Цель и пути          (контейнеры, исключения, лимит файла)"
+            if [[ "$UI_MODE" == "standard" ]]; then
+                # Простой режим — только суть. Пути/контейнеры/ротация/компрессия находятся
+                # и настраиваются автоматически; смена цели и тонкие пороги — в расширенном режиме.
+                echo " 1. Telegram-уведомления"
+                echo " 2. Шифрование (пароль)"
+                echo " 3. Копия вне сервера (S3 / FTP / WebDAV)"
+                echo ""
+                echo " 0. Назад"
+                echo ""
+                local _cat; safe_read -erp "Выбор: " _cat
+                case "$_cat" in
+                    1) _sview=telegram ;; 2) _sview=security ;; 3) _sview=storage ;;
+                    0|"") return ;;
+                    *) print_message "ERROR" "Введите 1–3 или 0"; sleep 1 ;;
+                esac
+                continue
+            fi
+            echo " 1. Что бэкапим и пути   (контейнеры, исключения, лимит файла)"
             echo " 2. Telegram             (токен, уведомления, проверка связи)"
             echo " 3. Удалённое хранилище  (S3 / FTP / WebDAV / Rclone)"
             echo " 4. Шифрование           (пароль AES-256)"
             echo " 5. Ротация и диск       (сколько хранить, пороги)"
             echo " 6. Компрессия и логи"
-            echo " 7. Сменить цель         (панель / бот / обе)"
-            echo " 8. Режим меню           (Эксперт → Стандартный, короткое главное меню)"
+            echo " 7. Сменить — что бэкапить (панель / бот / обе)"
             echo ""
             echo " 0. Назад"
+            echo -e "${GRAY} (переключение Простой/Расширенный режим — пункт 99 в главном меню)${RESET}"
             echo ""
             local _cat; safe_read -erp "Выбор раздела: " _cat
             case "$_cat" in
                 1) _sview=general ;; 2) _sview=telegram ;; 3) _sview=storage ;;
                 4) _sview=security ;; 5) _sview=rotation ;; 6) _sview=misc ;;
                 7) menu_backup_target ;;
-                8) # Переключатель в Стандартный режим — обратно: пункт 77 главного меню.
-                   UI_MODE="standard"; save_config
-                   print_message "SUCCESS" "Стандартный режим включён (вернуться: пункт 77 в главном меню)"
-                   sleep 1; return ;;
                 0|"") return ;;
-                *) print_message "ERROR" "Введите 1–8 или 0"; sleep 1 ;;
+                *) print_message "ERROR" "Введите 1–7 или 0"; sleep 1 ;;
             esac
             continue
         fi
@@ -13876,18 +14265,18 @@ menu_settings() {
         if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then STORAGE_TYPE_DISP="${REMOTE_STORAGE_TYPE^^}"; fi
 
         if [[ "$_sview" == "general" ]]; then
-        echo -e "${CYAN}--- ЦЕЛЬ И ПУТИ ---${RESET}"
+        echo -e "${CYAN}--- ЧТО БЭКАПИМ И ПУТИ ---${RESET}"
         local _sec_disp=""
         if [[ "$BACKUP_SECONDARY" == "bot" ]]; then _sec_disp=" ${GREEN}+ бот${RESET}"
         elif [[ "$BACKUP_SECONDARY" == "panel" ]]; then _sec_disp=" ${GREEN}+ панель${RESET}"; fi
         if [[ "$BACKUP_TARGET" == "panel" ]]; then
-            echo -e " ${GRAY}Цель бэкапа: ${CYAN}Remnawave Panel${RESET}${_sec_disp}  ${GRAY}(раздел 7 — сменить)${RESET}"
+            echo -e " ${GRAY}Бэкапим: ${CYAN}Remnawave Panel${RESET}${_sec_disp}  ${GRAY}(раздел 7 — сменить)${RESET}"
             echo -e " 1. Путь к панели:      ${GRAY}${PANEL_PATH}${RESET}"
             echo -e " 2. Контейнер БД:       ${GRAY}${PANEL_DB_CONTAINER}${RESET}"
             # H4: для панели юзер БД берётся из .env (POSTGRES_USER); ручная правка тут — для бота.
             echo -e " 4. Пользователь БД:    ${GRAY}из .env панели (POSTGRES_USER)${RESET}"
         else
-            echo -e " ${GRAY}Цель бэкапа: ${CYAN}Telegram-бот${RESET}${_sec_disp}  ${GRAY}(раздел 7 — сменить)${RESET}"
+            echo -e " ${GRAY}Бэкапим: ${CYAN}Telegram-бот${RESET}${_sec_disp}  ${GRAY}(раздел 7 — сменить)${RESET}"
             echo -e " 1. Путь к боту:        ${GRAY}${BOT_PATH}${RESET}"
             echo -e " 2. Контейнер бота:     ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
             echo -e " 3. Контейнер БД:       ${GRAY}${DB_CONTAINER_NAME}${RESET}"
@@ -13896,10 +14285,10 @@ menu_settings() {
         # M2/M9: both-режим — вторая цель read-only (правка через мастер «Что бэкапить», п.27).
         if [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]]; then
             if [[ "$BACKUP_SECONDARY" == "panel" ]]; then
-                echo -e " ${GRAY}── 2-я цель: Панель ($(_target_loc_label panel)) · правка — раздел 7 ──${RESET}"
+                echo -e " ${GRAY}── Ещё бэкапим: Панель ($(_target_loc_label panel)) · правка — раздел 7 ──${RESET}"
                 echo -e "    ${GRAY}Путь: ${PANEL_PATH} · Контейнер БД: ${PANEL_DB_CONTAINER}${RESET}"
             else
-                echo -e " ${GRAY}── 2-я цель: Бот ($(_target_loc_label bot)) · правка — раздел 7 ──${RESET}"
+                echo -e " ${GRAY}── Ещё бэкапим: Бот ($(_target_loc_label bot)) · правка — раздел 7 ──${RESET}"
                 echo -e "    ${GRAY}Путь: ${_CANON_BOT_PATH:-$BOT_PATH} · Контейнер БД: ${_CANON_DB_CONTAINER:-не задан}${RESET}"
             fi
         fi
@@ -14037,7 +14426,7 @@ menu_settings() {
                if [[ -n "$np" ]]; then
                    # low#8: SSH/scp-пути сюда не годятся — это поле для ЛОКАЛЬНОГО каталога.
                    if [[ "$np" =~ ^(ssh://|[^/]+:/) ]]; then
-                       print_message "ERROR" "SSH-пути здесь не поддерживаются — удалённую цель настройте в разделе 7 (Сменить цель)."; sleep 1.5; continue
+                       print_message "ERROR" "SSH-пути здесь не поддерживаются — удалённую цель настройте в разделе 7 (Сменить — что бэкапить)."; sleep 1.5; continue
                    fi
                    if [[ -d "$np" ]]; then
                        # Валидация НА ВХОДЕ (identity-слой): панельный путь обязан декларировать
@@ -14492,19 +14881,22 @@ cleanup_old_backups() {
     local size_exceeded=false
 
     # low#36: видно, ЧЬИ бэкапы затронет очистка (в both-режиме — обе цели).
-    if [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]]; then
-        echo -e "${GRAY}Цель: ОБЕ ($([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот) + $([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот))${RESET}"
-    else
-        echo -e "${GRAY}Цель: $([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот)${RESET}"
+    # Стандартный режим: без пояснительного блока (режим/лимиты/размер) — только действия.
+    if [[ "$UI_MODE" != "standard" ]]; then
+        if [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]]; then
+            echo -e "${GRAY}Цель: ОБЕ ($([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот) + $([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот))${RESET}"
+        else
+            echo -e "${GRAY}Цель: $([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот)${RESET}"
+        fi
+        echo -e "Текущий режим очистки: ${YELLOW}$DELETE_MODE${RESET}"
+        if [[ "$DELETE_MODE" == "count" ]]; then
+            echo "Лимит хранения: $MAX_BACKUPS_COUNT шт."
+        else
+            echo -e "Срок хранения: ${YELLOW}$RETENTION_DAYS дней${RESET}"
+        fi
+        echo -e "Лимит размера: ${YELLOW}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
+        echo ""
     fi
-    echo -e "Текущий режим очистки: ${YELLOW}$DELETE_MODE${RESET}"
-    if [[ "$DELETE_MODE" == "count" ]]; then
-        echo "Лимит хранения: $MAX_BACKUPS_COUNT шт."
-    else
-        echo -e "Срок хранения: ${YELLOW}$RETENTION_DAYS дней${RESET}"
-    fi
-    echo -e "Лимит размера: ${YELLOW}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
-    echo ""
     
     # H13: в both-режиме чистим ОБЕ цели (primary + secondary), иначе архивы второй копятся без ротации.
     local _cl_prefixes=("$BACKUP_PREFIX")
@@ -14595,6 +14987,8 @@ cleanup_old_backups() {
             [[ -t 0 && -t 1 ]] && safe_read -rp "Enter — назад " dummy
             return
         fi
+        # Размер каталога ДО удаления — для короткого «освобождено X» (standard).
+        local _cl_before; _cl_before=$(du -sb "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
         for _cl_pfx in "${_cl_prefixes[@]}"; do
             if [[ "$DELETE_MODE" == "count" ]]; then
                 rotate_backups_by_count "${_cl_pfx}_full" "Полные бэкапы" "true" > "$SILENT_LOG"
@@ -14611,7 +15005,18 @@ cleanup_old_backups() {
             rotate_backups_by_size "true"
         fi
         [[ "$_cl_lock" == "true" ]] && release_lock
-        echo ""; print_message "SUCCESS" "Очистка завершена."
+        echo ""
+        # Стандартный режим: короткий итог «удалено N, освобождено X» вместо подробностей.
+        if [[ "$UI_MODE" == "standard" ]]; then
+            local _cl_after _cl_freed="?"
+            _cl_after=$(du -sb "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+            if [[ "$_cl_before" =~ ^[0-9]+$ && "$_cl_after" =~ ^[0-9]+$ && "$_cl_after" -le "$_cl_before" ]]; then
+                _cl_freed=$(numfmt --to=iec "$((_cl_before - _cl_after))" 2>/dev/null || echo "$((_cl_before - _cl_after))B")
+            fi
+            print_message "SUCCESS" "Удалено: $total_del · освобождено $_cl_freed"
+        else
+            print_message "SUCCESS" "Очистка завершена."
+        fi
         log_message "INFO" "Cleanup completed (mode=$DELETE_MODE, retention_days=$RETENTION_DAYS, max_count=$MAX_BACKUPS_COUNT, deleted=$total_del)"
         if [[ "$REPORT_TO_TG" == "true" && "$SEND_TO_TELEGRAM" == "true" ]]; then
             send_telegram_alert "INFO" "Ротация выполнена" \
@@ -14646,7 +15051,7 @@ _transport_of() { if [[ "$1" == "panel" ]]; then echo "$PANEL_TRANSPORT"; else e
 
 # _target_status_line: строка статуса цели для дашборда (иконка · метка · где · доступность).
 _target_status_line() {
-    local _t="$1" _label _loc _cont _tr _reach _host
+    local _t="$1" _pfx="${2:-   }" _label _loc _cont _tr _reach _host
     if [[ "$_t" == "panel" ]]; then
         _label="Панель"; _cont="$PANEL_DB_CONTAINER"; _tr="$PANEL_TRANSPORT"; _host="$PANEL_SSH_HOST"
     else
@@ -14677,22 +15082,37 @@ _target_status_line() {
             _reach="${RED}✗ ${_cont} не найден → пункт 2${RESET}"
         fi
     fi
-    echo -e "   ${_label} — ${CYAN}${_loc}${RESET} · ${_reach}"
+    echo -e "${_pfx}${_label} — ${CYAN}${_loc}${RESET} · ${_reach}"
 }
 
-# _print_targets_summary: блок «что бэкапим» (primary + secondary).
+# _print_targets_summary: блок «что бэкапим» — панель-callout с левым рельсом (primary + secondary).
 _print_targets_summary() {
-    echo -e "${BOLD}Что бэкапим:${RESET}"
-    _target_status_line "$BACKUP_TARGET"
-    [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && _target_status_line "$BACKUP_SECONDARY"
+    local _rail="  ${CYAN}│${RESET}  "
+    echo -e "  ${CYAN}┌─${RESET}${BOLD} Что бэкапим${RESET}"
+    _target_status_line "$BACKUP_TARGET" "$_rail"
+    [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && _target_status_line "$BACKUP_SECONDARY" "$_rail"
     # infra-billing: если панель среди целей (локально) и контейнер биллинга запущен —
     # его БД войдёт в panel-бэкап sidecar'ом. Для SSH-панели не проверяем (докер удалённый).
     if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]] \
        && [[ "$PANEL_BILLING_BACKUP" != "false" && -n "$PANEL_BILLING_DB_CONTAINER" && "$PANEL_TRANSPORT" != "ssh" ]]; then
         if [[ "$(timeout 5 docker inspect --format '{{.State.Status}}' "$PANEL_BILLING_DB_CONTAINER" 2> "$SILENT_LOG")" == "running" ]]; then
-            echo -e "   ${GRAY}+ infra-billing (${PANEL_BILLING_DB_CONTAINER}) — БД войдёт в бэкап панели${RESET}"
+            echo -e "  ${CYAN}│${RESET}  ${GRAY}+ infra-billing (${PANEL_BILLING_DB_CONTAINER}) — БД войдёт в бэкап панели${RESET}"
         fi
     fi
+    # KB ИИ-саппорта: если бот среди целей (локально) и kb-контейнер запущен — его БД войдёт в bot-бэкап.
+    if [[ "$BACKUP_TARGET" == "bot" || "$BACKUP_SECONDARY" == "bot" ]] \
+       && [[ "$BOT_KB_BACKUP" != "false" && -n "$BOT_KB_DB_CONTAINER" && "$BOT_TRANSPORT" != "ssh" ]]; then
+        if [[ "$(timeout 5 docker inspect --format '{{.State.Status}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")" == "running" ]]; then
+            echo -e "  ${CYAN}│${RESET}  ${GRAY}+ KB ИИ-саппорта (${BOT_KB_DB_CONTAINER}) — БД войдёт в бэкап бота${RESET}"
+        fi
+    fi
+    # Доп. пути ВНЕ PANEL_PATH (certwarden и т.п.) — в full-бэкапе панели.
+    if [[ ( "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ) && -n "${PANEL_EXTRA_PATHS:-}" ]]; then
+        local _ep_n=0 _ep_x
+        for _ep_x in $(printf '%s' "$PANEL_EXTRA_PATHS" | tr ',;' '  '); do [[ -n "$_ep_x" && -e "$_ep_x" ]] && _ep_n=$((_ep_n + 1)); done
+        [[ $_ep_n -gt 0 ]] && echo -e "  ${CYAN}│${RESET}  ${GRAY}+ доп. путей: ${_ep_n} — в full-бэкапе панели${RESET}"
+    fi
+    echo -e "  ${CYAN}└${RESET}${GRAY}$(_hrule '─' 46)${RESET}"
 }
 
 # _cron_inactive: true, если нет ни full-, ни db-cron. Самодостаточно (читает crontab),
@@ -14721,27 +15141,27 @@ _readiness_line() {
     [[ -z "$_ci" ]] && { _cron_inactive && _ci=true || _ci=false; }
     # №5: три состояния — реально читается / файл есть но НЕЧИТАЕМ / выключено.
     if _encryption_ready; then
-        _enc="${GREEN}шифр${RESET}"
+        _enc="${GREEN}✓ шифрование${RESET}"
     elif [[ -f "$BACKUP_PASSWORD_FILE" ]]; then
-        _enc="${RED}файл пароля НЕЧИТАЕМ${RESET}"
+        _enc="${RED}✗ пароль НЕЧИТАЕМ${RESET}"
     else
-        _enc="${RED}шифрование ВЫКЛ${RESET}"
+        _enc="${RED}✗ шифрование${RESET}"
     fi
     if [[ "$REMOTE_STORAGE_TYPE" != "off" && "$SEND_TO_REMOTE" == "true" ]]; then
-        _stor="${GREEN}${REMOTE_STORAGE_TYPE^^} off-site${RESET}"
+        _stor="${GREEN}✓ off-site (${REMOTE_STORAGE_TYPE^^})${RESET}"
     elif [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
-        _stor="${YELLOW}${REMOTE_STORAGE_TYPE^^} (отправка ВЫКЛ)${RESET}"
+        _stor="${YELLOW}~ off-site (${REMOTE_STORAGE_TYPE^^}, отправка ВЫКЛ)${RESET}"
     else
-        _stor="${RED}только локально${RESET}"
+        _stor="${RED}✗ только локально${RESET}"
     fi
     # cron-флаг: из аргумента (дашборд) либо из _cron_inactive (first-run). НЕ из NO_CRITICAL_BACKUP
     # напрямую — та переменная пуста вне цикла дашборда (была причиной ложно-зелёного «авто»).
     if [[ "$_ci" == "true" ]]; then
-        _cron="${RED}авто ВЫКЛ${RESET}"
+        _cron="${RED}✗ авто-бэкап${RESET}"
     else
-        _cron="${GREEN}авто${RESET}"
+        _cron="${GREEN}✓ авто-бэкап${RESET}"
     fi
-    echo -e "${BOLD}Готовность:${RESET} ${_enc} · ${_stor} · ${_cron}"
+    echo -e "  ${BOLD}Защита:${RESET}    ${_enc} · ${_stor} · ${_cron}"
 }
 
 # _quickstart_protect: пошаговый мастер защиты (шифрование → авто-бэкап → off-site).
@@ -14749,15 +15169,35 @@ _readiness_line() {
 # первого запуска и по «Q» с дашборда. Каждый шаг можно пропустить (Enter).
 _quickstart_protect() {
     clear_screen
-    echo -e "${GREEN}${BOLD}Быстрая настройка защиты${RESET}"
+    echo -e "${GREEN}${BOLD}Настройка бэкапа${RESET}  ${GRAY}(уведомления · шифрование · авто-бэкап · копия в облако)${RESET}"
     echo ""
     _print_targets_summary
     echo ""
-    echo -e "${GRAY}Три шага к защищённому бэкапу. Enter — пропустить любой шаг.${RESET}"
+    echo -e "${GRAY}Несколько шагов. Каждый можно пропустить — просто нажмите Enter.${RESET}"
 
-    # [1/3] Шифрование архивов
+    # [1/4] Уведомления в Telegram
     echo ""
-    echo -e "${CYAN}${BOLD}[1/3] Шифрование архивов (AES-256)${RESET}"
+    echo -e "${CYAN}${BOLD}[1/4] Уведомления в Telegram${RESET}"
+    if [[ -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+        echo -e "  ${GREEN}✓ уже настроено${RESET}"
+    else
+        echo -e "  ${GRAY}Бот пришлёт результат каждого бэкапа. Токен — у @BotFather, ваш ID — у @userinfobot.${RESET}"
+        local _tk _ci
+        safe_read -erp "  Токен бота (Enter — пропустить): " _tk
+        if [[ -n "$_tk" ]]; then
+            safe_read -erp "  Ваш Chat ID: " _ci
+            if [[ -n "$_ci" ]]; then
+                BOT_TOKEN="$_tk"; CHAT_ID="$_ci"; SEND_TO_TELEGRAM="true"; save_config
+                print_message "SUCCESS" "Telegram-уведомления включены"
+            else
+                echo -e "  ${YELLOW}Chat ID не задан — Telegram пропущен${RESET}"
+            fi
+        fi
+    fi
+
+    # [2/4] Шифрование архивов
+    echo ""
+    echo -e "${CYAN}${BOLD}[2/4] Шифрование архивов (AES-256)${RESET}"
     if _encryption_ready; then   # №5: не голое -f — реальная читаемость пароля
         echo -e "  ${GREEN}✓ уже включено${RESET}"
     else
@@ -14782,30 +15222,40 @@ _quickstart_protect() {
 
     # [2/3] Авто-бэкап по расписанию (ежедневный full)
     echo ""
-    echo -e "${CYAN}${BOLD}[2/3] Авто-бэкап по расписанию${RESET}"
+    echo -e "${CYAN}${BOLD}[3/4] Авто-бэкап по расписанию${RESET}"
     local _cf _cd; _cf=$(get_cron_status "full"); _cd=$(get_cron_status "db")
     if [[ "$_cf" != "Выкл" || "$_cd" != "Выкл" ]]; then
         echo -e "  ${GREEN}✓ уже настроено${RESET}"
     else
-        echo "  1) Ежедневно 04:00 (рекомендуется)   2) Каждые 6 часов   Enter — пропустить"
+        echo "  1) Ежедневно 04:00 (рекомендуется)"
+        echo "  2) Каждые 6 часов"
+        echo "  3) Каждые N минут (задать интервал)"
+        echo "  Enter — пропустить"
         local _sc; safe_read -erp "  Выбор: " _sc
-        local _spec=""
+        local _spec="" _label=""
         case "$_sc" in
-            1) _spec="0 4 * * *" ;;
-            2) _spec="0 */6 * * *" ;;
+            1) _spec="0 4 * * *"; _label="ежедневно 04:00" ;;
+            2) _spec="0 */6 * * *"; _label="каждые 6 ч" ;;
+            3) local _iv; safe_read -erp "  Интервал в минутах (1-59): " _iv
+               if _cron_every_n_min "$_iv"; then _spec="$_CRON_MIN_SPEC"; _label="каждые $_CRON_MIN_N мин"
+               else print_message "ERROR" "Интервал — число 1-59; авто-бэкап не настроен"; fi ;;
         esac
         if [[ -n "$_spec" ]]; then
             local _job_id="# LAZARUS-JOB-FULL" _cur
             _cur=$(crontab -l 2> "$SILENT_LOG" | grep -v "$_job_id")
-            printf '%s\n%s\n' "$_cur" "$_spec $SYMLINK_PATH backup_full >> /var/log/lazarus_backup.log 2>&1 $_job_id" | crontab -
-            sync_cron_with_config
-            print_message "SUCCESS" "Авто-бэкап настроен (Полный, $([[ "$_sc" == 1 ]] && echo 'ежедневно 04:00' || echo 'каждые 6 ч'))"
+            # rc-check как в setup_cron_task/menu_automation_simple: не рапортовать успех, если crontab отклонил.
+            if printf '%s\n%s\n' "$_cur" "$_spec $SYMLINK_PATH backup_full >> /var/log/lazarus_backup.log 2>&1 $_job_id" | crontab -; then
+                sync_cron_with_config
+                print_message "SUCCESS" "Авто-бэкап настроен (Полный, $_label)"
+            else
+                print_message "ERROR" "crontab отклонил запись — авто-бэкап не настроен"
+            fi
         fi
     fi
 
     # [3/3] Копия вне сервера
     echo ""
-    echo -e "${CYAN}${BOLD}[3/3] Копия вне сервера${RESET}"
+    echo -e "${CYAN}${BOLD}[4/4] Копия вне сервера (облако)${RESET}"
     if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
         echo -e "  ${GREEN}✓ уже настроено (${REMOTE_STORAGE_TYPE^^})${RESET}"
     else
@@ -14815,7 +15265,7 @@ _quickstart_protect() {
     fi
 
     echo ""
-    print_message "SUCCESS" "Настройка защиты завершена"
+    print_message "SUCCESS" "Мастер настройки завершён"
     _readiness_line
     echo ""
     safe_read -erp "Enter — продолжить " _dummy
@@ -16096,10 +16546,57 @@ case "$1" in
             # low#0: статус контейнера показывает _print_targets_summary (строка «🎯 Что бэкапим»);
             # прежние BOT_VERSION/CONTAINER_STATUS/STATUS_COLOR здесь были мёртвым кодом — убраны.
 
+            # Общие производные (нужны обоим режимам). Top-level (не функция) — без local (SC2168).
+            _both_mode=false
+            [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && _both_mode=true
+            CLEANUP_LABEL=""
+            if [[ "$DELETE_MODE" == "time" ]]; then CLEANUP_LABEL="(>$RETENTION_DAYS дней)"; else CLEANUP_LABEL="(>$MAX_BACKUPS_COUNT шт.)"; fi
+            [[ "${MAX_BACKUP_SIZE_MB:-0}" =~ ^[0-9]+$ && "${MAX_BACKUP_SIZE_MB:-0}" -gt 0 ]] && CLEANUP_LABEL="${CLEANUP_LABEL} + size-лимит"
+
+            # ═══════════ СТАНДАРТНЫЙ РЕЖИМ — компактно, для новичков ═══════════
+            # Свой короткий экран (НЕ тяжёлый дашборд эксперта): цель + защита + последний бэкап
+            # одной-двумя строками, действия сгруппированы разделителями. Переключатель режима — п.9.
+            if [[ "$UI_MODE" == "standard" ]]; then
+                clear_screen
+                _banner 16 "${BOLD}LAZARUS${RESET}${GRAY} · Бэкапы${RESET}"
+                # Одна строка состояния — без жаргона. Либо «когда последний бэкап», либо призыв.
+                if [[ -n "$STATS_LAST" ]]; then
+                    echo -e "  ${GRAY}Последний бэкап: ${STATS_LAST} (${STATS_LAST_AGO})${RESET}"
+                else
+                    echo -e "  ${GRAY}Бэкапов ещё нет${RESET}"
+                fi
+                # Мягкая подсказка, только если защита не настроена (одна строка).
+                if _protection_needed "$NO_CRITICAL_BACKUP"; then
+                    echo -e "  ${YELLOW}Бэкапы ещё не настроены — начните с пункта 3${RESET}"
+                fi
+                echo ""
+                echo "   1.  Сделать бэкап"
+                echo "   2.  Восстановить из бэкапа"
+                echo -e "   3.  ${CYAN}Настроить${RESET}"
+                echo "   4.  Перенести панель на другой сервер"
+                echo ""
+                echo -e "   ${GRAY}99. Все функции (расширенный режим)   ·   0. Выход${RESET}"
+                echo ""
+                safe_read -erp "Выбор (Enter — выход): " opt; [[ -z "$opt" ]] && exit 0
+                case $opt in
+                    # Простой п.1 — сразу полный бэкап (без под-меню Full/БД/Файлы):
+                    # ровно то, что делает «Полный бэкап» в menu_manual_backup.
+                    1) create_backup_dispatch "full"; _post_backup_prompt "full" ;;
+                    2) menu_restore ;;
+                    3|m|M|м|М|q|Q) _quickstart_protect ;;   # единый пошаговый мастер настройки
+                    4) panel_migrate_in ;;         # мастер сам спросит IP/пароль (гейт «ПЕРЕНОС» + identity-гарды)
+                    99|77|р|Р|p|P) UI_MODE="expert"; save_config
+                        print_message "SUCCESS" "Расширенный режим включён (вернуться: п.99 «Простой режим»)"
+                        sleep 1 ;;
+                    0) exit 0 ;;
+                    *) print_message "ERROR" "Введите 1–4, 99 или 0"; sleep 1 ;;
+                esac
+                continue
+            fi
+
+            # ═══════════ РАСШИРЕННЫЙ (ЭКСПЕРТ) РЕЖИМ — полный дашборд + все функции ═══════════
             clear_screen
-            echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
-            echo -e "${GREEN}${BOLD}  LAZARUS Backup Manager${RESET}"
-            echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
+            _banner 26 "${BOLD}LAZARUS${RESET}${GRAY} · Менеджер бэкапов${RESET}"
             # ГЛАВНОЕ: что и откуда бэкапим (сразу видно). cron-состояние уже посчитано выше
             # (NO_CRITICAL_BACKUP) — передаём, чтобы не читать crontab повторно в цикле.
             _print_targets_summary
@@ -16110,9 +16607,9 @@ case "$1" in
             # честно указываем путь через эксперт-меню, иначе подсказка врала бы.
             if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
                 if [[ "$UI_MODE" == "standard" ]]; then
-                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (Эксперт-режим: 77 → пункт 8)${RESET}"
+                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (Расширенный режим: п.99 → пункт 7)${RESET}"
                 else
-                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 8)${RESET}"
+                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 7)${RESET}"
                 fi
             fi
             # Уведомление о pending v1→v2 миграции
@@ -16131,32 +16628,36 @@ case "$1" in
                 _sec_prefix="lazarus"; [[ "$BACKUP_SECONDARY" == "panel" ]] && _sec_prefix="lazarus_panel"
                 _sec_n=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) 2> "$SILENT_LOG" | wc -l | tr -d ' ')
             fi
+            # Выровненные метки (Бэкапы / Последний / Авто) — колонка значений на одном уровне
+            # с «Что бэкапим/Защита». Логика подсчёта не меняется.
             if [[ "$_prim_total" -eq 0 && "$_sec_n" -eq 0 ]]; then
-                # Пустое состояние: вместо голых нулей — призыв к действию.
-                echo -e "${CYAN}Бэкапов ещё нет — сделайте первый: пункт 1${RESET}"
-            elif [[ "$_both_mode" == true ]]; then
-                echo -e "${GRAY}Бэкапов: $([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот) ${_prim_total} · $([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот) ${_sec_n} · всего ${STATS_SIZE}${RESET}"
+                echo -e "  ${CYAN}Бэкапов ещё нет — сделайте первый: пункт 1${RESET}"
             else
-                echo -e "${GRAY}Бэкапов: ${STATS_FULL} Full · ${STATS_DB} DB · ${STATS_FILES} Files · всего ${STATS_SIZE}${RESET}"
-            fi
-            # M1: метка цели у «Последний» — в both-режиме иначе непонятно, чей это бэкап.
-            [[ -n "$STATS_LAST" ]] && echo -e "${GRAY}Последний ($([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот)): ${STATS_LAST} (${STATS_LAST_AGO})${RESET}"
-            # idx0: в both-режиме показываем и «Последний» ВТОРИЧНОЙ цели (её namespace отдельный).
-            if [[ "$_both_mode" == true && "$_sec_n" -gt 0 ]]; then
-                _sec_last_f=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) -printf '%T@\t%p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -f2-)
-                if [[ -n "$_sec_last_f" ]]; then
-                    _sec_last=$(date -r "$_sec_last_f" '+%d.%m %H:%M' 2> "$SILENT_LOG")
-                    echo -e "${GRAY}Последний ($([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот)): ${_sec_last}${RESET}"
+                if [[ "$_both_mode" == true ]]; then
+                    echo -e "  ${BOLD}Бэкапы:${RESET}    $([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот) ${_prim_total} · $([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот) ${_sec_n} · всего ${STATS_SIZE}"
+                else
+                    echo -e "  ${BOLD}Бэкапы:${RESET}    ${STATS_FULL} Full · ${STATS_DB} DB · ${STATS_FILES} Files · всего ${STATS_SIZE}"
                 fi
+                # «Последний»: primary (+ secondary в both-режиме) ОДНОЙ строкой.
+                _last_line=""
+                [[ -n "$STATS_LAST" ]] && _last_line="$([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот) ${STATS_LAST} (${STATS_LAST_AGO})"
+                if [[ "$_both_mode" == true && "$_sec_n" -gt 0 ]]; then
+                    _sec_last_f=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) -printf '%T@\t%p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -f2-)
+                    if [[ -n "$_sec_last_f" ]]; then
+                        _sec_last=$(date -r "$_sec_last_f" '+%d.%m %H:%M' 2> "$SILENT_LOG")
+                        _last_line="${_last_line:+$_last_line · }$([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот) ${_sec_last}"
+                    fi
+                fi
+                [[ -n "$_last_line" ]] && echo -e "  ${BOLD}Последний:${RESET} ${GRAY}${_last_line}${RESET}"
             fi
             # Off-site nudge: бэкапы есть, но копии только локальные (диск умрёт — бэкап умрёт).
-            [[ "$REMOTE_STORAGE_TYPE" == "off" && "$_prim_total" -gt 0 ]] && echo -e "${GRAY}Только локальные копии — настроить off-site: Настройки → Удалённое хранилище${RESET}"
+            [[ "$REMOTE_STORAGE_TYPE" == "off" && "$_prim_total" -gt 0 ]] && echo -e "  ${GRAY}Только локальные копии — off-site: Настройки → Удалённое хранилище${RESET}"
 
             # Авто-бэкап (cron) одной строкой.
             if [[ "$NO_CRITICAL_BACKUP" == true ]]; then
-                echo -e "${YELLOW}Авто-бэкап (cron) НЕ настроен — пункт 3${RESET}"
+                echo -e "  ${BOLD}Авто:${RESET}      ${YELLOW}НЕ настроен — пункт 3${RESET}"
             else
-                echo -e "${GRAY}Авто-бэкап: Full ${COLOR_FULL}${CRON_STATUS_FULL}${RESET}${GRAY} · DB ${COLOR_DB}${CRON_STATUS_DB}${RESET}${GRAY} · Files ${COLOR_FILES}${CRON_STATUS_FILES}${RESET}"
+                echo -e "  ${BOLD}Авто:${RESET}      Full ${COLOR_FULL}${CRON_STATUS_FULL}${RESET} · DB ${COLOR_DB}${CRON_STATUS_DB}${RESET} · Files ${COLOR_FILES}${CRON_STATUS_FILES}${RESET}"
             fi
             echo ""
 
@@ -16165,70 +16666,59 @@ case "$1" in
             # low#2: size-лимит (п.21) срабатывает ПОВЕРХ выбранного режима — показываем это в метке.
             [[ "${MAX_BACKUP_SIZE_MB:-0}" =~ ^[0-9]+$ && "${MAX_BACKUP_SIZE_MB:-0}" -gt 0 ]] && CLEANUP_LABEL="${CLEANUP_LABEL} + size-лимит"
 
+            # «Обновить бота» показываем ТОЛЬКО когда бот входит в бэкап-цель и он на этом сервере.
+            # Панель-only (бота не бэкапим) → пункта нет; удалённый (SSH) бот — обновить локально нельзя.
+            SHOW_BOT_UPDATE=0
+            if [[ ( "$BACKUP_TARGET" == "bot" || "$BACKUP_SECONDARY" == "bot" ) && "$BOT_TRANSPORT" != "ssh" ]]; then SHOW_BOT_UPDATE=1; fi
+
             # Шорткат быстрой настройки — только если что-то в «Готовности» красное.
             if _protection_needed "$NO_CRITICAL_BACKUP"; then
-                echo -e "${YELLOW}${BOLD} Быстрая настройка защиты — введите Q${RESET}"
+                echo -e "${YELLOW}${BOLD}  Мастер настройки — введите Q${RESET}"
                 echo ""
             fi
-            # === СТАНДАРТНЫЙ РЕЖИМ: короткое меню для новичков (дашборд выше — общий) ===
-            # Только базовые операции; цели/both/хранилище/обновления/uninstall — в эксперт-режиме (77).
-            if [[ "$UI_MODE" == "standard" ]]; then
-                echo " --- ДЕЙСТВИЯ ---"
-                echo " 1. Сделать бэкап сейчас"
-                echo " 2. Восстановить из бэкапа"
-                echo " 3. Расписание бэкапов"
-                echo " 4. Telegram-уведомления"
-                echo " 5. Очистить старые бэкапы $CLEANUP_LABEL"
-                echo -e " 77. ${CYAN}Эксперт-режим${RESET} ${GRAY}(все настройки: цели, хранилище, обновления)${RESET}"
-                echo " 0. Выход"
-                echo ""
-                safe_read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
-                case $opt in
-                    q|Q) _quickstart_protect ;;
-                    1) menu_manual_backup ;;
-                    2) menu_restore ;;
-                    3) menu_automation ;;
-                    4) menu_settings telegram ;;   # сразу раздел Telegram, без эксперт-навигации
-                    5) cleanup_old_backups ;;
-                    77) UI_MODE="expert"; save_config
-                        print_message "SUCCESS" "Эксперт-режим включён (вернуться: Настройки → Режим меню)"
-                        sleep 1 ;;
-                    0) exit 0 ;;
-                    *) print_message "ERROR" "Неверный пункт меню"; sleep 1 ;;
-                esac
-                continue
-            fi
-
-            echo " --- ДЕЙСТВИЯ ---"
-            echo " 1. Сделать бэкап сейчас"
-            echo -e " 2. ${CYAN}${BOLD}Что бэкапить${RESET} — цели и серверы (панель / бот / обе)"
-            echo " 3. Авто-бэкап (расписание)"
-            echo " 4. Восстановить из бэкапа"
-            echo " 5. Настройки (Telegram / хранилище / шифрование / ротация)"
-            echo " 6. Удалить старые бэкапы $CLEANUP_LABEL"
-            # «Обновить бота» — при локальном bot-транспорте, НЕЗАВИСИМО от цели бэкапа (№13):
+            # Меню эксперта — три группы с воздухом: что делаю / как настроено / обслуживание.
+            # «Что бэкапить» отдельным пунктом НЕ дублируем — это раздел 7 Настроек. Нумерация
+            # 4–8 стабильна (на «пункт 7» ссылается уведомление об обновлении).
+            echo -e "  ${GRAY}── Действия ──${RESET}"
+            echo "   1.  Сделать бэкап сейчас"
+            echo "   2.  Восстановить из бэкапа"
+            echo ""
+            echo -e "  ${GRAY}── Настройка ──${RESET}"
+            echo "   3.  Авто-бэкап (расписание)"
+            echo "   4.  Настройки"
+            echo ""
+            echo -e "  ${GRAY}── Обслуживание ──${RESET}"
+            echo "   5.  Удалить старые бэкапы $CLEANUP_LABEL"
             # update_bot сам привязывается к РЕАЛЬНОМУ боту через bind_bot_runtime_or_fail и
             # жёстко откажет, если бота нет / путь совпал с панелью.
-            [[ "$BOT_TRANSPORT" != "ssh" ]] && echo -e " 7. ${CYAN}Обновить бота${RESET}"
+            [[ "$SHOW_BOT_UPDATE" == 1 ]] && echo -e "   6.  ${CYAN}Обновить бота${RESET}"
             if [[ -n "$UPDATE_AVAILABLE" ]]; then
-                echo -e " 8. ${CYAN}${BOLD}Обновления скрипта [NEW!]${RESET}"
+                echo -e "   7.  ${CYAN}${BOLD}Обновления скрипта [NEW!]${RESET}"
             else
-                echo " 8. Обновления скрипта"
+                echo "   7.  Обновления скрипта"
             fi
-            echo -e "${RED} 666. Удалить скрипт (Uninstall)${RESET}"
-            echo " 0. Выход"
+            echo "   8.  Перенести панель на другой сервер"
+            echo ""
+            echo -e "  ${GRAY}────────────────────────────────────────${RESET}"
+            echo -e "   ${CYAN}99.  Простой режим${RESET} ${GRAY}(меню для новичков)${RESET}"
+            echo -e "   ${RED}666.  Удалить скрипт (Uninstall)${RESET}"
+            echo "   0.  Выход"
             echo ""
             safe_read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
             case $opt in
-                q|Q) _quickstart_protect ;;
+                m|M|м|М|q|Q) _quickstart_protect ;;
                 1) menu_manual_backup ;;
-                2) menu_backup_target ;;
+                2) menu_restore ;;
                 3) menu_automation ;;
-                4) menu_restore ;;
-                5) menu_settings ;;
-                6) cleanup_old_backups ;;
-                7) if [[ "$BOT_TRANSPORT" != "ssh" ]]; then update_bot; unbind_bot_runtime; else print_message "WARN" "Обновление бота недоступно для удалённого (SSH) бота"; sleep 1; fi ;;
-                8) check_for_updates ;;
+                4) menu_settings ;;
+                5) cleanup_old_backups ;;
+                6) if [[ "$SHOW_BOT_UPDATE" == 1 ]]; then update_bot; unbind_bot_runtime;
+                   else print_message "WARN" "«Обновить бота» доступно, только когда на этом сервере бэкапится бот"; sleep 1; fi ;;
+                7) check_for_updates ;;
+                8) panel_migrate_in ;;
+                99|77|р|Р|p|P) UI_MODE="standard"; save_config
+                    print_message "SUCCESS" "Простой режим включён (вернуться: п.99 «Расширенный режим»)"
+                    sleep 1 ;;
                 666) uninstall_script ;;
                 0) exit 0 ;;
                 *) print_message "ERROR" "Неверный пункт меню"; sleep 1 ;;

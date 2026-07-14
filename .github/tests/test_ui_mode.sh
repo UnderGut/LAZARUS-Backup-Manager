@@ -123,6 +123,31 @@ grep -q "Первичная настройка" "$TMP_DIR/out_int1.txt" && ok \
     || bad "intent 1 must show target selection screen"
 [[ "$UI_MODE" == "standard" ]] && ok || bad "intent 1 flow must set standard, got '$UI_MODE'"
 
+# === 5) Пункт «Перенести панель» в ОБОИХ главных меню + режимо-зависимые под-потоки ===
+# Статические проверки исходника (главные меню — top-level while-loop, не функции).
+# 5a) standard-меню: минимальное простое меню содержит вызов panel_migrate_in (обработчик п.4).
+grep -qE '4\)[[:space:]]*panel_migrate_in' "$SCRIPT" && ok \
+    || bad "standard menu must dispatch panel_migrate_in on choice 4"
+# 5b) expert-меню: case-ветка "8) panel_migrate_in" (после удаления дубля «Что бэкапить» renumber 9→8).
+grep -qE '8\)[[:space:]]*panel_migrate_in' "$SCRIPT" && ok \
+    || bad "expert menu must dispatch panel_migrate_in on choice 8"
+# 5c) простой бэкап-пункт (п.1) зовёт create_backup_dispatch "full" НАПРЯМУЮ,
+#     а не через menu_manual_backup. Проверяем case-ветку "1) create_backup_dispatch \"full\"".
+grep -qE '1\)[[:space:]]*create_backup_dispatch[[:space:]]+"full";[[:space:]]*_post_backup_prompt[[:space:]]+"full"' "$SCRIPT" && ok \
+    || bad "standard menu choice 1 must call create_backup_dispatch \"full\" directly"
+# 5d) menu_automation имеет ветку по UI_MODE==standard (простой один-вопрос поток).
+grep -qE 'menu_automation_simple' "$SCRIPT" && ok \
+    || bad "menu_automation must have a standard-mode simple branch (menu_automation_simple)"
+# 5e) cleanup_old_backups имеет ветку по UI_MODE (краткий вывод в standard).
+if grep -n 'cleanup_old_backups()' "$SCRIPT" >/dev/null; then
+    _cl_start=$(grep -n 'cleanup_old_backups()' "$SCRIPT" | head -1 | cut -d: -f1)
+    _cl_end=$(( _cl_start + 200 ))
+    if sed -n "${_cl_start},${_cl_end}p" "$SCRIPT" | grep -qE 'UI_MODE.*standard'; then ok
+    else bad "cleanup_old_backups must branch on UI_MODE==standard"; fi
+else
+    bad "cleanup_old_backups() not found"
+fi
+
 echo "---"
 echo "ok=$n_ok err=$n_err"
 [[ $n_err -eq 0 ]] || exit 1

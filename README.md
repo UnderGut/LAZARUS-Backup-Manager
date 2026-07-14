@@ -15,10 +15,10 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-5.7.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-5.8.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
-**LAZARUS** — продвинутая система резервного копирования для **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)** с поддержкой шифрования, облачных хранилищ и умной автоматизацией.
+**LAZARUS** — продвинутая система резервного копирования для **Remnawave Panel** и **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: панель, бот, infra-billing и KB — одним инструментом. Шифрование, облачные хранилища, умная автоматизация, перенос панели на новый сервер и два режима меню — **Простой** (для новичков: 4 пункта, пошаговый мастер) и **Расширенный** (для экспертов: полный контроль).
 
 ---
 
