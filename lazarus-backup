@@ -14627,11 +14627,16 @@ menu_settings() {
                     2) PANEL_BILLING_BACKUP="true" ;;
                     3) PANEL_BILLING_BACKUP="false" ;;
                 esac
-                local _bb_cont
-                safe_read -erp "Контейнер БД биллинга (Enter = '${PANEL_BILLING_DB_CONTAINER:-infra-billing-db}'): " _bb_cont
-                [[ -n "$_bb_cont" ]] && PANEL_BILLING_DB_CONTAINER="$_bb_cont"
-                [[ -z "$PANEL_BILLING_DB_CONTAINER" ]] && PANEL_BILLING_DB_CONTAINER="infra-billing-db"
-                save_config; print_message "SUCCESS" "Сохранено: ${PANEL_BILLING_DB_CONTAINER} · режим ${PANEL_BILLING_BACKUP}" ;;
+                # Имя контейнера спрашиваем только когда компонент ВКЛючён — при «выкл» оно не нужно.
+                if [[ "$PANEL_BILLING_BACKUP" != "false" ]]; then
+                    local _bb_cont
+                    safe_read -erp "Контейнер БД биллинга (Enter = '${PANEL_BILLING_DB_CONTAINER:-infra-billing-db}'): " _bb_cont
+                    [[ -n "$_bb_cont" ]] && PANEL_BILLING_DB_CONTAINER="$_bb_cont"
+                    [[ -z "$PANEL_BILLING_DB_CONTAINER" ]] && PANEL_BILLING_DB_CONTAINER="infra-billing-db"
+                    save_config; print_message "SUCCESS" "Сохранено: ${PANEL_BILLING_DB_CONTAINER} · режим ${PANEL_BILLING_BACKUP}"
+                else
+                    save_config; print_message "SUCCESS" "Infra-billing: не бэкапим (выкл)"
+                fi ;;
 
             14) # KB ИИ-саппорта: режим бэкапа + имя контейнера БД KB (зеркально п.13)
                 if [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]]; then
@@ -14648,11 +14653,16 @@ menu_settings() {
                     2) BOT_KB_BACKUP="true" ;;
                     3) BOT_KB_BACKUP="false" ;;
                 esac
-                local _kb_cont
-                safe_read -erp "Контейнер БД KB (Enter = '${BOT_KB_DB_CONTAINER:-rwp_shop_kb_db}'): " _kb_cont
-                [[ -n "$_kb_cont" ]] && BOT_KB_DB_CONTAINER="$_kb_cont"
-                [[ -z "$BOT_KB_DB_CONTAINER" ]] && BOT_KB_DB_CONTAINER="rwp_shop_kb_db"
-                save_config; print_message "SUCCESS" "Сохранено: ${BOT_KB_DB_CONTAINER} · режим ${BOT_KB_BACKUP}" ;;
+                # Имя контейнера спрашиваем только когда компонент ВКЛючён — при «выкл» оно не нужно.
+                if [[ "$BOT_KB_BACKUP" != "false" ]]; then
+                    local _kb_cont
+                    safe_read -erp "Контейнер БД KB (Enter = '${BOT_KB_DB_CONTAINER:-rwp_shop_kb_db}'): " _kb_cont
+                    [[ -n "$_kb_cont" ]] && BOT_KB_DB_CONTAINER="$_kb_cont"
+                    [[ -z "$BOT_KB_DB_CONTAINER" ]] && BOT_KB_DB_CONTAINER="rwp_shop_kb_db"
+                    save_config; print_message "SUCCESS" "Сохранено: ${BOT_KB_DB_CONTAINER} · режим ${BOT_KB_BACKUP}"
+                else
+                    save_config; print_message "SUCCESS" "KB: не бэкапим (выкл)"
+                fi ;;
 
             17) configure_remote_storage ;;
             

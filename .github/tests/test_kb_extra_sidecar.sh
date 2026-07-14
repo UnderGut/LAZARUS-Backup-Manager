@@ -119,6 +119,15 @@ sed -n "${_gen_start},${_gen_end}p" "$SCRIPT" | grep -q 'Infra-billing БД' \
 # 6d) first-run: явный вопрос про обнаруженные доп. компоненты (Y/n), отказ = false
 grep -qE 'бэкапить вместе с панелью\? \(Y/n\)' "$SCRIPT" && ok || bad "first-run должен спрашивать про infra-billing"
 grep -qE 'бэкапить вместе с ботом\? \(Y/n\)' "$SCRIPT" && ok || bad "first-run должен спрашивать про KB"
+# 6e) при «выкл» имя контейнера НЕ спрашивается (вопрос — только внутри гейта != false)
+_q13=$(grep -n 'Контейнер БД биллинга (Enter' "$SCRIPT" | head -1 | cut -d: -f1)
+_g13=$(grep -n 'if \[\[ "\$PANEL_BILLING_BACKUP" != "false" \]\]; then' "$SCRIPT" | head -1 | cut -d: -f1)
+[[ -n "$_q13" && -n "$_g13" && "$_g13" -lt "$_q13" && $((_q13 - _g13)) -le 3 ]] && ok \
+    || bad "вопрос про контейнер биллинга должен быть внутри гейта PANEL_BILLING_BACKUP != false"
+_q14=$(grep -n 'Контейнер БД KB (Enter' "$SCRIPT" | head -1 | cut -d: -f1)
+_g14=$(grep -n 'if \[\[ "\$BOT_KB_BACKUP" != "false" \]\]; then' "$SCRIPT" | head -1 | cut -d: -f1)
+[[ -n "$_q14" && -n "$_g14" && "$_g14" -lt "$_q14" && $((_q14 - _g14)) -le 3 ]] && ok \
+    || bad "вопрос про контейнер KB должен быть внутри гейта BOT_KB_BACKUP != false"
 
 echo "---"
 echo "ok=$n_ok err=$n_err"
