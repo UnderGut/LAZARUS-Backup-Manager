@@ -14256,163 +14256,162 @@ menu_settings() {
             fi
         fi
 
-        # Статусы
-        local ST_TG_NOTIFY="${RED}Выкл${RESET}"; [[ "$SEND_TO_TELEGRAM" == "true" ]] && ST_TG_NOTIFY="${GREEN}Вкл${RESET}"
-        local ST_TG_FILE="${RED}Выкл${RESET}"; [[ "$TG_SEND_FILE" == "true" ]] && ST_TG_FILE="${GREEN}Вкл${RESET}"
-        local ST_REM="${RED}Выкл${RESET}"; [[ "$SEND_TO_REMOTE" == "true" ]] && ST_REM="${GREEN}Вкл${RESET}"
+        # Статусы — в едином стиле ✓/✗ (как «Защита» на дашборде)
+        local ST_TG_NOTIFY="${RED}✗ Выкл${RESET}"; [[ "$SEND_TO_TELEGRAM" == "true" ]] && ST_TG_NOTIFY="${GREEN}✓ Вкл${RESET}"
+        local ST_TG_FILE="${RED}✗ Выкл${RESET}"; [[ "$TG_SEND_FILE" == "true" ]] && ST_TG_FILE="${GREEN}✓ Вкл${RESET}"
+        local ST_REM="${RED}✗ Выкл${RESET}"; [[ "$SEND_TO_REMOTE" == "true" ]] && ST_REM="${GREEN}✓ Вкл${RESET}"
         
         local STORAGE_TYPE_DISP="Выкл"
         if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then STORAGE_TYPE_DISP="${REMOTE_STORAGE_TYPE^^}"; fi
 
         if [[ "$_sview" == "general" ]]; then
-        echo -e "${CYAN}--- ЧТО БЭКАПИМ И ПУТИ ---${RESET}"
+        # Единый стиль разделов: заголовок как в главном меню, выровненные колонки,
+        # номера по возрастанию, подсказки — одной серой строкой внизу (не в каждой строке).
+        local _tgt_disp="Telegram-бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _tgt_disp="Remnawave Panel"
         local _sec_disp=""
-        if [[ "$BACKUP_SECONDARY" == "bot" ]]; then _sec_disp=" ${GREEN}+ бот${RESET}"
-        elif [[ "$BACKUP_SECONDARY" == "panel" ]]; then _sec_disp=" ${GREEN}+ панель${RESET}"; fi
+        [[ "$BACKUP_SECONDARY" == "bot" ]] && _sec_disp=" + бот"
+        [[ "$BACKUP_SECONDARY" == "panel" ]] && _sec_disp=" + панель"
+        echo -e "  ${GRAY}── Что бэкапим и пути ──${RESET}"
+        echo -e "  Бэкапим: ${CYAN}${_tgt_disp}${_sec_disp}${RESET}"
+        echo ""
         if [[ "$BACKUP_TARGET" == "panel" ]]; then
-            echo -e " ${GRAY}Бэкапим: ${CYAN}Remnawave Panel${RESET}${_sec_disp}  ${GRAY}(раздел 7 — сменить)${RESET}"
-            echo -e " 1. Путь к панели:      ${GRAY}${PANEL_PATH}${RESET}"
-            echo -e " 2. Контейнер БД:       ${GRAY}${PANEL_DB_CONTAINER}${RESET}"
+            echo -e "   1.  Путь к панели        ${GRAY}${PANEL_PATH}${RESET}"
+            echo -e "   2.  Контейнер БД         ${GRAY}${PANEL_DB_CONTAINER}${RESET}"
             # H4: для панели юзер БД берётся из .env (POSTGRES_USER); ручная правка тут — для бота.
-            echo -e " 4. Пользователь БД:    ${GRAY}из .env панели (POSTGRES_USER)${RESET}"
+            echo -e "   4.  Пользователь БД      ${GRAY}из .env панели (POSTGRES_USER)${RESET}"
         else
-            echo -e " ${GRAY}Бэкапим: ${CYAN}Telegram-бот${RESET}${_sec_disp}  ${GRAY}(раздел 7 — сменить)${RESET}"
-            echo -e " 1. Путь к боту:        ${GRAY}${BOT_PATH}${RESET}"
-            echo -e " 2. Контейнер бота:     ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
-            echo -e " 3. Контейнер БД:       ${GRAY}${DB_CONTAINER_NAME}${RESET}"
-            echo -e " 4. Пользователь БД:    ${GRAY}${DB_USER}${RESET}"
+            echo -e "   1.  Путь к боту          ${GRAY}${BOT_PATH}${RESET}"
+            echo -e "   2.  Контейнер бота       ${GRAY}${BOT_CONTAINER_NAME}${RESET}"
+            echo -e "   3.  Контейнер БД         ${GRAY}${DB_CONTAINER_NAME}${RESET}"
+            echo -e "   4.  Пользователь БД      ${GRAY}${DB_USER}${RESET}"
         fi
-        # M2/M9: both-режим — вторая цель read-only (правка через мастер «Что бэкапить», п.27).
-        if [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]]; then
-            if [[ "$BACKUP_SECONDARY" == "panel" ]]; then
-                echo -e " ${GRAY}── Ещё бэкапим: Панель ($(_target_loc_label panel)) · правка — раздел 7 ──${RESET}"
-                echo -e "    ${GRAY}Путь: ${PANEL_PATH} · Контейнер БД: ${PANEL_DB_CONTAINER}${RESET}"
-            else
-                echo -e " ${GRAY}── Ещё бэкапим: Бот ($(_target_loc_label bot)) · правка — раздел 7 ──${RESET}"
-                echo -e "    ${GRAY}Путь: ${_CANON_BOT_PATH:-$BOT_PATH} · Контейнер БД: ${_CANON_DB_CONTAINER:-не задан}${RESET}"
-            fi
+        echo -e "   5.  Исключить папки      ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
+        # H3/M6: «лимит на файл» ≠ «лимит на папку» (п.21). idx3: применим только к боту —
+        # в panel-only скрыт; при боте-secondary показываем canon-значение.
+        if [[ "$BACKUP_TARGET" != "panel" ]]; then
+            echo -e "   6.  Лимит на файл        ${GRAY}${MAX_FILE_SIZE_MB} MB${RESET}"
+        elif [[ "$BACKUP_SECONDARY" == "bot" ]]; then
+            echo -e "   6.  Лимит на файл (бот)  ${GRAY}${_CANON_MAX_FILE_SIZE_MB:-1} MB${RESET}"
         fi
         # infra-billing: sidecar панельного бэкапа (актуален, когда панель среди целей).
         if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]]; then
             local _bb_disp
             case "$PANEL_BILLING_BACKUP" in
-                false) _bb_disp="${GRAY}выкл${RESET}" ;;
-                true)  _bb_disp="${GREEN}обязателен${RESET}" ;;
-                *)     _bb_disp="${GREEN}авто${RESET} ${GRAY}(если контейнер запущен)${RESET}" ;;
+                false) _bb_disp="выкл" ;;
+                true)  _bb_disp="обязателен" ;;
+                *)     _bb_disp="авто" ;;
             esac
-            echo -e " 13. Infra-billing БД:  ${GRAY}${PANEL_BILLING_DB_CONTAINER:-не задан}${RESET} · $_bb_disp"
+            echo -e "  13.  Infra-billing БД     ${GRAY}${PANEL_BILLING_DB_CONTAINER:-не задан} · ${_bb_disp}${RESET}"
         fi
-        echo -e " 5. Исключить папки:    ${GRAY}${EXCLUDE_DIRS:-Нет}${RESET}"
-        # H3/M6: «лимит на файл» (пропуск крупных файлов) ≠ «лимит на папку» (п.21).
-        # idx3: лимит на файл применим только к боту. В panel-only режиме (бота нет) пункт 6 СКРЫТ;
-        # показываем его только когда бот участвует (бот primary ИЛИ бот secondary).
-        if [[ "$BACKUP_TARGET" != "panel" ]]; then
-            echo -e " 6. Лимит на файл:      ${GRAY}${MAX_FILE_SIZE_MB} MB${RESET} ${GRAY}(пропуск файлов крупнее)${RESET}"
-        elif [[ "$BACKUP_SECONDARY" == "bot" ]]; then
-            echo -e " 6. Лимит на файл (только бот): ${GRAY}${_CANON_MAX_FILE_SIZE_MB:-1} MB${RESET}"
+        # M2/M9: both-режим — вторая цель read-only, одной строкой (правка — раздел 7).
+        if [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]]; then
+            if [[ "$BACKUP_SECONDARY" == "panel" ]]; then
+                echo -e "  ${GRAY}Вторая цель — Панель: ${PANEL_PATH} · ${PANEL_DB_CONTAINER}${RESET}"
+            else
+                echo -e "  ${GRAY}Вторая цель — Бот: ${_CANON_BOT_PATH:-$BOT_PATH} · ${_CANON_DB_CONTAINER:-не задан}${RESET}"
+            fi
         fi
-        
+        echo ""
+        echo -e "  ${GRAY}Лимит на файл — пропуск крупных файлов бота. Сменить цель — раздел 7.${RESET}"
         fi  # /general
         if [[ "$_sview" == "telegram" ]]; then
-        echo -e "${CYAN}--- TELEGRAM ---${RESET}"
-        echo -e " 7.  Token:             ${GRAY}${MASKED_TOKEN}${RESET}"
-        echo -e " 8.  Chat ID:           ${GRAY}${MASKED_CHAT_ID}${RESET}"
-        echo -e " 9.  Thread ID:         ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
-        echo -e " 10. Уведомления:       $ST_TG_NOTIFY"
-        echo -e " 11. Отправка файла:    $ST_TG_FILE"
-        echo -e " 12. Проверить связь"
+        echo -e "  ${GRAY}── Telegram ──${RESET}"
+        echo ""
+        echo -e "   7.  Token                ${GRAY}${MASKED_TOKEN}${RESET}"
+        echo -e "   8.  Chat ID              ${GRAY}${MASKED_CHAT_ID}${RESET}"
+        echo -e "   9.  Thread ID            ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
+        echo -e "  10.  Уведомления          $ST_TG_NOTIFY"
+        echo -e "  11.  Отправка файла       $ST_TG_FILE"
+        echo -e "  12.  Проверить связь"
+        echo ""
+        echo -e "  ${GRAY}Токен — у @BotFather, свой ID — у @userinfobot. Thread ID — для групп с топиками.${RESET}"
         fi  # /telegram
         if [[ "$_sview" == "storage" ]]; then
+        echo -e "  ${GRAY}── Удалённое хранилище ──${RESET}"
         if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
-            echo -e "${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET} ${GRAY}(поля — инфо; правка — пункт 17)${RESET}"
-            echo -e "     Тип:              ${GRAY}${STORAGE_TYPE_DISP}${RESET}"
-            # H6: у S3 поля URL/Пользователь пусты (визард их обнуляет) — показываем реальные
-            # Bucket/Endpoint/Region/Access-Key (ключ маскируем), иначе оператор не видит, куда уходят бэкапы.
+            # H6: у S3 поля URL/Пользователь пусты — показываем реальные Bucket/Endpoint/Region/Key
+            # (ключ маскируем) ОДНИМ компактным блоком, иначе оператор не видит, куда уходят бэкапы.
             if [[ "$REMOTE_STORAGE_TYPE" == "s3" ]]; then
                 local _s3ak="Нет"; [[ -n "$S3_ACCESS_KEY" ]] && _s3ak="${S3_ACCESS_KEY:0:3}...${S3_ACCESS_KEY: -2}"
-                echo -e "     Bucket:           ${GRAY}${S3_BUCKET:-Нет}${S3_PATH:+/$S3_PATH}${RESET}"
-                echo -e "     Endpoint:         ${GRAY}${S3_ENDPOINT:-Нет}${RESET}"
-                echo -e "     Region:           ${GRAY}${S3_REGION:-Нет}${RESET}"
-                echo -e "     Access Key:       ${GRAY}${_s3ak}${RESET}"
+                echo -e "  ${CYAN}${STORAGE_TYPE_DISP}${RESET} ${GRAY}· ${S3_BUCKET:-Нет}${S3_PATH:+/$S3_PATH} · ${S3_REGION:-?} · key ${_s3ak}${RESET}"
+                echo -e "  ${GRAY}${S3_ENDPOINT:-Endpoint не задан}${RESET}"
             else
-                echo -e "     URL:              ${GRAY}${REMOTE_STORAGE_URL:-Нет}${RESET}"
-                echo -e "     Пользователь:     ${GRAY}${MASKED_REMOTE_USER}${RESET}"
+                echo -e "  ${CYAN}${STORAGE_TYPE_DISP}${RESET} ${GRAY}· ${REMOTE_STORAGE_URL:-URL не задан} · ${MASKED_REMOTE_USER}${RESET}"
             fi
-            echo -e " 16. Загрузка:          $ST_REM"
-            echo -e " 17. Настроить / Изменить хранилище"
+            echo ""
+            echo -e "  16.  Загрузка             $ST_REM"
+            echo -e "  17.  Настроить / изменить хранилище"
         else
-            echo -e "\n${CYAN}--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---${RESET} ${GRAY}(не настроено)${RESET}"
-            echo -e " 17. ${YELLOW}Настроить хранилище (S3/FTP/WebDAV/Rclone)${RESET}"
+            echo -e "  ${GRAY}Не настроено — бэкапы хранятся только на этом сервере.${RESET}"
+            echo ""
+            echo -e "  17.  ${YELLOW}Настроить хранилище (S3 / FTP / WebDAV / Rclone)${RESET}"
         fi
-
         fi  # /storage
         if [[ "$_sview" == "security" ]]; then
-        echo -e "${CYAN}--- ШИФРОВАНИЕ ---${RESET}"
+        echo -e "  ${GRAY}── Шифрование ──${RESET}"
+        echo ""
         # low#18: «не установлен», только если шифрования реально нет (ни в памяти, ни в файле).
-        if [[ -n "$BACKUP_PASSWORD" || -f "$BACKUP_PASSWORD_FILE" ]]; then
-            echo -e " 18. Пароль шифрования: ${GRAY}${PASS_MASK}${RESET}"
-        else
-            echo -e " 18. Пароль шифрования: ${GRAY}(не установлен)${RESET}"
-        fi
-        
+        local _pm="$PASS_MASK"
+        [[ -z "$BACKUP_PASSWORD" && ! -f "$BACKUP_PASSWORD_FILE" ]] && _pm="не установлен"
+        echo -e "  18.  Пароль шифрования    ${GRAY}${_pm}${RESET}"
+        echo ""
+        echo -e "  ${GRAY}Смена пароля не перешифровывает старые бэкапы — они остаются под старым.${RESET}"
         fi  # /security
         if [[ "$_sview" == "rotation" ]]; then
-        echo -e "${CYAN}--- РОТАЦИЯ БЭКАПОВ ---${RESET}"
+        echo -e "  ${GRAY}── Ротация и диск ──${RESET}"
+        echo ""
         local DM_DISPLAY="По времени"; [[ "$DELETE_MODE" == "count" ]] && DM_DISPLAY="По количеству"
-        echo -e " 19. Режим удаления:    ${GRAY}${DM_DISPLAY}${RESET}"
+        echo -e "  19.  Режим удаления       ${GRAY}${DM_DISPLAY}${RESET}"
         if [[ "$DELETE_MODE" == "count" ]]; then
-            echo -e " 20. Макс. бэкапов:     ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
+            echo -e "  20.  Макс. бэкапов        ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
         else
-            echo -e " 20. Срок хранения:     ${GRAY}${RETENTION_DAYS} дней${RESET}"
+            echo -e "  20.  Срок хранения        ${GRAY}${RETENTION_DAYS} дней${RESET}"
         fi
-        echo -e " 21. Лимит на папку:    ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET} ${GRAY}(весь каталог бэкапов)${RESET}"
-
-        echo -e "\n${CYAN}--- ДИСК И ХРАНЕНИЕ ---${RESET}"
-        # Текущий disk usage для подсказки
+        echo -e "  21.  Лимит на папку       ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
+        echo -e "  22.  Порог WARN диска     ${YELLOW}${DISK_WARN_PERCENT}%${RESET}"
+        echo -e "  23.  Порог CRITICAL       ${RED}${DISK_CRITICAL_PERCENT}%${RESET}"
+        local _del_disp="${RED}✗ Выкл${RESET}"
+        case "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" in
+            any)         _del_disp="${YELLOW}any${RESET} ${GRAY}— любой канал OK${RESET}" ;;
+            all)         _del_disp="${YELLOW}all${RESET} ${GRAY}— все каналы OK${RESET}" ;;
+            remote_only) _del_disp="${YELLOW}remote_only${RESET} ${GRAY}— S3/FTP/WebDAV OK${RESET}" ;;
+        esac
+        echo -e "  24.  Удалять локально     $_del_disp"
+        # Текущий disk usage — одной строкой внизу. idx15/44: пороги относятся к ЛОКАЛЬНОМУ
+        # каталогу бэкапов, даже если цель — SSH. low#19: сравнения только для чисел.
         local _disk_cur_pct=$(df -P "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
         local _disk_cur_free=$(df -h "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
         local _disk_color="$GREEN"
-        # low#19: численные сравнения только когда _disk_cur_pct — действительно число.
         if [[ -n "$_disk_cur_pct" ]] && [[ "$_disk_cur_pct" =~ ^[0-9]+$ ]]; then
             [[ "$_disk_cur_pct" -ge "$DISK_WARN_PERCENT" ]] && _disk_color="$YELLOW"
             [[ "$_disk_cur_pct" -ge "$DISK_CRITICAL_PERCENT" ]] && _disk_color="$RED"
         fi
-        echo -e " 22. Порог WARN:        ${YELLOW}${DISK_WARN_PERCENT}%${RESET} ${GRAY}(TG-уведомление при заполнении)${RESET}"
-        echo -e " 23. Порог CRITICAL:    ${RED}${DISK_CRITICAL_PERCENT}%${RESET} ${RED}(остановка бэкапов)${RESET}"
-
-        local _del_disp="${RED}Выкл${RESET}"
-        case "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" in
-            any)         _del_disp="${YELLOW}any${RESET} (любой канал OK)" ;;
-            all)         _del_disp="${YELLOW}all${RESET} (все каналы OK)" ;;
-            remote_only) _del_disp="${YELLOW}remote_only${RESET} (S3/FTP/WebDAV OK)" ;;
-        esac
-        echo -e " 24. Удалять локально:  $_del_disp"
+        echo ""
         if [[ -n "$_disk_cur_pct" ]]; then
-            # idx15/44: пороги диска относятся к ЛОКАЛЬНОМУ каталогу бэкапов, даже если цель — SSH.
-            echo -e "     ${GRAY}Текущее заполнение (локально, ${BACKUP_DIR}): ${_disk_color}${_disk_cur_pct}%${RESET}${GRAY}, свободно: $_disk_cur_free${RESET}"
+            echo -e "  ${GRAY}Диск: занято ${_disk_color}${_disk_cur_pct}%${RESET}${GRAY}, свободно ${_disk_cur_free} (${BACKUP_DIR})${RESET}"
         fi
-
+        echo -e "  ${GRAY}Лимит на папку — весь каталог бэкапов. WARN — уведомление, CRITICAL — остановка бэкапов.${RESET}"
         fi  # /rotation
         if [[ "$_sview" == "misc" ]]; then
-        echo -e "${CYAN}--- КОМПРЕССИЯ И ЛОГИ ---${RESET}"
+        echo -e "  ${GRAY}── Компрессия и логи ──${RESET}"
+        echo ""
         local _log_disp
         case "$BACKUP_LOG_FILES" in
-            true)  _log_disp="${YELLOW}Да${RESET} (логи в архиве)" ;;
-            false) _log_disp="${GREEN}Нет${RESET} (логи исключены)" ;;
+            true)  _log_disp="${YELLOW}Да${RESET} ${GRAY}— логи в архиве${RESET}" ;;
+            false) _log_disp="${GREEN}Нет${RESET} ${GRAY}— логи исключены${RESET}" ;;
             ask|*) _log_disp="${GRAY}спросить при первом бэкапе${RESET}" ;;
         esac
-        echo -e " 25. Бэкап логов:       $_log_disp"
-
+        echo -e "  25.  Бэкап логов          $_log_disp"
         # Compression: gzip (default) / zstd (~2.5× быстрее, ~11% меньше)
-        local _curr_compress _zstd_avail _compress_disp
+        local _curr_compress _zstd_note _compress_disp
         _curr_compress=$(_compress_current)
-        _zstd_avail="(${RED}zstd не установлен${RESET})"
-        command -v zstd > "$SILENT_LOG" 2>&1 && _zstd_avail="(${GREEN}zstd доступен${RESET})"
+        _zstd_note="${GRAY}· zstd не установлен${RESET}"
+        command -v zstd > "$SILENT_LOG" 2>&1 && _zstd_note="${GRAY}· zstd доступен${RESET}"
         case "$_curr_compress" in
-            zstd) _compress_disp="${GREEN}zstd${RESET} (быстрее ~2.5×)" ;;
-            gzip) _compress_disp="${YELLOW}gzip${RESET} (классика, default)" ;;
+            zstd) _compress_disp="${GREEN}zstd${RESET} ${GRAY}— быстрее ~2.5×${RESET}" ;;
+            gzip) _compress_disp="${YELLOW}gzip${RESET} ${GRAY}— классика${RESET}" ;;
         esac
-        echo -e " 26. Компрессия:        $_compress_disp $_zstd_avail"
+        echo -e "  26.  Компрессия           $_compress_disp $_zstd_note"
         fi  # /misc
 
         echo -e "\n 0. Назад к разделам"
@@ -15175,12 +15174,16 @@ _quickstart_protect() {
     echo ""
     echo -e "${GRAY}Несколько шагов. Каждый можно пропустить — просто нажмите Enter.${RESET}"
 
-    # [1/4] Уведомления в Telegram
+    # [1/4] Уведомления в Telegram. Настроено ≠ тупик: Enter — оставить, 1 — изменить.
     echo ""
     echo -e "${CYAN}${BOLD}[1/4] Уведомления в Telegram${RESET}"
+    local _do_tg=1
     if [[ -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
-        echo -e "  ${GREEN}✓ уже настроено${RESET}"
-    else
+        _do_tg=0
+        local _tg_re; safe_read -erp "  ${GREEN}✓ настроено${RESET} · Enter — оставить, 1 — изменить: " _tg_re
+        [[ "$_tg_re" == "1" ]] && _do_tg=1
+    fi
+    if [[ $_do_tg -eq 1 ]]; then
         echo -e "  ${GRAY}Бот пришлёт результат каждого бэкапа. Токен — у @BotFather, ваш ID — у @userinfobot.${RESET}"
         local _tk _ci
         safe_read -erp "  Токен бота (Enter — пропустить): " _tk
@@ -15195,18 +15198,25 @@ _quickstart_protect() {
         fi
     fi
 
-    # [2/4] Шифрование архивов
+    # [2/4] Шифрование архивов. Настроено ≠ тупик: Enter — оставить, 1 — сменить пароль.
     echo ""
     echo -e "${CYAN}${BOLD}[2/4] Шифрование архивов (AES-256)${RESET}"
+    local _do_enc=1
     if _encryption_ready; then   # №5: не голое -f — реальная читаемость пароля
-        echo -e "  ${GREEN}✓ уже включено${RESET}"
-    else
-        [[ -f "$BACKUP_PASSWORD_FILE" ]] && echo -e "  ${YELLOW}⚠ файл пароля существует, но НЕ читается — задайте пароль заново${RESET}"
-        echo -e "  ${GRAY}Без пароля дамп БД (PII, токены) хранится в открытом виде.${RESET}"
+        _do_enc=0
+        local _enc_re; safe_read -erp "  ${GREEN}✓ включено${RESET} · Enter — оставить, 1 — сменить пароль: " _enc_re
+        if [[ "$_enc_re" == "1" ]]; then
+            _do_enc=1
+            echo -e "  ${YELLOW}Старые бэкапы останутся под СТАРЫМ паролем — не потеряйте его.${RESET}"
+        fi
+    fi
+    if [[ $_do_enc -eq 1 ]]; then
+        [[ -f "$BACKUP_PASSWORD_FILE" ]] && ! _encryption_ready && echo -e "  ${YELLOW}Файл пароля существует, но НЕ читается — задайте пароль заново.${RESET}"
+        _encryption_ready || echo -e "  ${GRAY}Без пароля дамп БД (PII, токены) хранится в открытом виде.${RESET}"
         local _p1 _p2
-        safe_read -s -erp "Пароль шифрования (Enter — пропустить): " _p1; echo ""
+        safe_read -s -erp "  Пароль шифрования (Enter — пропустить): " _p1; echo ""
         if [[ -n "$_p1" ]]; then
-            safe_read -s -erp "Повторите пароль: " _p2; echo ""
+            safe_read -s -erp "  Повторите пароль: " _p2; echo ""
             if [[ "$_p1" == "$_p2" ]]; then
                 if write_password_file "$_p1"; then
                     BACKUP_PASSWORD="$_p1"; save_config
@@ -15220,13 +15230,17 @@ _quickstart_protect() {
         fi
     fi
 
-    # [2/3] Авто-бэкап по расписанию (ежедневный full)
+    # [3/4] Авто-бэкап по расписанию. Настроено ≠ тупик: Enter — оставить, 1 — изменить
+    # (изменение перезаписывает FULL-задачу; тонкая настройка db/files — расширенный режим).
     echo ""
     echo -e "${CYAN}${BOLD}[3/4] Авто-бэкап по расписанию${RESET}"
-    local _cf _cd; _cf=$(get_cron_status "full"); _cd=$(get_cron_status "db")
+    local _cf _cd _do_cron=1; _cf=$(get_cron_status "full"); _cd=$(get_cron_status "db")
     if [[ "$_cf" != "Выкл" || "$_cd" != "Выкл" ]]; then
-        echo -e "  ${GREEN}✓ уже настроено${RESET}"
-    else
+        _do_cron=0
+        local _cr_re; safe_read -erp "  ${GREEN}✓ настроено${RESET} ${GRAY}(Полный: ${_cf} · БД: ${_cd})${RESET} · Enter — оставить, 1 — изменить: " _cr_re
+        [[ "$_cr_re" == "1" ]] && _do_cron=1
+    fi
+    if [[ $_do_cron -eq 1 ]]; then
         echo "  1) Ежедневно 04:00 (рекомендуется)"
         echo "  2) Каждые 6 часов"
         echo "  3) Каждые N минут (задать интервал)"
@@ -15253,11 +15267,12 @@ _quickstart_protect() {
         fi
     fi
 
-    # [3/3] Копия вне сервера
+    # [4/4] Копия вне сервера. Настроено ≠ тупик: Enter — оставить, 1 — изменить.
     echo ""
     echo -e "${CYAN}${BOLD}[4/4] Копия вне сервера (облако)${RESET}"
     if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
-        echo -e "  ${GREEN}✓ уже настроено (${REMOTE_STORAGE_TYPE^^})${RESET}"
+        local _rs_re; safe_read -erp "  ${GREEN}✓ настроено (${REMOTE_STORAGE_TYPE^^})${RESET} · Enter — оставить, 1 — изменить: " _rs_re
+        [[ "$_rs_re" == "1" ]] && configure_remote_storage
     else
         echo -e "  ${GRAY}Сервер умрёт — локальные бэкапы умрут вместе с ним.${RESET}"
         local _rs; safe_read -erp "  Настроить S3/FTP/WebDAV сейчас? (y/N): " _rs
