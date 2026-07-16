@@ -377,6 +377,18 @@ _banner() {
     echo -e "${GREEN}${BOLD}╚${bar}╝${RESET}"
 }
 
+# _group_hdr "Заголовок": серый разделитель группы меню с заголовком в самой линии,
+# добитый '─' до единой сетки LZ_BOX_W (49) — все линейки экранов одной ширины.
+# Длину считаем в СИМВОЛАХ независимо от локали: ${#t} в C-локали мерит кириллицу
+# байтами (×2) и линия выходила бы короче сетки. tr -d '\200-\277' срезает
+# continuation-байты UTF-8 → остаются ровно lead-байты = число символов.
+_group_hdr() {
+    local t="$1" n _len
+    _len=$(printf '%s' "$t" | LC_ALL=C tr -d '\200-\277' | LC_ALL=C wc -c)
+    n=$(( LZ_BOX_W - 4 - _len )); (( n < 2 )) && n=2
+    echo -e "  ${GRAY}── ${t} $(_hrule '─' "$n")${RESET}"
+}
+
 # Очистка экрана (пропускается в debug режиме)
 clear_screen() {
     if [[ "$DEBUG_MODE" == true ]]; then
@@ -4655,7 +4667,7 @@ update_bot() {
                 echo -e "  ├── .env"
                 echo -e "  └── rwp_shop-X.Y.Z-amd64.tar"
                 echo ""
-                read -erp "Укажите путь вручную (Enter - $DEFAULT_BOT_PATH): " manual_path
+                read -erp "Укажите путь вручную (Enter — $DEFAULT_BOT_PATH): " manual_path
                 manual_path="${manual_path:-$DEFAULT_BOT_PATH}"
                 
                 if [[ -d "$manual_path" ]]; then
@@ -5051,13 +5063,13 @@ update_bot() {
             debug_log "UPDATE" "Current version is latest ($current_version >= $latest_version)"
             print_message "INFO" "Установлена последняя версия ($current_version)"
             echo ""
-            read -erp "Выберите файл для переустановки (или Enter - назад): " choice
+            read -erp "Выберите файл для переустановки (Enter — назад): " choice
             [[ -z "$choice" || "$choice" == "0" ]] && return 0
         else
             debug_log "UPDATE" "Update available: $current_version -> $latest_version"
             echo -e "${YELLOW}${BOLD}Доступно обновление: $current_version → $latest_version${RESET}"
             echo ""
-            read -erp "Выберите файл (Enter - последний v$latest_version): " choice
+            read -erp "Выберите файл (Enter — последний v$latest_version): " choice
             [[ -z "$choice" ]] && choice=1
         fi
         
@@ -5474,7 +5486,7 @@ detect_bot_installation() {
             idx=$((idx + 1))
         done
         echo "  0. Отмена"
-        read -erp "Ваш выбор: " sel
+        read -erp "Выбор: " sel
         if [[ "$sel" =~ ^[0-9]+$ && "$sel" -ge 1 && "$sel" -le ${#FOUND_PATHS[@]} ]]; then
             local selected_path="${FOUND_PATHS[$((sel-1))]}"
             local selected_bot="${FOUND_BOTS[$((sel-1))]}"
@@ -6724,7 +6736,7 @@ bind_bot_runtime_or_fail() {
     if ! resolve_bot_runtime; then
         print_message "ERROR" "Установка бота не найдена на этом сервере — «$_action» отклонена."
         echo "  Это сервер панели без бота? Для панели: lazarus backup db | full | restore." >&2
-        echo "  Если бот есть — укажите путь: Настройки → «Что бэкапить», либо BOT_PATH в config.env." >&2
+        echo "  Если бот есть — укажите путь: Настройки → «Цель бэкапа», либо BOT_PATH в config.env." >&2
         log_message "ERROR" "bind_bot_runtime: real bot not found ($_action)"
         return 1
     fi
@@ -7015,25 +7027,30 @@ panel_migrate_in() {
         esac
     done
     clear_screen
-    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
-    echo -e "${GREEN}${BOLD}  Перенос Remnawave-панели НА ЭТОТ сервер${RESET}"
-    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════${RESET}"
-    echo -e "${GRAY}Источник трогается только read-only; старая панель продолжает работать.${RESET}"
+    # Рукописная рамка «═» заменена _banner (единая сетка всех полноэкранных сценариев).
+    _banner 38 "${BOLD}Перенос панели Remnawave НА ЭТОТ сервер${RESET}"
+    echo -e "  ${GRAY}Старый сервер мы только читаем: панель там продолжит работать,${RESET}"
+    echo -e "  ${GRAY}пока вы сами не убедитесь, что на новом всё в порядке.${RESET}"
     echo ""
-    echo -e "  ${BOLD}Понадобятся всего 3 вещи о СТАРОМ сервере:${RESET}"
-    echo -e "   1. IP-адрес           ${GRAY}(например 1.2.3.4)${RESET}"
-    echo -e "   2. SSH-порт           ${GRAY}(если не меняли — 22)${RESET}"
-    echo -e "   3. Пароль root        ${GRAY}(или SSH-ключ, если настроен)${RESET}"
+    echo -e "  ${BOLD}Понадобятся всего 3 вещи о старом сервере:${RESET}"
+    # Порт: интро и prompt ниже говорят ОДНО И ТО ЖЕ (раньше интро «22», prompt «22»).
+    echo -e "   1. IP-адрес           ${GRAY}например 1.2.3.4${RESET}"
+    echo -e "   2. SSH-порт           ${GRAY}Enter = 22; если порт не меняли — введите 22${RESET}"
+    echo -e "   3. Пароль root        ${GRAY}или путь к SSH-ключу, если вход по паролю отключён${RESET}"
     echo -e "  ${GRAY}Всё остальное — папку панели, базу, контейнеры — скрипт найдёт и перенесёт сам.${RESET}"
     echo ""
     if [[ -z "$_from" ]]; then
-        safe_read -erp "Старый сервер (user@host, напр. root@1.2.3.4): " _from
+        safe_read -erp "Старый сервер — IP или root@IP (напр. 1.2.3.4): " _from
         [[ -z "$_from" ]] && { print_message "ERROR" "Источник не задан."; return 2; }
-        safe_read -erp "SSH-порт (Enter = 22): " _port; _port="${_port:-22}"
+        safe_read -erp "SSH-порт старого сервера (Enter = 22): " _port; _port="${_port:-22}"
         # Новичкам ключи не нужны: парольный режим через sshpass -e (пароль только в env,
         # НИКОГДА не печатается, не логируется и не попадает в argv).
         local _auth=""
-        safe_read -erp "Как подключиться к старому серверу? 1 = пароль root (просто, Enter) · 2 = SSH-ключ: " _auth
+        echo ""
+        echo -e "  ${BOLD}Как подключаться к старому серверу?${RESET}"
+        echo -e "   1. Пароль root   ${GRAY}— проще всего, подходит большинству${RESET}"
+        echo -e "   2. SSH-ключ      ${GRAY}— если вход по паролю на сервере отключён${RESET}"
+        safe_read -erp "  Выбор (Enter = 1): " _auth
         if [[ -z "$_auth" || "$_auth" == "1" ]]; then
             if ! command -v sshpass > "$SILENT_LOG" 2>&1; then
                 print_message "WARN" "Для парольного режима нужен пакет sshpass (не установлен)."
@@ -7186,6 +7203,13 @@ panel_migrate_in() {
             _mig_restore_env; return 1
         fi
     fi
+    # Резюме «что сейчас произойдёт» — перед самой страшной для новичка точкой.
+    echo ""
+    echo -e "${BOLD}Что сейчас произойдёт:${RESET}"
+    echo -e "  1. Со старого сервера скачается полный бэкап ${GRAY}(файлы панели + база данных)${RESET}"
+    echo    "  2. Бэкап проверится и развернётся на ЭТОМ сервере"
+    echo -e "  3. Вы получите чеклист: что переключить вручную ${GRAY}(DNS, ноды, вебхуки)${RESET}"
+    echo -e "  ${GRAY}Старый сервер не изменится и продолжит работать. Прервать можно в любой момент.${RESET}"
     echo ""
     local _go=""
     safe_read -erp "Начать перенос? (y/N): " _go
@@ -7250,24 +7274,28 @@ panel_migrate_in() {
     if timeout 15 docker exec "${PANEL_DB_CONTAINER:-remnawave-db}" pg_isready > "$SILENT_LOG" 2>&1; then _pgok="✓"; fi
     echo -e "  pg_isready: $_pgok"
 
-    # --- 9. Чеклист cutover (вручную!) — универсальный: официальная установка и eGames ---
+    # --- 9. Чеклист cutover (вручную!) — универсальный: официальная установка и eGames.
+    # Три фазы (Проверить → Переключить → Завершить) — новичку видна последовательность.
     echo ""
-    echo -e "${YELLOW}${BOLD}═══ ЧТО СДЕЛАТЬ ПОСЛЕ ПЕРЕНОСА (старую панель пока НЕ выключать) ═══${RESET}"
-    echo "  1. Откройте панель на ЭТОМ сервере, проверьте данные (пользователи / ноды / подписки)."
-    echo "  2. DNS: домен панели и домен подписок → IP ЭТОГО сервера (у Cloudflare учтите proxy/TTL)."
-    echo "  3. Ноды: в панели все должны стать online (файрвол нод должен пускать НОВЫЙ IP панели)."
+    echo -e "${YELLOW}${BOLD}ПОСЛЕ ПЕРЕНОСА — старую панель пока НЕ выключайте${RESET}"
+    echo -e "  ${CYAN}Проверить${RESET}"
+    echo    "   1. Откройте панель на ЭТОМ сервере: пользователи, ноды, подписки на месте?"
+    echo -e "  ${CYAN}Переключить${RESET}"
+    echo -e "   2. DNS: домен панели и домен подписок → IP этого сервера ${GRAY}(Cloudflare: учтите proxy/TTL)${RESET}"
+    echo -e "   3. Ноды: в панели все должны стать online ${GRAY}(файрвол нод должен пускать новый IP)${RESET}"
     if [[ "${_MIG_NODE_STATE:-}" == "colocated" ]]; then
-        echo "     • Нода переехала вместе с панелью: DNS её домена (selfsteal) → новый IP."
-        echo "       Если нода offline — проверьте файрвол: панель ходит на 172.30.0.1:2222."
+        echo "      • Нода переехала вместе с панелью: DNS её домена (selfsteal) → новый IP."
+        echo "        Если нода offline — проверьте файрвол: панель ходит на 172.30.0.1:2222."
     elif [[ "${_MIG_NODE_STATE:-}" == "separate" ]]; then
-        echo "     • Нода осталась на СТАРОМ сервере: если была записана локальным адресом —"
-        echo "       смените адрес в панели на публичный IP старого сервера (или вынесите ноду)."
+        echo "      • Нода осталась на СТАРОМ сервере: если была записана локальным адресом —"
+        echo "        смените адрес в панели на публичный IP старого сервера (или вынесите ноду)."
     fi
-    echo "  4. Сертификаты: если выпуск шёл на старом сервере (acme/CertWarden) — перенастройте сюда."
-    echo "  5. Вебхуки и интеграции (бот, платёжные callbacks) → новый адрес панели."
-    echo "  6. Только когда всё проверено — останавливайте панель на старом сервере."
-    echo "  7. lazarus: PANEL_PATH зафиксирован на '$_rdir' (проверьте 'lazarus stacks' + тестовый бэкап)."
-    echo "  Подробный runbook: .github/PANEL_MIGRATION_RUNBOOK.md"
+    echo    "   4. Сертификаты: если выпуск шёл на старом сервере (acme/CertWarden) — перенастройте сюда."
+    echo    "   5. Вебхуки и интеграции (бот, платёжные callbacks) → новый адрес панели."
+    echo -e "  ${CYAN}Завершить${RESET}"
+    echo    "   6. Только когда всё проверено — останавливайте панель на старом сервере."
+    echo -e "   7. Сделайте здесь тестовый бэкап ${GRAY}(меню lazarus → пункт 1) — убедитесь, что новый сервер под защитой${RESET}"
+    echo -e "  ${GRAY}Подробный runbook: .github/PANEL_MIGRATION_RUNBOOK.md (в каталоге скрипта)${RESET}"
     log_message "INFO" "panel migrate-in completed from $_from:$_port ($_rdir), archive=$(basename "$_arc")"
     _mig_restore_env
     # Персист ФАКТИЧЕСКОГО расположения панели: панель теперь живёт ЗДЕСЬ ($_rdir, local) —
@@ -8772,44 +8800,47 @@ configure_remote_storage() {
     while true; do
         clear_screen
         echo -e "${GREEN}${BOLD}Настройка удалённого хранилища${RESET}"
+        echo -e "${GRAY}Вторая копия бэкапа вне этого сервера: если сервер погибнет — данные уцелеют.${RESET}"
         echo ""
-        
-        # Показываем текущий статус
+
+        # Текущие настройки — справочная информация (CYAN, не «тревожный» YELLOW).
         if [[ "$REMOTE_STORAGE_TYPE" == "s3" && -n "$S3_BUCKET" ]]; then
-            echo -e "Текущие настройки:"
-            echo -e "  Тип: ${YELLOW}S3${RESET}"
-            echo -e "  Bucket: ${CYAN}${S3_BUCKET}${RESET}"
-            [[ -n "$S3_PATH" ]] && echo -e "  Путь: ${GRAY}${S3_PATH}${RESET}"
-            [[ -n "$S3_ENDPOINT" ]] && echo -e "  Endpoint: ${GRAY}${S3_ENDPOINT}${RESET}"
+            echo -e "Сейчас подключено: ${CYAN}S3${RESET} → ${CYAN}${S3_BUCKET}${S3_PATH:+/$S3_PATH}${RESET}"
+            [[ -n "$S3_ENDPOINT" ]] && echo -e "  ${GRAY}Endpoint: ${S3_ENDPOINT}${RESET}"
             echo ""
         elif [[ "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_URL" ]]; then
-            echo -e "Текущие настройки:"
-            echo -e "  Тип: ${YELLOW}${REMOTE_STORAGE_TYPE^^}${RESET}"
-            echo -e "  URL: ${CYAN}${REMOTE_STORAGE_URL}${RESET}"
-            [[ -n "$REMOTE_STORAGE_USER" ]] && echo -e "  Пользователь: ${GRAY}${REMOTE_STORAGE_USER}${RESET}"
+            echo -e "Сейчас подключено: ${CYAN}${REMOTE_STORAGE_TYPE^^}${RESET} → ${CYAN}${REMOTE_STORAGE_URL}${RESET}"
+            [[ -n "$REMOTE_STORAGE_USER" ]] && echo -e "  ${GRAY}Пользователь: ${REMOTE_STORAGE_USER}${RESET}"
             echo ""
         fi
-        
-        echo " 1. FTP / FTPS"
-        echo " 2. WebDAV (Яндекс.Диск, Nextcloud, и др.)"
-        echo -e " 3. ${CYAN}S3 Storage${RESET} (AWS, MinIO, RustFS, Yandex Cloud)"
-        echo " 4. Rclone (Google Drive, Dropbox, и др.)"
+
+        # Порядок — по рекомендуемости (S3 первым); у каждого типа GRAY-подсказка «для кого».
+        echo -e "${BOLD}Куда отправлять копии:${RESET}"
+        echo -e " 1. S3-хранилище   ${GRAY}— AWS, Cloudflare R2, Yandex Cloud, MinIO${RESET} ${GREEN}← рекомендуется${RESET}"
+        echo -e " 2. WebDAV         ${GRAY}— Яндекс.Диск, Nextcloud: если облако уже есть${RESET}"
+        echo -e " 3. FTP / FTPS     ${GRAY}— классический файловый сервер${RESET}"
+        echo -e " 4. Rclone         ${GRAY}— Google Drive, Dropbox: нужен настроенный rclone${RESET}"
         echo ""
-        echo -e " ${RED}0. Отключить${RESET}"
+        # Инвариант «0 = Назад»: деструктивное «Отключить» — на 9 и только когда есть что отключать.
+        if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
+            echo -e " ${RED}9. Отключить удалённое хранилище${RESET}"
+        fi
+        echo " 0. Назад"
         echo ""
-        read -erp "Выбор (Enter - Назад): " r_type
+        read -erp "Выбор (Enter — назад): " r_type
         [[ -z "$r_type" ]] && return
-        
+
         local new_type="off"
         local input_url="" input_user="" input_pass="" input_folder=""
         local base_url=""
-        
+
         case $r_type in
-            1) new_type="ftp" ;;
+            1) new_type="s3" ;;
             2) new_type="webdav" ;;
-            3) new_type="s3" ;;
+            3) new_type="ftp" ;;
             4) new_type="rclone" ;;
-            0) 
+            9)
+                if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then continue; fi
                 REMOTE_STORAGE_TYPE="off"
                 REMOTE_STORAGE_URL=""
                 REMOTE_STORAGE_USER=""
@@ -8817,9 +8848,10 @@ configure_remote_storage() {
                 save_config
                 print_message "SUCCESS" "Удалённое хранилище отключено."
                 sleep 1
-                return 
+                return
                 ;;
-            *) continue ;;
+            0) return ;;
+            *) print_message "ERROR" "Введите 1–4, 9 или 0"; sleep 1; continue ;;
         esac
 
         echo ""
@@ -8833,7 +8865,7 @@ configure_remote_storage() {
             echo -e "  ${GRAY}ftp://backup.example.com${RESET}"
             echo -e "  ${GRAY}ftps://secure.example.com:990${RESET}"
             echo ""
-            read -erp "Адрес сервера (Enter - назад): " base_url
+            read -erp "Адрес сервера (Enter — назад): " base_url
             [[ -z "$base_url" ]] && continue
             
             # Убираем trailing slash
@@ -8876,7 +8908,7 @@ configure_remote_storage() {
             echo -e "  ${GRAY}https://webdav.yandex.ru${RESET}                    (Яндекс.Диск)"
             echo -e "  ${GRAY}https://cloud.example.com/remote.php/dav/files/user${RESET} (Nextcloud)"
             echo ""
-            read -erp "Адрес сервера (Enter - назад): " base_url
+            read -erp "Адрес сервера (Enter — назад): " base_url
             [[ -z "$base_url" ]] && continue
             
             # Убираем trailing slash
@@ -8960,7 +8992,7 @@ configure_remote_storage() {
             echo " 7. Backblaze B2"
             echo " 8. Другой S3-совместимый"
             echo ""
-            read -erp "Выбор (Enter - назад): " s3_provider
+            read -erp "Выбор (Enter — назад): " s3_provider
             [[ -z "$s3_provider" ]] && continue
 
             local default_endpoint="" default_region="" provider_hint=""
@@ -9153,7 +9185,7 @@ configure_remote_storage() {
             fi
             echo "$remotes" | sed 's/^/  /'
             echo ""
-            read -erp "Имя remote (без двоеточия, Enter - назад): " base_url
+            read -erp "Имя remote (без двоеточия, Enter — назад): " base_url
             [[ -z "$base_url" ]] && continue
             
             # Убираем двоеточие если пользователь его добавил
@@ -10010,7 +10042,7 @@ check_cron_mismatch() {
     echo " 2. Синхронизировать настройки с cron (сбросить в 'Выкл')"
     echo " 0. Пропустить (оставить как есть)"
     echo ""
-    read -erp "Ваш выбор: " choice
+    read -erp "Выбор: " choice
     
     case $choice in
         1)
@@ -10113,7 +10145,7 @@ _ensure_encryption_or_confirm() {
     echo " 0. Отмена"
     echo ""
     local enc_choice np np_confirm _dummy
-    safe_read -erp "Ваш выбор: " enc_choice
+    safe_read -erp "Выбор: " enc_choice
     case $enc_choice in
         1) return 0 ;;
         2)
@@ -11036,7 +11068,7 @@ create_backup() {
     fi
 
     if [[ "$_skipped_count" -gt 0 ]]; then
-        echo -e "${GRAY}ℹ Пропущено файлов: ${_skipped_count} (детали — пункт 88 в меню ниже)${RESET}"
+        echo -e "${GRAY}ℹ Пропущено файлов: ${_skipped_count} (детали — пункт 2 в меню ниже)${RESET}"
     fi
 
     debug_log "UPLOAD" "Starting remote upload..."
@@ -11286,7 +11318,7 @@ _backup_active_target() {
     # в ЛОКАЛЬНЫЙ create_backup (бэкап не той цели/пустого пути). Явный отказ вместо тихого fallback.
     local _tr; [[ "$BACKUP_TARGET" == "panel" ]] && _tr="${PANEL_TRANSPORT:-local}" || _tr="${BOT_TRANSPORT:-local}"
     if [[ "$_tr" == "ssh" && -z "${TARGET_SSH:-}" ]]; then
-        print_message "ERROR" "Транспорт цели = ssh, но SSH-хост не задан — бэкап НЕ выполнен (Настройки → Что бэкапить)."
+        print_message "ERROR" "Транспорт цели = ssh, но SSH-хост не задан — бэкап НЕ выполнен (Настройки → Цель бэкапа)."
         log_message "ERROR" "_backup_active_target: transport=ssh but SSH host empty — refusing local fallback"
         return 1
     fi
@@ -11606,13 +11638,15 @@ select_backup_file() {
         
         local CURRENT_VER=$(get_raw_bot_version)
 
-        clear_screen; echo -e "${GREEN}Восстановление: ${BOLD}${TITLE}${RESET}"
+        clear_screen; echo -e "${GREEN}${BOLD}Восстановление: ${TITLE}${RESET}"
         if [[ -n "$date_filter" ]]; then
             echo -e "Найдено: ${CYAN}${total_count}${RESET} из ${GRAY}${total_all}${RESET} (фильтр: ${YELLOW}${date_filter}${RESET})"
         else
             echo -e "Всего файлов: ${CYAN}${total_count}${RESET}"
         fi
         echo ""
+        # Строка-заголовок колонок (в компактном виде каждая строка = дата | размер | версия).
+        [[ "$show_filenames" == "false" ]] && echo -e "     ${GRAY}дата время  | размер | версия бота${RESET}"
 
         local loop_limit=$show_limit
         if [[ $loop_limit -gt $total_count ]]; then loop_limit=$total_count; fi
@@ -11649,14 +11683,16 @@ select_backup_file() {
                 fi
             fi
             
-            local ENC_MARK=""; [[ "$file" == *".enc" ]] && ENC_MARK="${RED}[ENC]${RESET} "
-            
+            # Шифрование — это хорошо: метка YELLOW-информативная, не «красная тревога».
+            local ENC_MARK=""; [[ "$file" == *".enc" ]] && ENC_MARK="${YELLOW}[шифр]${RESET} "
+
             local VER_STR=""
             if [[ "$B_VER" == "Unknown" || "$B_VER" == "" ]]; then VER_STR="${GRAY}[Н/Д]${RESET}"
-            elif [[ "$B_VER" == "?" ]]; then VER_STR="${GRAY}[Legacy]${RESET}"
+            elif [[ "$B_VER" == "?" ]]; then VER_STR="${GRAY}[старый формат]${RESET}"
             elif [[ -z "$CURRENT_VER" ]]; then VER_STR="${GRAY}[v$B_VER]${RESET}"
             elif [[ "$B_VER" == "$CURRENT_VER" ]]; then VER_STR="${GREEN}[v$B_VER]${RESET}"
-            else VER_STR="${RED}[v$B_VER]${RESET}"; fi
+            # Несовпадение версии — предупреждение (жёлтое), не ошибка: restore возможен.
+            else VER_STR="${YELLOW}[v$B_VER]${RESET}"; fi
 
             if [[ "$show_filenames" == "true" ]]; then
                 printf " %2d. %s%s %s\n" "$((i+1))" "$ENC_MARK" "$filename" "$VER_STR"
@@ -11675,29 +11711,31 @@ select_backup_file() {
         done
 
         echo ""
-        if [[ $total_count -gt 5 ]]; then
-            if [[ $loop_limit -lt $total_count ]]; then
-                 echo -e " ${MAGENTA}888. Показать все ($total_count шт)${RESET}"
-            else
-                 echo -e " ${MAGENTA}888. Свернуть список (показать 5)${RESET}"
-            fi
-        fi
-
-        if [[ "$show_filenames" == "false" ]]; then
-            echo -e " 999. Показать имена файлов";
-        else
-            echo -e " 999. Показать дату и размер";
-        fi
-        # Date filter (показываем только если файлов > 5 — иначе бесполезно)
+        # Служебные команды — одной серой строкой по возрастанию (777/888/999 — канонические
+        # хоткеи браузера файлов; MAGENTA убран — не боевой цвет схемы).
+        local _svc=""
         if [[ $total_all -gt 5 ]]; then
             if [[ -n "$date_filter" ]]; then
-                echo -e " 777. Сбросить фильтр даты (${YELLOW}${date_filter}${RESET})"
+                _svc="777. Сбросить фильтр (${date_filter})"
             else
-                echo -e " 777. Фильтр по дате (например: 25.12 или 25.12.2026)"
+                _svc="777. Фильтр по дате"
             fi
         fi
+        if [[ $total_count -gt 5 ]]; then
+            if [[ $loop_limit -lt $total_count ]]; then
+                _svc="${_svc:+$_svc   ·   }888. Показать все (${total_count} шт)"
+            else
+                _svc="${_svc:+$_svc   ·   }888. Свернуть до 5"
+            fi
+        fi
+        if [[ "$show_filenames" == "false" ]]; then
+            _svc="${_svc:+$_svc   ·   }999. Имена файлов"
+        else
+            _svc="${_svc:+$_svc   ·   }999. Дата и размер"
+        fi
+        [[ -n "$_svc" ]] && echo -e " ${GRAY}${_svc}${RESET}"
         echo " 0. Назад"; echo ""
-        read -erp "Номер файла или команда (Enter - Назад): " choice
+        read -erp "Номер файла (Enter — назад): " choice
 
         if [[ -z "$choice" || "$choice" == "0" ]]; then return 1
         elif [[ "$choice" == "888" ]]; then
@@ -13949,12 +13987,15 @@ menu_list_backups() {
             local _tlabel="Бот"; [[ "$_tg" == "panel" ]] && _tlabel="Панель"
             echo -e "${BOLD}${_tlabel}${RESET} ${GRAY}($(_target_loc_label "$_tg"))${RESET}"
         fi
-        for prefix in "${_pfx}_full" "${_pfx}_db" "${_pfx}_files"; do
+        # + _inc: инкрементальные бэкапы раньше были невидимы (занимают диск, счётчик
+        # «Всего: N» врал, хотя restore их считает и предлагает).
+        for prefix in "${_pfx}_full" "${_pfx}_db" "${_pfx}_files" "${_pfx}_inc"; do
             local label
             case "$prefix" in
                 *_full)  label="Полные (БД+файлы)" ;;
                 *_db)    label="Только БД" ;;
                 *_files) label="Только файлы" ;;
+                *_inc)   label="Инкрементальные" ;;
             esac
             local files=()
             while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(
@@ -14001,40 +14042,42 @@ menu_list_backups() {
         echo -e "${BOLD}Всего: ${total_count} файлов, ${total_h}${RESET}"
     fi
     echo ""
-    safe_read -rp "Enter — назад " _dummy
+    safe_read -rp "Enter — назад: " _dummy
 }
 
 menu_manual_backup() {
     while true; do
-        clear_screen; echo -e "${GREEN}Создание ручного бэкапа${RESET}"
+        clear_screen; echo -e "${GREEN}${BOLD}Создание бэкапа${RESET}"
         echo ""
         # H17: видно, ЧТО и куда бэкапим (особенно в both-режиме).
         _print_targets_summary
         [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && \
-            echo -e "${GRAY}Каждый пункт снимает бэкап ОБЕИХ целей (панель + бот).${RESET}"
+            echo -e "${GRAY}Каждый пункт снимает бэкап обеих целей: панель + бот.${RESET}"
         echo ""
-        echo " 1. Полный бэкап (БД + Файлы)"
-        echo " 2. Только БД"
-        echo " 3. Только Файлы"
-        echo " 0. Назад"
+        echo -e " 1. Полный бэкап          ${GRAY}— база данных + файлы${RESET} ${GREEN}← рекомендуется${RESET}"
+        echo -e " 2. Только база данных    ${GRAY}— быстро, файлы не входят${RESET}"
+        echo -e " 3. Только файлы          ${GRAY}— без базы данных${RESET}"
+        echo    " 0. Назад"
         echo ""
-        safe_read -erp "Ваш выбор (Enter - Назад): " m_choice
+        safe_read -erp "Выбор (Enter — назад): " m_choice
         [[ -z "$m_choice" ]] && return
         case $m_choice in
             1) create_backup_dispatch "full";       _post_backup_prompt "full"; return ;;
             2) create_backup_dispatch "db_only";    _post_backup_prompt "db_only"; return ;;
             3) create_backup_dispatch "files_only"; _post_backup_prompt "files_only"; return ;;
             0) return ;;
-            *) print_message "ERROR" "Выберите 0, 1, 2 или 3"; sleep 1 ;;
+            *) print_message "ERROR" "Введите 1–3 или 0"; sleep 1 ;;
         esac
     done
 }
 
 # _post_backup_prompt: интерактивный prompt после create_backup с опциями:
-#   77 — топ-5 крупных файлов в архиве (что попало)
-#   88 — пропущенные файлы (что НЕ попало) с группировкой по причине
-#   99 — настроить удалённое хранилище (если REMOTE_STORAGE_TYPE=off)
+#   1 — топ-5 крупных файлов в архиве (что попало)
+#   2 — пропущенные файлы (что НЕ попало) с группировкой по причине
+#   3 — настроить удалённое хранилище (если REMOTE_STORAGE_TYPE=off)
 #   Enter / 0 — вернуться в меню
+# «Телефонные» коды 77/88/99 заменены обычной нумерацией (канон: двузначные коды —
+# только 99=режим и 777/888/999 браузера файлов). Старые коды принимаются как алиасы.
 _post_backup_prompt() {
     local _btype="${1:-full}"
     local _skipped="$BACKUP_DIR/.last_skipped.txt"
@@ -14047,22 +14090,22 @@ _post_backup_prompt() {
 
     while true; do
         printf '\n'
-        printf '%s\n' "─────────────────────────────────────────────"
+        printf '%b\n' "${GRAY}$(_hrule '─' 49)${RESET}"
         if [[ "$_show_top" -eq 1 ]]; then
-            printf '%s\n' "  77 — топ-5 крупных файлов в архиве"
+            printf '%s\n' "  1. Топ-5 крупных файлов в архиве"
         fi
         if [[ "$_has_skipped" -gt 0 ]]; then
-            printf '%b\n' "  ${YELLOW}88${RESET} — пропущенные файлы (${_has_skipped} шт)"
+            printf '%b\n' "  ${YELLOW}2.${RESET} Пропущенные файлы (${_has_skipped} шт)"
         fi
         if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
-            printf '%b\n' "  ${RED}99${RESET} — настроить S3 / FTP / WebDAV хранилище"
+            printf '%b\n' "  ${YELLOW}3.${RESET} Настроить копию в облако ${GRAY}(S3 / FTP / WebDAV)${RESET}"
         fi
-        printf '%s\n' "  Enter или 0 — вернуться"
-        printf '%s\n' "─────────────────────────────────────────────"
-        safe_read -rp "Ваш выбор: " _pb_choice
+        printf '%s\n' "  0. Вернуться в меню"
+        printf '%b\n' "${GRAY}$(_hrule '─' 49)${RESET}"
+        safe_read -rp "Выбор (Enter — назад): " _pb_choice
         case "$_pb_choice" in
-            77) _show_top_in_archive ;;
-            88)
+            1|77) _show_top_in_archive ;;
+            2|88)
                 if [[ "$_has_skipped" -gt 0 ]]; then
                     show_skipped_report
                 else
@@ -14070,7 +14113,7 @@ _post_backup_prompt() {
                     sleep 1
                 fi
                 ;;
-            99)
+            3|99)
                 if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
                     configure_remote_storage
                 else
@@ -14103,9 +14146,10 @@ _show_top_in_archive() {
         fi
     fi
     echo ""
-    echo -e "${GRAY}Чтобы исключить — Настройки → Что бэкапим и пути (исключения / лимит файла)${RESET}"
+    # Маршрут достижим из ОБОИХ режимов: в Простом раздела нет — ведём через 99.
+    echo -e "${GRAY}Исключить лишнее: Настройки → Что бэкапим и пути (в Простом режиме: 99 → Настройки)${RESET}"
     echo ""
-    safe_read -rp "Enter — назад " _dummy
+    safe_read -rp "Enter — назад: " _dummy
 }
 
 # menu_restore: в both-режиме сначала спрашивает цель (восстановление target-specific —
@@ -14116,7 +14160,7 @@ menu_restore() {
         # H9: восстановление для SSH-цели не поддерживается (импорт идёт в локальный контейнер).
         if [[ "$(_transport_of "$BACKUP_TARGET")" == "ssh" ]]; then
             clear_screen; print_message "WARN" "Восстановление недоступно для удалённой (SSH) цели."
-            echo -e "${GRAY}Запустите lazarus на сервере самой цели, либо переключите её на 'этот сервер' (Настройки › Что бэкапить).${RESET}"
+            echo -e "${GRAY}Запустите lazarus на сервере самой цели, либо переключите её на 'этот сервер' (Настройки → Цель бэкапа).${RESET}"
             echo ""; safe_read -erp "Enter — назад " _d; return
         fi
         _menu_restore_for_target
@@ -14126,13 +14170,19 @@ menu_restore() {
     local _pl="Telegram-бот"; [[ "$_prim" == "panel" ]] && _pl="Remnawave Panel"
     local _sl="Telegram-бот"; [[ "$_sec" == "panel" ]] && _sl="Remnawave Panel"
     local _pt _st; _pt=$(_transport_of "$_prim"); _st=$(_transport_of "$_sec")
-    local _pm="" _sm=""
-    [[ "$_pt" == "ssh" ]] && _pm=" ${YELLOW}(SSH — восстановление недоступно)${RESET}"
-    [[ "$_st" == "ssh" ]] && _sm=" ${YELLOW}(SSH — восстановление недоступно)${RESET}"
     clear_screen; echo -e "${GREEN}${BOLD}Восстановление — какую цель?${RESET}"
     echo ""
-    echo -e " 1. ${CYAN}${_pl}${RESET} ${GRAY}— $(_target_loc_label "$_prim")${RESET}${_pm}"
-    echo -e " 2. ${CYAN}${_sl}${RESET} ${GRAY}— $(_target_loc_label "$_sec")${RESET}${_sm}"
+    # Недоступную (SSH) цель НЕ красим CYAN-акцентом — рисуем серой с причиной в той же строке.
+    if [[ "$_pt" == "ssh" ]]; then
+        echo -e " ${GRAY}1. ${_pl} — $(_target_loc_label "$_prim") · по SSH восстановление недоступно${RESET}"
+    else
+        echo -e " 1. ${CYAN}${_pl}${RESET} ${GRAY}— $(_target_loc_label "$_prim")${RESET}"
+    fi
+    if [[ "$_st" == "ssh" ]]; then
+        echo -e " ${GRAY}2. ${_sl} — $(_target_loc_label "$_sec") · по SSH восстановление недоступно${RESET}"
+    else
+        echo -e " 2. ${CYAN}${_sl}${RESET} ${GRAY}— $(_target_loc_label "$_sec")${RESET}"
+    fi
     echo " 0. Назад"
     echo ""
     local _rt; read -erp "Выбор (Enter — назад): " _rt
@@ -14141,7 +14191,8 @@ menu_restore() {
            _resolve_target_config "$_prim" ;;
         2) if [[ "$_st" == "ssh" ]]; then print_message "WARN" "Цель на SSH — восстановление недоступно отсюда."; sleep 1.5; return; fi
            _resolve_target_config "$_sec" ;;
-        *) return ;;
+        0|"") return ;;
+        *) print_message "ERROR" "Введите 1, 2 или 0"; sleep 1; return ;;
     esac
     _menu_restore_for_target
     # Вернуть чистое primary-состояние (рабочие переменные + BACKUP_PREFIX).
@@ -14169,40 +14220,42 @@ _menu_restore_for_target() {
         local c_fl="$CYAN"; [[ "$n_files" == "0" ]] && c_fl="$GRAY"
         local c_i="$CYAN"; [[ "$n_inc" == "0" ]] && c_i="$GRAY"
 
-        clear_screen; echo -e "${GREEN}Меню восстановления${RESET}"
+        clear_screen; echo -e "${GREEN}${BOLD}Восстановление из бэкапа${RESET}"
         # H10: видно, КАКУЮ цель и КУДА восстанавливаем (операция необратима).
         local _rt_label="Telegram-бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _rt_label="Remnawave Panel"
         echo -e "${GRAY}Цель: ${_rt_label} · $(_target_loc_label "$BACKUP_TARGET") · контейнер БД ${DB_CONTAINER_NAME:-$PANEL_DB_CONTAINER}${RESET}"
+        echo -e "${YELLOW}Восстановление заменит текущие данные этой цели.${RESET}"
         # Пустое состояние: ни одного бэкапа — не показываем «мёртвое» меню с нулями.
         if [[ "$n_full" -eq 0 && "$n_db" -eq 0 && "$n_files" -eq 0 && "$n_inc" -eq 0 ]]; then
             echo ""
             echo -e "  ${YELLOW}Бэкапов для восстановления пока нет.${RESET}"
-            echo -e "  ${GRAY}Сначала создайте бэкап (главное меню → пункт 1) или включите авто-бэкап (пункт 3).${RESET}"
+            echo -e "  ${GRAY}Сначала создайте бэкап: главное меню → пункт 1 «Сделать бэкап сейчас».${RESET}"
             echo ""
-            safe_read -erp "Enter — назад " _d; return
+            safe_read -erp "Enter — назад: " _d; return
         fi
         echo ""
-        echo -e " 1. Полный бэкап      ${c_f}[${n_full} шт]${RESET}"
-        echo -e " 2. Только БД         ${c_d}[${n_db} шт]${RESET}"
-        echo -e " 3. Только Файлы      ${c_fl}[${n_files} шт]${RESET}"
-        echo -e " 4. Incremental       ${c_i}[${n_inc} шт]${RESET} ${GRAY}(ПОЛНОЕ восстановление из chain: base full + inc)${RESET}"
+        echo -e " 1. Полный бэкап        ${c_f}[${n_full} шт]${RESET}"
+        echo -e " 2. Только БД           ${c_d}[${n_db} шт]${RESET}"
+        echo -e " 3. Только файлы        ${c_fl}[${n_files} шт]${RESET}"
+        echo -e " 4. Инкрементальный     ${c_i}[${n_inc} шт]${RESET} ${GRAY}— восстановит всё: последний полный + изменения${RESET}"
         echo " 0. Назад"
         echo ""
-        local r_choice; safe_read -erp "Выбор (Enter - Назад): " r_choice
+        local r_choice; safe_read -erp "Выбор (Enter — назад): " r_choice
         [[ -z "$r_choice" ]] && return
 
         local SELECTED_FILE=""
         case $r_choice in
             1) if select_backup_file "${BACKUP_PREFIX}_full" "Полные бэкапы"; then execute_restore "full" "$SELECTED_FILE"; fi ;;
             2) if select_backup_file "${BACKUP_PREFIX}_db" "Бэкапы БД"; then execute_restore "db_only" "$SELECTED_FILE"; fi ;;
-            3) if select_backup_file "${BACKUP_PREFIX}_files" "Бэкапы Файлов"; then
+            3) if select_backup_file "${BACKUP_PREFIX}_files" "Бэкапы файлов"; then
                    execute_restore "files_only" "$SELECTED_FILE"
                fi ;;
-            4) if select_backup_file "${BACKUP_PREFIX}_inc" "Incremental бэкапы"; then
+            4) if select_backup_file "${BACKUP_PREFIX}_inc" "Инкрементальные бэкапы"; then
                    # MODE="full" — после chain resolution merged tar содержит DB + files как full.
                    execute_restore "full" "$SELECTED_FILE"
                fi ;;
             0) return ;;
+            *) print_message "ERROR" "Введите 1–4 или 0"; sleep 1 ;;
         esac
     done
 }
@@ -14216,35 +14269,38 @@ setup_cron_task() {
     elif [[ "$TASK_TYPE" == "files" ]]; then if [[ "$_need_path" == true ]] && ! ensure_bot_path; then return; fi; JOB_CMD="$SYMLINK_PATH backup_files"; JOB_ID="# LAZARUS-JOB-FILES"
     elif [[ "$TASK_TYPE" == "full" ]]; then if [[ "$_need_path" == true ]] && ! ensure_bot_path; then return; fi; JOB_CMD="$SYMLINK_PATH backup_full"; JOB_ID="# LAZARUS-JOB-FULL"; fi
 
-    # Получаем текущий статус
+    # Получаем текущий статус — единая семантика: «✓ …» GREEN / «— выкл» GRAY.
     local CURRENT_STATUS=$(get_cron_status "$TASK_TYPE")
-    local STATUS_COLOR="$GRAY"; [[ "$CURRENT_STATUS" != "Выкл" ]] && STATUS_COLOR="$YELLOW"
-    
+    local STATUS_COLOR="$GRAY" STATUS_LBL="— выкл"
+    [[ "$CURRENT_STATUS" != "Выкл" ]] && { STATUS_COLOR="$GREEN"; STATUS_LBL="✓ ${CURRENT_STATUS}"; }
+
     # Человекочитаемое название типа
     local TYPE_NAME=""
     case "$TASK_TYPE" in
         "full") TYPE_NAME="Полный бэкап" ;;
         "db") TYPE_NAME="Только БД" ;;
-        "files") TYPE_NAME="Только Файлы" ;;
+        "files") TYPE_NAME="Только файлы" ;;
     esac
 
     clear_screen
-    echo -e "${GREEN}${BOLD}Настройка расписания: ${TYPE_NAME}${RESET}"
-    echo -e "Текущий статус: [${STATUS_COLOR}${CURRENT_STATUS}${RESET}]"
+    echo -e "${GREEN}${BOLD}Расписание: ${TYPE_NAME}${RESET}"
+    echo -e "Сейчас: [${STATUS_COLOR}${STATUS_LBL}${RESET}]"
     echo ""
-    echo -e " 1. Ежечасно          ${GRAY}[в :00]${RESET}"
-    echo -e " 2. Ежедневно         ${GRAY}[в 04:00]${RESET} ${GREEN}← рекомендуется${RESET}"
-    echo -e " 3. Еженедельно       ${GRAY}[Пн в 04:00]${RESET}"
-    echo -e " 4. Своё время        ${GRAY}[ЧЧ:ММ]${RESET}"
-    echo -e " 5. Каждые N минут    ${GRAY}[1-59]${RESET}"
+    echo -e " 1. Ежечасно           ${GRAY}в :00 каждого часа${RESET}"
+    echo -e " 2. Ежедневно          ${GRAY}в 04:00${RESET}  ${GREEN}← рекомендуется${RESET}"
+    echo -e " 3. Еженедельно        ${GRAY}Пн, 04:00${RESET}"
+    echo -e " 4. Своё время         ${GRAY}ЧЧ:ММ, можно несколько через пробел${RESET}"
+    echo -e " 5. Каждые N минут     ${GRAY}число 1–59${RESET}"
     echo ""
+    # Инвариант «0 = Назад»: деструктив НИКОГДА не висит на 0 (мышечная память «0 — выйти»
+    # молча отключала расписание). Отключение — на 9, показывается только когда есть что отключать.
     if [[ "$CURRENT_STATUS" != "Выкл" ]]; then
-        echo -e " ${RED}0. Отключить${RESET}"
-    else
-        echo " 0. Назад"
+        echo -e " ${RED}9. Отключить это расписание${RESET}"
+        echo ""
     fi
+    echo " 0. Назад"
     echo ""
-    read -erp "Выбор (Enter - Назад): " c
+    read -erp "Выбор (Enter — назад): " c
     [[ -z "$c" ]] && return
     
     local NEW_CRON_LINES=""; local DISPLAY_TIME=""
@@ -14292,13 +14348,15 @@ setup_cron_task() {
                NEW_CRON_LINES="$_CRON_MIN_SPEC $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
                DISPLAY_TIME="Каждые $_CRON_MIN_N мин"
            else print_message "ERROR" "Введите число от 1 до 59."; sleep 1; return; fi ;;
-        0) 
+        9)
+           # Отключение — только когда расписание реально активно (иначе пункт не показывался).
            if [[ "$CURRENT_STATUS" != "Выкл" ]]; then
                DISPLAY_TIME="Выкл"
            else
                return
            fi ;;
-        *) return ;;
+        0) return ;;
+        *) print_message "ERROR" "Введите 1–5, 9 или 0"; sleep 1; return ;;
     esac
 
     # SHELL-3 fix: printf вместо `echo -e` — иначе backslash'и в существующих cron-строках
@@ -14337,45 +14395,54 @@ menu_automation() {
         local CRON_DB=$(get_cron_status "db")
         local CRON_FILES=$(get_cron_status "files")
         
-        # Цветовая индикация: жёлтый если активен, серый если выключен
-        local COLOR_FULL="$GRAY"; [[ "$CRON_FULL" != "Выкл" ]] && COLOR_FULL="$YELLOW"
-        local COLOR_DB="$GRAY"; [[ "$CRON_DB" != "Выкл" ]] && COLOR_DB="$YELLOW"
-        local COLOR_FILES="$GRAY"; [[ "$CRON_FILES" != "Выкл" ]] && COLOR_FILES="$YELLOW"
-        
+        # Единая семантика статусов (как на дашборде): «✓ …» GREEN = включено,
+        # «— выкл» GRAY = норма-выключено. YELLOW тут запрещён (это цвет предупреждений).
+        local COLOR_FULL="$GRAY" ST_FULL="— выкл"
+        [[ "$CRON_FULL" != "Выкл" ]] && { COLOR_FULL="$GREEN"; ST_FULL="✓ ${CRON_FULL}"; }
+        local COLOR_DB="$GRAY" ST_DB="— выкл"
+        [[ "$CRON_DB" != "Выкл" ]] && { COLOR_DB="$GREEN"; ST_DB="✓ ${CRON_DB}"; }
+        local COLOR_FILES="$GRAY" ST_FILES="— выкл"
+        [[ "$CRON_FILES" != "Выкл" ]] && { COLOR_FILES="$GREEN"; ST_FILES="✓ ${CRON_FILES}"; }
+
         # Проверяем есть ли хоть один активный авто-бэкап
         local HAS_ANY_CRON=false
         [[ "$CRON_FULL" != "Выкл" || "$CRON_DB" != "Выкл" || "$CRON_FILES" != "Выкл" ]] && HAS_ANY_CRON=true
-        
+
         clear_screen
-        echo -e "${GREEN}${BOLD}Настройка Автоматического Бэкапа${RESET}"
+        # Заголовок = точное имя пункта главного меню, из которого пришли.
+        echo -e "${GREEN}${BOLD}Авто-бэкап (расписание)${RESET}"
         echo ""
         # M14: видно, ЧТО именно будет бэкапиться по расписанию.
         _print_targets_summary
         [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && \
-            echo -e "${GRAY}Каждая задача по расписанию бэкапит ОБЕ цели (панель + бот).${RESET}"
+            echo -e "${GRAY}Каждая задача по расписанию бэкапит обе цели: панель + бот.${RESET}"
         echo ""
-        echo -e " 1. Полный бэкап  [${COLOR_FULL}${CRON_FULL}${RESET}]"
-        echo -e " 2. Только БД     [${COLOR_DB}${CRON_DB}${RESET}]"
-        echo -e " 3. Только Файлы  [${COLOR_FILES}${CRON_FILES}${RESET}]"
+        echo -e " 1. Полный бэкап   ${GRAY}(БД + файлы)${RESET}     [${COLOR_FULL}${ST_FULL}${RESET}]"
+        echo -e " 2. Только БД      ${GRAY}(быстро, часто)${RESET}  [${COLOR_DB}${ST_DB}${RESET}]"
+        echo -e " 3. Только файлы                    [${COLOR_FILES}${ST_FILES}${RESET}]"
         echo ""
         if [[ "$HAS_ANY_CRON" == true ]]; then
             echo -e " ${RED}9. Отключить все авто-бэкапы${RESET}"
             echo ""
+        else
+            echo -e " ${YELLOW}Авто-бэкап полностью выключен. Рекомендуем: пункт 1 → «Ежедневно».${RESET}"
+            echo ""
         fi
         echo " 0. Назад"
         echo ""
-        read -erp "Выбор (Enter - Назад): " ac
+        read -erp "Выбор (Enter — назад): " ac
         [[ -z "$ac" ]] && return
         case $ac in
             1) setup_cron_task "full" ;;
             2) setup_cron_task "db" ;;
             3) setup_cron_task "files" ;;
-            9) 
+            9)
                 if [[ "$HAS_ANY_CRON" == true ]]; then
                     disable_all_cron_tasks
                 fi
                 ;;
             0) return ;;
+            *) print_message "ERROR" "Введите 1–3, 9 или 0"; sleep 1 ;;
         esac
     done
 }
@@ -14444,19 +14511,23 @@ menu_settings() {
                 esac
                 continue
             fi
-            echo " 1. Что бэкапим и пути   (контейнеры, исключения, лимит файла)"
-            echo " 2. Telegram             (токен, уведомления, проверка связи)"
-            echo " 3. Удалённое хранилище  (S3 / FTP / WebDAV / Rclone)"
-            echo " 4. Шифрование           (пароль AES-256)"
-            echo " 5. Ротация и диск       (сколько хранить, пороги)"
-            echo " 6. Компрессия и логи"
-            echo " 7. Сменить — что бэкапить (панель / бот / обе)"
-            echo " 8. Доп. компоненты      (infra-billing · KB ИИ-саппорта)"
+            # Разделы сгруппированы по смыслу; номера 1–8 стабильны (на них ссылаются подсказки).
+            _group_hdr "Что бэкапим"
+            echo " 1. Что бэкапим и пути    (контейнеры, исключения, лимит файла)"
+            echo " 7. Цель бэкапа           (панель / бот / обе · этот сервер или SSH)"
+            echo " 8. Доп. компоненты       (infra-billing · KB ИИ-саппорта)"
+            _group_hdr "Куда доставляем"
+            echo " 2. Telegram              (токен, уведомления, проверка связи)"
+            echo " 3. Удалённое хранилище   (S3 / FTP / WebDAV / Rclone)"
+            _group_hdr "Как храним"
+            echo " 4. Шифрование            (пароль AES-256)"
+            echo " 5. Ротация и диск        (сколько хранить, пороги)"
+            echo " 6. Компрессия и бэкап логов"
             echo ""
             echo " 0. Назад"
             echo -e "${GRAY} (переключение Простой/Расширенный режим — пункт 99 в главном меню)${RESET}"
             echo ""
-            local _cat; safe_read -erp "Выбор раздела: " _cat
+            local _cat; safe_read -erp "Выбор раздела (Enter — назад): " _cat
             case "$_cat" in
                 1) _sview=general ;; 2) _sview=telegram ;; 3) _sview=storage ;;
                 4) _sview=security ;; 5) _sview=rotation ;; 6) _sview=misc ;;
@@ -14508,7 +14579,7 @@ menu_settings() {
         local _sec_disp=""
         [[ "$BACKUP_SECONDARY" == "bot" ]] && _sec_disp=" + бот"
         [[ "$BACKUP_SECONDARY" == "panel" ]] && _sec_disp=" + панель"
-        echo -e "  ${GRAY}── Что бэкапим и пути ──${RESET}"
+        _group_hdr "Настройки → Что бэкапим и пути"
         echo -e "  Бэкапим: ${CYAN}${_tgt_disp}${_sec_disp}${RESET}"
         echo ""
         if [[ "$BACKUP_TARGET" == "panel" ]]; then
@@ -14542,19 +14613,21 @@ menu_settings() {
         echo -e "  ${GRAY}Лимит на файл — пропуск крупных файлов бота. Сменить цель — раздел 7. Доп. компоненты — раздел 8.${RESET}"
         fi  # /general
         if [[ "$_sview" == "telegram" ]]; then
-        echo -e "  ${GRAY}── Telegram ──${RESET}"
+        # Нумерация ЛОКАЛЬНАЯ 1..N (диспетчер матчит пару «раздел:номер» — номер чужого
+        # раздела здесь НЕ сработает). Так в каждом разделе счёт с 1, без сквозных «7…12».
+        _group_hdr "Настройки → Telegram"
         echo ""
-        echo -e "   7.  Token                ${GRAY}${MASKED_TOKEN}${RESET}"
-        echo -e "   8.  Chat ID              ${GRAY}${MASKED_CHAT_ID}${RESET}"
-        echo -e "   9.  Thread ID            ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
-        echo -e "  10.  Уведомления          $ST_TG_NOTIFY"
-        echo -e "  11.  Отправка файла       $ST_TG_FILE"
-        echo -e "  12.  Проверить связь"
+        echo -e "   1.  Token                ${GRAY}${MASKED_TOKEN}${RESET}"
+        echo -e "   2.  Chat ID              ${GRAY}${MASKED_CHAT_ID}${RESET}"
+        echo -e "   3.  Thread ID            ${GRAY}${TG_MESSAGE_THREAD_ID:-Нет}${RESET}"
+        echo -e "   4.  Уведомления          $ST_TG_NOTIFY"
+        echo -e "   5.  Отправка файла       $ST_TG_FILE"
+        echo -e "   6.  Проверить связь"
         echo ""
         echo -e "  ${GRAY}Токен — у @BotFather, свой ID — у @userinfobot. Thread ID — для групп с топиками.${RESET}"
         fi  # /telegram
         if [[ "$_sview" == "storage" ]]; then
-        echo -e "  ${GRAY}── Удалённое хранилище ──${RESET}"
+        _group_hdr "Настройки → Удалённое хранилище"
         if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
             # H6: у S3 поля URL/Пользователь пусты — показываем реальные Bucket/Endpoint/Region/Key
             # (ключ маскируем) ОДНИМ компактным блоком, иначе оператор не видит, куда уходят бэкапы.
@@ -14566,44 +14639,46 @@ menu_settings() {
                 echo -e "  ${CYAN}${STORAGE_TYPE_DISP}${RESET} ${GRAY}· ${REMOTE_STORAGE_URL:-URL не задан} · ${MASKED_REMOTE_USER}${RESET}"
             fi
             echo ""
-            echo -e "  16.  Загрузка             $ST_REM"
-            echo -e "  17.  Настроить / изменить хранилище"
+            echo -e "   1.  Отправлять в хранилище    $ST_REM"
+            echo -e "   2.  Настроить / изменить хранилище"
         else
             echo -e "  ${GRAY}Не настроено — бэкапы хранятся только на этом сервере.${RESET}"
             echo ""
-            echo -e "  17.  ${YELLOW}Настроить хранилище (S3 / FTP / WebDAV / Rclone)${RESET}"
+            echo -e "   1.  ${YELLOW}Настроить хранилище${RESET} ${GRAY}(S3 / FTP / WebDAV / Rclone)${RESET}"
         fi
         fi  # /storage
         if [[ "$_sview" == "security" ]]; then
-        echo -e "  ${GRAY}── Шифрование ──${RESET}"
+        _group_hdr "Настройки → Шифрование"
         echo ""
         # low#18: «не установлен», только если шифрования реально нет (ни в памяти, ни в файле).
         local _pm="$PASS_MASK"
         [[ -z "$BACKUP_PASSWORD" && ! -f "$BACKUP_PASSWORD_FILE" ]] && _pm="не установлен"
-        echo -e "  18.  Пароль шифрования    ${GRAY}${_pm}${RESET}"
+        echo -e "   1.  Пароль шифрования    ${GRAY}${_pm}${RESET}"
         echo ""
         echo -e "  ${GRAY}Смена пароля не перешифровывает старые бэкапы — они остаются под старым.${RESET}"
         fi  # /security
         if [[ "$_sview" == "rotation" ]]; then
-        echo -e "  ${GRAY}── Ротация и диск ──${RESET}"
+        _group_hdr "Настройки → Ротация и диск"
         echo ""
         local DM_DISPLAY="По времени"; [[ "$DELETE_MODE" == "count" ]] && DM_DISPLAY="По количеству"
-        echo -e "  19.  Режим удаления       ${GRAY}${DM_DISPLAY}${RESET}"
+        echo -e "   1.  Режим удаления       ${GRAY}${DM_DISPLAY}${RESET}"
         if [[ "$DELETE_MODE" == "count" ]]; then
-            echo -e "  20.  Макс. бэкапов        ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
+            echo -e "   2.  Макс. бэкапов        ${GRAY}${MAX_BACKUPS_COUNT} шт.${RESET}"
         else
-            echo -e "  20.  Срок хранения        ${GRAY}${RETENTION_DAYS} дней${RESET}"
+            echo -e "   2.  Срок хранения        ${GRAY}${RETENTION_DAYS} дней${RESET}"
         fi
-        echo -e "  21.  Лимит на папку       ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
-        echo -e "  22.  Порог WARN диска     ${YELLOW}${DISK_WARN_PERCENT}%${RESET}"
-        echo -e "  23.  Порог CRITICAL       ${RED}${DISK_CRITICAL_PERCENT}%${RESET}"
-        local _del_disp="${RED}✗ Выкл${RESET}"
+        # Значения настроек — GRAY (справка, не тревога); YELLOW/RED тут были ложным сигналом.
+        echo -e "   3.  Лимит на папку       ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
+        echo -e "   4.  Порог WARN диска     ${GRAY}${DISK_WARN_PERCENT}% — уведомление${RESET}"
+        echo -e "   5.  Порог CRITICAL       ${GRAY}${DISK_CRITICAL_PERCENT}% — стоп бэкапов${RESET}"
+        # Жаргон any/all/remote_only — русская метка, ключ конфига серым в скобках.
+        local _del_disp="${GRAY}— выкл${RESET}"
         case "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" in
-            any)         _del_disp="${YELLOW}any${RESET} ${GRAY}— любой канал OK${RESET}" ;;
-            all)         _del_disp="${YELLOW}all${RESET} ${GRAY}— все каналы OK${RESET}" ;;
-            remote_only) _del_disp="${YELLOW}remote_only${RESET} ${GRAY}— S3/FTP/WebDAV OK${RESET}" ;;
+            any)         _del_disp="${GREEN}✓ Вкл${RESET} ${GRAY}— доставил любой канал (any)${RESET}" ;;
+            all)         _del_disp="${GREEN}✓ Вкл${RESET} ${GRAY}— доставили все каналы (all)${RESET}" ;;
+            remote_only) _del_disp="${GREEN}✓ Вкл${RESET} ${GRAY}— доставило хранилище (remote_only)${RESET}" ;;
         esac
-        echo -e "  24.  Удалять локально     $_del_disp"
+        echo -e "   6.  Удалять локально     $_del_disp"
         # Текущий disk usage — одной строкой внизу. idx15/44: пороги относятся к ЛОКАЛЬНОМУ
         # каталогу бэкапов, даже если цель — SSH. low#19: сравнения только для чисел.
         local _disk_cur_pct=$(df -P "$BACKUP_DIR" 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%')
@@ -14620,7 +14695,7 @@ menu_settings() {
         echo -e "  ${GRAY}Лимит на папку — весь каталог бэкапов. WARN — уведомление, CRITICAL — остановка бэкапов.${RESET}"
         fi  # /rotation
         if [[ "$_sview" == "misc" ]]; then
-        echo -e "  ${GRAY}── Компрессия и логи ──${RESET}"
+        _group_hdr "Настройки → Компрессия и бэкап логов"
         echo ""
         local _log_disp
         case "$BACKUP_LOG_FILES" in
@@ -14628,7 +14703,7 @@ menu_settings() {
             false) _log_disp="${GREEN}Нет${RESET} ${GRAY}— логи исключены${RESET}" ;;
             ask|*) _log_disp="${GRAY}спросить при первом бэкапе${RESET}" ;;
         esac
-        echo -e "  25.  Бэкап логов          $_log_disp"
+        echo -e "   1.  Бэкап логов          $_log_disp"
         # Compression: gzip (default) / zstd (~2.5× быстрее, ~11% меньше)
         local _curr_compress _zstd_note _compress_disp
         _curr_compress=$(_compress_current)
@@ -14638,12 +14713,12 @@ menu_settings() {
             zstd) _compress_disp="${GREEN}zstd${RESET} ${GRAY}— быстрее ~2.5×${RESET}" ;;
             gzip) _compress_disp="${YELLOW}gzip${RESET} ${GRAY}— классика${RESET}" ;;
         esac
-        echo -e "  26.  Компрессия           $_compress_disp $_zstd_note"
+        echo -e "   2.  Компрессия           $_compress_disp $_zstd_note"
         fi  # /misc
         if [[ "$_sview" == "addons" ]]; then
         # Доп. компоненты — НЕОБЯЗАТЕЛЬНЫЕ базы рядом с основными целями. Приоритет юзера:
         # панель → бот → (опционально) биллинг/KB. Компактная таблица: всё видно одним взглядом.
-        echo -e "  ${GRAY}── Доп. компоненты ──${RESET}"
+        _group_hdr "Настройки → Доп. компоненты"
         echo -e "  Необязательные базы рядом с панелью и ботом — бэкапить их или нет, решаете вы."
         echo ""
         local _bb_disp _kb_disp
@@ -14657,24 +14732,33 @@ menu_settings() {
         # контейнер (docker-имена всегда ASCII) — через printf.
         echo -e "   ${GRAY}№    Компонент          Контейнер            Бэкапим    Идёт в бэкап${RESET}"
         echo -e "  ${GRAY}$(_hrule '─' 72)${RESET}"
-        printf '  13.  Infra-billing БД   %-20s ' "${PANEL_BILLING_DB_CONTAINER:-—}"; echo -e "${_bb_disp}      ${GRAY}${_bb_ctx}${RESET}"
-        printf '  14.  KB ИИ-саппорта     %-20s ' "${BOT_KB_DB_CONTAINER:-—}"; echo -e "${_kb_disp}      ${GRAY}${_kb_ctx}${RESET}"
+        printf '   1.  Infra-billing БД   %-20s ' "${PANEL_BILLING_DB_CONTAINER:-—}"; echo -e "${_bb_disp}      ${GRAY}${_bb_ctx}${RESET}"
+        printf '   2.  KB ИИ-саппорта     %-20s ' "${BOT_KB_DB_CONTAINER:-—}"; echo -e "${_kb_disp}      ${GRAY}${_kb_ctx}${RESET}"
         echo ""
-        echo -e "  ${GRAY}13 / 14 — переключить ДА⇄НЕТ. «ДА» бэкапит, когда контейнер запущен.${RESET}"
+        echo -e "  ${GRAY}1 / 2 — переключить ДА⇄НЕТ. «ДА» бэкапит, когда контейнер запущен.${RESET}"
         fi  # /addons
 
-        echo -e "\n 0. Назад к разделам"
+        # Футер говорит правду в обоих режимах входа: из standard-меню (_sdirect) «назад» —
+        # это выход из настроек; из списка разделов — возврат к разделам.
+        if [[ -n "$_sdirect" ]]; then
+            echo -e "\n 0. Назад"
+        else
+            echo -e "\n 0. К списку разделов"
+        fi
         echo ""
-        safe_read -erp "Выбор: " s
+        safe_read -erp "Выбор (Enter — назад): " s
         # В прямом режиме (standard-меню) «назад» = выход из настроек, разделы не светим.
         [[ -z "$s" ]] && { [[ -n "$_sdirect" ]] && return; _sview=""; continue; }
 
-        case $s in
-            1) read -erp "Новый путь (только локально; для SSH — раздел 7): " np
+        # Диспетчер матчит ПАРУ «раздел:номер» — нумерация в каждом разделе локальная (1..N),
+        # и номер из чужого раздела здесь физически не может сработать (закрыт high-риск
+        # «в экране Telegram ввёл 1 — молча отредактировал путь панели»).
+        case "${_sview}:${s}" in
+            general:1) read -erp "Новый путь (только локально; для SSH — раздел 7): " np
                if [[ -n "$np" ]]; then
                    # low#8: SSH/scp-пути сюда не годятся — это поле для ЛОКАЛЬНОГО каталога.
                    if [[ "$np" =~ ^(ssh://|[^/]+:/) ]]; then
-                       print_message "ERROR" "SSH-пути здесь не поддерживаются — удалённую цель настройте в разделе 7 (Сменить — что бэкапить)."; sleep 1.5; continue
+                       print_message "ERROR" "SSH-пути здесь не поддерживаются — удалённую цель настройте в разделе 7 «Цель бэкапа»."; sleep 1.5; continue
                    fi
                    if [[ -d "$np" ]]; then
                        # Валидация НА ВХОДЕ (identity-слой): панельный путь обязан декларировать
@@ -14688,7 +14772,7 @@ menu_settings() {
                    else print_message "ERROR" "Локальная папка не найдена (для удалённой цели — раздел 7)."; fi
                fi ;;
 
-            2)
+            general:2)
                 if [[ "$BACKUP_TARGET" == "panel" ]]; then
                     read -erp "Имя контейнера БД панели (Enter='${PANEL_DB_CONTAINER}'; также обновит compose-service): " nc
                     nc="${nc:-$PANEL_DB_CONTAINER}"
@@ -14714,9 +14798,9 @@ menu_settings() {
                     if [[ -n "$nc" ]]; then BOT_CONTAINER_NAME="$nc"; _CANON_BOT_CONTAINER="$nc"; save_config; print_message "SUCCESS" "Сохранено"; fi
                 fi ;;
 
-            3)
+            general:3)
                 if [[ "$BACKUP_TARGET" == "panel" ]]; then
-                    print_message "ERROR" "Опция 3 недоступна в режиме panel — контейнер БД задаётся в пункте 2 (app-контейнер remnawave фиксирован)."; sleep 1.5; continue
+                    print_message "ERROR" "Для панели этот пункт не нужен — контейнер БД задаётся в пункте 2."; sleep 1.5; continue
                 else
                     scan_system_for_bot
                     local def_db="${FOUND_DB:-$DB_CONTAINER_NAME}"
@@ -14726,7 +14810,7 @@ menu_settings() {
                     if [[ -n "$ndb_c" ]]; then DB_CONTAINER_NAME="$ndb_c"; _CANON_DB_CONTAINER="$ndb_c"; save_config; print_message "SUCCESS" "Сохранено"; fi
                 fi ;;
 
-            4) # H4: юзер БД панели берётся из .env (POSTGRES_USER) — ручная правка только для бота.
+            general:4) # H4: юзер БД панели берётся из .env (POSTGRES_USER) — ручная правка только для бота.
                if [[ "$BACKUP_TARGET" == "panel" && "$BACKUP_SECONDARY" != "bot" ]]; then
                    print_message "INFO" "Юзер БД панели берётся из ${PANEL_PATH}/.env (POSTGRES_USER) — ручная правка не нужна."
                    sleep 1.5
@@ -14736,7 +14820,7 @@ menu_settings() {
                    if [[ -n "$ndb" ]]; then _CANON_DB_USER="$ndb"; [[ "$BACKUP_TARGET" == "bot" ]] && DB_USER="$ndb"; save_config; print_message "SUCCESS" "Сохранено"; fi
                fi ;;
                
-            5) echo -e "${GRAY}Разделитель: \",\" или \";\" (поддержка пробелов в путях)${RESET}"
+            general:5) echo -e "${GRAY}Разделитель: \",\" или \";\" (поддержка пробелов в путях)${RESET}"
                echo -e "${GRAY}Пример: ${CYAN}node_modules, .cache, my dir/temp${RESET}"
                echo -e "${GRAY}Backward-compat: \"foo bar\" (через пробел) тоже работает, но без поддержки пробелов в путях${RESET}"
                read -erp "Исключить: " ed
@@ -14754,7 +14838,7 @@ menu_settings() {
                    fi
                fi ;;
                
-            6) # idx3: в panel-only режиме пункт 6 скрыт и неприменим — выходим, не редактируем.
+            general:6) # idx3: в panel-only режиме пункт 6 скрыт и неприменим — выходим, не редактируем.
                if [[ "$BACKUP_TARGET" == "panel" && "$BACKUP_SECONDARY" != "bot" ]]; then
                    print_message "INFO" "Лимит на файл неприменим для панели (бэкапится целиком)."; sleep 1.5; continue
                fi
@@ -14766,15 +14850,15 @@ menu_settings() {
                    save_config; print_message "SUCCESS" "Сохранено"
                fi ;;
             
-            7) # low#10/13: токен вводим без эха (как пароль) и через safe_read.
+            telegram:1) # low#10/13: токен вводим без эха (как пароль) и через safe_read.
                safe_read -s -erp "Новый Token: " nt; echo ""
                if [[ -n "$nt" ]]; then BOT_TOKEN="$nt"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
 
-            8) echo -e "Текущий Chat ID: ${CYAN}${MASKED_CHAT_ID}${RESET}"
+            telegram:2) echo -e "Текущий Chat ID: ${CYAN}${MASKED_CHAT_ID}${RESET}"
                safe_read -erp "Новый Chat ID: " nid
                if [[ -n "$nid" ]]; then CHAT_ID="$nid"; save_config; print_message "SUCCESS" "Сохранено"; fi ;;
                
-            9) safe_read -erp "Новый Thread ID (пусто - сбросить): " ntid
+            telegram:3) safe_read -erp "Новый Thread ID (пусто - сбросить): " ntid
                 # low#12: Thread ID — пусто (сброс) или число; иначе отказ.
                 if [[ -z "$ntid" || "$ntid" =~ ^[0-9]+$ ]]; then
                     TG_MESSAGE_THREAD_ID="$ntid"; save_config; print_message "SUCCESS" "Сохранено"
@@ -14782,7 +14866,7 @@ menu_settings() {
                     print_message "ERROR" "Thread ID должен быть пустым или числом"
                 fi ;;
                 
-            10) # Переключение уведомлений
+            telegram:4) # Переключение уведомлений
                 if [[ "$SEND_TO_TELEGRAM" == "true" ]]; then 
                     SEND_TO_TELEGRAM="false"
                     print_message "INFO" "Уведомления Telegram отключены"
@@ -14792,7 +14876,7 @@ menu_settings() {
                 fi
                 save_config ;;
                 
-            11) # Переключение отправки файла
+            telegram:5) # Переключение отправки файла
                 if [[ "$TG_SEND_FILE" == "true" ]]; then
                     # Проверяем есть ли альтернативное хранилище
                     if [[ "$REMOTE_STORAGE_TYPE" == "off" || "$SEND_TO_REMOTE" != "true" ]]; then
@@ -14814,9 +14898,9 @@ menu_settings() {
                 fi
                 save_config ;;
                 
-            12) test_telegram_connection ;;
+            telegram:6) test_telegram_connection ;;
 
-            13) # infra-billing: простой тумблер ✓ ДА / ✗ НЕТ (без меню и вопросов).
+            addons:1) # infra-billing: простой тумблер ✓ ДА / ✗ НЕТ (без меню и вопросов).
                 # «ДА» = auto (бэкапим, когда контейнер запущен). Строгий режим (true) и имя
                 # контейнера — ручные ключи config.env для экспертов (см. CONFIG_REFERENCE.md);
                 # тумблер значение true не затирает молча: ДА⇄НЕТ работает поверх auto/true.
@@ -14833,7 +14917,7 @@ menu_settings() {
                 fi
                 sleep 1 ;;
 
-            14) # KB ИИ-саппорта: простой тумблер ✓ ДА / ✗ НЕТ (зеркально п.13)
+            addons:2) # KB ИИ-саппорта: простой тумблер ✓ ДА / ✗ НЕТ (зеркально п.13)
                 if [[ "$BACKUP_TARGET" != "bot" && "$BACKUP_SECONDARY" != "bot" ]]; then
                     print_message "INFO" "KB относится к бэкапу бота (бот не среди целей)."; sleep 1.5; continue
                 fi
@@ -14847,24 +14931,23 @@ menu_settings() {
                 fi
                 sleep 1 ;;
 
-            17) configure_remote_storage ;;
+            storage:2) configure_remote_storage ;;
             
-            16) # Переключение загрузки на удалённое хранилище
-                if [[ "$SEND_TO_REMOTE" == "true" ]]; then 
+            storage:1) # Хранилище настроено → тумблер отправки; выключено → пункт 1 на экране
+                # называется «Настроить хранилище», значит и ведём сразу в настройку.
+                if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
+                    configure_remote_storage
+                elif [[ "$SEND_TO_REMOTE" == "true" ]]; then
                     SEND_TO_REMOTE="false"
                     print_message "INFO" "Загрузка на удалённое хранилище отключена"
-                else 
-                    if [[ "$REMOTE_STORAGE_TYPE" == "off" ]]; then
-                        print_message "WARN" "Сначала настройте хранилище (пункт 17)"
-                        sleep 1.5
-                        continue
-                    fi
+                    save_config
+                else
                     SEND_TO_REMOTE="true"
                     print_message "SUCCESS" "Загрузка на удалённое хранилище включена"
-                fi
-                save_config ;;
+                    save_config
+                fi ;;
 
-            18) echo ""
+            security:1) echo ""
                 echo -e "${CYAN}${BOLD}━━━ Пароль шифрования бэкапов ━━━${RESET}"
                 echo -e "${GRAY}Алгоритм: AES-256-CBC + PBKDF2 (100k итераций)${RESET}"
                 echo -e "${GRAY}Хранится в файле ${BACKUP_PASSWORD_FILE} (chmod 600)${RESET}"
@@ -14931,7 +15014,7 @@ menu_settings() {
                     fi
                 fi ;;
                 
-            19) echo ""
+            rotation:1) echo ""
                 echo "Режим удаления старых бэкапов:"
                 echo " 1. По времени (старше N дней)"
                 echo " 2. По количеству (оставлять N последних)"
@@ -14939,7 +15022,7 @@ menu_settings() {
                 if [[ "$dm" == "1" ]]; then DELETE_MODE="time"; elif [[ "$dm" == "2" ]]; then DELETE_MODE="count"; fi
                 save_config; print_message "SUCCESS" "Сохранено" ;;
                 
-            20) # Настройка параметра ротации в зависимости от режима
+            rotation:2) # Настройка параметра ротации в зависимости от режима
                 if [[ "$DELETE_MODE" == "count" ]]; then
                     read -erp "Макс. количество бэкапов: " nd
                     if [[ "$nd" =~ ^[0-9]+$ ]] && [ "$nd" -ge 1 ]; then 
@@ -14956,7 +15039,7 @@ menu_settings() {
                     fi
                 fi ;;
                 
-            21) # Лимит размера бэкапов
+            rotation:3) # Лимит размера бэкапов
                 echo ""
                 echo "Лимит размера папки с бэкапами (в MB)"
                 echo "Введите 0 для отключения лимита"
@@ -14976,7 +15059,7 @@ menu_settings() {
                     print_message "ERROR" "Введите целое число (0 для отключения)"
                 fi ;;
 
-            22) # Порог WARN заполнения диска
+            rotation:4) # Порог WARN заполнения диска
                 echo ""
                 echo -e "Текущий порог WARN: ${CYAN}${DISK_WARN_PERCENT}%${RESET}"
                 echo "При достижении этого процента — TG-уведомление, бэкап продолжается."
@@ -14990,7 +15073,7 @@ menu_settings() {
                     print_message "ERROR" "Введите число 50–$((DISK_CRITICAL_PERCENT - 1))"
                 fi ;;
 
-            23) # Порог CRITICAL заполнения диска
+            rotation:5) # Порог CRITICAL заполнения диска
                 echo ""
                 echo -e "Текущий порог CRITICAL: ${CYAN}${DISK_CRITICAL_PERCENT}%${RESET}"
                 echo "При достижении этого процента — бэкапы ОТМЕНЯЮТСЯ + TG-уведомление."
@@ -15004,7 +15087,7 @@ menu_settings() {
                     print_message "ERROR" "Введите число $((DISK_WARN_PERCENT + 1))–99"
                 fi ;;
 
-            24) # Удаление локального бэкапа после успешной отправки
+            rotation:6) # Удаление локального бэкапа после успешной отправки
                 echo ""
                 echo -e "${RED}${BOLD}ВНИМАНИЕ:${RESET} при включении этой опции локальный архив УДАЛЯЕТСЯ"
                 echo -e "после подтверждённой отправки. В случае ошибки отправки или сбоя сети"
@@ -15123,10 +15206,10 @@ menu_settings() {
                     *) print_message "ERROR" "Введите 1 или 2" ;;
                 esac ;;
 
-            27) # Цель и серверы — единый пошаговый мастер (что бэкапить + где). Доступно как раздел 7.
-                menu_backup_target ;;
-
-            0) [[ -n "$_sdirect" ]] && return; _sview=""; continue ;;   # назад к списку разделов (direct — выход)
+            # Легаси-«27» (мастер цели) удалён: с локальной нумерацией недостижим —
+            # мастер живёт в списке разделов как «7. Цель бэкапа».
+            *:0) [[ -n "$_sdirect" ]] && return; _sview=""; continue ;;   # назад к списку разделов (direct — выход)
+            *) print_message "ERROR" "Введите номер пункта из списка (0 — назад)"; sleep 1 ;;
         esac
         [[ -n "$s" ]] && sleep 0.5
     done
@@ -15324,10 +15407,10 @@ _target_status_line() {
     if [[ "$_tr" == "ssh" ]]; then
         # H1: непустой хост ≠ рабочая связь (порт/ключ/сеть). Нейтральный жёлтый статус —
         # честнее зелёной «✓»; реальная проверка делается в мастере «Что бэкапить».
-        if [[ -n "$_host" ]]; then _reach="${YELLOW}настроено (связь не проверена)${RESET}"; else _reach="${RED}✗ хост не задан → Настройки › Что бэкапить${RESET}"; fi
+        if [[ -n "$_host" ]]; then _reach="${YELLOW}настроено (связь не проверена)${RESET}"; else _reach="${RED}✗ хост не задан → Настройки → Цель бэкапа${RESET}"; fi
     else
         if [[ -z "$_cont" ]]; then
-            _reach="${RED}✗ контейнер не задан → Настройки › Что бэкапить${RESET}"
+            _reach="${RED}✗ контейнер не задан → Настройки → Цель бэкапа${RESET}"
         elif docker inspect "$_cont" > "$SILENT_LOG" 2>&1; then
             # low#5: отличаем «есть» от «запущен» — остановленный контейнер для бэкапа БД не годится.
             local _state; _state=$(docker inspect --format='{{.State.Status}}' "$_cont" 2> "$SILENT_LOG" || echo "")
@@ -15337,7 +15420,7 @@ _target_status_line() {
                 _reach="${YELLOW}${_cont} (есть, не запущен: ${_state:-?})${RESET}"
             fi
         else
-            _reach="${RED}✗ ${_cont} не найден → Настройки › Что бэкапить${RESET}"
+            _reach="${RED}✗ ${_cont} не найден → Настройки → Цель бэкапа${RESET}"
         fi
     fi
     echo -e "${_pfx}${_label} — ${CYAN}${_loc}${RESET} · ${_reach}"
@@ -15371,7 +15454,7 @@ _print_targets_summary() {
         for _ep_x in $(printf '%s' "$PANEL_EXTRA_PATHS" | tr ',;' '  '); do [[ -n "$_ep_x" && -e "$_ep_x" ]] && _ep_n=$((_ep_n + 1)); done
         [[ $_ep_n -gt 0 ]] && echo -e "  ${CYAN}│${RESET}  ${GRAY}+ доп. путей: ${_ep_n} — в full-бэкапе панели${RESET}"
     fi
-    echo -e "  ${CYAN}└${RESET}${GRAY}$(_hrule '─' 46)${RESET}"
+    echo -e "  ${CYAN}└${RESET}${GRAY}$(_hrule '─' 48)${RESET}"
 }
 
 # _cron_inactive: true, если нет ни full-, ни db-cron. Самодостаточно (читает crontab),
@@ -15428,19 +15511,23 @@ _readiness_line() {
 # первого запуска и по «Q» с дашборда. Каждый шаг можно пропустить (Enter).
 _quickstart_protect() {
     clear_screen
-    echo -e "${GREEN}${BOLD}Настройка бэкапа${RESET}  ${GRAY}(уведомления · шифрование · авто-бэкап · копия в облако)${RESET}"
+    # Полноэкранный сценарий — открывается _banner, как оба главных меню (единый вид «приложения»).
+    _banner 16 "${BOLD}Настройка бэкапа${RESET}"
+    echo -e "  ${GRAY}4 шага: уведомления · шифрование · авто-бэкап · копия в облако${RESET}"
+    echo -e "  ${GRAY}Любой шаг можно пропустить — просто нажмите Enter.${RESET}"
     echo ""
     _print_targets_summary
-    echo ""
-    echo -e "${GRAY}Несколько шагов. Каждый можно пропустить — просто нажмите Enter.${RESET}"
 
     # [1/4] Уведомления в Telegram. Настроено ≠ тупик: Enter — оставить, 1 — изменить.
+    # Цветной статус — ОТДЕЛЬНЫМ echo, prompt без ANSI: readline не понимает escape-байты
+    # в prompt (без \[ \]) и «ломает» строку при backspace/стрелках. Паттерн для всех 4 шагов.
     echo ""
     echo -e "${CYAN}${BOLD}[1/4] Уведомления в Telegram${RESET}"
     local _do_tg=1
     if [[ -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
         _do_tg=0
-        local _tg_re; safe_read -erp "  ${GREEN}✓ настроено${RESET} · Enter — оставить, 1 — изменить: " _tg_re
+        echo -e "  ${GREEN}✓ Уже настроено${RESET}"
+        local _tg_re; safe_read -erp "  Enter — оставить как есть, 1 — изменить: " _tg_re
         [[ "$_tg_re" == "1" ]] && _do_tg=1
     fi
     if [[ $_do_tg -eq 1 ]]; then
@@ -15464,7 +15551,8 @@ _quickstart_protect() {
     local _do_enc=1
     if _encryption_ready; then   # №5: не голое -f — реальная читаемость пароля
         _do_enc=0
-        local _enc_re; safe_read -erp "  ${GREEN}✓ включено${RESET} · Enter — оставить, 1 — сменить пароль: " _enc_re
+        echo -e "  ${GREEN}✓ Уже включено${RESET}"
+        local _enc_re; safe_read -erp "  Enter — оставить как есть, 1 — сменить пароль: " _enc_re
         if [[ "$_enc_re" == "1" ]]; then
             _do_enc=1
             echo -e "  ${YELLOW}Старые бэкапы останутся под СТАРЫМ паролем — не потеряйте его.${RESET}"
@@ -15472,7 +15560,11 @@ _quickstart_protect() {
     fi
     if [[ $_do_enc -eq 1 ]]; then
         [[ -f "$BACKUP_PASSWORD_FILE" ]] && ! _encryption_ready && echo -e "  ${YELLOW}Файл пароля существует, но НЕ читается — задайте пароль заново.${RESET}"
-        _encryption_ready || echo -e "  ${GRAY}Без пароля дамп БД (PII, токены) хранится в открытом виде.${RESET}"
+        # Без жаргона («дамп БД», «PII») — это строка, которая должна убедить новичка.
+        if ! _encryption_ready; then
+            echo -e "  ${GRAY}Без пароля копия базы данных (данные пользователей, ключи доступа)${RESET}"
+            echo -e "  ${GRAY}лежит в открытом виде — её прочитает любой, кто добудет файл бэкапа.${RESET}"
+        fi
         local _p1 _p2
         safe_read -s -erp "  Пароль шифрования (Enter — пропустить): " _p1; echo ""
         if [[ -n "$_p1" ]]; then
@@ -15497,14 +15589,15 @@ _quickstart_protect() {
     local _cf _cd _do_cron=1; _cf=$(get_cron_status "full"); _cd=$(get_cron_status "db")
     if [[ "$_cf" != "Выкл" || "$_cd" != "Выкл" ]]; then
         _do_cron=0
-        local _cr_re; safe_read -erp "  ${GREEN}✓ настроено${RESET} ${GRAY}(Полный: ${_cf} · БД: ${_cd})${RESET} · Enter — оставить, 1 — изменить: " _cr_re
+        echo -e "  ${GREEN}✓ Уже настроено${RESET} ${GRAY}(Полный: ${_cf} · БД: ${_cd})${RESET}"
+        local _cr_re; safe_read -erp "  Enter — оставить как есть, 1 — изменить: " _cr_re
         [[ "$_cr_re" == "1" ]] && _do_cron=1
     fi
     if [[ $_do_cron -eq 1 ]]; then
-        echo "  1) Ежедневно 04:00 (рекомендуется)"
-        echo "  2) Каждые 6 часов"
-        echo "  3) Каждые N минут (задать интервал)"
-        echo "  Enter — пропустить"
+        echo    "  1. Ежедневно в 04:00 (рекомендуется)"
+        echo    "  2. Каждые 6 часов"
+        echo    "  3. Свой интервал в минутах"
+        echo -e "  ${GRAY}Enter — пропустить этот шаг${RESET}"
         local _sc; safe_read -erp "  Выбор: " _sc
         local _spec="" _label=""
         case "$_sc" in
@@ -15531,11 +15624,13 @@ _quickstart_protect() {
     echo ""
     echo -e "${CYAN}${BOLD}[4/4] Копия вне сервера (облако)${RESET}"
     if [[ "$REMOTE_STORAGE_TYPE" != "off" ]]; then
-        local _rs_re; safe_read -erp "  ${GREEN}✓ настроено (${REMOTE_STORAGE_TYPE^^})${RESET} · Enter — оставить, 1 — изменить: " _rs_re
+        echo -e "  ${GREEN}✓ Уже настроено${RESET} ${GRAY}(${REMOTE_STORAGE_TYPE^^})${RESET}"
+        local _rs_re; safe_read -erp "  Enter — оставить как есть, 1 — изменить: " _rs_re
         [[ "$_rs_re" == "1" ]] && configure_remote_storage
     else
-        echo -e "  ${GRAY}Сервер умрёт — локальные бэкапы умрут вместе с ним.${RESET}"
-        local _rs; safe_read -erp "  Настроить S3/FTP/WebDAV сейчас? (y/N): " _rs
+        echo -e "  ${GRAY}Если сервер выйдет из строя, локальные бэкапы пропадут вместе с ним.${RESET}"
+        # Единая Enter-конвенция мастера (Enter = пропустить), жаргон — серым в скобках.
+        local _rs; safe_read -erp "  Настроить копию в облако сейчас? (y/д — да, Enter — пропустить): " _rs
         [[ "$_rs" =~ ^[YyДд]$ ]] && configure_remote_storage
     fi
 
@@ -15543,7 +15638,7 @@ _quickstart_protect() {
     print_message "SUCCESS" "Мастер настройки завершён"
     _readiness_line
     echo ""
-    safe_read -erp "Enter — продолжить " _dummy
+    safe_read -erp "Enter — вернуться в меню: " _dummy
 }
 
 # _ask_target_location: интерактивно спрашивает где находится цель $1 (этот сервер / SSH)
@@ -15553,10 +15648,16 @@ _ask_target_location() {
     [[ "$_t" == "panel" ]] && _label="Панель (Remnawave)" || _label="Бот (Telegram shop)"
     _ASK_TARGET_CONN_OK="true"   # idx47: локально = ок по умолчанию; SSH-провал переставит в false
     echo ""
-    echo -e "${CYAN}Где находится: ${BOLD}${_label}${RESET}${CYAN}?${RESET}"
-    echo "  1. На ЭТОМ сервере (локально)"
-    echo "  2. На ДРУГОМ сервере (по SSH)"
-    local _loc; safe_read -erp "  Выбор (1/2, Enter = 1): " _loc; _loc="${_loc:-1}"
+    echo -e "${CYAN}${BOLD}Шаг 2/2 — где находится: ${_label}?${RESET}"
+    echo -e "  1. На этом сервере       ${GRAY}(локально — найдём автоматически)${RESET}"
+    echo -e "  2. На другом сервере     ${GRAY}(подключимся по SSH)${RESET}"
+    # Опечатка не должна молча выбирать «локально» — переспрашиваем.
+    local _loc
+    while true; do
+        safe_read -erp "  Выбор (1/2, Enter = 1): " _loc; _loc="${_loc:-1}"
+        [[ "$_loc" == "1" || "$_loc" == "2" ]] && break
+        print_message "ERROR" "Введите 1 или 2"
+    done
     if [[ "$_loc" == "2" ]]; then
         local _h _p _u _k
         safe_read -erp "  Хост (IP или user@host): " _h
@@ -15635,22 +15736,25 @@ _ask_target_location() {
 menu_backup_target() {
     while true; do
         clear_screen
-        echo -e "${GREEN}${BOLD}Что бэкапить и откуда${RESET}"
+        # Заголовок = имя пункта, из которого пришли (Настройки → 7. Цель бэкапа).
+        echo -e "${GREEN}${BOLD}Цель бэкапа${RESET}"
         echo ""
         _print_targets_summary
         echo ""
-        echo "Выберите, ЧТО бэкапить:"
-        echo " 1. Только Панель (Remnawave)"
-        echo " 2. Только Бот (Telegram shop)"
-        echo " 3. Панель + Бот (обе цели)"
-        echo " 0. Назад"
+        # Мастер из двух вопросов — маркируем шаги; пояснение «оба архива» живёт в строке
+        # пункта 3 (читается ДО выбора, а не мгновенным INFO после).
+        echo -e "${BOLD}Шаг 1/2 — что бэкапить:${RESET}"
+        echo    " 1. Панель Remnawave"
+        echo    " 2. Бот магазина (Telegram)"
+        echo -e " 3. Панель + бот   ${GRAY}— оба архива за один запуск, папка: ${BACKUP_DIR}${RESET}"
+        echo    " 0. Назад"
         echo ""
-        local _w; safe_read -erp "Выбор: " _w
+        local _w; safe_read -erp "Выбор (Enter — назад): " _w
         local _prim="" _sec=""
         case "$_w" in
             1) _prim="panel"; _sec="" ;;
             2) _prim="bot";   _sec="" ;;
-            3) _prim="panel"; _sec="bot"; print_message "INFO" "Обе цели будут бэкапиться в ${BACKUP_DIR} одним прогоном." ;;
+            3) _prim="panel"; _sec="bot" ;;
             0|"") return ;;
             *) print_message "ERROR" "Введите 1, 2, 3 или 0"; sleep 1; continue ;;
         esac
@@ -15670,7 +15774,7 @@ menu_backup_target() {
         fi
         _print_targets_summary
         echo ""
-        safe_read -erp "Enter — назад " _dummy
+        safe_read -erp "Enter — назад: " _dummy
         return
     done
 }
@@ -16814,9 +16918,15 @@ case "$1" in
             NO_CRITICAL_BACKUP=false
             [[ "$CRON_STATUS_FULL" == "Выкл" && "$CRON_STATUS_DB" == "Выкл" ]] && NO_CRITICAL_BACKUP=true
             
-            COLOR_FULL="$GRAY"; [[ "$CRON_STATUS_FULL" != "Выкл" ]] && COLOR_FULL="$YELLOW"
-            COLOR_DB="$GRAY"; [[ "$CRON_STATUS_DB" != "Выкл" ]] && COLOR_DB="$YELLOW"
-            COLOR_FILES="$GRAY"; [[ "$CRON_STATUS_FILES" != "Выкл" ]] && COLOR_FILES="$YELLOW"
+            # UX-канон: активное расписание = GREEN «✓ …» (настроено — это хорошо, не «внимание»),
+            # выключенное = GRAY «— выкл» (норма, не тревога). YELLOW здесь запрещён — он для
+            # предупреждений. Единая семантика с «Защитой» (_readiness_line) и menu_automation.
+            COLOR_FULL="$GRAY"; [[ "$CRON_STATUS_FULL" != "Выкл" ]] && COLOR_FULL="$GREEN"
+            COLOR_DB="$GRAY"; [[ "$CRON_STATUS_DB" != "Выкл" ]] && COLOR_DB="$GREEN"
+            COLOR_FILES="$GRAY"; [[ "$CRON_STATUS_FILES" != "Выкл" ]] && COLOR_FILES="$GREEN"
+            CRON_DISP_FULL="— выкл"; [[ "$CRON_STATUS_FULL" != "Выкл" ]] && CRON_DISP_FULL="✓ ${CRON_STATUS_FULL}"
+            CRON_DISP_DB="— выкл"; [[ "$CRON_STATUS_DB" != "Выкл" ]] && CRON_DISP_DB="✓ ${CRON_STATUS_DB}"
+            CRON_DISP_FILES="— выкл"; [[ "$CRON_STATUS_FILES" != "Выкл" ]] && CRON_DISP_FILES="✓ ${CRON_STATUS_FILES}"
             
             # low#0: статус контейнера показывает _print_targets_summary (строка «🎯 Что бэкапим»);
             # прежние BOT_VERSION/CONTAINER_STATUS/STATUS_COLOR здесь были мёртвым кодом — убраны.
@@ -16826,7 +16936,7 @@ case "$1" in
             [[ -n "$BACKUP_SECONDARY" && "$BACKUP_SECONDARY" != "$BACKUP_TARGET" ]] && _both_mode=true
             CLEANUP_LABEL=""
             if [[ "$DELETE_MODE" == "time" ]]; then CLEANUP_LABEL="(>$RETENTION_DAYS дней)"; else CLEANUP_LABEL="(>$MAX_BACKUPS_COUNT шт.)"; fi
-            [[ "${MAX_BACKUP_SIZE_MB:-0}" =~ ^[0-9]+$ && "${MAX_BACKUP_SIZE_MB:-0}" -gt 0 ]] && CLEANUP_LABEL="${CLEANUP_LABEL} + size-лимит"
+            [[ "${MAX_BACKUP_SIZE_MB:-0}" =~ ^[0-9]+$ && "${MAX_BACKUP_SIZE_MB:-0}" -gt 0 ]] && CLEANUP_LABEL="${CLEANUP_LABEL} + лимит размера"
 
             # ═══════════ СТАНДАРТНЫЙ РЕЖИМ — компактно, для новичков ═══════════
             # Свой короткий экран (НЕ тяжёлый дашборд эксперта): цель + защита + последний бэкап
@@ -16842,23 +16952,29 @@ case "$1" in
                 fi
                 # Мягкая подсказка, только если защита не настроена (одна строка).
                 if _protection_needed "$NO_CRITICAL_BACKUP"; then
-                    echo -e "  ${YELLOW}Бэкапы ещё не настроены — начните с пункта 3${RESET}"
+                    echo -e "  ${YELLOW}Бэкапы ещё не настроены — начните с пункта 3 «Настроить»${RESET}"
                 fi
                 # L5: уведомление об обновлении показываем и в Стандартном режиме (раньше блок
                 # ниже был недостижим из-за 'continue' — новичок никогда не узнавал о новой версии).
-                # Прямого пункта обновления тут нет → ведём в расширенный режим (п.99).
+                # Прямого пункта обновления тут нет → маршрут по шагам (99 → пункт 7), без «п.»-сокращений.
                 if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
-                    echo -e "  ${CYAN}${BOLD}Доступно обновление: ${VERSION} → ${UPDATE_REMOTE_VERSION}${RESET} ${GRAY}(обновить: п.99 → Обновления скрипта)${RESET}"
+                    echo -e "  ${CYAN}${BOLD}Доступно обновление: ${VERSION} → ${UPDATE_REMOTE_VERSION}${RESET}"
+                    echo -e "  ${GRAY}Как обновить: введите 99, затем пункт 7 «Обновления скрипта»${RESET}"
                 fi
                 echo ""
-                echo "   1.  Сделать бэкап"
-                echo "   2.  Восстановить из бэкапа"
-                echo -e "   3.  ${CYAN}Настроить${RESET}"
-                echo "   4.  Перенести панель на другой сервер"
+                # Подписи 1:1 с расширенным режимом — пользователь узнаёт пункты по одинаковым словам.
+                echo    "   1.  Сделать бэкап сейчас"
+                echo    "   2.  Восстановить из бэкапа"
+                echo -e "   3.  ${CYAN}Настроить${RESET} ${GRAY}— уведомления · шифрование · авто-бэкап · облако${RESET}"
+                echo    "   4.  Перенести панель на другой сервер"
                 echo ""
-                echo -e "   ${GRAY}99. Все функции (расширенный режим)   ·   0. Выход${RESET}"
+                echo -e "  ${GRAY}$(_hrule '─' 49)${RESET}"
+                echo -e "  ${GRAY}99.  Все функции (расширенный режим)${RESET}"
+                echo -e "  ${GRAY} 0.  Выход${RESET}"
                 echo ""
-                safe_read -erp "Выбор (Enter — выход): " opt; [[ -z "$opt" ]] && exit 0
+                # «выход из программы» — явно: в мастере (п.3) Enter = «пропустить», и новичок,
+                # привыкший жать Enter, не должен неожиданно вылетать из скрипта.
+                safe_read -erp "Выбор (Enter — выход из программы): " opt; [[ -z "$opt" ]] && exit 0
                 case $opt in
                     # Простой п.1 — сразу полный бэкап (без под-меню Full/БД/Файлы):
                     # ровно то, что делает «Полный бэкап» в menu_manual_backup.
@@ -16867,7 +16983,7 @@ case "$1" in
                     3|m|M|м|М|q|Q) _quickstart_protect ;;   # единый пошаговый мастер настройки
                     4) panel_migrate_in ;;         # мастер сам спросит IP/пароль (гейт «ПЕРЕНОС» + identity-гарды)
                     99|77|р|Р|p|P) UI_MODE="expert"; save_config
-                        print_message "SUCCESS" "Расширенный режим включён (вернуться: п.99 «Простой режим»)"
+                        print_message "SUCCESS" "Расширенный режим включён (вернуться: пункт 99 «Простой режим»)"
                         sleep 1 ;;
                     0) exit 0 ;;
                     *) print_message "ERROR" "Введите 1–4, 99 или 0"; sleep 1 ;;
@@ -16884,16 +17000,12 @@ case "$1" in
             _readiness_line "$NO_CRITICAL_BACKUP"
             echo ""
 
-            # Уведомление о доступном обновлении скрипта (только эксперт-режим — Стандартный
-            # показывает свою строку выше и сюда не доходит из-за 'continue'). Пункт 7 — «Обновления».
-            if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
-                echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 7)${RESET}"
-            fi
-            # Уведомление о pending v1→v2 миграции
+            # Обновление скрипта НЕ дублируем строкой в шапке — версию несёт сам пункт 7 меню
+            # (один сигнал об одной вещи). Уведомление о pending v1→v2 миграции — по-русски.
             if [[ -f "$INSTALL_DIR/.v2_migration_pending" ]]; then
                 _V2_PENDING_COUNT=$(cat "$INSTALL_DIR/.v2_migration_pending" 2>/dev/null | head -1)
                 [[ "$_V2_PENDING_COUNT" =~ ^[0-9]+$ && "$_V2_PENDING_COUNT" -gt 0 ]] && \
-                    echo -e "${YELLOW}${_V2_PENDING_COUNT} backup'ов v1 (без HMAC) — ${CYAN}lazarus migrate-v2${RESET}"
+                    echo -e "  ${YELLOW}${_V2_PENDING_COUNT} бэкапов старого формата (v1, без подписи) — обновить: ${CYAN}lazarus migrate-v2${RESET}"
             fi
 
             # Счётчик бэкапов (компактно, по целям). Top-level — без local (SC2168).
@@ -16927,21 +17039,16 @@ case "$1" in
                 fi
                 [[ -n "$_last_line" ]] && echo -e "  ${BOLD}Последний:${RESET} ${GRAY}${_last_line}${RESET}"
             fi
-            # Off-site nudge: бэкапы есть, но копии только локальные (диск умрёт — бэкап умрёт).
-            [[ "$REMOTE_STORAGE_TYPE" == "off" && "$_prim_total" -gt 0 ]] && echo -e "  ${GRAY}Только локальные копии — off-site: Настройки → Удалённое хранилище${RESET}"
+            # Off-site nudge отдельной строкой НЕ дублируем — «Защита» ниже уже несёт
+            # «✗ только локально» (один сигнал об одной проблеме на экран).
 
-            # Авто-бэкап (cron) одной строкой.
-            if [[ "$NO_CRITICAL_BACKUP" == true ]]; then
-                echo -e "  ${BOLD}Авто:${RESET}      ${YELLOW}НЕ настроен — пункт 3${RESET}"
-            else
-                echo -e "  ${BOLD}Авто:${RESET}      Full ${COLOR_FULL}${CRON_STATUS_FULL}${RESET} · DB ${COLOR_DB}${CRON_STATUS_DB}${RESET} · Files ${COLOR_FILES}${CRON_STATUS_FILES}${RESET}"
-            fi
+            # Авто-бэкап (cron) одной строкой — всегда три статуса в единой семантике:
+            # «✓ …» GREEN = включено, «— выкл» GRAY = норма-выключено. Сигнал «не настроен»
+            # несёт «Защита» (✗ авто-бэкап) + пункт Q — без третьего дубля YELLOW.
+            echo -e "  ${BOLD}Авто:${RESET}      Full ${COLOR_FULL}${CRON_DISP_FULL}${RESET} · DB ${COLOR_DB}${CRON_DISP_DB}${RESET} · Files ${COLOR_FILES}${CRON_DISP_FILES}${RESET}"
             echo ""
 
-            CLEANUP_LABEL=""
-            if [[ "$DELETE_MODE" == "time" ]]; then CLEANUP_LABEL="(>$RETENTION_DAYS дней)"; else CLEANUP_LABEL="(>$MAX_BACKUPS_COUNT шт.)"; fi
-            # low#2: size-лимит (п.21) срабатывает ПОВЕРХ выбранного режима — показываем это в метке.
-            [[ "${MAX_BACKUP_SIZE_MB:-0}" =~ ^[0-9]+$ && "${MAX_BACKUP_SIZE_MB:-0}" -gt 0 ]] && CLEANUP_LABEL="${CLEANUP_LABEL} + size-лимит"
+            # CLEANUP_LABEL уже посчитан выше (общие производные до ветвления режимов).
 
             # «Обновить бота» показываем, когда бот входит в бэкап-цель и он на этом сервере,
             # ЛИБО (L9) mixed-сервер: панель primary, а реальный бот стоит на ЭТОМ же сервере
@@ -16953,40 +17060,46 @@ case "$1" in
             if [[ "$SHOW_BOT_UPDATE" != 1 && -n "${_CANON_BOT_PATH:-}" && "$BOT_TRANSPORT" != "ssh" ]] \
                && ! _same_path "${_CANON_BOT_PATH}" "${PANEL_PATH:-/opt/remnawave}"; then SHOW_BOT_UPDATE=1; fi
 
-            # Шорткат быстрой настройки — только если что-то в «Готовности» красное.
-            if _protection_needed "$NO_CRITICAL_BACKUP"; then
-                echo -e "${YELLOW}${BOLD}  Мастер настройки — введите Q${RESET}"
-                echo ""
-            fi
-            # Меню эксперта — три группы с воздухом: что делаю / как настроено / обслуживание.
-            # «Что бэкапить» отдельным пунктом НЕ дублируем — это раздел 7 Настроек. Нумерация
-            # 4–8 стабильна (на «пункт 7» ссылается уведомление об обновлении).
-            echo -e "  ${GRAY}── Действия ──${RESET}"
-            echo "   1.  Сделать бэкап сейчас"
-            echo "   2.  Восстановить из бэкапа"
+            # Меню эксперта — три группы: что делаю / как настроено / обслуживание.
+            # «Что бэкапить» отдельным пунктом НЕ дублируем — это раздел 7 Настроек.
+            # Пункт 7 «Обновления скрипта» — якорь для подсказки Простого режима («99 → пункт 7»):
+            # номер 7 фиксирован, при перенумерации синхронно править подсказку выше.
+            _group_hdr "Действия"
+            echo    "    1.  Сделать бэкап сейчас"
+            echo    "    2.  Восстановить из бэкапа"
+            # Мастер защиты — видимый псевдопункт (вместо жёлтого баннера): показываем,
+            # только пока что-то в «Защите» красное; хоткей Q обрабатывается в case.
+            _protection_needed "$NO_CRITICAL_BACKUP" && \
+                echo -e "    ${YELLOW}Q.  Мастер настройки защиты${RESET} ${GRAY}— закроет красные ✗ выше${RESET}"
             echo ""
-            echo -e "  ${GRAY}── Настройка ──${RESET}"
-            echo "   3.  Авто-бэкап (расписание)"
-            echo "   4.  Настройки"
+            _group_hdr "Настройка"
+            echo    "    3.  Авто-бэкап (расписание)"
+            echo    "    4.  Настройки"
             echo ""
-            echo -e "  ${GRAY}── Обслуживание ──${RESET}"
-            echo "   5.  Удалить старые бэкапы $CLEANUP_LABEL"
+            _group_hdr "Обслуживание"
+            echo    "    5.  Удалить старые бэкапы $CLEANUP_LABEL"
             # update_bot сам привязывается к РЕАЛЬНОМУ боту через bind_bot_runtime_or_fail и
-            # жёстко откажет, если бота нет / путь совпал с панелью.
-            [[ "$SHOW_BOT_UPDATE" == 1 ]] && echo -e "   6.  ${CYAN}Обновить бота${RESET}"
-            if [[ -n "$UPDATE_AVAILABLE" ]]; then
-                echo -e "   7.  ${CYAN}${BOLD}Обновления скрипта [NEW!]${RESET}"
+            # жёстко откажет, если бота нет / путь совпал с панелью. Недоступный пункт НЕ прячем
+            # (скачок 5→7 путает) — рисуем серым с причиной в той же строке.
+            if [[ "$SHOW_BOT_UPDATE" == 1 ]]; then
+                echo -e "    6.  ${CYAN}Обновить бота${RESET}"
             else
-                echo "   7.  Обновления скрипта"
+                echo -e "    ${GRAY}6.  Обновить бота — недоступно: бот не на этом сервере${RESET}"
             fi
-            echo "   8.  Перенести панель на другой сервер"
+            # Версию несёт сам пункт (единственный сигнал об обновлении на экране).
+            if [[ -n "$UPDATE_AVAILABLE" ]]; then
+                echo -e "    7.  ${CYAN}${BOLD}Обновить скрипт: ${VERSION} → ${UPDATE_REMOTE_VERSION}${RESET}"
+            else
+                echo    "    7.  Обновления скрипта"
+            fi
+            echo    "    8.  Перенести панель на другой сервер"
             echo ""
-            echo -e "  ${GRAY}────────────────────────────────────────${RESET}"
-            echo -e "   ${CYAN}99.  Простой режим${RESET} ${GRAY}(меню для новичков)${RESET}"
-            echo -e "   ${RED}666.  Удалить скрипт (Uninstall)${RESET}"
-            echo "   0.  Выход"
+            echo -e "  ${GRAY}$(_hrule '─' 49)${RESET}"
+            echo -e "   ${CYAN}99.  Простой режим${RESET} ${GRAY}(короткое меню для новичков)${RESET}"
+            echo -e "  ${RED}666.  Удалить скрипт${RESET}"
+            echo    "    0.  Выход"
             echo ""
-            safe_read -erp "Выбор (Enter - выход): " opt; [[ -z "$opt" ]] && exit 0
+            safe_read -erp "Выбор (Enter — выход из программы): " opt; [[ -z "$opt" ]] && exit 0
             case $opt in
                 m|M|м|М|q|Q) _quickstart_protect ;;
                 1) menu_manual_backup ;;
@@ -16995,15 +17108,15 @@ case "$1" in
                 4) menu_settings ;;
                 5) cleanup_old_backups ;;
                 6) if [[ "$SHOW_BOT_UPDATE" == 1 ]]; then update_bot; unbind_bot_runtime;
-                   else print_message "WARN" "«Обновить бота» доступно, только когда на этом сервере бэкапится бот"; sleep 1; fi ;;
+                   else print_message "WARN" "«Обновить бота» недоступно: бот не на этом сервере"; sleep 1; fi ;;
                 7) check_for_updates ;;
                 8) panel_migrate_in ;;
                 99|77|р|Р|p|P) UI_MODE="standard"; save_config
-                    print_message "SUCCESS" "Простой режим включён (вернуться: п.99 «Расширенный режим»)"
+                    print_message "SUCCESS" "Простой режим включён (вернуться: пункт 99 «Расширенный режим»)"
                     sleep 1 ;;
                 666) uninstall_script ;;
                 0) exit 0 ;;
-                *) print_message "ERROR" "Неверный пункт меню"; sleep 1 ;;
+                *) print_message "ERROR" "Введите 1–8, Q, 99, 666 или 0"; sleep 1 ;;
             esac
         done
         ;;

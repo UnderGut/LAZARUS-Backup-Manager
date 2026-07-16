@@ -108,11 +108,12 @@ grep -qE '_CRITICAL_SECTION=1   # опасное окно импорта KB' "$S
 grep -qE '8\. Доп\. компоненты' "$SCRIPT" && ok || bad "категории настроек должны содержать раздел 8 «Доп. компоненты»"
 grep -qE '8\) _sview=addons' "$SCRIPT" && ok || bad "выбор 8 должен открывать _sview=addons"
 grep -qE '_sview" == "addons"' "$SCRIPT" && ok || bad "должен существовать рендер раздела addons"
-# 6b) пункт 14 (KB) — зеркальный обработчик п.13 (billing), с гардом «бот среди целей».
-# Тумблер ДА⇄НЕТ: включение и выключение без под-меню.
-grep -qE '14\) # KB ИИ-саппорта' "$SCRIPT" && ok || bad "должен быть обработчик 14 (KB-тумблер)"
-grep -qE 'BOT_KB_BACKUP="false"$' "$SCRIPT" && ok || bad "тумблер 14 должен уметь выключать KB"
-grep -qE 'BOT_KB_BACKUP="auto"$' "$SCRIPT" && ok || bad "тумблер 14 должен уметь включать KB (auto)"
+# 6b) KB-тумблер — зеркальный обработчик billing, с гардом «бот среди целей».
+# После UX-редизайна нумерация в разделе ЛОКАЛЬНАЯ: диспетчер матчит "addons:2" (не «14»).
+grep -qE 'addons:2\) # KB ИИ-саппорта' "$SCRIPT" && ok || bad "должен быть обработчик addons:2 (KB-тумблер)"
+grep -qE 'addons:1\) # infra-billing' "$SCRIPT" && ok || bad "должен быть обработчик addons:1 (billing-тумблер)"
+grep -qE 'BOT_KB_BACKUP="false"$' "$SCRIPT" && ok || bad "KB-тумблер должен уметь выключать KB"
+grep -qE 'BOT_KB_BACKUP="auto"$' "$SCRIPT" && ok || bad "KB-тумблер должен уметь включать KB (auto)"
 # 6c) billing больше НЕ живёт строкой в разделе general (переехал в addons)
 _gen_start=$(grep -n '_sview" == "general"' "$SCRIPT" | head -1 | cut -d: -f1)
 _gen_end=$(grep -n '# /general' "$SCRIPT" | head -1 | cut -d: -f1)

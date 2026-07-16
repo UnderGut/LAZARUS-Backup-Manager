@@ -35,11 +35,11 @@ PANEL_TRANSPORT="ssh"; PANEL_SSH_HOST="10.0.0.5"; PANEL_SSH_USER="root"; PANEL_D
 BACKUP_TARGET="panel"; BACKUP_SECONDARY=""
 line=$(_target_status_line panel)
 [[ "$line" == *"настроено"* && "$line" != *"✓"* ]] && ok || bad "H1 ssh status must be neutral 'настроено', got: $line"
-# хост не задан → подсказка ведёт в Настройки › Что бэкапить (L6: раньше врала «→ пункт 2»,
-# который после перенумерации главного меню указывал на Restore).
+# хост не задан → подсказка ведёт в Настройки → Цель бэкапа (L6: раньше врала «→ пункт 2»,
+# после UX-редизайна раздел 7 называется «Цель бэкапа»).
 PANEL_SSH_HOST=""
 line=$(_target_status_line panel)
-[[ "$line" == *"хост не задан"* && "$line" == *"Что бэкапить"* ]] && ok || bad "H1 ssh no-host hint: $line"
+[[ "$line" == *"хост не задан"* && "$line" == *"Цель бэкапа"* ]] && ok || bad "H1 ssh no-host hint: $line"
 
 # --- 2) H2: бот как SECONDARY (панель primary) НЕ показывает контейнер панели ---
 # Симулируем in-process клоббер: DB_CONTAINER_NAME затёрт панельным значением, canon пуст.
