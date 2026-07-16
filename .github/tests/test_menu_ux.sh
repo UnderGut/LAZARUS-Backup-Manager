@@ -66,7 +66,7 @@ BACKUP_PASSWORD=""; rm -f "$BACKUP_PASSWORD_FILE"
 REMOTE_STORAGE_TYPE="off"; SEND_TO_REMOTE="false"
 get_cron_status() { echo "Выкл"; }   # cron не настроен
 rl=$(_readiness_line)
-[[ "$rl" == *"✗ шифрование"* && "$rl" == *"только локально"* && "$rl" == *"✗ авто-бэкап"* ]] && ok || bad "readiness all-off: $rl"
+[[ "$rl" == *"✗ шифрование"* && "$rl" == *"копии только на этом сервере"* && "$rl" == *"✗ авто-бэкап"* ]] && ok || bad "readiness all-off: $rl"
 _protection_needed && ok || bad "_protection_needed must be true when all off"
 
 # --- 5) всё настроено → зелёная готовность + защита не нужна ---
@@ -74,7 +74,7 @@ printf 'secret' > "$BACKUP_PASSWORD_FILE"
 REMOTE_STORAGE_TYPE="s3"; SEND_TO_REMOTE="true"
 get_cron_status() { echo "Ежедневно 04:00"; }   # cron активен
 rl=$(_readiness_line)
-[[ "$rl" == *"шифр"* && "$rl" == *"off-site"* && "$rl" != *"ВЫКЛ"* ]] && ok || bad "readiness all-on: $rl"
+[[ "$rl" == *"шифр"* && "$rl" == *"копия в облаке"* && "$rl" != *"ВЫКЛ"* ]] && ok || bad "readiness all-on: $rl"
 _protection_needed && bad "_protection_needed must be false when all configured" || ok
 
 # --- 5b) РЕГРЕССИЯ-ГАРД: при НЕнастроенном cron и unset NO_CRITICAL_BACKUP — НЕ зелёный авто ---

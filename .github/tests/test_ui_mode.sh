@@ -129,8 +129,9 @@ grep -q "Первичная настройка" "$TMP_DIR/out_int1.txt" && ok \
 grep -qE '4\)[[:space:]]*panel_migrate_in' "$SCRIPT" && ok \
     || bad "standard menu must dispatch panel_migrate_in on choice 4"
 # 5b) expert-меню: case-ветка "8) panel_migrate_in" (после удаления дубля «Что бэкапить» renumber 9→8).
-grep -qE '8\)[[:space:]]*panel_migrate_in' "$SCRIPT" && ok \
-    || bad "expert menu must dispatch panel_migrate_in on choice 8"
+# После вырезания «Обновить бота» пункты сдвинулись: 6=обновления скрипта, 7=перенос.
+grep -qE '7\)[[:space:]]*panel_migrate_in' "$SCRIPT" && ok \
+    || bad "expert menu must dispatch panel_migrate_in on choice 7"
 # 5c) простой бэкап-пункт (п.1) зовёт create_backup_dispatch "full" НАПРЯМУЮ,
 #     а не через menu_manual_backup. Проверяем case-ветку "1) create_backup_dispatch \"full\"".
 grep -qE '1\)[[:space:]]*create_backup_dispatch[[:space:]]+"full";[[:space:]]*_post_backup_prompt[[:space:]]+"full"' "$SCRIPT" && ok \
@@ -155,10 +156,15 @@ fi
 grep -qE 'Доступно обновление: \$\{VERSION\}' "$SCRIPT" && ok \
     || bad "L5: стандартный режим должен показывать «Доступно обновление» при UPDATE_AVAILABLE"
 
-# 5g) L9: «Обновить бота» доступно и для panel-only с ЛОКАЛЬНЫМ ботом (mixed-сервер) —
-#     SHOW_BOT_UPDATE ставится по _CANON_BOT_PATH != PANEL_PATH, не только если бот в цели.
-grep -qE 'SHOW_BOT_UPDATE" != 1 && -n "\$\{_CANON_BOT_PATH' "$SCRIPT" && ok \
-    || bad "L9: SHOW_BOT_UPDATE должен учитывать co-located бота (_CANON_BOT_PATH != PANEL_PATH)"
+# 5g) Обновление бота ВЫРЕЗАНО из скрипта целиком (решение владельца): ни функций,
+#     ни пункта меню, ни рабочего CLI. Команды upgrade дают явный отказ (не молчат).
+grep -qE 'SHOW_BOT_UPDATE|auto_update_bot\(\)|^update_bot\(\)|download_bot_release\(\)' "$SCRIPT" \
+    && bad "bot-update должен быть вырезан (найдены остатки)" || ok
+grep -qE 'Обновление бота удалено из lazarus' "$SCRIPT" && ok \
+    || bad "CLI 'bot upgrade' должен давать явный отказ с объяснением"
+# Пункт 6 эксперт-меню теперь — «Обновления скрипта» (перенумерация после вырезания).
+grep -qE '6\)\s+check_for_updates' "$SCRIPT" && ok || bad "пункт 6 эксперт-меню должен вести в check_for_updates"
+grep -qE '7\)\s+panel_migrate_in' "$SCRIPT" && ok || bad "пункт 7 эксперт-меню должен вести в panel_migrate_in"
 
 echo "---"
 echo "ok=$n_ok err=$n_err"

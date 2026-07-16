@@ -68,7 +68,6 @@
 | `DB_USER` | `postgres` | пользователь БД |
 | `DB_NAME` | из `.env` бота | override, если в `.env` нет `POSTGRES_DB` |
 | `IGNORE_MISMATCH` | `false` | игнорировать расхождения имён контейнеров |
-| `BOT_RELEASE_URL_BASE` | `https://releases.example.com` | откуда `lazarus bot upgrade <V>` качает релиз (`${BASE}/<V>/rwp_shop_<V>.tar`) |
 
 ## Удалённая цель (SSH) — бэкап панели/бота на ДРУГОМ сервере
 

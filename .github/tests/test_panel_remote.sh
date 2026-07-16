@@ -51,16 +51,16 @@ case "\$cmd" in
 esac
 MOCKEOF
 chmod +x "$MOCK/ssh"
-TARGET_SSH="ssh -p 22 -o BatchMode=yes user@remotehost"
+TARGET_SSH="ssh -p 21022 -o BatchMode=yes user@remotehost"
 export PATH="$MOCK:$PATH"
 
 # --- 1) _build_target_ssh: ssh prefix only for transport=ssh ---
 # AUDIT v2: _build_target_ssh теперь ВАЛИДИРУЕТ существование ключа + whitelist полей.
 _KEYF="$MOCK/k.pem"; : > "$_KEYF"   # реальный (пустой) файл ключа — иначе key-existence guard отвергнет
 BOT_TRANSPORT="local"; got=$(_build_target_ssh "bot"); [[ -z "$got" ]] && ok || bad "local transport must yield empty ssh: '$got'"
-BOT_TRANSPORT="ssh"; BOT_SSH_HOST="1.2.3.4"; BOT_SSH_PORT="22"; BOT_SSH_USER="root"; BOT_SSH_KEY="$_KEYF"
+BOT_TRANSPORT="ssh"; BOT_SSH_HOST="1.2.3.4"; BOT_SSH_PORT="21022"; BOT_SSH_USER="root"; BOT_SSH_KEY="$_KEYF"
 got=$(_build_target_ssh "bot")
-[[ "$got" == *"ssh -p 22"* && "$got" == *"-i $_KEYF"* && "$got" == *"root@1.2.3.4"* && "$got" == *"BatchMode=yes"* ]] && ok || bad "ssh prefix build: '$got'"
+[[ "$got" == *"ssh -p 21022"* && "$got" == *"-i $_KEYF"* && "$got" == *"root@1.2.3.4"* && "$got" == *"BatchMode=yes"* ]] && ok || bad "ssh prefix build: '$got'"
 # guard: несуществующий ключ → пустой префикс (remote отключён)
 BOT_SSH_KEY="/nonexistent-key.pem"; got=$(_build_target_ssh "bot" 2>/dev/null); [[ -z "$got" ]] && ok || bad "missing key must yield empty ssh: '$got'"
 # guard: инъекция в host отвергается
@@ -68,7 +68,7 @@ BOT_SSH_KEY="$_KEYF"; BOT_SSH_HOST='1.2.3.4 -oProxyCommand=evil'; got=$(_build_t
 BOT_SSH_HOST="1.2.3.4"
 
 # --- 2) remote db_only → valid archive with correct inner layout ---
-TARGET_SSH="ssh -p 22 -o BatchMode=yes user@remotehost"
+TARGET_SSH="ssh -p 21022 -o BatchMode=yes user@remotehost"
 _backup_remote_target "db_only" >/dev/null 2>&1
 arc=$(find "$BACKUP_DIR" -name 'lazarus_db_*.tar.gz' | head -1)
 [[ -n "$arc" && -f "$arc" ]] && ok || bad "remote db_only produced no archive"

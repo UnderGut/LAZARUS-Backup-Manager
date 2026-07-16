@@ -302,10 +302,10 @@ SCAN_ALLOW_LABEL_FALLBACK=0
 
 # === 13) Парольный SSH-режим (sshpass -e) — _build_target_ssh ===
 # (а) SSH_PASSWORD_MODE=1: префикс начинается с sshpass -e, БЕЗ BatchMode, с PubkeyAuthentication=no
-BOT_TRANSPORT="ssh"; BOT_SSH_HOST="203.0.113.7"; BOT_SSH_PORT="22"; BOT_SSH_USER="root"; BOT_SSH_KEY=""
+BOT_TRANSPORT="ssh"; BOT_SSH_HOST="203.0.113.7"; BOT_SSH_PORT="21022"; BOT_SSH_USER="root"; BOT_SSH_KEY=""
 SSH_PASSWORD_MODE=1
 got=$(_build_target_ssh bot)
-[[ "$got" == "sshpass -e ssh -p 22 "* ]] && ok || bad "pw-mode: prefix must start with 'sshpass -e ssh -p 22': '$got'"
+[[ "$got" == "sshpass -e ssh -p 21022 "* ]] && ok || bad "pw-mode: prefix must start with 'sshpass -e ssh -p 21022': '$got'"
 [[ "$got" != *"BatchMode"* ]] && ok || bad "pw-mode: BatchMode must be ABSENT: '$got'"
 [[ "$got" == *"PubkeyAuthentication=no"* ]] && ok || bad "pw-mode: PubkeyAuthentication=no missing: '$got'"
 # (б) SSH_PASSWORD_MODE=0: как раньше — BatchMode=yes, без sshpass

@@ -95,7 +95,6 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 - **Severity bands** — CRITICAL 🔴 / ERROR ❌ / WARN ⚠️ / INFO ℹ️
 - **Hashtags на первой строке** — `#alert #critical` / `#warning` / `#info` для quick-scan
 - **Disk monitoring** — TG alert при заполнении диска (WARN 90% / CRITICAL 95%, конфигурируемо)
-- **Bot update notification** — INFO alert при обнаружении новой версии бота
 
 ### Автоматизация
 - **Cron интеграция** — настройка расписания из меню
@@ -108,7 +107,6 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 - **Восстановление** — Full / DB / Files из любого бэкапа
 - **Date filter** — поиск backup'ов по дате (`25.12` / `25.12.2026` / ISO) в restore меню
 - **Timer-confirm** — для destructive операций (`RESTORE`/`DELETE`/`DROP`) auto-cancel через 60 сек
-- **Обновление бота** — установка новой версии из tar-файла с автобэкапом
 - **Health-check** — проверка контейнеров перед операциями
 
 ### Диагностика
@@ -330,14 +328,11 @@ lazarus backup_files     # = lazarus backup files
 ### 🆕 Управление ботом (v4.30.0+)
 
 ```bash
-lazarus upgrade          # Авто-обновление бота (non-interactive)
 lazarus bot up           # Запустить контейнеры бота
 lazarus bot down         # Остановить контейнеры бота  
 lazarus bot status       # Статус контейнеров
-lazarus bot upgrade      # Авто-обновление бота
 
 # Короткие флаги
-lazarus -b -u            # = lazarus bot upgrade
 lazarus -b -s            # = lazarus bot status
 ```
 
@@ -403,22 +398,6 @@ dropbox:backup-folder
 ```
 
 ---
-
-## 🔄 Обновление бота
-
-LAZARUS включает функцию обновления Remnawave Telegram Shop Bot:
-
-### Умное обновление (v4.29.0+)
-- **Проверка Docker images** — если образ уже загружен в Docker, предлагает обновиться сразу без поиска tar-файлов
-- **Проверка требований** — для версий 3.25.5+ показывает статус LICENSE_KEY и machine-id volume
-- **Предупреждения** — красные уведомления если LICENSE_KEY или machine-id отсутствуют
-
-### CLI команды обновления (v4.30.0+)
-```bash
-lazarus upgrade          # Авто-обновление бота без интерактивного меню
-lazarus bot upgrade      # То же самое
-lazarus -b -u            # Короткая форма
-```
 
 ### Обновление скрипта
 Скрипт использует **jsDelivr CDN** для проверки обновлений (быстрее чем raw.githubusercontent.com).

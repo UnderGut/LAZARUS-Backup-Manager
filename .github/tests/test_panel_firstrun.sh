@@ -75,8 +75,8 @@ BACKUP_TARGET="bot"; resolve_backup_target
 # --- 7) _target_loc_label: dashboard "where" label is clear for local vs ssh ---
 PANEL_TRANSPORT="local"; PANEL_SSH_HOST=""
 [[ "$(_target_loc_label panel)" == "этот сервер" ]] && ok || bad "panel local label: '$(_target_loc_label panel)'"
-BOT_TRANSPORT="ssh"; BOT_SSH_HOST="203.0.113.59"; BOT_SSH_USER="root"
-[[ "$(_target_loc_label bot)" == "SSH → root@203.0.113.59" ]] && ok || bad "bot ssh label: '$(_target_loc_label bot)'"
+BOT_TRANSPORT="ssh"; BOT_SSH_HOST="198.51.100.7"; BOT_SSH_USER="root"
+[[ "$(_target_loc_label bot)" == "SSH → root@198.51.100.7" ]] && ok || bad "bot ssh label: '$(_target_loc_label bot)'"
 BOT_SSH_HOST="admin@host"  # already user@host → no dup
 [[ "$(_target_loc_label bot)" == "SSH → admin@host" ]] && ok || bad "bot ssh user@host label: '$(_target_loc_label bot)'"
 

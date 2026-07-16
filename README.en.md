@@ -84,7 +84,6 @@ curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/mai
 
 ### Bot Management
 - **Restore** — Full / DB / Files from any backup
-- **Bot update** — install new version from tar file with auto-backup
 - **Health-check** — container verification before operations
 
 ### Debugging
@@ -220,14 +219,11 @@ lazarus backup_files     # = lazarus backup files
 ### 🆕 Bot Management (v4.30.0+)
 
 ```bash
-lazarus upgrade          # Auto-update bot (non-interactive)
 lazarus bot up           # Start bot containers
 lazarus bot down         # Stop bot containers  
 lazarus bot status       # Container status
-lazarus bot upgrade      # Auto-update bot
 
 # Short flags
-lazarus -b -u            # = lazarus bot upgrade
 lazarus -b -s            # = lazarus bot status
 ```
 
@@ -314,22 +310,6 @@ lazarus migrate
 📖 **Full documentation:** [migration/README.en.md](migration/README.en.md)
 
 ---
-
-## 🔄 Bot Update
-
-LAZARUS includes Remnawave Telegram Shop Bot update functionality:
-
-### Smart Update (v4.29.0+)
-- **Docker images check** — if image is already loaded in Docker, offers to update immediately without searching for tar files
-- **Requirements check** — for versions 3.25.5+ shows LICENSE_KEY and machine-id volume status
-- **Warnings** — red notifications if LICENSE_KEY or machine-id are missing
-
-### CLI Update Commands (v4.30.0+)
-```bash
-lazarus upgrade          # Auto-update bot without interactive menu
-lazarus bot upgrade      # Same
-lazarus -b -u            # Short form
-```
 
 ### Script Update
 The script uses **jsDelivr CDN** for update checks (faster than raw.githubusercontent.com).
