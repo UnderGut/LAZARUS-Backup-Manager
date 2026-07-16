@@ -55,9 +55,14 @@ grep -qE '_CRITICAL_SECTION=1 *#.*импорт' "$SCRIPT" && ok \
     || bad "restore должен ставить _CRITICAL_SECTION=1 перед импортом БД"
 grep -qE '_CRITICAL_SECTION=0 *#.*(окно закрыто|импорт)' "$SCRIPT" && ok \
     || bad "restore должен снимать _CRITICAL_SECTION=0 после импорта"
-# ровно 2 постановки =1 (главный импорт + billing-импорт)
+# H1 расширил защищённый коридор restore (down → rsync → volume rm → import) + #3 добавил
+# db_only app-stop, поэтому постановок _CRITICAL_SECTION=1 стало больше исходных 3. Проверяем
+# нижнюю границу И что каждая постановка перекрыта сбросами (=0 не меньше =1) — иначе флаг
+# «залипнет» в 1 после restore и следующий Ctrl+C потребует двойного подтверждения зря.
 _sets=$(grep -cE '_CRITICAL_SECTION=1' "$SCRIPT")
-[[ "$_sets" -eq 3 ]] && ok || bad "ждали 3 постановки _CRITICAL_SECTION=1 (главный+billing+KB импорт), нашли $_sets"
+_resets=$(grep -cE '_CRITICAL_SECTION=0' "$SCRIPT")
+[[ "$_sets" -ge 3 ]] && ok || bad "ждали >=3 постановки _CRITICAL_SECTION=1 (коридор+импорты), нашли $_sets"
+[[ "$_resets" -ge "$_sets" ]] && ok || bad "сбросов =0 ($_resets) должно быть не меньше постановок =1 ($_sets) — иначе флаг залипнет"
 # хендлер выходит сразу, когда флаг != 1
 grep -qE '\[\[ "\$\{_CRITICAL_SECTION:-0\}" != 1 \]\]' "$SCRIPT" && ok \
     || bad "хендлер должен сразу выходить, если _CRITICAL_SECTION != 1"

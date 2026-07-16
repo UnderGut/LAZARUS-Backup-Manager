@@ -135,9 +135,11 @@ grep -qE '8\)[[:space:]]*panel_migrate_in' "$SCRIPT" && ok \
 #     а не через menu_manual_backup. Проверяем case-ветку "1) create_backup_dispatch \"full\"".
 grep -qE '1\)[[:space:]]*create_backup_dispatch[[:space:]]+"full";[[:space:]]*_post_backup_prompt[[:space:]]+"full"' "$SCRIPT" && ok \
     || bad "standard menu choice 1 must call create_backup_dispatch \"full\" directly"
-# 5d) menu_automation имеет ветку по UI_MODE==standard (простой один-вопрос поток).
-grep -qE 'menu_automation_simple' "$SCRIPT" && ok \
-    || bad "menu_automation must have a standard-mode simple branch (menu_automation_simple)"
+# 5d) L8: menu_automation_simple УДАЛЁН (был мёртвым кодом — standard-меню не имеет пункта
+#     «Расписание», планирование идёт через мастер _quickstart_protect; его disable сносил ВСЕ
+#     LAZARUS-задачи). Проверяем, что функция удалена и standard-планирование живёт в мастере.
+grep -qE 'menu_automation_simple\(\)' "$SCRIPT" && bad "L8: menu_automation_simple должна быть удалена (мёртвый код)" || ok
+grep -qE '_quickstart_protect' "$SCRIPT" && ok || bad "standard-планирование должно идти через мастер _quickstart_protect"
 # 5e) cleanup_old_backups имеет ветку по UI_MODE (краткий вывод в standard).
 if grep -n 'cleanup_old_backups()' "$SCRIPT" >/dev/null; then
     _cl_start=$(grep -n 'cleanup_old_backups()' "$SCRIPT" | head -1 | cut -d: -f1)
@@ -147,6 +149,16 @@ if grep -n 'cleanup_old_backups()' "$SCRIPT" >/dev/null; then
 else
     bad "cleanup_old_backups() not found"
 fi
+
+# 5f) L5: Стандартный режим показывает уведомление об обновлении (раньше блок был недостижим
+#     из-за 'continue' → новичок не узнавал о новой версии). Ищем строку внутри standard-экрана.
+grep -qE 'Доступно обновление: \$\{VERSION\}' "$SCRIPT" && ok \
+    || bad "L5: стандартный режим должен показывать «Доступно обновление» при UPDATE_AVAILABLE"
+
+# 5g) L9: «Обновить бота» доступно и для panel-only с ЛОКАЛЬНЫМ ботом (mixed-сервер) —
+#     SHOW_BOT_UPDATE ставится по _CANON_BOT_PATH != PANEL_PATH, не только если бот в цели.
+grep -qE 'SHOW_BOT_UPDATE" != 1 && -n "\$\{_CANON_BOT_PATH' "$SCRIPT" && ok \
+    || bad "L9: SHOW_BOT_UPDATE должен учитывать co-located бота (_CANON_BOT_PATH != PANEL_PATH)"
 
 echo "---"
 echo "ok=$n_ok err=$n_err"

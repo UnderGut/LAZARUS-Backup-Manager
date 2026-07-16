@@ -94,6 +94,26 @@ grep -qE 'Понадобятся всего 3 вещи' "$SCRIPT" && ok || bad "
 grep -qE 'IP-адрес' "$SCRIPT" && ok || bad "migrate-интро: IP-адрес"
 grep -qE 'Пароль root' "$SCRIPT" && ok || bad "migrate-интро: пароль root"
 
+# === 5) L11 (находки 12/28/33): files_only-restore распаковывает combine, а не трактует его как dir ===
+# restore должен искать inner dir-член ТАКЖЕ по bot_files_* (имя из files-бэкапа), не только dir_*.
+grep -qE 'name "bot_files_\*\.tar\.gz"' "$SCRIPT" && ok || bad "L11: DIR_ARC find должен ловить bot_files_*.tar.gz (files-архив)"
+# старого безусловного 'files_only → DIR_ARC=WORK_FILE' быть не должно — только legacy-fallback при пустом DIR_ARC
+grep -qE 'MODE" == "files_only" && -z "\$DIR_ARC"' "$SCRIPT" && ok || bad "L11: files_only должен ставить DIR_ARC=WORK_FILE лишь как legacy-fallback (при пустом inner)"
+# конфликт-гард и extra-restore теперь достижимы для files-архива (гейт != db_only, а не == full)
+grep -qE 'MODE" != "db_only" && -n "\$DIR_ARC"' "$SCRIPT" && ok || bad "L11: конфликт-гард должен работать для files_only (гейт по != db_only)"
+
+# === 6) #3: db_only останавливает приложение на импорт и перезапускает стек (свежий пул A039) ===
+grep -qE 'db_only" && -n "\$\{DB_SERVICE_NAME' "$SCRIPT" && ok || bad "#3: db_only должен останавливать приложение (сервисы кроме БД) на время импорта"
+grep -qE 'docker compose stop "\$\{_app_svc' "$SCRIPT" && ok || bad "#3: db_only должен docker compose stop не-БД сервисы"
+grep -qE '_dbonly_app_stopped' "$SCRIPT" && ok || bad "#3: должен трекать факт остановки приложения для последующего перезапуска"
+grep -qE 'свежий пул после импорта' "$SCRIPT" && ok || bad "#3: после db_only-импорта стек поднимается заново (fresh pool)"
+
+# === 7) #15: «точная копия» реально возвращает .env из архива ===
+# при полной замене (KEEP_INFRA=0) rsync-exclude .env снимается, живой .env заранее в infra_replaced_
+grep -qE 'RESTORE_INCLUDE_ENV="true"' "$SCRIPT" && ok || bad "#15: полная замена должна снимать exclude .env (RESTORE_INCLUDE_ENV=true)"
+# и это ЛОКАЛЬНАЯ тень (не течёт в следующий restore сессии)
+grep -qE 'local RESTORE_INCLUDE_ENV=' "$SCRIPT" && ok || bad "#15: RESTORE_INCLUDE_ENV должна быть локальной тенью в execute_restore"
+
 echo "---"
 echo "ok=$n_ok err=$n_err"
 [[ $n_err -eq 0 ]] || exit 1

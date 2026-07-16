@@ -7557,14 +7557,15 @@ select_backup_target_firstrun() {
     # Доп. компоненты — ВТОРИЧНЫ (приоритет: панель → бот → потом это). Спрашиваем только про
     # ОБНАРУЖЕННЫЕ необязательные базы: infra-billing (компонент панели) и KB ИИ-саппорта
     # (компонент бота). Enter = да (данные безопаснее бэкапить); «n» = выкл. Всегда можно
-    # передумать: Настройки → Доп. компоненты (раздел 8).
+    # передумать: п.99 (расширенный режим) → Настройки → Доп. компоненты.
+    # L10: раздел 8 живёт в эксперт-меню Настроек — из Простого режима туда только через п.99.
     if [[ "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ]] && [[ -n "${DISC_BILLING_DB:-}" ]]; then
         echo ""
         local _ad_b
         safe_read -erp "Обнаружен infra-billing (${DISC_BILLING_DB}) — бэкапить вместе с панелью? (Y/n): " _ad_b
         if [[ "$_ad_b" =~ ^[NnНн] ]]; then
             PANEL_BILLING_BACKUP="false"
-            print_message "INFO" "Infra-billing НЕ бэкапим (вернуть: Настройки → Доп. компоненты)"
+            print_message "INFO" "Infra-billing НЕ бэкапим (вернуть: п.99 → Настройки → Доп. компоненты)"
         else
             PANEL_BILLING_BACKUP="auto"; PANEL_BILLING_DB_CONTAINER="$DISC_BILLING_DB"
         fi
@@ -7576,7 +7577,7 @@ select_backup_target_firstrun() {
         safe_read -erp "Обнаружена БД ИИ-саппорта (${BOT_KB_DB_CONTAINER}) — бэкапить вместе с ботом? (Y/n): " _ad_k
         if [[ "$_ad_k" =~ ^[NnНн] ]]; then
             BOT_KB_BACKUP="false"
-            print_message "INFO" "KB НЕ бэкапим (вернуть: Настройки → Доп. компоненты)"
+            print_message "INFO" "KB НЕ бэкапим (вернуть: п.99 → Настройки → Доп. компоненты)"
         else
             BOT_KB_BACKUP="auto"
         fi
@@ -9897,7 +9898,10 @@ uninstall_script() {
 # '*/08' грязно) и _CRON_MIN_SPEC="*/N * * * *", rc=0. Иначе очищает обе и rc=1.
 _cron_every_n_min() {
     _CRON_MIN_N=""; _CRON_MIN_SPEC=""
-    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    # L7: cap длины (≤3 цифр) ДО 10#-конвертации — иначе 20-значный ввод переполняет int64 и
+    # молча wrap'ится в валидное 1..59 (напр. 2^64+1 → 1 → «каждую минуту»). 3 цифры (макс 999)
+    # не переполняют int64 и сохраняют нормализацию ведущих нулей ('030'→30); range 1..59 ниже.
+    [[ "$1" =~ ^[0-9]{1,3}$ ]] || return 1
     local _n=$((10#$1))
     [[ "$_n" -ge 1 && "$_n" -le 59 ]] || return 1
     _CRON_MIN_N="$_n"; _CRON_MIN_SPEC="*/$_n * * * *"
@@ -10448,6 +10452,11 @@ create_backup() {
         # Timeout-обёртка: при stuck-БД (lock на длинной транзакции) cron мог висеть
         # часами без сигнала. PG_DUMP_TIMEOUT_SEC=0 → отключить (для гигантских БД).
         # $6 = $_compress_pipe_cmd передаётся как параметр чтобы eval'нуть его внутри bash -c.
+        # Незашифрованный дамп БД (PII/токены) до упаковки+шифрования — регистрируем как
+        # sensitive-tmp: одиночный Ctrl+C = мгновенный выход (новая модель), и без этого
+        # обрезанный plaintext-дамп остался бы в BACKUP_DIR навсегда (не матчит ротацию).
+        # cleanup_on_exit снесёт его на любом выходе; при нормальном завершении файл уже удалён.
+        register_sensitive_tmp "$BACKUP_DIR/$FILE_DB"
         _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump" \
             'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
             "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$BACKUP_DIR/$FILE_DB" "$_compress_pipe_cmd"
@@ -12556,9 +12565,12 @@ _restore_rsync_flags() {
     fi
     if [[ "${RESTORE_KEEP_INFRA:-0}" == "1" ]]; then
         _RS_DEL=()
-        _RS_EXCL+=("--exclude" "docker-compose.yml" "--exclude" "docker-compose.yaml")
-        _RS_EXCL+=("--exclude" "compose.yml" "--exclude" "compose.yaml")
-        _RS_EXCL+=("--exclude" ".env" "--exclude" ".env.*")
+        # L3: ЯКОРЬ ведущим '/' → rsync матчит только КОРЕНЬ трансфера. Без якоря паттерн бьёт по
+        # basename на ЛЮБОЙ глубине → compose вложенных суб-стеков (subscription-page и т.п.) тоже
+        # исключались бы и не восстанавливались. Сохраняем только корневые compose/.env панели.
+        _RS_EXCL+=("--exclude" "/docker-compose.yml" "--exclude" "/docker-compose.yaml")
+        _RS_EXCL+=("--exclude" "/compose.yml" "--exclude" "/compose.yaml")
+        _RS_EXCL+=("--exclude" "/.env" "--exclude" "/.env.*")
     fi
 }
 
@@ -12821,6 +12833,16 @@ confirm_drop_schema() {
 
 execute_restore() {
     local MODE="$1"; local FILE="$2"
+    # M3: _live_snap объявляем на уровне ФУНКЦИИ (не внутри full-блока) — иначе при db_only она
+    # не переинициализируется и утекает глобально между двумя restore за сессию, ломая автооткат.
+    local _live_snap=""
+    # #3: флаг «приложение остановлено ради db_only-импорта» (см. блок импорта). На уровне функции,
+    # т.к. читается в пост-блоке запуска контейнеров ПОСЛЕ закрытия if-блока импорта.
+    local _dbonly_app_stopped=0
+    # #15: ЛОКАЛЬНАЯ тень RESTORE_INCLUDE_ENV (наследует глобальное значение от CLI/migrate). Даёт
+    # конфликт-гарду включить восстановление .env для варианта 3 «точная копия» БЕЗ утечки флага в
+    # следующий restore сессии. _restore_rsync_flags видит её по динамической области (как RESTORE_KEEP_INFRA).
+    local RESTORE_INCLUDE_ENV="${RESTORE_INCLUDE_ENV:-false}"
     debug_log "RESTORE" "=== execute_restore ==="
     debug_log "RESTORE" "Mode: $MODE, File: $FILE"
     # ГАРД remote: restore выполняет docker exec / docker volume rm / DROP SCHEMA ЛОКАЛЬНО.
@@ -13021,33 +13043,42 @@ execute_restore() {
     local KB_DUMP=""        # bot: sidecar БД KB ИИ-саппорта (kb_*.sql.*)
     local EXTRA_ARC=""      # panel: sidecar доп. путей ВНЕ PANEL_PATH (extra_*.tar.*)
 
-    if [[ "$MODE" == "files_only" ]]; then
+    # L11 (находки 12/28/33): files-архив — тоже COMBINE (внутри bot_files_*.tar + version +
+    # опц. extra_*/manifest), НЕ голый dir-tarball. Раньше files_only ставил DIR_ARC=WORK_FILE →
+    # dir-restore высыпал в BOT_PATH сам combine-архив (bot_files_*.tar.gz как файл), а extra-sidecar
+    # и конфликт-гард версий для files-архива не срабатывали. Теперь распаковываем внешний архив и
+    # ищем внутренние члены для ВСЕХ режимов; для files-архива inner называется bot_files_*.tar.*
+    # (full — dir_*.tar.*, incremental merged — dir_merged.tar.*, тоже ловится dir_*).
+    local OUTER_LIST="$TMP_DIR/outer_list.txt"
+    if ! validate_tar_safety "$WORK_FILE" "$OUTER_LIST"; then rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1; fi
+
+    print_message "INFO" "Распаковка..."
+    # Detect формат внешнего архива (gzip или zstd) и распаковать с нужным флагом.
+    local _outer_fmt _outer_tar_args
+    _outer_fmt=$(_compress_detect_format "$WORK_FILE")
+    _outer_tar_args=$(_tar_extract_args_for "$_outer_fmt")
+    debug_log "RESTORE" "Extracting ($_outer_fmt): tar $_outer_tar_args -xf $WORK_FILE -C $TMP_DIR"
+    tar $_outer_tar_args -xf "$WORK_FILE" -C "$TMP_DIR" --no-same-owner --no-same-permissions
+    debug_log "RESTORE" "Contents: $(ls -la "$TMP_DIR")"
+
+    # SQL dump: .sql.gz (gzip) или .sql.zst (zstd)
+    DB_DUMP=$(find "$TMP_DIR" \( -name "db_*.sql.gz" -o -name "db_*.sql.zst" \) | head -1)
+    # Inner dir archive: full=dir_*.tar.*, files=bot_files_*.tar.*, inc=dir_merged.tar.* (ловится dir_*).
+    DIR_ARC=$(find "$TMP_DIR" \( -name "dir_*.tar.gz" -o -name "dir_*.tar.zst" \
+                                 -o -name "bot_files_*.tar.gz" -o -name "bot_files_*.tar.zst" \) | head -1)
+    # Panel sidecar (опционально): globals_*.sql.* — роли/гранты кластера.
+    GLOBALS_DUMP=$(find "$TMP_DIR" \( -name "globals_*.sql.gz" -o -name "globals_*.sql.zst" \) | head -1)
+    # Panel sidecar (опционально): billing_*.sql.* — БД infra-billing.
+    BILLING_DUMP=$(find "$TMP_DIR" \( -name "billing_*.sql.gz" -o -name "billing_*.sql.zst" \) | head -1)
+    # Bot sidecar (опционально): kb_*.sql.* — БД KB ИИ-саппорта.
+    KB_DUMP=$(find "$TMP_DIR" \( -name "kb_*.sql.gz" -o -name "kb_*.sql.zst" \) | head -1)
+    # Panel sidecar (опционально): extra_*.tar.* — доп. пути ВНЕ PANEL_PATH.
+    EXTRA_ARC=$(find "$TMP_DIR" \( -name "extra_*.tar.gz" -o -name "extra_*.tar.zst" \) | head -1)
+    # Legacy: очень старый files-бэкап мог быть ГОЛЫМ dir-tarball (без combine) — внутренних членов
+    # нет → трактуем сам WORK_FILE как dir-архив (обратная совместимость со старыми файлами).
+    if [[ "$MODE" == "files_only" && -z "$DIR_ARC" ]]; then
         DIR_ARC="$WORK_FILE"
-    else
-        local OUTER_LIST="$TMP_DIR/outer_list.txt"
-        if ! validate_tar_safety "$WORK_FILE" "$OUTER_LIST"; then rm -rf "$TMP_DIR"; return 1; fi
-
-        print_message "INFO" "Распаковка..."
-        # Detect формат внешнего архива (gzip или zstd) и распаковать с нужным флагом.
-        local _outer_fmt _outer_tar_args
-        _outer_fmt=$(_compress_detect_format "$WORK_FILE")
-        _outer_tar_args=$(_tar_extract_args_for "$_outer_fmt")
-        debug_log "RESTORE" "Extracting ($_outer_fmt): tar $_outer_tar_args -xf $WORK_FILE -C $TMP_DIR"
-        tar $_outer_tar_args -xf "$WORK_FILE" -C "$TMP_DIR" --no-same-owner --no-same-permissions
-        debug_log "RESTORE" "Contents: $(ls -la "$TMP_DIR")"
-
-        # SQL dump: .sql.gz (gzip) или .sql.zst (zstd)
-        DB_DUMP=$(find "$TMP_DIR" \( -name "db_*.sql.gz" -o -name "db_*.sql.zst" \) | head -1)
-        # Inner dir archive: .tar.gz (gzip) или .tar.zst (zstd)
-        DIR_ARC=$(find "$TMP_DIR" \( -name "dir_*.tar.gz" -o -name "dir_*.tar.zst" \) | head -1)
-        # Panel sidecar (опционально): globals_*.sql.* — роли/гранты кластера.
-        GLOBALS_DUMP=$(find "$TMP_DIR" \( -name "globals_*.sql.gz" -o -name "globals_*.sql.zst" \) | head -1)
-        # Panel sidecar (опционально): billing_*.sql.* — БД infra-billing.
-        BILLING_DUMP=$(find "$TMP_DIR" \( -name "billing_*.sql.gz" -o -name "billing_*.sql.zst" \) | head -1)
-        # Bot sidecar (опционально): kb_*.sql.* — БД KB ИИ-саппорта.
-        KB_DUMP=$(find "$TMP_DIR" \( -name "kb_*.sql.gz" -o -name "kb_*.sql.zst" \) | head -1)
-        # Panel sidecar (опционально): extra_*.tar.* — доп. пути ВНЕ PANEL_PATH.
-        EXTRA_ARC=$(find "$TMP_DIR" \( -name "extra_*.tar.gz" -o -name "extra_*.tar.zst" \) | head -1)
+        debug_log "RESTORE" "files_only: нет inner-члена → legacy голый tarball, DIR_ARC=WORK_FILE"
     fi
 
     debug_log "RESTORE" "DB_DUMP: $DB_DUMP"
@@ -13075,8 +13106,12 @@ execute_restore() {
     # (выбор «только данные» просто переводит restore в db_only). Compose из архива смотрим
     # одним членом (tar -xO, без распаковки на диск). На чистом сервере live-compose нет →
     # конфликта нет → вопрос не задаётся (bootstrap отработает как раньше).
+    # DRY-RUN: конфликт-гард НЕ трогаем — он и спрашивает интерактивно, и (вариант 3) копирует
+    # live compose/.env, и (вариант 1) переводит в db_only, обходя dry-run-гейт файлового блока
+    # ниже → реальный DROP при симуляции. В dry-run пропускаем guard целиком; для full сработает
+    # штатный dry-run-гейт файлового блока, для db_only — гейт перед импортом БД (добавлен ниже).
     local RESTORE_KEEP_INFRA=0
-    if [[ "$MODE" != "db_only" && -n "$DIR_ARC" && -f "$DIR_ARC" ]]; then
+    if [[ "${DRY_RUN:-false}" != "true" && "$MODE" != "db_only" && -n "$DIR_ARC" && -f "$DIR_ARC" ]]; then
         local _live_cmp="" _cmp_f
         for _cmp_f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
             [[ -z "$_live_cmp" && -f "$BOT_PATH/$_cmp_f" ]] && _live_cmp="$BOT_PATH/$_cmp_f"
@@ -13119,12 +13154,26 @@ execute_restore() {
                     # Полная замена: страховочная копия живых compose/.env ВНЕ каталога цели
                     # (внутри нельзя — rsync --delete её снесёт).
                     if [[ "$RESTORE_KEEP_INFRA" -eq 0 && "$MODE" != "db_only" ]]; then
-                        local _inf_bak="$BACKUP_DIR/infra_replaced_$(date +%Y%m%d-%H%M%S)"
-                        mkdir -p "$_inf_bak"
-                        cp -f "$_live_cmp" "$_inf_bak/" 2> "$SILENT_LOG"
-                        [[ -f "$BOT_PATH/.env" ]] && cp -f "$BOT_PATH/.env" "$_inf_bak/" 2> "$SILENT_LOG"
-                        print_message "INFO" "Текущие compose/.env сохранены: $_inf_bak"
-                        log_message "INFO" "restore: live infra backed up to $_inf_bak before full replace"
+                        # L2: проверяем rc mkdir/cp — иначе при полном диске «сохранены» печаталось бы
+                        # ложно, а rsync --delete затёр бы live compose БЕЗ реальной страховки.
+                        local _inf_bak="$BACKUP_DIR/infra_replaced_$(date +%Y%m%d-%H%M%S)" _inf_ok=1
+                        mkdir -p "$_inf_bak" 2> "$SILENT_LOG" || _inf_ok=0
+                        [[ $_inf_ok -eq 1 ]] && { cp -f "$_live_cmp" "$_inf_bak/" 2> "$SILENT_LOG" || _inf_ok=0; }
+                        [[ $_inf_ok -eq 1 && -f "$BOT_PATH/.env" ]] && { cp -f "$BOT_PATH/.env" "$_inf_bak/" 2> "$SILENT_LOG" || _inf_ok=0; }
+                        if [[ $_inf_ok -eq 1 ]]; then
+                            print_message "INFO" "Текущие compose/.env сохранены: $_inf_bak"
+                            log_message "INFO" "restore: live infra backed up to $_inf_bak before full replace"
+                            # #15: «точная копия» обязана вернуть и .env из архива. По умолчанию rsync
+                            # исключает .env (защита секретов) → живой .env оставался бы, и «как есть»
+                            # был неполным. Живой .env только что сохранён в $_inf_bak, поэтому снимаем
+                            # exclude ТОЛЬКО для этого restore (RESTORE_INCLUDE_ENV — локальная тень #15).
+                            RESTORE_INCLUDE_ENV="true"
+                            print_message "INFO" ".env будет восстановлен из архива (полная замена). Резерв: $_inf_bak/.env"
+                        else
+                            print_message "WARN" "Не удалось сохранить страховочную копию compose/.env (диск полон?) — полная замена отменена, оставляю текущие файлы."
+                            log_message "ERROR" "restore: infra backup failed — falling back to keep-infra"
+                            RESTORE_KEEP_INFRA=1   # без страховки не делаем полную замену
+                        fi
                     fi
                 else
                     # cron/--yes: поведение прежнее (полная замена), но след в логе оставляем.
@@ -13202,7 +13251,7 @@ execute_restore() {
         # дамп и снимаем snapshot живой БД, ДО уничтожения volume. Раньше snapshot
         # снимался ВНУТРИ confirm_drop_schema — уже ПОСЛЕ `docker volume rm`, т.е. с
         # пустой свежесозданной БД → откат был невозможен (catastrophic data loss).
-        local _live_snap=""
+        _live_snap=""   # (объявлена на уровне функции — M3; здесь только сброс для full-пути)
         if [[ "$MODE" == "full" && -n "$DB_DUMP" ]]; then
             # 1) Новый дамп ОБЯЗАН быть валиден ДО разрушения текущей БД.
             local _dd_fmt
@@ -13271,10 +13320,16 @@ execute_restore() {
             rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
         fi
 
+        # Начинается деструктивный коридор (down → rsync --delete → volume rm → DROP → import).
+        # _CRITICAL_SECTION=1: одиночный Ctrl+C здесь НЕ выходит мгновенно (иначе rsync/volume/DROP
+        # обрываются на полпути, стек остаётся погашенным, recovery-ветки не выполняются) —
+        # требует второго нажатия. safe_read сбрасывает флаг на промптах меню как и прежде.
+        _CRITICAL_SECTION=1
         print_message "INFO" "Остановка контейнеров..."
         debug_log "RESTORE" "Stopping containers in $BOT_PATH"
         cd "$BOT_PATH" || {
             print_message "ERROR" "cd $BOT_PATH провалился — restore прерван."
+            _CRITICAL_SECTION=0
             rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
         }
         # rc down проверяем: при лежащем docker down «проваливается молча», а rsync --delete ниже
@@ -13293,6 +13348,7 @@ execute_restore() {
             print_message "ERROR" "Синхронизация файлов провалилась — restore прерван ДО разрушения БД."
             log_message "ERROR" "restore_rsync_apply failed — aborting before destructive DB ops"
             ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
+            _CRITICAL_SECTION=0
             rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
         fi
 
@@ -13304,6 +13360,7 @@ execute_restore() {
                && ! ( cd "$BOT_PATH" && docker compose config --services 2> "$SILENT_LOG" | grep -qx "$DB_SERVICE_NAME" ); then
                 print_message "ERROR" "Сервис БД '$DB_SERVICE_NAME' не объявлен в восстановленном compose — restore прерван."
                 ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
+                _CRITICAL_SECTION=0
                 rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
             fi
             local volume_name
@@ -13317,6 +13374,9 @@ execute_restore() {
                 log_message "WARN" "full restore: no DB dump — skipping volume drop (DB preserved)"
             elif [[ -n "$volume_name" ]]; then
                 if confirm_drop_volume "$volume_name"; then
+                    # confirm_drop_volume читает через safe_read (сбросил флаг) — re-assert перед
+                    # необратимым volume rm; далее до импорта safe_read'ов нет, флаг доживёт.
+                    _CRITICAL_SECTION=1
                     print_message "INFO" "Удаление старого volume: $volume_name"
                     debug_log "RESTORE" "Running: docker volume rm $volume_name"
                     docker volume rm "$volume_name" 2> "$SILENT_LOG" || true
@@ -13335,11 +13395,35 @@ execute_restore() {
         fi
     fi
 
+    # DRY-RUN для db_only (в т.ч. после downgrade из конфликт-гарда): файловый блock с его
+    # dry-run-гейтом пропущен, поэтому проверяем здесь — ДО DROP SCHEMA/импорта. rc=3 = «пропущено».
+    if [[ "${DRY_RUN:-false}" == "true" && "$MODE" == "db_only" ]]; then
+        print_message "INFO" "DRY-RUN: импорт БД пропущен (db_only) — ничего не изменено."
+        rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 3
+    fi
     if [[ -n "$DB_DUMP" ]]; then
         print_message "INFO" "Импорт базы данных..."
         if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return 1; fi
         if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return 1; fi
         if ! assert_db_container_matches_bot; then rm -rf "$TMP_DIR"; return 1; fi
+
+        # #3: db_only НЕ проходит через файловый коридор (там `compose down`), поэтому без этого
+        # шага DROP SCHEMA + импорт идут под РАБОТАЮЩИМ приложением: живые коннекты мешают DROP,
+        # а после — устаревший пул/кэш планов (класс A039, для панели критично). Останавливаем
+        # ПРИЛОЖЕНИЕ, оставляя контейнер БД поднятым (он нужен для docker exec). Пост-блок ниже
+        # поднимет весь стек заново (свежий пул). Full/files_only сюда не заходят — у них коридор.
+        if [[ "$MODE" == "db_only" && -n "${DB_SERVICE_NAME:-}" ]]; then
+            local _all_svc _svc; local -a _app_svc=()
+            _all_svc=$( cd "$BOT_PATH" && docker compose config --services 2> "$SILENT_LOG" )
+            for _svc in $_all_svc; do [[ "$_svc" != "$DB_SERVICE_NAME" ]] && _app_svc+=("$_svc"); done
+            if [[ ${#_app_svc[@]} -gt 0 ]]; then
+                print_message "INFO" "Остановка приложения (контейнер БД остаётся поднятым для импорта)..."
+                _CRITICAL_SECTION=1   # начали менять состояние стека — одиночный Ctrl+C через подтверждение
+                ( cd "$BOT_PATH" && docker compose stop "${_app_svc[@]}" 2> "$SILENT_LOG" ) || true
+                ( cd "$BOT_PATH" && docker compose up -d "$DB_SERVICE_NAME" 2> "$SILENT_LOG" ) || true
+                _dbonly_app_stopped=1
+            fi
+        fi
 
         local ACTUAL_DB_USER ACTUAL_DB_NAME
         ACTUAL_DB_USER=$(get_db_user)
@@ -13454,6 +13538,21 @@ execute_restore() {
         print_message "INFO" "Запуск всех контейнеров..."
         debug_log "RESTORE" "Running: docker compose up -d"
         cd "$BOT_PATH" && docker compose up -d
+    elif [[ "$MODE" == "db_only" && -n "$DB_DUMP" ]]; then
+        if [[ "$_dbonly_app_stopped" == "1" ]]; then
+            # #3: приложение останавливалось на время импорта — поднимаем весь стек заново.
+            # Свежие контейнеры = свежий пул соединений/кэш планов (без A039 stale-pool).
+            print_message "INFO" "Запуск всех контейнеров (свежий пул после импорта)..."
+            ( cd "$BOT_PATH" && docker compose up -d ) || \
+                print_message "WARN" "Не удалось поднять стек — вручную: cd $BOT_PATH && docker compose up -d"
+            log_message "INFO" "db_only restore: стек перезапущен после импорта (fresh pool)"
+        else
+            # Стек остановить не удалось (сервис БД неизвестен) — импорт шёл «на живую».
+            # Советуем ручной перезапуск, чтобы приложение подхватило новую БД (класс A039).
+            print_message "WARN" "БД восстановлена «на живую». Перезапустите стек, чтобы приложение подхватило новую БД:"
+            echo -e "  ${CYAN}cd $BOT_PATH && docker compose down && docker compose up -d${RESET}"
+            log_message "INFO" "db_only restore done under live stack — advised restart"
+        fi
     fi
 
     # === INFRA-BILLING restore (panel sidecar) ===
@@ -13535,6 +13634,7 @@ execute_restore() {
                         print_message "ERROR" "Точки отката биллинга нет — восстановите вручную (панель при этом восстановлена успешно)."
                     fi
                 fi
+                _CRITICAL_SECTION=0   # L1: окно импорта billing закрыто (симметрично main/KB)
             fi
         fi
     fi
@@ -13562,11 +13662,23 @@ execute_restore() {
                 log_message "ERROR" "kb restore guard: collides with main db — refusing"
                 _kb_do="false"
             else
-                local _kb_rimg; _kb_rimg=$(timeout 15 docker inspect --format '{{.Config.Image}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
+                local _kb_rimg _kb_rwd
+                _kb_rimg=$(timeout 15 docker inspect --format '{{.Config.Image}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
                 if [[ -n "$_kb_rimg" ]] && ! _is_db_image "$_kb_rimg"; then
                     print_message "ERROR" "ГАРД: '$BOT_KB_DB_CONTAINER' (image=$_kb_rimg) — не БД-образ — импорт KB ОТКЛОНЁН."
                     log_message "ERROR" "kb restore guard: not a db image ($_kb_rimg)"
                     _kb_do="false"
+                else
+                    # M4: усиление до уровня billing — KB-контейнер обязан принадлежать compose-проекту
+                    # БОТА (working_dir == BOT_PATH). Иначе опечатка в имени (чужой postgres соседнего
+                    # приложения) прошла бы и получила DROP SCHEMA. Пустой label — пропускаем (не блокируем
+                    # legacy-раскладки без метки), но совпадение с BOT_PATH обязательно, если label есть.
+                    _kb_rwd=$(timeout 15 docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
+                    if [[ -n "$_kb_rwd" && -n "$BOT_PATH" ]] && ! _same_path "$_kb_rwd" "$BOT_PATH"; then
+                        print_message "ERROR" "ГАРД: '$BOT_KB_DB_CONTAINER' из чужого compose-проекта ($_kb_rwd ≠ $BOT_PATH) — импорт KB ОТКЛОНЁН."
+                        log_message "ERROR" "kb restore guard: foreign compose project ($_kb_rwd != $BOT_PATH) — refusing"
+                        _kb_do="false"
+                    fi
                 fi
             fi
         fi
@@ -13633,7 +13745,8 @@ execute_restore() {
     # основной dir-restore: (1) validate_tar_safety ловит abs/../unsafe-links; (2) распаковка в
     # изолированный STAGE; (3) в / копируем ТОЛЬКО пути из PANEL_EXTRA_PATHS (allowlist) через
     # rsync --safe-links. Члены вне allowlist остаются в STAGE и в / не попадают.
-    if [[ -n "$EXTRA_ARC" && -f "$EXTRA_ARC" && "$BACKUP_TARGET" == "panel" ]]; then
+    # MODE != db_only: при выборе «только данные» (конфликт-гард) файлы НЕ трогаем — extra тоже.
+    if [[ -n "$EXTRA_ARC" && -f "$EXTRA_ARC" && "$BACKUP_TARGET" == "panel" && "$MODE" != "db_only" ]]; then
         if [[ "$IS_INTERACTIVE" == true ]]; then
             echo ""
             print_message "WARN" "В архиве есть доп. пути (extra-sidecar). Восстановление ПЕРЕЗАПИШЕТ файлы вне PANEL_PATH (напр. certwarden-data)."
@@ -13644,16 +13757,31 @@ execute_restore() {
                 if ! validate_tar_safety "$EXTRA_ARC" "$_ex_list"; then
                     print_message "ERROR" "extra-sidecar не прошёл проверку безопасности (validate_tar_safety) — восстановление отклонено."
                     log_message "ERROR" "extra tar failed validate_tar_safety — refusing extract"
+                # H3: allowlist берётся из ЖИВОГО PANEL_EXTRA_PATHS. На свежем сервере (DR) он пуст →
+                # раньше молча «восстановлено (0)» + SUCCESS. Теперь: если пусто — НЕ врём успехом,
+                # показываем что в архиве и как включить (задать пути → повторить). Безопасность
+                # (allowlist против подделанного архива) сохранена: без явного списка в / не пишем.
+                elif [[ -z "${PANEL_EXTRA_PATHS//[[:space:],;]/}" ]]; then
+                    mkdir -p "$_ex_stage"
+                    tar $(_tar_extract_args_for "$(_compress_detect_format "$EXTRA_ARC")") -xf "$EXTRA_ARC" -C "$_ex_stage" --no-same-owner --no-same-permissions 2> "$SILENT_LOG" || true
+                    print_message "WARN" "PANEL_EXTRA_PATHS не задан — доп. пути из архива НЕ восстановлены (0)."
+                    local _ex_have
+                    _ex_have=$( (cd "$_ex_stage" 2>/dev/null && find . -mindepth 1 -maxdepth 2 -type d 2>/dev/null | sed 's#^\.#/#' | head -8 | tr '\n' ' ') )
+                    [[ -n "$_ex_have" ]] && echo -e "  ${GRAY}В архиве присутствуют: ${_ex_have}${RESET}"
+                    echo -e "  ${GRAY}Чтобы восстановить: задайте PANEL_EXTRA_PATHS нужными путями (config.env) и повторите restore.${RESET}"
+                    log_message "WARN" "extra restore skipped: PANEL_EXTRA_PATHS empty while archive had content"
                 else
                     mkdir -p "$_ex_stage"
                     local _ex_fmt _ex_args
                     _ex_fmt=$(_compress_detect_format "$EXTRA_ARC")
                     _ex_args=$(_tar_extract_args_for "$_ex_fmt")
                     if tar $_ex_args -xf "$EXTRA_ARC" -C "$_ex_stage" --no-same-owner --no-same-permissions 2> "$SILENT_LOG"; then
-                        local _ex_ok=0 _ex_p _ex_rel
+                        local _ex_ok=0 _ex_miss=0 _ex_p _ex_rel
                         for _ex_p in $(printf '%s' "$PANEL_EXTRA_PATHS" | tr ',;' '  '); do
                             [[ -z "$_ex_p" ]] && continue
-                            _ex_rel="${_ex_p#/}"
+                            # M1: срезаем ведущий И хвостовой слэш — иначе rsync src со слэшем сыплет
+                            # СОДЕРЖИМОЕ каталога в родителя (/opt вместо /opt/certwarden).
+                            _ex_rel="${_ex_p#/}"; _ex_rel="${_ex_rel%/}"
                             if [[ -e "$_ex_stage/$_ex_rel" ]]; then
                                 mkdir -p "$(dirname "/$_ex_rel")"
                                 # rsync только конкретного allowlist-пути; --safe-links режет симлинки наружу.
@@ -13663,11 +13791,17 @@ execute_restore() {
                                     print_message "WARN" "Не удалось восстановить путь: /$_ex_rel"
                                 fi
                             else
+                                _ex_miss=$((_ex_miss + 1))
                                 print_message "WARN" "Путь отсутствует в extra-архиве: /$_ex_rel"
                             fi
                         done
-                        print_message "SUCCESS" "Доп. пути восстановлены (${_ex_ok}) — только из PANEL_EXTRA_PATHS (allowlist)."
-                        log_message "SUCCESS" "extra paths restored via allowlist ($_ex_ok paths)"
+                        if [[ "$_ex_ok" -gt 0 ]]; then
+                            print_message "SUCCESS" "Доп. пути восстановлены (${_ex_ok}) — только из PANEL_EXTRA_PATHS (allowlist)."
+                            log_message "SUCCESS" "extra paths restored via allowlist ($_ex_ok paths)"
+                        else
+                            print_message "WARN" "Ни один путь из PANEL_EXTRA_PATHS не найден в архиве — восстановлено 0 (проверьте пути)."
+                            log_message "WARN" "extra restore: 0 paths matched allowlist ($_ex_miss missing)"
+                        fi
                     else
                         print_message "ERROR" "Распаковка extra-sidecar в STAGE не удалась."
                         log_message "ERROR" "extra sidecar stage extract failed"
@@ -13982,7 +14116,7 @@ menu_restore() {
         # H9: восстановление для SSH-цели не поддерживается (импорт идёт в локальный контейнер).
         if [[ "$(_transport_of "$BACKUP_TARGET")" == "ssh" ]]; then
             clear_screen; print_message "WARN" "Восстановление недоступно для удалённой (SSH) цели."
-            echo -e "${GRAY}Запустите lazarus на сервере самой цели, либо переключите её на 'этот сервер' (пункт 2).${RESET}"
+            echo -e "${GRAY}Запустите lazarus на сервере самой цели, либо переключите её на 'этот сервер' (Настройки › Что бэкапить).${RESET}"
             echo ""; safe_read -erp "Enter — назад " _d; return
         fi
         _menu_restore_for_target
@@ -14194,51 +14328,9 @@ setup_cron_task() {
     print_message "SUCCESS" "Расписание обновлено!"; sleep 1
 }
 
-# menu_automation_simple: один вопрос вместо полного меню расписаний (UI_MODE=standard).
-# Включает/выключает ТОЛЬКО ежедневный полный авто-бэкап в 04:00 тем же механизмом,
-# что и setup_cron_task «Ежедневно 04:00» (cron-строка 0 4 * * * … # LAZARUS-JOB-FULL +
-# sync_cron_with_config) — cron-формат идентичен, парсер get_cron_status его понимает.
-menu_automation_simple() {
-    local CRON_FULL; CRON_FULL=$(get_cron_status "full")
-    clear_screen
-    echo -e "${GREEN}${BOLD}Авто-бэкап${RESET}"
-    echo ""
-    if [[ "$CRON_FULL" == "Выкл" ]]; then
-        echo -e "  Ежедневный полный авто-бэкап: ${YELLOW}ВЫКЛ${RESET}"
-        echo ""
-        read -erp "Включить ежедневный полный авто-бэкап? [Y/n] " _a
-        [[ "$_a" =~ ^[Nn]$ ]] && return
-        # ensure_bot_path — как в setup_cron_task для локальной full-цели (SSH-цель не проверяем).
-        if [[ "$(_transport_of "$BACKUP_TARGET")" != "ssh" ]] && ! ensure_bot_path; then return; fi
-        local JOB_CMD="$SYMLINK_PATH backup_full"; local JOB_ID="# LAZARUS-JOB-FULL"
-        local NEW_CRON_LINE="0 4 * * * $JOB_CMD >> /var/log/lazarus_backup.log 2>&1 $JOB_ID"
-        # printf вместо echo -e (не портим backslash'и чужих задач); проверяем rc crontab.
-        local CURRENT_CRON; CURRENT_CRON=$(crontab -l 2> "$SILENT_LOG" | grep -v "$JOB_ID")
-        if printf '%s\n%s\n' "$CURRENT_CRON" "$NEW_CRON_LINE" | crontab -; then
-            sync_cron_with_config
-            log_message "INFO" "Cron task updated (simple): full -> Ежедневно 04:00"
-            print_message "SUCCESS" "Ежедневный авто-бэкап включён (04:00)."; sleep 1
-        else
-            print_message "ERROR" "crontab отклонил запись — расписание НЕ изменено."
-            log_message "ERROR" "crontab write failed (menu_automation_simple)"
-            sleep 1
-        fi
-    else
-        echo -e "  Ежедневный полный авто-бэкап: ${GREEN}${CRON_FULL}${RESET}"
-        echo ""
-        read -erp "Выключить авто-бэкап? [y/N] " _a
-        [[ "$_a" =~ ^[Yy]$ ]] || return
-        # disable_all_cron_tasks сам спрашивает подтверждение и чистит все LAZARUS-задачи.
-        disable_all_cron_tasks
-    fi
-}
-
 menu_automation() {
-    # Стандартный режим: один вопрос вместо полного меню расписаний.
-    if [[ "$UI_MODE" == "standard" ]]; then
-        menu_automation_simple
-        return
-    fi
+    # Планирование в Стандартном режиме идёт через мастер настройки (_quickstart_protect);
+    # это меню — только для эксперт-режима (вызывается из п.3 расширенного меню).
     while true; do
         # Получаем актуальные статусы из cron
         local CRON_FULL=$(get_cron_status "full")
@@ -15232,10 +15324,10 @@ _target_status_line() {
     if [[ "$_tr" == "ssh" ]]; then
         # H1: непустой хост ≠ рабочая связь (порт/ключ/сеть). Нейтральный жёлтый статус —
         # честнее зелёной «✓»; реальная проверка делается в мастере «Что бэкапить».
-        if [[ -n "$_host" ]]; then _reach="${YELLOW}настроено (связь не проверена)${RESET}"; else _reach="${RED}✗ хост не задан → пункт 2${RESET}"; fi
+        if [[ -n "$_host" ]]; then _reach="${YELLOW}настроено (связь не проверена)${RESET}"; else _reach="${RED}✗ хост не задан → Настройки › Что бэкапить${RESET}"; fi
     else
         if [[ -z "$_cont" ]]; then
-            _reach="${RED}✗ контейнер не задан → пункт 2${RESET}"
+            _reach="${RED}✗ контейнер не задан → Настройки › Что бэкапить${RESET}"
         elif docker inspect "$_cont" > "$SILENT_LOG" 2>&1; then
             # low#5: отличаем «есть» от «запущен» — остановленный контейнер для бэкапа БД не годится.
             local _state; _state=$(docker inspect --format='{{.State.Status}}' "$_cont" 2> "$SILENT_LOG" || echo "")
@@ -15245,7 +15337,7 @@ _target_status_line() {
                 _reach="${YELLOW}${_cont} (есть, не запущен: ${_state:-?})${RESET}"
             fi
         else
-            _reach="${RED}✗ ${_cont} не найден → пункт 2${RESET}"
+            _reach="${RED}✗ ${_cont} не найден → Настройки › Что бэкапить${RESET}"
         fi
     fi
     echo -e "${_pfx}${_label} — ${CYAN}${_loc}${RESET} · ${_reach}"
@@ -15272,8 +15364,9 @@ _print_targets_summary() {
             echo -e "  ${CYAN}│${RESET}  ${GRAY}+ KB ИИ-саппорта (${BOT_KB_DB_CONTAINER}) — БД войдёт в бэкап бота${RESET}"
         fi
     fi
-    # Доп. пути ВНЕ PANEL_PATH (certwarden и т.п.) — в full-бэкапе панели.
-    if [[ ( "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ) && -n "${PANEL_EXTRA_PATHS:-}" ]]; then
+    # Доп. пути ВНЕ PANEL_PATH (certwarden и т.п.) — в full-бэкапе панели. Только локально:
+    # remote-бэкап панели extra-sidecar НЕ создаёт (L12) — не обещаем то, чего не будет.
+    if [[ ( "$BACKUP_TARGET" == "panel" || "$BACKUP_SECONDARY" == "panel" ) && -n "${PANEL_EXTRA_PATHS:-}" && "$PANEL_TRANSPORT" != "ssh" ]]; then
         local _ep_n=0 _ep_x
         for _ep_x in $(printf '%s' "$PANEL_EXTRA_PATHS" | tr ',;' '  '); do [[ -n "$_ep_x" && -e "$_ep_x" ]] && _ep_n=$((_ep_n + 1)); done
         [[ $_ep_n -gt 0 ]] && echo -e "  ${CYAN}│${RESET}  ${GRAY}+ доп. путей: ${_ep_n} — в full-бэкапе панели${RESET}"
@@ -15424,7 +15517,7 @@ _quickstart_protect() {
         if [[ -n "$_spec" ]]; then
             local _job_id="# LAZARUS-JOB-FULL" _cur
             _cur=$(crontab -l 2> "$SILENT_LOG" | grep -v "$_job_id")
-            # rc-check как в setup_cron_task/menu_automation_simple: не рапортовать успех, если crontab отклонил.
+            # rc-check как в setup_cron_task: не рапортовать успех, если crontab отклонил запись.
             if printf '%s\n%s\n' "$_cur" "$_spec $SYMLINK_PATH backup_full >> /var/log/lazarus_backup.log 2>&1 $_job_id" | crontab -; then
                 sync_cron_with_config
                 print_message "SUCCESS" "Авто-бэкап настроен (Полный, $_label)"
@@ -16751,6 +16844,12 @@ case "$1" in
                 if _protection_needed "$NO_CRITICAL_BACKUP"; then
                     echo -e "  ${YELLOW}Бэкапы ещё не настроены — начните с пункта 3${RESET}"
                 fi
+                # L5: уведомление об обновлении показываем и в Стандартном режиме (раньше блок
+                # ниже был недостижим из-за 'continue' — новичок никогда не узнавал о новой версии).
+                # Прямого пункта обновления тут нет → ведём в расширенный режим (п.99).
+                if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
+                    echo -e "  ${CYAN}${BOLD}Доступно обновление: ${VERSION} → ${UPDATE_REMOTE_VERSION}${RESET} ${GRAY}(обновить: п.99 → Обновления скрипта)${RESET}"
+                fi
                 echo ""
                 echo "   1.  Сделать бэкап"
                 echo "   2.  Восстановить из бэкапа"
@@ -16785,14 +16884,10 @@ case "$1" in
             _readiness_line "$NO_CRITICAL_BACKUP"
             echo ""
 
-            # Уведомление о доступном обновлении скрипта. В Стандартном режиме пункта 8 нет —
-            # честно указываем путь через эксперт-меню, иначе подсказка врала бы.
+            # Уведомление о доступном обновлении скрипта (только эксперт-режим — Стандартный
+            # показывает свою строку выше и сюда не доходит из-за 'continue'). Пункт 7 — «Обновления».
             if [[ -n "$UPDATE_AVAILABLE" && -n "$UPDATE_REMOTE_VERSION" ]]; then
-                if [[ "$UI_MODE" == "standard" ]]; then
-                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (Расширенный режим: п.99 → пункт 7)${RESET}"
-                else
-                    echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 7)${RESET}"
-                fi
+                echo -e "${CYAN}${BOLD}Обновление скрипта: ${VERSION} → ${UPDATE_REMOTE_VERSION} (пункт 7)${RESET}"
             fi
             # Уведомление о pending v1→v2 миграции
             if [[ -f "$INSTALL_DIR/.v2_migration_pending" ]]; then
@@ -16848,10 +16943,15 @@ case "$1" in
             # low#2: size-лимит (п.21) срабатывает ПОВЕРХ выбранного режима — показываем это в метке.
             [[ "${MAX_BACKUP_SIZE_MB:-0}" =~ ^[0-9]+$ && "${MAX_BACKUP_SIZE_MB:-0}" -gt 0 ]] && CLEANUP_LABEL="${CLEANUP_LABEL} + size-лимит"
 
-            # «Обновить бота» показываем ТОЛЬКО когда бот входит в бэкап-цель и он на этом сервере.
-            # Панель-only (бота не бэкапим) → пункта нет; удалённый (SSH) бот — обновить локально нельзя.
+            # «Обновить бота» показываем, когда бот входит в бэкап-цель и он на этом сервере,
+            # ЛИБО (L9) mixed-сервер: панель primary, а реальный бот стоит на ЭТОМ же сервере
+            # (co-located, напр. /opt/rwp-shop). Обновить его локально можно даже если не бэкапим.
+            # Удалённый (SSH) бот — обновить локально нельзя, пункта нет.
             SHOW_BOT_UPDATE=0
             if [[ ( "$BACKUP_TARGET" == "bot" || "$BACKUP_SECONDARY" == "bot" ) && "$BOT_TRANSPORT" != "ssh" ]]; then SHOW_BOT_UPDATE=1; fi
+            # _CANON_BOT_PATH — снимок РЕАЛЬНОГО бота (≠ PANEL_PATH при co-located; пусто/=панель если бота нет).
+            if [[ "$SHOW_BOT_UPDATE" != 1 && -n "${_CANON_BOT_PATH:-}" && "$BOT_TRANSPORT" != "ssh" ]] \
+               && ! _same_path "${_CANON_BOT_PATH}" "${PANEL_PATH:-/opt/remnawave}"; then SHOW_BOT_UPDATE=1; fi
 
             # Шорткат быстрой настройки — только если что-то в «Готовности» красное.
             if _protection_needed "$NO_CRITICAL_BACKUP"; then
