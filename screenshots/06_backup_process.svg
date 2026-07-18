@@ -1,44 +1,30 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="550" height="350" viewBox="0 0 550 350">
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="280" viewBox="0 0 600 280">
   <style>
-    .bg { fill: #1e1e1e; }
-    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
-    .green { fill: #2ecc71; font-weight: bold; }
-    .cyan { fill: #3498db; }
-    .yellow { fill: #f1c40f; }
-    .gray { fill: #7f8c8d; }
-    .bold { font-weight: bold; }
-    .window-header { fill: #2d2d2d; }
-    .dot-red { fill: #ff5f56; }
-    .dot-yellow { fill: #ffbd2e; }
-    .dot-green { fill: #27c93f; }
+    .bg{fill:#1e1e1e}
+    .text{font-family:Consolas,'Courier New',monospace;font-size:14px;fill:#ecf0f1;white-space:pre}
+    .green{fill:#2ecc71;font-weight:bold}
+    .cyan{fill:#3498db}
+    .red{fill:#e74c3c}
+    .yellow{fill:#f1c40f}
+    .gray{fill:#7f8c8d}
+    .magenta{fill:#9b59b6}
+    .bold{font-weight:bold}
+    .wh{fill:#2d2d2d} .dr{fill:#ff5f56} .dy{fill:#ffbd2e} .dg{fill:#27c93f}
   </style>
-
-  <!-- Window Frame -->
-  <rect x="0" y="0" width="550" height="350" rx="10" ry="10" class="bg"/>
-  <path d="M0 10 C0 4 4 0 10 0 L540 0 C546 0 550 4 550 10 L550 30 L0 30 Z" class="window-header"/>
-  
-  <!-- Window Controls -->
-  <circle cx="20" cy="15" r="6" class="dot-red"/>
-  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
-  <circle cx="60" cy="15" r="6" class="dot-green"/>
-  
-  <!-- Body Content -->
-  <text x="20" y="55" class="text">
-    <tspan class="cyan">[INFO]</tspan><tspan>    Подготовка к созданию бэкапа...</tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Версия бота: <tspan class="cyan">3.21.0</tspan></tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Создание дампа базы данных...</tspan>
-    <tspan x="20" dy="20" class="green">[SUCCESS]</tspan><tspan> Дамп БД создан: 45.2 MB</tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Архивация файлов бота...</tspan>
-    <tspan x="20" dy="20" class="green">[SUCCESS]</tspan><tspan> Файлы заархивированы: 23.8 MB</tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Шифрование архива...</tspan>
-    <tspan x="20" dy="20" class="green">[SUCCESS]</tspan><tspan> Архив зашифрован.</tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Проверка целостности архива...</tspan>
-    <tspan x="20" dy="20" class="green">[SUCCESS]</tspan><tspan> Архив валиден.</tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Отправка в Telegram...</tspan>
-    <tspan x="20" dy="20" class="green">[SUCCESS]</tspan><tspan> Файл отправлен в Telegram.</tspan>
-    <tspan x="20" dy="20" class="cyan">[INFO]</tspan><tspan>    Ротация старых бэкапов...</tspan>
-    <tspan x="20" dy="20" class="green">[SUCCESS]</tspan><tspan> Удалено старых бэкапов: 3 шт.</tspan>
-    
-    <tspan x="20" dy="30" class="green bold">✓ Бэкап успешно создан: lazarus_full_2025-12-27_12_00.tar.gz.enc</tspan>
+  <rect x="0" y="0" width="600" height="280" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="wh"/>
+  <circle cx="20" cy="15" r="6" class="dr"/><circle cx="40" cy="15" r="6" class="dy"/><circle cx="60" cy="15" r="6" class="dg"/>
+  <text x="22" y="52" class="text">
+    <tspan x="22" dy="0"><tspan class="green">Создание бэкапа</tspan></tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Снимок живой БД (точка отката)...            <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Дамп БД + роли + infra-billing...            <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Архивация файлов /opt/remnawave...           <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Шифрование (AES-256-CBC + HMAC)...           <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Проверка целостности (verify)...             <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Отправка в Telegram / S3...                  <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="cyan">ℹ </tspan>Ротация старых бэкапов...                     <tspan class="green">✓</tspan></tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20"><tspan class="green">✓ Готово: </tspan>lazarus_panel_full_2026-01-01_04_00_00.tar.gz.enc <tspan class="gray">(51 MB)</tspan></tspan>
   </text>
 </svg>

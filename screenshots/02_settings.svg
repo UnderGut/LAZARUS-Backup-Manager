@@ -1,61 +1,38 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="580" viewBox="0 0 600 580">
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="440" viewBox="0 0 600 440">
   <style>
-    .bg { fill: #1e1e1e; }
-    .text { font-family: Consolas, 'Courier New', monospace; font-size: 14px; fill: #ecf0f1; white-space: pre; }
-    .green { fill: #2ecc71; font-weight: bold; }
-    .cyan { fill: #3498db; }
-    .yellow { fill: #f1c40f; }
-    .gray { fill: #7f8c8d; }
-    .bold { font-weight: bold; }
-    .window-header { fill: #2d2d2d; }
-    .dot-red { fill: #ff5f56; }
-    .dot-yellow { fill: #ffbd2e; }
-    .dot-green { fill: #27c93f; }
+    .bg{fill:#1e1e1e}
+    .text{font-family:Consolas,'Courier New',monospace;font-size:14px;fill:#ecf0f1;white-space:pre}
+    .green{fill:#2ecc71;font-weight:bold}
+    .cyan{fill:#3498db}
+    .red{fill:#e74c3c}
+    .yellow{fill:#f1c40f}
+    .gray{fill:#7f8c8d}
+    .magenta{fill:#9b59b6}
+    .bold{font-weight:bold}
+    .wh{fill:#2d2d2d} .dr{fill:#ff5f56} .dy{fill:#ffbd2e} .dg{fill:#27c93f}
   </style>
-
-  <!-- Window Frame -->
-  <rect x="0" y="0" width="600" height="580" rx="10" ry="10" class="bg"/>
-  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="window-header"/>
-  
-  <!-- Window Controls -->
-  <circle cx="20" cy="15" r="6" class="dot-red"/>
-  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
-  <circle cx="60" cy="15" r="6" class="dot-green"/>
-  
-  <!-- Title -->
-  <text x="300" y="60" text-anchor="middle" class="text yellow bold">Настройки</text>
-  
-  <!-- Body Content -->
-  <text x="20" y="100" class="text">
-    <tspan class="gray">--- ОБЩИЕ ---</tspan>
-    <tspan x="20" dy="25"> 1. Путь к боту:         <tspan class="cyan">/opt/remnawave</tspan></tspan>
-    <tspan x="20" dy="20"> 2. Контейнер бота:      <tspan class="cyan">remnawave-bot</tspan></tspan>
-    <tspan x="20" dy="20"> 3. Контейнер БД:        <tspan class="cyan">remnawave-db</tspan></tspan>
-    <tspan x="20" dy="20"> 4. Пользователь БД:     <tspan class="cyan">postgres</tspan></tspan>
-    <tspan x="20" dy="20"> 5. Макс. бэкапов:       <tspan class="cyan">100 шт.</tspan></tspan>
-    <tspan x="20" dy="20"> 6. Исключить папки:     <tspan class="cyan">node_modules .git</tspan></tspan>
-    <tspan x="20" dy="20"> 7. Макс. размер файла:  <tspan class="cyan">50 MB</tspan></tspan>
-    
-    <tspan x="20" dy="35" class="gray">--- TELEGRAM ---</tspan>
-    <tspan x="20" dy="25"> 8. Token:               <tspan class="cyan">12345.......ABCDE</tspan></tspan>
-    <tspan x="20" dy="20"> 9. Chat ID:             <tspan class="cyan">-100...789</tspan></tspan>
-    <tspan x="20" dy="20">10. Thread ID:           <tspan class="gray">Нет</tspan></tspan>
-    <tspan x="20" dy="20">11. Уведомления:        <tspan class="green">Вкл</tspan></tspan>
-    <tspan x="20" dy="20">12. Отправка файла:     <tspan class="green">Вкл</tspan></tspan>
-    <tspan x="20" dy="20">13. Проверить связь</tspan>
-    
-    <tspan x="20" dy="35" class="gray">--- УДАЛЁННОЕ ХРАНИЛИЩЕ ---</tspan>
-    <tspan x="20" dy="25">14. Тип:                <tspan class="cyan">FTP</tspan></tspan>
-    <tspan x="20" dy="20">15. URL:                <tspan class="cyan">ftp://backup.server.com/lazarus</tspan></tspan>
-    <tspan x="20" dy="20">16. Пользователь:       <tspan class="cyan">use...up</tspan></tspan>
-    <tspan x="20" dy="20">17. Загрузка:           <tspan class="green">Вкл</tspan></tspan>
-    <tspan x="20" dy="20">18. Настроить / Проверить</tspan>
-    
-    <tspan x="20" dy="35" class="gray">--- БЕЗОПАСНОСТЬ ---</tspan>
-    <tspan x="20" dy="25">19. Пароль архива:      <tspan class="cyan">********</tspan></tspan>
-    
-    <tspan x="20" dy="40"> 0. Назад</tspan>
-    
-    <tspan x="20" dy="30">Выбор (Enter - Назад): <tspan class="green">_</tspan></tspan>
+  <rect x="0" y="0" width="600" height="440" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L590 0 C596 0 600 4 600 10 L600 30 L0 30 Z" class="wh"/>
+  <circle cx="20" cy="15" r="6" class="dr"/><circle cx="40" cy="15" r="6" class="dy"/><circle cx="60" cy="15" r="6" class="dg"/>
+  <text x="22" y="52" class="text">
+    <tspan x="22" dy="0"><tspan class="green">Настройки</tspan></tspan>
+    <tspan x="22" dy="20"><tspan class="gray">Бэкапим: </tspan><tspan class="cyan">Remnawave Panel + бот</tspan></tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20"><tspan class="gray">── Что бэкапим ────────────────────────────────</tspan></tspan>
+    <tspan x="22" dy="20"> 1. Что бэкапим и пути    (контейнеры, исключения, лимит файла)</tspan>
+    <tspan x="22" dy="20"> 7. Цель бэкапа           (панель / бот / обе · этот сервер или SSH)</tspan>
+    <tspan x="22" dy="20"> 8. Доп. компоненты       (infra-billing · KB ИИ-саппорта)</tspan>
+    <tspan x="22" dy="20"><tspan class="gray">── Куда доставляем ────────────────────────────</tspan></tspan>
+    <tspan x="22" dy="20"> 2. Telegram              (токен, уведомления, проверка связи)</tspan>
+    <tspan x="22" dy="20"> 3. Удалённое хранилище   (S3 / FTP / WebDAV / Rclone)</tspan>
+    <tspan x="22" dy="20"><tspan class="gray">── Как храним ─────────────────────────────────</tspan></tspan>
+    <tspan x="22" dy="20"> 4. Шифрование            (пароль AES-256)</tspan>
+    <tspan x="22" dy="20"> 5. Ротация и диск        (сколько хранить, пороги)</tspan>
+    <tspan x="22" dy="20"> 6. Компрессия и бэкап логов</tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20"> 0. Назад</tspan>
+    <tspan x="22" dy="20"><tspan class="gray"> (переключение Простой/Расширенный режим — пункт 99 в главном меню)</tspan></tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20">Выбор раздела (Enter — назад): <tspan class="green">_</tspan></tspan>
   </text>
 </svg>

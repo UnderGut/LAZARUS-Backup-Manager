@@ -1,63 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="700" height="550" viewBox="0 0 700 550">
+<svg xmlns="http://www.w3.org/2000/svg" width="644" height="320" viewBox="0 0 644 320">
   <style>
-    .bg { fill: #1e1e1e; }
-    .text { font-family: Consolas, 'Courier New', monospace; font-size: 13px; fill: #ecf0f1; white-space: pre; }
-    .green { fill: #2ecc71; font-weight: bold; }
-    .cyan { fill: #3498db; }
-    .yellow { fill: #f1c40f; }
-    .gray { fill: #7f8c8d; }
-    .magenta { fill: #9b59b6; }
-    .bold { font-weight: bold; }
-    .window-header { fill: #2d2d2d; }
-    .dot-red { fill: #ff5f56; }
-    .dot-yellow { fill: #ffbd2e; }
-    .dot-green { fill: #27c93f; }
+    .bg{fill:#1e1e1e}
+    .text{font-family:Consolas,'Courier New',monospace;font-size:14px;fill:#ecf0f1;white-space:pre}
+    .green{fill:#2ecc71;font-weight:bold}
+    .cyan{fill:#3498db}
+    .red{fill:#e74c3c}
+    .yellow{fill:#f1c40f}
+    .gray{fill:#7f8c8d}
+    .magenta{fill:#9b59b6}
+    .bold{font-weight:bold}
+    .wh{fill:#2d2d2d} .dr{fill:#ff5f56} .dy{fill:#ffbd2e} .dg{fill:#27c93f}
   </style>
-
-  <!-- Window Frame -->
-  <rect x="0" y="0" width="700" height="550" rx="10" ry="10" class="bg"/>
-  <path d="M0 10 C0 4 4 0 10 0 L690 0 C696 0 700 4 700 10 L700 30 L0 30 Z" class="window-header"/>
-  
-  <!-- Window Controls -->
-  <circle cx="20" cy="15" r="6" class="dot-red"/>
-  <circle cx="40" cy="15" r="6" class="dot-yellow"/>
-  <circle cx="60" cy="15" r="6" class="dot-green"/>
-  
-  <!-- Body Content -->
-  <text x="20" y="55" class="text">
-    <tspan class="gray">$ lazarus --debug backup_full</tspan>
-    
-    <tspan x="20" dy="25" class="magenta">[DEBUG]</tspan><tspan> LAZARUS v4.35.0 starting in DEBUG mode</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> SILENT_LOG=/dev/stderr</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> CURL_SILENT=-v</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> CONFIG_FILE=/opt/lazarus-backup/config.env</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> BOT_PATH=/opt/remnawave</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> BACKUP_PASSWORD=***SET***</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> TELEGRAM_BOT_TOKEN=***SET***</tspan>
-    
-    <tspan x="20" dy="25" class="cyan">[INFO]</tspan><tspan>    Создание дампа базы данных...</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Container: remnawave-db</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Executing: docker exec remnawave-db pg_dumpall -U postgres</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Dump size: 47185920 bytes</tspan>
-    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Дамп БД создан: 45.0 MB</tspan>
-    
-    <tspan x="20" dy="25" class="cyan">[INFO]</tspan><tspan>    Архивация файлов бота...</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Source: /opt/remnawave</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Excluding: node_modules .git</tspan>
-    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Файлы заархивированы: 23.8 MB</tspan>
-    
-    <tspan x="20" dy="25" class="cyan">[INFO]</tspan><tspan>    Шифрование архива (это может занять время)...</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Using: openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> Input: lazarus_full_2025-12-27_12_00_00.tar.gz</tspan>
-    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Архив зашифрован.</tspan>
-    
-    <tspan x="20" dy="25" class="cyan">[INFO]</tspan><tspan>    Отправка в Telegram...</tspan>
-    <tspan x="20" dy="18" class="magenta">[DEBUG]</tspan><tspan> curl -v -F document=@file ...</tspan>
-    <tspan x="20" dy="18" class="gray">*   Trying 149.154.167.220:443...</tspan>
-    <tspan x="20" dy="18" class="gray">* TLS 1.3 connection using TLS_AES_256_GCM_SHA384</tspan>
-    <tspan x="20" dy="18" class="gray">&lt; HTTP/2 200</tspan>
-    <tspan x="20" dy="18" class="green">[SUCCESS]</tspan><tspan> Файл отправлен в Telegram.</tspan>
-    
-    <tspan x="20" dy="25" class="magenta">[DEBUG]</tspan><tspan> Total execution time: 147.3 seconds</tspan>
+  <rect x="0" y="0" width="644" height="320" rx="10" ry="10" class="bg"/>
+  <path d="M0 10 C0 4 4 0 10 0 L634 0 C640 0 644 4 644 10 L644 30 L0 30 Z" class="wh"/>
+  <circle cx="20" cy="15" r="6" class="dr"/><circle cx="40" cy="15" r="6" class="dy"/><circle cx="60" cy="15" r="6" class="dg"/>
+  <text x="22" y="52" class="text">
+    <tspan x="22" dy="0"><tspan class="green">LAZARUS Backup Manager v6.0.0</tspan><tspan class="gray">  --debug</tspan></tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:01.220</tspan> CONFIG  BACKUP_TARGET=panel  PANEL_PATH=/opt/remnawave</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:01.244</tspan> SCAN    discover_stacks: panel + infra-billing + бот</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:01.310</tspan> DB      pg_isready -U postgres → accepting</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:02.001</tspan> DB      pg_dump remnawave → 41.2 MB</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:02.640</tspan> DB      globals (roles) → 3.1 KB</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:03.115</tspan> TAR     /opt/remnawave (excl .git, backups)</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:05.400</tspan> ENC     AES-256-CBC + HMAC-SHA256 (LAZ2)</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:06.020</tspan> VERIFY  decrypt round-trip OK · gzip -t OK</tspan>
+    <tspan x="22" dy="20"><tspan class="magenta">[DEBUG]</tspan><tspan class="gray"> 13:42:06.900</tspan> UPLOAD  S3 head-object: size+ETag match</tspan>
+    <tspan x="22" dy="20"> </tspan>
+    <tspan x="22" dy="20"><tspan class="green">✓</tspan> Бэкап создан и проверен: lazarus_panel_full_…tar.gz.enc</tspan>
   </text>
 </svg>
