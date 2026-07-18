@@ -324,13 +324,28 @@ cleanup_on_exit() {
     fi
     # C1 fix: lock-файл НЕ удаляем (flock+unlink race — см. release_lock).
 
-    # КРИТИЧНО: удаляем sensitive temp paths (decrypted backups, S3 creds).
-    # Если скрипт умер по SIGKILL — этот trap не сработает, но при normal exit,
-    # ctrl+C-trap exit, double-confirm exit — сработает.
+    # КРИТИЧНО: удаляем sensitive temp paths (decrypted backups, S3 creds, вставленный SSH-ключ,
+    # remote plaintext-дампы). Если скрипт умер по SIGKILL — этот trap не сработает, но при normal
+    # exit, ctrl+C-trap exit, double-confirm exit — сработает.
+    # #ultra-LOW: ЗАТИРАЕМ (shred), а не просто unlink — на журналируемой/CoW ФС (дисковый TMPDIR,
+    # когда /dev/shm недоступен) содержимое иначе восстановимо undelete-инструментами. shred
+    # выполняет обещание docstring (_read_ssh_key_input: «shred при выходе»). Нет shred → rm-fallback.
     if [[ ${#SENSITIVE_TMP_PATHS[@]} -gt 0 ]]; then
-        local p
+        local p _has_shred=""
+        command -v shred >/dev/null 2>&1 && _has_shred=1
         for p in "${SENSITIVE_TMP_PATHS[@]}"; do
-            [[ -n "$p" && -e "$p" ]] && rm -rf "$p" 2>/dev/null || true
+            [[ -n "$p" && -e "$p" ]] || continue
+            if [[ -n "$_has_shred" ]]; then
+                if [[ -f "$p" ]]; then
+                    shred -fu "$p" 2>/dev/null || rm -f "$p" 2>/dev/null || true
+                else
+                    # каталог: затираем регулярные файлы внутри, затем сносим структуру
+                    find "$p" -type f -exec shred -fu {} + 2>/dev/null || true
+                    rm -rf "$p" 2>/dev/null || true
+                fi
+            else
+                rm -rf "$p" 2>/dev/null || true
+            fi
         done
     fi
 }
@@ -5271,6 +5286,10 @@ assert_target_identity() {
 panel_migrate_in() {
     # Гигиена пароля: SSHPASS и парольный режим живут ТОЛЬКО внутри этой функции —
     # RETURN-trap зачищает их на ЛЮБОМ return-пути (в т.ч. ранние отказы/отмены).
+    # #ultra-LOW: bash без functrace держит ОДИН RETURN-trap; вложенные функции (release_lock и др.)
+    # перетирают наш и утекают своим trap'ом в вызывающий код меню. Сохраняем прежний RETURN-trap
+    # и восстанавливаем его в _mig_restore_env (зовётся на всех return) — утечки чужого trap'а нет.
+    local _mig_prev_return_trap; _mig_prev_return_trap=$(trap -p RETURN)
     trap 'unset SSHPASS; SSH_PASSWORD_MODE=0' RETURN
     # --- 0. Только интерактивно: миграция — операторская операция ---
     if [[ "$IS_INTERACTIVE" != "true" ]]; then
@@ -5387,7 +5406,10 @@ panel_migrate_in() {
     PANEL_SSH_PORT="$_port"; PANEL_SSH_KEY="$_key"
     # Возврат окружения после миграции/отказа (bash-функции глобальны — определяем тут для читаемости).
     # Парольный режим гасим ПЕРВЫМ (до resolve → _build_target_ssh); RETURN-trap дублирует зачистку.
-    _mig_restore_env() { SSH_PASSWORD_MODE=0; unset SSHPASS; PANEL_TRANSPORT="$_sv_tr"; PANEL_SSH_HOST="$_sv_h"; PANEL_SSH_PORT="$_sv_p"; PANEL_SSH_USER="$_sv_u"; PANEL_SSH_KEY="$_sv_k"; PANEL_PATH="$_sv_ppath"; BACKUP_TARGET="$_sv_target"; BACKUP_SECONDARY="$_sv_sec"; resolve_backup_target; }
+    # #ultra-LOW: восстанавливаем прежний RETURN-trap (обычно пусто на уровне меню) — чистит любой
+    # утёкший trap вложенных функций (release_lock) до возврата panel_migrate_in. Зачистка SSHPASS
+    # тут ЯВНАЯ (не полагаемся на trap, который вложенные функции могли перетереть).
+    _mig_restore_env() { SSH_PASSWORD_MODE=0; unset SSHPASS; PANEL_TRANSPORT="$_sv_tr"; PANEL_SSH_HOST="$_sv_h"; PANEL_SSH_PORT="$_sv_p"; PANEL_SSH_USER="$_sv_u"; PANEL_SSH_KEY="$_sv_k"; PANEL_PATH="$_sv_ppath"; BACKUP_TARGET="$_sv_target"; BACKUP_SECONDARY="$_sv_sec"; resolve_backup_target; eval "${_mig_prev_return_trap:-trap - RETURN}"; }
     local _ssh; _ssh=$(_build_target_ssh "panel")
     if [[ -z "$_ssh" ]]; then
         print_message "ERROR" "Не удалось построить SSH-подключение (host/port/key не прошли валидацию)."
@@ -5447,20 +5469,45 @@ panel_migrate_in() {
     else
         _MIG_NODE_STATE=""
     fi
+    # #ultra-LOW: _rdir (метка контейнера ИСТОЧНИКА) идёт в удалённый shell — экранируем _shq,
+    # иначе метка вида `/opt/x; cmd` = инъекция на источнике.
+    local _rdir_q; _rdir_q=$(_shq "$_rdir")
+    # #ultra-LOW: имя DB-контейнера на ИСТОЧНИКЕ может отличаться от локального дефолта. Сначала
+    # пробуем заданное, при отказе — авто-детект postgres-контейнера в compose-проекте панели
+    # на источнике (label working_dir == _rdir). Найденное имя используем и для дампа, и локально
+    # (восстановленный compose пересоздаст контейнер с тем же service-именем).
+    local _src_db="${PANEL_DB_CONTAINER:-remnawave-db}"
     local _rdb_st
-    _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' ${PANEL_DB_CONTAINER:-remnawave-db}" 2> "$SILENT_LOG")
+    _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' $(_shq "$_src_db")" 2> "$SILENT_LOG")
     if [[ "$_rdb_st" != "running" ]]; then
-        print_message "ERROR" "БД панели на источнике не запущена (${PANEL_DB_CONTAINER:-remnawave-db}: ${_rdb_st:-absent}) — дамп невозможен."
+        local _detcmd="docker ps --filter label=com.docker.compose.project.working_dir=$_rdir_q --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '\$2 ~ /postgres/ {print \$1; exit}'"
+        local _det; _det=$(timeout 20 $_ssh "$_detcmd" 2> "$SILENT_LOG" | tr -d '\r')
+        if [[ -n "$_det" ]]; then
+            _src_db="$_det"; PANEL_DB_CONTAINER="$_det"; PANEL_DB_SERVICE="$_det"
+            _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' $(_shq "$_det")" 2> "$SILENT_LOG")
+            print_message "INFO" "БД-контейнер источника определён автоматически: $_det"
+        fi
+    fi
+    if [[ "$_rdb_st" != "running" ]]; then
+        print_message "ERROR" "БД панели на источнике не найдена/не запущена (проверял '$_src_db': ${_rdb_st:-absent})."
+        echo -e "  ${GRAY}Если контейнер БД называется иначе — задайте PANEL_DB_CONTAINER в config.env и повторите.${RESET}"
         _mig_restore_env; return 1
     fi
-    local _rsize_mb _lfree_mb
-    _rsize_mb=$(timeout 30 $_ssh "du -sm $_rdir 2>/dev/null | cut -f1" 2> "$SILENT_LOG"); _rsize_mb="${_rsize_mb:-0}"
+    local _rsize_mb _lfree_mb _dbsize_mb
+    _rsize_mb=$(timeout 30 $_ssh "du -sm $_rdir_q 2>/dev/null | cut -f1" 2> "$SILENT_LOG"); _rsize_mb="${_rsize_mb:-0}"
+    # #ultra-LOW: гейт места учитывает и РАЗМЕР БД (раньше считался только каталог → малый конфиг +
+    # крупная база проходили гейт, диск переполнялся при restore). Оценка БД — psql внутри
+    # контейнера (peer/trust к сокету); при недоступности best-effort 0 (падаем к старому поведению).
+    local _szcmd="docker exec $(_shq "$_src_db") psql -U postgres -tAc \"SELECT (COALESCE(sum(pg_database_size(datname)),0)/1024/1024)::bigint FROM pg_database WHERE datname NOT IN ('template0','template1')\" 2>/dev/null"
+    _dbsize_mb=$(timeout 20 $_ssh "$_szcmd" 2> "$SILENT_LOG" | tr -cd '0-9')
+    [[ "$_dbsize_mb" =~ ^[0-9]+$ ]] || _dbsize_mb=0
     _lfree_mb=$(df -Pm "$BACKUP_DIR" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}'); _lfree_mb="${_lfree_mb:-0}"
+    local _need_mb=$(( _rsize_mb + _dbsize_mb ))
     echo ""
-    echo -e "  Источник:        ${CYAN}$_from:$_port${RESET} → $_rdir (~${_rsize_mb} MB файлов + БД)"
+    echo -e "  Источник:        ${CYAN}$_from:$_port${RESET} → $_rdir (~${_rsize_mb} MB файлов + ~${_dbsize_mb} MB БД)"
     echo -e "  Локальный диск:  ${_lfree_mb} MB свободно в $BACKUP_DIR"
-    if [[ "$_lfree_mb" -gt 0 && "$_rsize_mb" -gt 0 && "$_lfree_mb" -lt $(( _rsize_mb * 3 )) ]]; then
-        print_message "WARN" "Мало места: нужно ~3x размера панели (архив + распаковка + запас)."
+    if [[ "$_lfree_mb" -gt 0 && "$_need_mb" -gt 0 && "$_lfree_mb" -lt $(( _need_mb * 3 )) ]]; then
+        print_message "WARN" "Мало места: нужно ~3× (файлы + БД) на архив + распаковку + запас."
         local _dsk=""; safe_read -erp "Продолжить всё равно? (y/N): " _dsk
         [[ "$_dsk" =~ ^[YyДд]$ ]] || { _mig_restore_env; return 1; }
     fi
@@ -6903,7 +6950,11 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
                 *)
                     # head-object недоступен (нет ListBucket/GetObject прав или provider не отвечает).
                     # Это не fail — продолжаем считать upload OK, но WARN'им.
-                    print_message "SUCCESS" "Файл загружен в S3 (verify пропущен — нет прав на head-object)." >&2
+                    # #ultra-LOW: симметрично FTP/WebDAV — взводим REMOTE_UPLOAD_SIZE_UNVERIFIED,
+                    # чтобы delete-local (any/remote_only) НЕ стёр единственную копию при несверенном
+                    # размере на remote (сеть/провайдер могли не ответить, а не только «нет прав»).
+                    REMOTE_UPLOAD_SIZE_UNVERIFIED="true"
+                    print_message "SUCCESS" "Файл загружен в S3 (verify пропущен — head-object недоступен)." >&2
                     debug_log "REMOTE" "S3 upload SUCCESS, verify skipped (head-object недоступен)"
                     REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ S3: OK (verify skipped)'
                     log_message "WARN" "Uploaded $filename to S3, но head-object verify пропущен"
@@ -9667,6 +9718,11 @@ _backup_remote_target() {
             print_message "ERROR" "Удалённая БД не готова (pg_isready)."; HAS_ERROR=1
         else
             local _dumpcmd="docker exec $_c_q pg_dump -U $_u_q $_d_q"
+            # #ultra-HIGH3: remote-путь пишет plaintext-дампы (PII/финансы) прямо в персистентный
+            # BACKUP_DIR (в отличие от локального, где они в registered _work_dir). Регистрируем как
+            # sensitive-tmp ДО дампа → cleanup_on_exit удалит при Ctrl+C/крэше между дампом и rm/шифром.
+            # Всегда промежуточные (combine+rm ниже) → unregister не нужен (cleanup на них no-op после rm).
+            register_sensitive_tmp "$BACKUP_DIR/$FILE_DB"
             _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "remote-pg_dump" \
                 '$1 "$2" 2> "$3" | $5 > "$4"' \
                 "$_ssh" "$_dumpcmd" "$SILENT_LOG" "$BACKUP_DIR/$FILE_DB" "$_comp_pipe"
@@ -9679,6 +9735,7 @@ _backup_remote_target() {
                 debug_log "DB" "remote pg_dump OK (${_bytes}b)"
                 if [[ -n "$FILE_GLOBALS" ]]; then
                     local _glcmd="docker exec $_c_q pg_dumpall --globals-only -U $_u_q"
+                    register_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"   # #ultra-HIGH3: роли/гранты — тоже sensitive
                     _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "remote-globals" \
                         '$1 "$2" 2> "$3" | $5 > "$4"' \
                         "$_ssh" "$_glcmd" "$SILENT_LOG" "$BACKUP_DIR/$FILE_GLOBALS" "$_comp_pipe"
@@ -9709,6 +9766,7 @@ _backup_remote_target() {
                     _rb_c_q=$(_shq "$PANEL_BILLING_DB_CONTAINER"); _rb_u_q=$(_shq "$_rb_u"); _rb_d_q=$(_shq "$_rb_d")
                     print_message "INFO" "Удалённый дамп infra-billing (db=$_rb_d)..."
                     local _rbcmd="docker exec $_rb_c_q pg_dump -U $_rb_u_q $_rb_d_q"
+                    register_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"   # #ultra-HIGH3: финансовый дамп — sensitive
                     _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "remote-billing" \
                         '$1 "$2" 2> "$3" | $5 > "$4"' \
                         "$_ssh" "$_rbcmd" "$SILENT_LOG" "$BACKUP_DIR/$FILE_BILLING" "$_comp_pipe"
@@ -9775,6 +9833,11 @@ _backup_remote_target() {
     esac
     [[ -n "$FILE_GLOBALS" && -f "$BACKUP_DIR/$FILE_GLOBALS" ]] && _inputs+=("$FILE_GLOBALS")
     [[ -n "$FILE_BILLING" && -f "$BACKUP_DIR/$FILE_BILLING" ]] && _inputs+=("$FILE_BILLING")
+    # #ultra-HIGH3: комбинированный plaintext-архив (содержит db+globals+billing) до шифрования —
+    # тоже sensitive. Регистрируем до combine; unregister ПОСЛЕ блока шифрования (там он либо
+    # rm'нут в пользу .enc, либо осознанно оставлен как unencrypted-артефакт — оба случая покрыты).
+    local _plain_final="$BACKUP_DIR/$FILE_FINAL"
+    register_sensitive_tmp "$_plain_final"
     _run_with_timeout "$TAR_TIMEOUT_SEC" "remote-combine" \
         tar $_tar_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_inputs[@]}" 2> "$SILENT_LOG"
     local _crc=$?
@@ -9782,7 +9845,7 @@ _backup_remote_target() {
     [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
     if [[ $_crc -ne 0 ]]; then
         print_message "ERROR" "Combine удалённого архива провален (rc=$_crc)."
-        rm -f "$BACKUP_DIR/$FILE_FINAL"; return 1
+        rm -f "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1
     fi
 
     # --- Шифрование (encrypt-then-MAC) — ТОЛЬКО локально. Те же гарантии, что в create_backup. ---
@@ -9804,10 +9867,14 @@ _backup_remote_target() {
                 echo -e "${RED}${BOLD}Архив содержит дамп БД. Отправить НЕЗАШИФРОВАННЫМ? Введите PLAINTEXT:${RESET}"
                 local _pc=""; read -erp "> " _pc; [[ "$_pc" == "PLAINTEXT" ]] && _ship=true
             fi
-            if [[ "$_ship" != "true" ]]; then rm -f "$BACKUP_DIR/$FILE_FINAL"; return 1; fi
+            if [[ "$_ship" != "true" ]]; then rm -f "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1; fi
             ENC_STATUS="⚠️ UNENCRYPTED"
         fi
     fi
+    # #ultra-HIGH3: окно plaintext-combine закрыто — либо стал .enc (plaintext rm'нут), либо
+    # осознанно оставлен unencrypted как финальный артефакт. Снимаем регистрацию, чтобы
+    # cleanup_on_exit не удалил намеренно оставленный незашифрованный архив на нормальном выходе.
+    unregister_sensitive_tmp "$_plain_final"
 
     # --- Verify (MAC pre-check + decrypt + compressed-test) — verify-before-rotate ---
     local VERIFY_OK="false"
@@ -11141,6 +11208,18 @@ confirm_drop_schema() {
     return 1
 }
 
+# _restore_abort: единый безопасный выход из деструктивного окна restore при провале гарда.
+# К моменту блока импорта стек уже погашен (full: `compose down`; db_only: `compose stop`),
+# поэтому ранний `return 1` без подъёма оставлял бы панель/бот OFFLINE, хотя БД ещё не тронута.
+# Поднимаем стек обратно (идемпотентно — `up -d` безопасен, если уже поднят), снимаем
+# _CRITICAL_SECTION (мы больше не в критической мутации) и чистим temp. BOT_PATH может быть
+# невалиден (провал ensure_bot_path) → подъём под guard `-d`.
+_restore_abort() {
+    [[ -n "${BOT_PATH:-}" && -d "${BOT_PATH:-}" ]] && ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
+    _CRITICAL_SECTION=0
+    rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+}
+
 execute_restore() {
     local MODE="$1"; local FILE="$2"
     # M3: _live_snap объявляем на уровне ФУНКЦИИ (не внутри full-блока) — иначе при db_only она
@@ -11713,9 +11792,11 @@ execute_restore() {
     fi
     if [[ -n "$DB_DUMP" ]]; then
         print_message "INFO" "Импорт базы данных..."
-        if ! ensure_bot_path; then rm -rf "$TMP_DIR"; return 1; fi
-        if ! assert_safe_bot_path "$BOT_PATH"; then rm -rf "$TMP_DIR"; return 1; fi
-        if ! assert_db_container_matches_bot; then rm -rf "$TMP_DIR"; return 1; fi
+        # #ultra-HIGH1: эти гарды выполняются, когда стек уже погашен (full corridor / db_only stop
+        # ниже) → на провале поднимаем стек обратно (_restore_abort), а не оставляем offline.
+        if ! ensure_bot_path; then _restore_abort; return 1; fi
+        if ! assert_safe_bot_path "$BOT_PATH"; then _restore_abort; return 1; fi
+        if ! assert_db_container_matches_bot; then _restore_abort; return 1; fi
 
         # #3: db_only НЕ проходит через файловый коридор (там `compose down`), поэтому без этого
         # шага DROP SCHEMA + импорт идут под РАБОТАЮЩИМ приложением: живые коннекты мешают DROP,
@@ -11741,7 +11822,8 @@ execute_restore() {
         if ! ACTUAL_DB_NAME=$(get_db_name); then
             print_message "ERROR" "Не удалось определить имя БД для restore (POSTGRES_DB отсутствует в .env)"
             log_message "ERROR" "Restore aborted: cannot resolve DB name"
-            rm -rf "$TMP_DIR"
+            # #ultra-HIGH1: стек уже погашен (full down / db_only stop) — поднимаем обратно, не оставляем offline.
+            _restore_abort
             return 1
         fi
         debug_log "RESTORE" "DB params: user=$ACTUAL_DB_USER, db=$ACTUAL_DB_NAME"
@@ -11749,7 +11831,7 @@ execute_restore() {
         # Проверяем что целевая БД валидна
         if ! assert_safe_db_target "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME"; then
             print_message "ERROR" "Целевая БД не прошла проверку безопасности. Восстановление прервано."
-            rm -rf "$TMP_DIR"
+            _restore_abort   # #ultra-HIGH1: поднять стек обратно (уже погашен к этому моменту)
             return 1
         fi
 
@@ -12376,7 +12458,10 @@ _post_backup_prompt() {
         printf '%b\n' "${GRAY}$(_hrule '─' 49)${RESET}"
         safe_read -rp "Выбор (Enter — назад): " _pb_choice
         case "$_pb_choice" in
-            1|77) _show_top_in_archive ;;
+            1|77) # #ultra-LOW: для db_only/SSH пункт «1» скрыт (_show_top=0) — тогда ввод «1»
+                  # не должен молча запускать просмотр (рассинхрон меню/обработчика).
+                  if [[ "$_show_top" -eq 1 ]]; then _show_top_in_archive
+                  else print_message "ERROR" "Введите один из показанных пунктов или Enter"; sleep 1; fi ;;
             2|88)
                 if [[ "$_has_skipped" -gt 0 ]]; then
                     show_skipped_report
@@ -13400,7 +13485,9 @@ menu_settings() {
                     *) print_message "ERROR" "Введите 0, 1, 2 или 3" ;;
                 esac ;;
 
-            25) # Бэкап файлов логов
+            misc:1) # Бэкап файлов логов (раздел «Компрессия и бэкап логов», пункт 1).
+                # #ultra-HIGH2: диспетчер матчит "${_sview}:${s}" → ветка обязана быть misc:1,
+                # а не голая 25) (старая плоская форма была недостижима — регрессия редизайна).
                 echo ""
                 echo "Бэкапить ли файлы логов (*.log, *.log.N, *.log-DATE.gz)?"
                 echo ""
@@ -13418,7 +13505,7 @@ menu_settings() {
                     *) print_message "ERROR" "Введите 1, 2 или 3" ;;
                 esac ;;
 
-            26)
+            misc:2)  # Компрессия (раздел «Компрессия и бэкап логов», пункт 2). #ultra-HIGH2: было 26).
                 # Compression: gzip / zstd. zstd ~2.5x быстрее + 11% меньше размер,
                 # но требует apt install zstd. Existing backup'ы остаются совместимы
                 # (restore определяет формат по magic bytes автоматически).
