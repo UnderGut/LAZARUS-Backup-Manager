@@ -9725,7 +9725,6 @@ _both_tg_flush() {
         local _bytes="${_BOTH_TG_BYTES[$i]}" _vok="${_BOTH_TG_VERIFY[$i]}" _enc="${_BOTH_TG_ENC[$i]}"
         local _ver="${_BOTH_TG_VER[$i]}" _rs="${_BOTH_TG_RSTATUS[$i]}" _skip="${_BOTH_TG_SKIP[$i]}"
         local _line="• ${_lbl} — ${_sz}${_ver}"
-        [[ "$_enc" == *"🔒"* ]] && _line+=" 🔒"
         [[ "$_vok" != "true" ]] && _line+=" ⚠️"
         _lines+="${_line}"$'\n'
         # детальный статус загрузки (☁️ S3: OK и т.п.) — без дублей (обе цели идут в то же хранилище)
@@ -9737,12 +9736,17 @@ _both_tg_flush() {
         fi
     done
 
-    # _lines заканчивается на \n; _rs/_skip начинаются с \n → строим без пустой строки между ними.
-    local CAPTION="${HASHTAG}
+    # Шифрование глобально (общий пароль) — одна строка, как в старой пофайловой подписи.
+    local _enc_line="${_BOTH_TG_ENC[0]:-}"
+    # _lines заканчивается на \n; строим: заголовок → хэштег → дата → тип → цели → шифрование → футер.
+    # _rs/_skip в _footer начинаются с \n → без пустой строки между блоками.
+    local CAPTION="📦 Бэкап создан
+${HASHTAG}
 ➖➖➖➖➖➖➖➖➖
 📅 ${DISPLAY_DATE}
 ${TYPE_NAME}
-${_lines%$'\n'}${_footer}"
+${_lines%$'\n'}
+${_enc_line}${_footer}"
 
     # Premium emoji: escape MarkdownV2 целиком, затем заменяем Unicode на Premium-литералы.
     local CAP; CAP=$(escape_markdown_v2 "$CAPTION")
