@@ -30,63 +30,27 @@ jobs:
           which python3 timeout gzip find tr
           uname -a
       - name: Install test deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq openssl coreutils python3 gzip zstd
-      # Каждый тест отдельным step — увидим в Job Summary какой именно упал.
-      - name: test_restore_safety
-        run: bash .github/tests/test_restore_safety.sh
-      - name: test_password_validation
-        run: bash .github/tests/test_password_validation.sh
-      - name: test_skipped_report
-        run: bash .github/tests/test_skipped_report.sh
-      - name: test_version_compare
-        run: bash .github/tests/test_version_compare.sh
-      - name: test_hmac_envelope
-        run: bash .github/tests/test_hmac_envelope.sh
-      - name: test_s3_helpers
-        run: bash .github/tests/test_s3_helpers.sh
-      - name: test_timeout_helpers
-        run: bash .github/tests/test_timeout_helpers.sh
-      - name: test_exclude_dirs_split
-        run: bash .github/tests/test_exclude_dirs_split.sh
-      - name: test_skipped_print0
-        run: bash .github/tests/test_skipped_print0.sh
-      - name: test_telegram_alert
-        run: bash .github/tests/test_telegram_alert.sh
-      - name: test_compression_helpers
-        run: bash .github/tests/test_compression_helpers.sh
-      - name: test_db_discovery
-        run: bash .github/tests/test_db_discovery.sh
-      - name: test_mb_to_human
-        run: bash .github/tests/test_mb_to_human.sh
-      - name: test_rotation_zst
-        run: bash .github/tests/test_rotation_zst.sh
-      - name: test_bot_release_download
-        run: bash .github/tests/test_bot_release_download.sh
-      - name: test_restore_snapshot
-        run: bash .github/tests/test_restore_snapshot.sh
-      - name: test_rotation_floor
-        run: bash .github/tests/test_rotation_floor.sh
-      - name: test_config_roundtrip
-        run: bash .github/tests/test_config_roundtrip.sh
-      - name: test_panel_target
-        run: bash .github/tests/test_panel_target.sh
-      - name: test_panel_prefix_wiring
-        run: bash .github/tests/test_panel_prefix_wiring.sh
-      - name: test_panel_globals_sidecar
-        run: bash .github/tests/test_panel_globals_sidecar.sh
-      - name: test_panel_firstrun
-        run: bash .github/tests/test_panel_firstrun.sh
-      - name: test_panel_both
-        run: bash .github/tests/test_panel_both.sh
-      - name: test_panel_remote
-        run: bash .github/tests/test_panel_remote.sh
-      - name: test_audit_fixes
-        run: bash .github/tests/test_audit_fixes.sh
-      - name: test_menu_ux
-        run: bash .github/tests/test_menu_ux.sh
-      - name: test_billing_sidecar
-        run: bash .github/tests/test_billing_sidecar.sh
-      - name: test_mixed_server
-        run: bash .github/tests/test_mixed_server.sh
-      - name: test_stack_guards
-        run: bash .github/tests/test_stack_guards.sh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq openssl coreutils python3 gzip zstd rsync
+      # Прогоняем ВСЕ .github/tests/test_*.sh в цикле — новые тесты подхватываются
+      # автоматически (раньше список был захардкожен по-степенно и отставал: часть тестов
+      # в CI не запускалась). Каждый тест печатает своё имя; при падении — явный маркер и
+      # список упавших в конце, exit 1.
+      - name: Run all tests
+        run: |
+          shopt -s nullglob
+          failed=()
+          for t in .github/tests/test_*.sh; do
+            echo "::group::${t}"
+            if bash "$t"; then
+              echo "PASS ${t}"
+            else
+              echo "::error::FAIL ${t}"
+              failed+=("$t")
+            fi
+            echo "::endgroup::"
+          done
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            echo "Провалено: ${#failed[@]} — ${failed[*]}"
+            exit 1
+          fi
+          echo "Все тесты зелёные."

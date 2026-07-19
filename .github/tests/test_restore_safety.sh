@@ -26,9 +26,13 @@ print_message() { :; }
 log_message() { :; }
 export SILENT_LOG
 
-# Extract validate_tar_safety + its №11 helper and source them
+# Extract validate_tar_safety + его зависимости (_compress_detect_format для формат-детекта,
+# _tar_link_target_safe — №11 helper) и подключаем. Без _compress_detect_format функция
+# работала бы деградированно («command not found») — детект формата возвращал бы пусто.
 FUNC_FILE="$TMP_DIR/validate_tar_safety.sh"
 {
+    sed -n '/^_compress_detect_format() {$/,/^}$/p' "$SCRIPT"
+    echo ""
     sed -n '/^_tar_link_target_safe() {$/,/^}$/p' "$SCRIPT"
     echo ""
     sed -n '/^validate_tar_safety() {$/,/^}$/p' "$SCRIPT"
@@ -138,7 +142,17 @@ mk_link_tar "$TMP_DIR/safe_hard.tgz" safe_hard
 assert_pass "$TMP_DIR/safe_hard.tgz" "№11: safe in-tree hardlink must be allowed"
 
 mk_link_tar "$TMP_DIR/esc_hard.tgz" esc_hard
-assert_fail "$TMP_DIR/esc_hard.tgz" "№11: escaping hardlink target"
+# GNU tar ≥1.32 САМ вычищает '..' из hardlink-target на listing/extract («Removing leading
+# '..' from hard link targets») → цель становится in-tree и безопасной ЕЩЁ ДО нашего разбора,
+# и extraction не выйдет за корень. bsdtar/libarchive (напр. Git-Bash на Windows) сохраняет
+# escape verbatim. Поэтому проверяем ПРАВИЛЬНОЕ поведение под конкретный tar: если escape
+# сохранён в листинге → validate ОБЯЗАН отклонить; если tar уже вычистил → цель безопасна,
+# validate КОРРЕКТНО пропускает (второй рубеж — сам tar).
+if tar -tvf "$TMP_DIR/esc_hard.tgz" 2>/dev/null | grep -E '^h' | grep -q '\.\.'; then
+    assert_fail "$TMP_DIR/esc_hard.tgz" "№11: escaping hardlink target (сохранён tar'ом)"
+else
+    assert_pass "$TMP_DIR/esc_hard.tgz" "№11: hardlink escape вычищен самим tar (in-tree, безопасно)"
+fi
 
 mk_link_tar "$TMP_DIR/chardev.tgz" chardev
 assert_fail "$TMP_DIR/chardev.tgz" "№11: char device still rejected"
