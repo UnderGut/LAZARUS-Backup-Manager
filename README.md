@@ -51,6 +51,19 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 
 ---
 
+## 📚 Инструкции
+
+Пошаговые руководства по каждому сценарию — в **[docs/](docs/README.md)**:
+
+| | | |
+|---|---|---|
+| [Установка](docs/install.md) | [Резервное копирование](docs/backup.md) | [Восстановление](docs/restore.md) |
+| **[Перенос панели](docs/panel-migration.md)** | [Аварийное восстановление](docs/disaster-recovery.md) | [Удалённый бэкап по SSH](docs/remote-backup.md) |
+| [Облачные хранилища](docs/remote-storage.md) | [Шифрование](docs/encryption.md) | [Автоматизация (cron)](docs/automation.md) |
+| [Доп. компоненты](docs/sidecars.md) | [Диагностика](docs/troubleshooting.md) | [Удаление](docs/uninstall.md) |
+
+---
+
 ## ✨ Возможности
 
 ### 🛡️ Защита от потери данных
