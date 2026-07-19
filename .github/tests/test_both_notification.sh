@@ -81,7 +81,7 @@ rec bot   lazarus_full.tar.zst       "4.1M"  4300000  "🔒 Encrypted" "true" "f
 _both_tg_flush
 [[ $CALL_ALBUM -eq 1 && $CALL_DOC -eq 0 && $CALL_TEXT -eq 0 ]] && ok "ровно 1 альбом" || bad "T1 роутинг: album=$CALL_ALBUM doc=$CALL_DOC text=$CALL_TEXT"
 [[ $LAST_ALBUM_FILES -eq 2 ]] && ok "в альбоме 2 файла" || bad "T1 файлов в альбоме: $LAST_ALBUM_FILES"
-[[ "$LAST_CAP" == *"Remnawave Panel"* && "$LAST_CAP" == *"Telegram-бот"* ]] && ok "подпись перечисляет обе цели" || bad "T1 нет обеих целей в подписи"
+[[ "$LAST_CAP" == *"Remnawave"* && "$LAST_CAP" == *"RWP Shop"* ]] && ok "подпись перечисляет обе цели" || bad "T1 нет обеих целей в подписи"
 [[ "$LAST_CAP" == *"12.3M"* && "$LAST_CAP" == *"4.1M"* ]] && ok "подпись содержит оба размера" || bad "T1 нет размеров"
 [[ "$LAST_CAP" == *"tg://emoji?id="* ]] && ok "премиум-эмодзи применены" || bad "T1 нет премиум-эмодзи"
 [[ "$LAST_CAP" != *"не бэкап"* ]] && ok "нет фразы «не бэкапится»" || bad "T1 подпись говорит о том что НЕ бэкапится"
@@ -93,7 +93,7 @@ rec panel lazarus_panel_full.tar.zst "80M"  84000000 "🔒 Encrypted" "true" "fa
 rec bot   lazarus_full.tar.zst       "4.1M" 4300000  "🔒 Encrypted" "true" "false"
 _both_tg_flush
 [[ $CALL_DOC -eq 1 && $CALL_ALBUM -eq 0 && $CALL_TEXT -eq 0 ]] && ok "ровно 1 sendDocument" || bad "T2 роутинг: album=$CALL_ALBUM doc=$CALL_DOC text=$CALL_TEXT"
-[[ "$LAST_CAP" == *"Remnawave Panel"* && "$LAST_CAP" == *"Telegram-бот"* ]] && ok "подпись перечисляет обе цели" || bad "T2 нет обеих целей"
+[[ "$LAST_CAP" == *"Remnawave"* && "$LAST_CAP" == *"RWP Shop"* ]] && ok "подпись перечисляет обе цели" || bad "T2 нет обеих целей"
 
 echo "== T3: 0 годных (TG_SEND_FILE=false) → текст-сводка =="
 reset_acc
@@ -103,7 +103,7 @@ rec panel lazarus_panel_full.tar.zst "12.3M" 12900000 "🔒 Encrypted" "true" "f
 rec bot   lazarus_full.tar.zst       "4.1M"  4300000  "🔒 Encrypted" "true" "false"
 _both_tg_flush
 [[ $CALL_TEXT -eq 1 && $CALL_ALBUM -eq 0 && $CALL_DOC -eq 0 ]] && ok "ровно 1 текст-сводка" || bad "T3 роутинг: album=$CALL_ALBUM doc=$CALL_DOC text=$CALL_TEXT"
-[[ "$LAST_CAP" == *"Remnawave Panel"* && "$LAST_CAP" == *"Telegram-бот"* ]] && ok "сводка перечисляет обе цели" || bad "T3 нет обеих целей"
+[[ "$LAST_CAP" == *"Remnawave"* && "$LAST_CAP" == *"RWP Shop"* ]] && ok "сводка перечисляет обе цели" || bad "T3 нет обеих целей"
 TG_SEND_FILE="true"
 
 echo "== T4: отложенное удаление (DELETE=any, доставка ok) → файлы удалены =="

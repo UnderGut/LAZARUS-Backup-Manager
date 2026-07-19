@@ -9625,7 +9625,7 @@ _delete_local_after_send() {
 # =============================================================================
 _both_tg_record() {
     # $1 FILE_FINAL, $2 size_h, $3 bytes, $4 ENC_STATUS, $5 VERIFY_OK, $6 remote_ok, $7 remote_unverified
-    local _lbl="Telegram-бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _lbl="Remnawave Panel"
+    local _lbl="RWP Shop"; [[ "$BACKUP_TARGET" == "panel" ]] && _lbl="Remnawave"
     _BOTH_TG_FILES+=("$BACKUP_DIR/$1")
     _BOTH_TG_LABELS+=("$_lbl")
     _BOTH_TG_SIZES+=("$2")
