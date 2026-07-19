@@ -64,14 +64,14 @@ source "$FUNCS"
 reset_acc() {
     _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
     _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=()
-    _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_TYPE=""
+    _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_SKIPCOUNT=(); _BOTH_TG_TYPE=""
     CALL_ALBUM=0; CALL_DOC=0; CALL_TEXT=0; LAST_CAP=""; LAST_ALBUM_FILES=0
 }
 
 # записать цель напрямую в аккумулятор (эмулируем _both_tg_record из прохода)
-rec() { # $1 target $2 file $3 size $4 bytes $5 enc $6 verify $7 remote_ok [$8 is_remote] [$9 ver] [$10 rstatus] [$11 skip]
+rec() { # $1 target $2 file $3 size $4 bytes $5 enc $6 verify $7 remote_ok [$8 is_remote] [$9 ver] [$10 rstatus] [$11 skip] [$12 skipcount]
     BACKUP_TARGET="$1"; TYPE="full"
-    _both_tg_record "$2" "$3" "$4" "$5" "$6" "$7" "false" "${8:-false}" "${9:-}" "${10:-}" "${11:-}"
+    _both_tg_record "$2" "$3" "$4" "$5" "$6" "$7" "false" "${8:-false}" "${9:-}" "${10:-}" "${11:-}" "${12:-0}"
 }
 
 echo "== T1: 2 годных → альбом =="
@@ -89,15 +89,16 @@ _both_tg_flush
 [[ "$LAST_CAP" == *"Бэкап создан"* ]] && ok "заголовок «Бэкап создан»" || bad "T1 нет заголовка"
 [[ "$LAST_CAP" == *"Encrypted"* ]] && ok "строка шифрования (глобальная)" || bad "T1 нет строки шифрования"
 
-echo "== T1d: восстановленные строки (версия · статус загрузки · пропущенные) =="
+echo "== T1d: версии НЕТ · счётчик пропущенных · статус загрузки без дублей =="
 reset_acc
 : > "$BACKUP_DIR/lazarus_panel_full.tar.zst"; : > "$BACKUP_DIR/lazarus_full.tar.zst"
-rec panel lazarus_panel_full.tar.zst "12.3M" 12900000 "🔒 Encrypted" "true" "true" "false" ""            $'\n☁️ S3: OK' ""
-rec bot   lazarus_full.tar.zst       "4.1M"  4300000  "🔒 Encrypted" "true" "true" "false" " | 🏷 v6.6.2" $'\n☁️ S3: OK' $'\n⚠️ Skip: 2 (>100MB)'
+# версию (arg9) передаём НАРОЧНО — она НЕ должна попасть в подпись; счётчики 3 и 2 → сумма 5
+rec panel lazarus_panel_full.tar.zst "12.3M" 12900000 "🔒 Encrypted" "true" "true" "false" " | 🏷 v2"   $'\n☁️ S3: OK' "" 3
+rec bot   lazarus_full.tar.zst       "4.1M"  4300000  "🔒 Encrypted" "true" "true" "false" " | 🏷 vdev" $'\n☁️ S3: OK' "" 2
 _both_tg_flush
-[[ "$LAST_CAP" == *"v6.6.2"* ]]  && ok "версия в подписи" || bad "T1d нет версии"
-[[ "$LAST_CAP" == *"S3: OK"* ]]  && ok "детальный статус загрузки" || bad "T1d нет статуса загрузки"
-[[ "$LAST_CAP" == *"Skip: 2"* ]] && ok "инфо о пропущенных файлах" || bad "T1d нет skip-инфо"
+[[ "$LAST_CAP" != *"v2"* && "$LAST_CAP" != *"vdev"* && "$LAST_CAP" != *"🏷"* ]] && ok "версия НЕ отображается" || bad "T1d версия всё ещё в подписи"
+[[ "$LAST_CAP" == *"S3: OK"* ]] && ok "детальный статус загрузки" || bad "T1d нет статуса загрузки"
+[[ "$LAST_CAP" == *"Пропущено файлов: 5"* ]] && ok "счётчик пропущенных (3+2=5)" || bad "T1d нет/неверен счётчик пропущенных"
 cnt=$(grep -o "S3: OK" <<<"$LAST_CAP" | wc -l | tr -d ' ')
 [[ "$cnt" -eq 1 ]] && ok "статус загрузки без дублей (1×)" || bad "T1d дубли статуса загрузки ($cnt)"
 

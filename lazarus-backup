@@ -187,7 +187,7 @@ BACKUP_PREFIX="lazarus"            # namespace имён архивов (lazarus 
 _BOTH_TG_DEFER=""
 _BOTH_TG_TYPE=""
 _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
-_BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=()
+_BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_SKIPCOUNT=()
 # === ТРАНСПОРТ ЦЕЛИ (local | ssh) ===
 # Для удалённой цели (на другом сервере) дамп БД и tar файлов СТРИМЯТСЯ по SSH (шифрованный
 # канал) на этот хост и шифруются ТОЛЬКО локально (plaintext НИКОГДА не пишется на диск
@@ -9482,7 +9482,7 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
         # both-режим: единое уведомление (альбом) шлёт create_backup_dispatch после ОБОИХ
         # проходов (_both_tg_flush). Здесь только записываем результат прохода в аккумулятор;
         # отправку документа и удаление-после-доставки откладываем до flush.
-        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$VERIFY_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "false" "$VER_MSG" "$REMOTE_UPLOAD_STATUS_TEXT" "$SKIP_INFO"
+        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$VERIFY_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "false" "$VER_MSG" "$REMOTE_UPLOAD_STATUS_TEXT" "$SKIP_INFO" "$([[ "$TYPE" != "db_only" ]] && echo "${_skipped_count:-0}" || echo 0)"
     else
         local _tg_rc=1
         if [[ "$VERIFY_OK" == "true" ]]; then
@@ -9636,9 +9636,10 @@ _both_tg_record() {
     _BOTH_TG_REMOTE_OK+=("$6")
     _BOTH_TG_REMOTE_UNVERIFIED+=("$7")
     _BOTH_TG_IS_REMOTE+=("${8:-false}")   # "true" = удалённая цель (стрим по SSH); flush не удаляет её локаль
-    _BOTH_TG_VER+=("${9:-}")              # версия (🏷) — как в single-подписи, обычно только у бота
+    _BOTH_TG_VER+=("${9:-}")              # версия (🏷) — не отображается (по запросу владельца), капчим для истории
     _BOTH_TG_RSTATUS+=("${10:-}")         # детальный статус загрузки (☁️ S3: OK и т.п.)
-    _BOTH_TG_SKIP+=("${11:-}")            # пропущенные файлы (⚠️ Skip: N)
+    _BOTH_TG_SKIP+=("${11:-}")            # size-skip строка (⚠️ Skip: N) — не отображается, заменена счётчиком
+    _BOTH_TG_SKIPCOUNT+=("${12:-0}")      # число пропущенных файлов (0 для db_only — файловой фазы нет)
     _BOTH_TG_TYPE="$TYPE"
     debug_log "BOTHTG" "recorded $_lbl: $1 (size=$2 bytes=$3 verify=$5 remote=$6)"
 }
@@ -9716,25 +9717,26 @@ _both_tg_flush() {
 
     # Строки по целям (размер · версия · шифр) + футер (статус загрузки, пропущенные) — как в
     # старой пофайловой подписи. Отбор файлов, годных для отправки в TG (verify ok, <50МБ, отправка вкл).
-    local _lines="" _footer="" i=0
+    local _lines="" _footer="" i=0 _skiptotal=0
     local -a _elig=()
     local -A _seen_rs=()
     local _TGMAX=52428800
     for (( i=0; i<_n; i++ )); do
         local _sz="${_BOTH_TG_SIZES[$i]}" _lbl="${_BOTH_TG_LABELS[$i]}"
-        local _bytes="${_BOTH_TG_BYTES[$i]}" _vok="${_BOTH_TG_VERIFY[$i]}" _enc="${_BOTH_TG_ENC[$i]}"
-        local _ver="${_BOTH_TG_VER[$i]}" _rs="${_BOTH_TG_RSTATUS[$i]}" _skip="${_BOTH_TG_SKIP[$i]}"
-        local _line="• ${_lbl} — ${_sz}${_ver}"
+        local _bytes="${_BOTH_TG_BYTES[$i]}" _vok="${_BOTH_TG_VERIFY[$i]}"
+        local _rs="${_BOTH_TG_RSTATUS[$i]}" _sc="${_BOTH_TG_SKIPCOUNT[$i]:-0}"
+        local _line="• ${_lbl} — ${_sz}"
         [[ "$_vok" != "true" ]] && _line+=" ⚠️"
         _lines+="${_line}"$'\n'
         # детальный статус загрузки (☁️ S3: OK и т.п.) — без дублей (обе цели идут в то же хранилище)
         if [[ -n "$_rs" && -z "${_seen_rs[$_rs]:-}" ]]; then _footer+="$_rs"; _seen_rs["$_rs"]=1; fi
-        # пропущенные по размеру файлы (⚠️ Skip: N)
-        [[ -n "$_skip" ]] && _footer+="$_skip"
+        [[ "$_sc" =~ ^[0-9]+$ ]] && _skiptotal=$((_skiptotal + _sc))
         if [[ "$_vok" == "true" && "$_bytes" -lt "$_TGMAX" && "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" ]]; then
             _elig+=("${_BOTH_TG_FILES[$i]}")
         fi
     done
+    # Сколько файлов пропущено (по запросу владельца). Для db_only — 0 (файловой фазы нет).
+    _footer+=$'\nℹ️ Пропущено файлов: '"$_skiptotal"
 
     # Шифрование глобально (общий пароль) — одна строка, как в старой пофайловой подписи.
     local _enc_line="${_BOTH_TG_ENC[0]:-}"
@@ -9785,7 +9787,7 @@ ${_enc_line}${_footer}"
 
     # Очистка аккумулятора (следующий прогон начинает с чистого листа).
     _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
-    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=()
+    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_SKIPCOUNT=()
     _BOTH_TG_TYPE=""
 }
 
@@ -9832,7 +9834,7 @@ create_backup_dispatch() {
     # Единое TG-уведомление: откладываем пофайловую отправку, соберём ОДИН альбом после проходов.
     _BOTH_TG_DEFER="1"
     _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
-    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_TYPE=""
+    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_SKIPCOUNT=(); _BOTH_TG_TYPE=""
 
     # --- Проход 1: primary (рабочие переменные уже зарезолвены на init) ---
     print_message "INFO" "Цель 1/2: ${_p_label}"
@@ -10157,7 +10159,7 @@ _backup_remote_target() {
     if [[ -n "$_BOTH_TG_DEFER" ]]; then
         # both-режим: единое уведомление шлёт dispatch (_both_tg_flush) — здесь только запись.
         local _rbytes; _rbytes=$(stat -c%s "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG" || echo 0)
-        _both_tg_record "$FILE_FINAL" "$SIZE" "$_rbytes" "$ENC_STATUS" "$VERIFY_OK" "$_rok" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "true" "" "${REMOTE_UPLOAD_STATUS_TEXT:-}" ""
+        _both_tg_record "$FILE_FINAL" "$SIZE" "$_rbytes" "$ENC_STATUS" "$VERIFY_OK" "$_rok" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "true" "" "${REMOTE_UPLOAD_STATUS_TEXT:-}" "" "0"
     else
         local _who="бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _who="панель"
         send_telegram_document "$BACKUP_DIR/$FILE_FINAL" \
