@@ -2775,6 +2775,25 @@ get_raw_bot_version() {
     fi
 }
 
+# get_app_version: ТОЧНАЯ версия приложения в контейнере $1 (для TG-подписи), в порядке надёжности:
+#   1) OCI-лейбл org.opencontainers.image.version (rwp-shop → 6.7.8.5; работает и когда тег образа = dev/latest)
+#   2) env __RW_METADATA_VERSION (Remnawave backend → 2.8.1; тег образа пиннится к мажору «2»)
+#   3) fallback — тег образа (последнее после ':').
+# Пусто, если контейнер не задан/не запущен. Без эмодзи и «v»-префикса.
+get_app_version() {
+    local _c="$1"
+    [[ -z "$_c" ]] && { echo ""; return; }
+    docker container inspect -f '{{.State.Running}}' "$_c" > /dev/null 2> "$SILENT_LOG" || { echo ""; return; }
+    local _v
+    _v=$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$_c" 2> "$SILENT_LOG")
+    [[ -n "$_v" && "$_v" != "<no value>" ]] && { echo "$_v"; return; }
+    _v=$(docker exec "$_c" printenv __RW_METADATA_VERSION 2> "$SILENT_LOG" | tr -d '\r')
+    [[ -n "$_v" ]] && { echo "$_v"; return; }
+    local _img; _img=$(docker inspect -f '{{.Config.Image}}' "$_c" 2> "$SILENT_LOG")
+    _v="${_img##*:}"; [[ "$_v" == "$_img" ]] && _v=""
+    echo "$_v"
+}
+
 # Получение статуса контейнера бота
 get_container_status() {
     if [[ -z "$BOT_CONTAINER_NAME" ]]; then
@@ -9482,7 +9501,7 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
         # both-режим: единое уведомление (альбом) шлёт create_backup_dispatch после ОБОИХ
         # проходов (_both_tg_flush). Здесь только записываем результат прохода в аккумулятор;
         # отправку документа и удаление-после-доставки откладываем до flush.
-        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$VERIFY_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "false" "$VER_MSG" "$REMOTE_UPLOAD_STATUS_TEXT" "$SKIP_INFO" "$([[ "$TYPE" != "db_only" ]] && echo "${_skipped_count:-0}" || echo 0)"
+        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$VERIFY_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "false" "$(get_app_version "$BOT_CONTAINER_NAME")" "$REMOTE_UPLOAD_STATUS_TEXT" "$SKIP_INFO" "0"
     else
         local _tg_rc=1
         if [[ "$VERIFY_OK" == "true" ]]; then
@@ -9717,26 +9736,24 @@ _both_tg_flush() {
 
     # Строки по целям (размер · версия · шифр) + футер (статус загрузки, пропущенные) — как в
     # старой пофайловой подписи. Отбор файлов, годных для отправки в TG (verify ok, <50МБ, отправка вкл).
-    local _lines="" _footer="" i=0 _skiptotal=0
+    local _lines="" _footer="" i=0
     local -a _elig=()
     local -A _seen_rs=()
     local _TGMAX=52428800
     for (( i=0; i<_n; i++ )); do
         local _sz="${_BOTH_TG_SIZES[$i]}" _lbl="${_BOTH_TG_LABELS[$i]}"
         local _bytes="${_BOTH_TG_BYTES[$i]}" _vok="${_BOTH_TG_VERIFY[$i]}"
-        local _rs="${_BOTH_TG_RSTATUS[$i]}" _sc="${_BOTH_TG_SKIPCOUNT[$i]:-0}"
+        local _rs="${_BOTH_TG_RSTATUS[$i]}" _ver="${_BOTH_TG_VER[$i]}"
         local _line="• ${_lbl} — ${_sz}"
+        [[ -n "$_ver" ]] && _line+=" | ${_ver}"   # точная версия без эмодзи: «• Remnawave — 20M | 2.8.1»
         [[ "$_vok" != "true" ]] && _line+=" ⚠️"
         _lines+="${_line}"$'\n'
         # детальный статус загрузки (☁️ S3: OK и т.п.) — без дублей (обе цели идут в то же хранилище)
         if [[ -n "$_rs" && -z "${_seen_rs[$_rs]:-}" ]]; then _footer+="$_rs"; _seen_rs["$_rs"]=1; fi
-        [[ "$_sc" =~ ^[0-9]+$ ]] && _skiptotal=$((_skiptotal + _sc))
         if [[ "$_vok" == "true" && "$_bytes" -lt "$_TGMAX" && "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" ]]; then
             _elig+=("${_BOTH_TG_FILES[$i]}")
         fi
     done
-    # Сколько файлов пропущено (по запросу владельца). Для db_only — 0 (файловой фазы нет).
-    _footer+=$'\nℹ️ Пропущено файлов: '"$_skiptotal"
 
     # Шифрование глобально (общий пароль) — одна строка, как в старой пофайловой подписи.
     local _enc_line="${_BOTH_TG_ENC[0]:-}"

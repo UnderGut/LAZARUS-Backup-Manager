@@ -89,16 +89,17 @@ _both_tg_flush
 [[ "$LAST_CAP" == *"Бэкап создан"* ]] && ok "заголовок «Бэкап создан»" || bad "T1 нет заголовка"
 [[ "$LAST_CAP" == *"Encrypted"* ]] && ok "строка шифрования (глобальная)" || bad "T1 нет строки шифрования"
 
-echo "== T1d: версии НЕТ · счётчик пропущенных · статус загрузки без дублей =="
+echo "== T1d: точные версии БЕЗ эмодзи (| X.Y.Z) · без «Пропущено» · статус без дублей =="
 reset_acc
 : > "$BACKUP_DIR/lazarus_panel_full.tar.zst"; : > "$BACKUP_DIR/lazarus_full.tar.zst"
-# версию (arg9) передаём НАРОЧНО — она НЕ должна попасть в подпись; счётчики 3 и 2 → сумма 5
-rec panel lazarus_panel_full.tar.zst "12.3M" 12900000 "🔒 Encrypted" "true" "true" "false" " | 🏷 v2"   $'\n☁️ S3: OK' "" 3
-rec bot   lazarus_full.tar.zst       "4.1M"  4300000  "🔒 Encrypted" "true" "true" "false" " | 🏷 vdev" $'\n☁️ S3: OK' "" 2
+# arg9 = точная версия (как вернёт get_app_version) → рендерится «| 2.8.1»
+rec panel lazarus_panel_full.tar.zst "20M"  21000000 "🔒 Encrypted" "true" "true" "false" "2.8.1"   $'\n☁️ S3: OK' "" 0
+rec bot   lazarus_full.tar.zst       "6.4M" 6700000  "🔒 Encrypted" "true" "true" "false" "6.7.8.5" $'\n☁️ S3: OK' "" 0
 _both_tg_flush
-[[ "$LAST_CAP" != *"v2"* && "$LAST_CAP" != *"vdev"* && "$LAST_CAP" != *"🏷"* ]] && ok "версия НЕ отображается" || bad "T1d версия всё ещё в подписи"
+[[ "$LAST_CAP" == *"| 2.8.1"* && "$LAST_CAP" == *"| 6.7.8.5"* ]] && ok "точные версии в формате | X.Y.Z" || bad "T1d версии не в формате | X.Y.Z"
+[[ "$LAST_CAP" != *"🏷"* ]] && ok "эмодзи версии нет" || bad "T1d эмодзи версии остался"
+[[ "$LAST_CAP" != *"Пропущено"* ]] && ok "строки «Пропущено» нет" || bad "T1d «Пропущено» всё ещё есть"
 [[ "$LAST_CAP" == *"S3: OK"* ]] && ok "детальный статус загрузки" || bad "T1d нет статуса загрузки"
-[[ "$LAST_CAP" == *"Пропущено файлов: 5"* ]] && ok "счётчик пропущенных (3+2=5)" || bad "T1d нет/неверен счётчик пропущенных"
 cnt=$(grep -o "S3: OK" <<<"$LAST_CAP" | wc -l | tr -d ' ')
 [[ "$cnt" -eq 1 ]] && ok "статус загрузки без дублей (1×)" || bad "T1d дубли статуса загрузки ($cnt)"
 
