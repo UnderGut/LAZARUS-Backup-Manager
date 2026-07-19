@@ -63,14 +63,15 @@ source "$FUNCS"
 
 reset_acc() {
     _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
-    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_TYPE=""
+    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=()
+    _BOTH_TG_VER=(); _BOTH_TG_RSTATUS=(); _BOTH_TG_SKIP=(); _BOTH_TG_TYPE=""
     CALL_ALBUM=0; CALL_DOC=0; CALL_TEXT=0; LAST_CAP=""; LAST_ALBUM_FILES=0
 }
 
 # записать цель напрямую в аккумулятор (эмулируем _both_tg_record из прохода)
-rec() { # $1 target(panel|bot) $2 file $3 size $4 bytes $5 enc $6 verify $7 remote_ok [$8 is_remote]
+rec() { # $1 target $2 file $3 size $4 bytes $5 enc $6 verify $7 remote_ok [$8 is_remote] [$9 ver] [$10 rstatus] [$11 skip]
     BACKUP_TARGET="$1"; TYPE="full"
-    _both_tg_record "$2" "$3" "$4" "$5" "$6" "$7" "false" "${8:-false}"
+    _both_tg_record "$2" "$3" "$4" "$5" "$6" "$7" "false" "${8:-false}" "${9:-}" "${10:-}" "${11:-}"
 }
 
 echo "== T1: 2 годных → альбом =="
@@ -85,6 +86,18 @@ _both_tg_flush
 [[ "$LAST_CAP" == *"12.3M"* && "$LAST_CAP" == *"4.1M"* ]] && ok "подпись содержит оба размера" || bad "T1 нет размеров"
 [[ "$LAST_CAP" == *"tg://emoji?id="* ]] && ok "премиум-эмодзи применены" || bad "T1 нет премиум-эмодзи"
 [[ "$LAST_CAP" != *"не бэкап"* ]] && ok "нет фразы «не бэкапится»" || bad "T1 подпись говорит о том что НЕ бэкапится"
+
+echo "== T1d: восстановленные строки (версия · статус загрузки · пропущенные) =="
+reset_acc
+: > "$BACKUP_DIR/lazarus_panel_full.tar.zst"; : > "$BACKUP_DIR/lazarus_full.tar.zst"
+rec panel lazarus_panel_full.tar.zst "12.3M" 12900000 "🔒 Encrypted" "true" "true" "false" ""            $'\n☁️ S3: OK' ""
+rec bot   lazarus_full.tar.zst       "4.1M"  4300000  "🔒 Encrypted" "true" "true" "false" " | 🏷 v6.6.2" $'\n☁️ S3: OK' $'\n⚠️ Skip: 2 (>100MB)'
+_both_tg_flush
+[[ "$LAST_CAP" == *"v6.6.2"* ]]  && ok "версия в подписи" || bad "T1d нет версии"
+[[ "$LAST_CAP" == *"S3: OK"* ]]  && ok "детальный статус загрузки" || bad "T1d нет статуса загрузки"
+[[ "$LAST_CAP" == *"Skip: 2"* ]] && ok "инфо о пропущенных файлах" || bad "T1d нет skip-инфо"
+cnt=$(grep -o "S3: OK" <<<"$LAST_CAP" | wc -l | tr -d ' ')
+[[ "$cnt" -eq 1 ]] && ok "статус загрузки без дублей (1×)" || bad "T1d дубли статуса загрузки ($cnt)"
 
 echo "== T2: 1 годный (второй >50МБ) → sendDocument =="
 reset_acc
