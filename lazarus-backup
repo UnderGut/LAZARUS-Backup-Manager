@@ -180,6 +180,14 @@ _CANON_BOT_PATH=""; _CANON_BOT_CONTAINER=""; _CANON_DB_CONTAINER=""; _CANON_DB_S
 _CANON_DB_NAME=""; _CANON_DB_USER=""; _CANON_MAX_FILE_SIZE_MB=""
 _CANON_SNAPSHOT_TAKEN=""   # снимок берётся один раз (init); recovery-перевходы его не пересоздают
 BACKUP_PREFIX="lazarus"            # namespace имён архивов (lazarus | lazarus_panel)
+# === Both-режим: аккумулятор ЕДИНОГО TG-уведомления (альбом панель+бот) ===
+# _BOTH_TG_DEFER="1" (ставит create_backup_dispatch на время обоих проходов) → create_backup и
+# _backup_remote_target НЕ шлют свой документ, а пишут результат сюда; после проходов dispatch
+# шлёт ОДИН sendMediaGroup (_both_tg_flush). Пусто = обычная пофайловая отправка (single-режим).
+_BOTH_TG_DEFER=""
+_BOTH_TG_TYPE=""
+_BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
+_BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=()
 # === ТРАНСПОРТ ЦЕЛИ (local | ssh) ===
 # Для удалённой цели (на другом сервере) дамп БД и tar файлов СТРИМЯТСЯ по SSH (шифрованный
 # канал) на этот хост и шифруются ТОЛЬКО локально (plaintext НИКОГДА не пишется на диск
@@ -9470,16 +9478,66 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
     CAPTION_ESC="${CAPTION_ESC//🏷/$(tg_emoji "🏷" "$EMO_BADGE")}"
     debug_log "TG" "CAPTION_ESC after premium replace: $CAPTION_ESC"
 
-    local _tg_rc=1
-    if [[ "$VERIFY_OK" == "true" ]]; then
-        send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION_ESC" "pre-escaped"
-        _tg_rc=$?
-        # TG success — только rc=0 (sendDocument 200 OK). rc=2 (>50MB) — НЕ считаем доставленным.
-        if [[ "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" && $_tg_rc -eq 0 ]]; then
-            _UPLOAD_TG_OK="true"
+    if [[ -n "$_BOTH_TG_DEFER" ]]; then
+        # both-режим: единое уведомление (альбом) шлёт create_backup_dispatch после ОБОИХ
+        # проходов (_both_tg_flush). Здесь только записываем результат прохода в аккумулятор;
+        # отправку документа и удаление-после-доставки откладываем до flush.
+        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$VERIFY_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}"
+    else
+        local _tg_rc=1
+        if [[ "$VERIFY_OK" == "true" ]]; then
+            send_telegram_document "$BACKUP_DIR/$FILE_FINAL" "$CAPTION_ESC" "pre-escaped"
+            _tg_rc=$?
+            # TG success — только rc=0 (sendDocument 200 OK). rc=2 (>50MB) — НЕ считаем доставленным.
+            if [[ "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" && $_tg_rc -eq 0 ]]; then
+                _UPLOAD_TG_OK="true"
+            fi
         fi
+        debug_log "UPLOAD" "TG send complete (rc=$_tg_rc, ok=$_UPLOAD_TG_OK)"
+
+        _delete_local_after_send "$FILE_FINAL" "$VERIFY_OK" "$_UPLOAD_TG_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}"
     fi
-    debug_log "UPLOAD" "TG send complete (rc=$_tg_rc, ok=$_UPLOAD_TG_OK)"
+
+    # VERIFY-1 fix: ротацию запускаем ТОЛЬКО если архив прошёл verify. Иначе
+    # повреждённый backup мог бы вытеснить валидные (count/age/size rotation).
+    if [[ "$VERIFY_OK" == "true" ]]; then
+        # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
+        local ROTATION_PREFIX="${BACKUP_PREFIX}_$TYPE"
+        if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="${BACKUP_PREFIX}_db"; fi
+        if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="${BACKUP_PREFIX}_files"; fi
+
+        # Ротация в зависимости от настроек DELETE_MODE
+        if [[ "$DELETE_MODE" == "count" ]]; then
+            rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true" > /dev/null
+        else
+            rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true" > /dev/null
+        fi
+
+        # Ротация по размеру (если настроен лимит)
+        rotate_backups_by_size "true" > /dev/null
+    else
+        debug_log "ROTATION" "Skipped rotation: VERIFY_OK=false (защита валидных бэкапов)"
+    fi
+
+    # Освобождаем блокировку
+    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+
+    # VERIFY-1 fix: возвращаем non-zero при verify-fail, чтобы cron/wrapper
+    # видели провал в exit-коде (а не ложный success).
+    [[ "$VERIFY_OK" == "true" ]] && return 0
+    return 1
+}
+
+# =============================================================================
+# _delete_local_after_send: удаление локального архива после доставки. Вынесено из
+# create_backup, чтобы both-режим мог вызвать ТУ ЖЕ логику ПОСЛЕ отправки альбома
+# (_both_tg_flush), с per-target результатом доставки. Single-режим вызывает как раньше.
+# Аргументы: 1=FILE_FINAL, 2=VERIFY_OK, 3=_UPLOAD_TG_OK, 4=_UPLOAD_REMOTE_OK,
+#            5=REMOTE_UPLOAD_SIZE_UNVERIFIED. Конфиг (DELETE_LOCAL_..., каналы) — из глобалов.
+# =============================================================================
+_delete_local_after_send() {
+    local FILE_FINAL="$1"; local VERIFY_OK="$2"; local _UPLOAD_TG_OK="$3"
+    local _UPLOAD_REMOTE_OK="$4"; local REMOTE_UPLOAD_SIZE_UNVERIFIED="${5:-false}"
 
     # === УДАЛЕНИЕ ЛОКАЛЬНОГО ФАЙЛА ПОСЛЕ УСПЕШНОЙ ОТПРАВКИ ===
     # Режимы:
@@ -9555,35 +9613,165 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
             fi
         fi
     fi
+}
 
-    # VERIFY-1 fix: ротацию запускаем ТОЛЬКО если архив прошёл verify. Иначе
-    # повреждённый backup мог бы вытеснить валидные (count/age/size rotation).
-    if [[ "$VERIFY_OK" == "true" ]]; then
-        # Автоматическая ротация бэкапов после создания (подавляем вывод счётчиков)
-        local ROTATION_PREFIX="${BACKUP_PREFIX}_$TYPE"
-        if [[ "$TYPE" == "db_only" ]]; then ROTATION_PREFIX="${BACKUP_PREFIX}_db"; fi
-        if [[ "$TYPE" == "files_only" ]]; then ROTATION_PREFIX="${BACKUP_PREFIX}_files"; fi
+# =============================================================================
+# _both_tg_record / _both_tg_flush: единое TG-уведомление для both-режима (панель+бот).
+# create_backup записывает результат каждого прохода в аккумулятор (_both_tg_record);
+# после ОБОИХ проходов create_backup_dispatch вызывает _both_tg_flush — ОДИН sendMediaGroup
+# (альбом) с общей подписью, перечисляющей ТОЛЬКО реально забэкапленные цели (без «бот не
+# бэкапится»). Fallback: 1 подходящий файл → sendDocument, 0 (>50МБ / отправка файла выкл) →
+# текст-сводка. Затем — отложенные удаления-после-доставки per target.
+# =============================================================================
+_both_tg_record() {
+    # $1 FILE_FINAL, $2 size_h, $3 bytes, $4 ENC_STATUS, $5 VERIFY_OK, $6 remote_ok, $7 remote_unverified
+    local _lbl="Telegram-бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _lbl="Remnawave Panel"
+    _BOTH_TG_FILES+=("$BACKUP_DIR/$1")
+    _BOTH_TG_LABELS+=("$_lbl")
+    _BOTH_TG_SIZES+=("$2")
+    _BOTH_TG_BYTES+=("$3")
+    _BOTH_TG_ENC+=("$4")
+    _BOTH_TG_VERIFY+=("$5")
+    _BOTH_TG_REMOTE_OK+=("$6")
+    _BOTH_TG_REMOTE_UNVERIFIED+=("$7")
+    _BOTH_TG_IS_REMOTE+=("${8:-false}")   # "true" = удалённая цель (стрим по SSH); flush не удаляет её локаль
+    _BOTH_TG_TYPE="$TYPE"
+    debug_log "BOTHTG" "recorded $_lbl: $1 (size=$2 bytes=$3 verify=$5 remote=$6)"
+}
 
-        # Ротация в зависимости от настроек DELETE_MODE
-        if [[ "$DELETE_MODE" == "count" ]]; then
-            rotate_backups_by_count "$ROTATION_PREFIX" "$ROTATION_KEY" "true" > /dev/null
+# JSON-escape строки для тела sendMediaGroup (media=[...]). Порядок важен: сперва backslash.
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Отправка альбома (2..10 документов) одним сообщением. $1=подпись (pre-escaped MarkdownV2,
+# на первом документе), далее — пути к файлам. Возвращает 0 при HTTP 200.
+_send_telegram_album() {
+    local caption="$1"; shift
+    local -a files=("$@")
+    [[ ${#files[@]} -lt 2 ]] && return 3
+    local media="[" i=0
+    local -a form=()
+    local f key
+    for f in "${files[@]}"; do
+        key="doc$i"
+        [[ $i -gt 0 ]] && media+=","
+        if [[ $i -eq 0 ]]; then
+            media+="{\"type\":\"document\",\"media\":\"attach://$key\",\"caption\":\"$(_json_escape "$caption")\",\"parse_mode\":\"MarkdownV2\"}"
         else
-            rotate_backups_by_age "$ROTATION_PREFIX" "$ROTATION_KEY" "$RETENTION_DAYS" "true" > /dev/null
+            media+="{\"type\":\"document\",\"media\":\"attach://$key\"}"
         fi
+        form+=(-F "$key=@$f")
+        i=$((i + 1))
+    done
+    media+="]"
+    [[ -n "$TG_MESSAGE_THREAD_ID" ]] && form+=(-F "message_thread_id=$TG_MESSAGE_THREAD_ID")
+    local http_code
+    http_code=$(curl $CURL_SILENT --max-time 300 -o "$SILENT_LOG" -w "%{http_code}" -X POST \
+        "https://api.telegram.org/bot$BOT_TOKEN/sendMediaGroup" \
+        -F "chat_id=$CHAT_ID" -F "media=$media" "${form[@]}" 2> "$SILENT_LOG")
+    debug_log "TG" "sendMediaGroup HTTP $http_code (${#files[@]} docs)"
+    [[ "$http_code" == "200" ]] && return 0
+    log_message "WARN" "sendMediaGroup failed HTTP $http_code"
+    return 1
+}
 
-        # Ротация по размеру (если настроен лимит)
-        rotate_backups_by_size "true" > /dev/null
-    else
-        debug_log "ROTATION" "Skipped rotation: VERIFY_OK=false (защита валидных бэкапов)"
+# Текст-сводка (fallback когда файлов в TG нет). $1=текст (pre-escaped MarkdownV2).
+_send_telegram_text() {
+    local text="$1"
+    [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
+    local thread=(); [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread=(-d "message_thread_id=$TG_MESSAGE_THREAD_ID")
+    local http_code
+    http_code=$(curl $CURL_SILENT --max-time 120 -o "$SILENT_LOG" -w "%{http_code}" -X POST \
+        "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d chat_id="$CHAT_ID" -d parse_mode="MarkdownV2" \
+        --data-urlencode text="$text" "${thread[@]}" 2> "$SILENT_LOG")
+    debug_log "TG" "album text-summary HTTP $http_code"
+    [[ "$http_code" == "200" ]] && return 0
+    return 1
+}
+
+_both_tg_flush() {
+    local _n=${#_BOTH_TG_FILES[@]}
+    [[ $_n -eq 0 ]] && return 0
+
+    local HASHTAG TYPE_NAME
+    case "$_BOTH_TG_TYPE" in
+        full)       HASHTAG="💾 #full_backup"; TYPE_NAME="📦 Полный бэкап" ;;
+        db_only)    HASHTAG="💾 #db_only";     TYPE_NAME="🗄 Дамп базы данных" ;;
+        files_only) HASHTAG="💾 #files_only";  TYPE_NAME="📂 Файлы" ;;
+        *)          HASHTAG="💾 #backup";      TYPE_NAME="📦 Бэкап" ;;
+    esac
+    local DISPLAY_DATE; DISPLAY_DATE=$(date "+%d.%m.%Y %H:%M:%S")
+
+    # Строки по целям + отбор файлов, годных для отправки в TG (verify ok, <50МБ, отправка вкл).
+    local _lines="" _remote_line="" i=0
+    local -a _elig=()
+    local _TGMAX=52428800
+    for (( i=0; i<_n; i++ )); do
+        local _sz="${_BOTH_TG_SIZES[$i]}" _lbl="${_BOTH_TG_LABELS[$i]}"
+        local _bytes="${_BOTH_TG_BYTES[$i]}" _vok="${_BOTH_TG_VERIFY[$i]}" _enc="${_BOTH_TG_ENC[$i]}"
+        local _line="• ${_lbl} — ${_sz}"
+        [[ "$_enc" == *"🔒"* ]] && _line+=" 🔒"
+        [[ "$_vok" != "true" ]] && _line+=" ⚠️"
+        _lines+="${_line}"$'\n'
+        [[ "${_BOTH_TG_REMOTE_OK[$i]}" == "true" ]] && _remote_line="☁️ Загружено в облако"
+        if [[ "$_vok" == "true" && "$_bytes" -lt "$_TGMAX" && "$SEND_TO_TELEGRAM" == "true" && "$TG_SEND_FILE" == "true" ]]; then
+            _elig+=("${_BOTH_TG_FILES[$i]}")
+        fi
+    done
+
+    local CAPTION="${HASHTAG}
+➖➖➖➖➖➖➖➖➖
+📅 ${DISPLAY_DATE}
+${TYPE_NAME}
+${_lines}"
+    [[ -n "$_remote_line" ]] && CAPTION="${CAPTION}${_remote_line}"
+
+    # Premium emoji: escape MarkdownV2 целиком, затем заменяем Unicode на Premium-литералы.
+    local CAP; CAP=$(escape_markdown_v2 "$CAPTION")
+    CAP="${CAP//💾/$(tg_emoji "💾" "$EMO_PACKAGE")}"
+    CAP="${CAP//📦/$(tg_emoji "📦" "$EMO_PACKAGE")}"
+    CAP="${CAP//📂/$(tg_emoji "📂" "$EMO_FOLDER")}"
+    CAP="${CAP//🗄/$(tg_emoji "🗄" "$EMO_DOC")}"
+    CAP="${CAP//📅/$(tg_emoji "📅" "$EMO_CALENDAR")}"
+    CAP="${CAP//🔒/$(tg_emoji "🔒" "$EMO_LOCK")}"
+    CAP="${CAP//⚠️/$(tg_emoji "⚠️" "$EMO_WARN")}"
+
+    # Отправка: ≥2 годных → альбом; 1 → документ; 0 → текст-сводка.
+    local _tg_ok="false"
+    if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+        if [[ ${#_elig[@]} -ge 2 ]]; then
+            _send_telegram_album "$CAP" "${_elig[@]}" && _tg_ok="true"
+        elif [[ ${#_elig[@]} -eq 1 ]]; then
+            send_telegram_document "${_elig[0]}" "$CAP" "pre-escaped" && _tg_ok="true"
+        else
+            _send_telegram_text "$CAP" && _tg_ok="true"
+        fi
     fi
 
-    # Освобождаем блокировку
-    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+    # Отложенные удаления-после-доставки per target (tg_ok — только для файлов, реально ушедших в TG).
+    for (( i=0; i<_n; i++ )); do
+        local _f="${_BOTH_TG_FILES[$i]}" _base="${_BOTH_TG_FILES[$i]##*/}" _this_tg="false" _e
+        # Удалённая цель (стрим по SSH): в single-режиме delete-after-send для неё не было —
+        # сохраняем то же поведение (локальный стрим-архив удалённой цели не удаляем).
+        [[ "${_BOTH_TG_IS_REMOTE[$i]}" == "true" ]] && continue
+        if [[ "$_tg_ok" == "true" ]]; then
+            for _e in "${_elig[@]}"; do [[ "$_e" == "$_f" ]] && _this_tg="true"; done
+        fi
+        _delete_local_after_send "$_base" "${_BOTH_TG_VERIFY[$i]}" "$_this_tg" "${_BOTH_TG_REMOTE_OK[$i]}" "${_BOTH_TG_REMOTE_UNVERIFIED[$i]}"
+    done
 
-    # VERIFY-1 fix: возвращаем non-zero при verify-fail, чтобы cron/wrapper
-    # видели провал в exit-коде (а не ложный success).
-    [[ "$VERIFY_OK" == "true" ]] && return 0
-    return 1
+    # Очистка аккумулятора (следующий прогон начинает с чистого листа).
+    _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
+    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=()
+    _BOTH_TG_TYPE=""
 }
 
 # =============================================================================
@@ -9626,6 +9814,11 @@ create_backup_dispatch() {
     # Глушим save_config на время обоих проходов (защита bot-полей config.env от panel-клоббера).
     local _SUPPRESS_SAVE=1
 
+    # Единое TG-уведомление: откладываем пофайловую отправку, соберём ОДИН альбом после проходов.
+    _BOTH_TG_DEFER="1"
+    _BOTH_TG_FILES=(); _BOTH_TG_LABELS=(); _BOTH_TG_SIZES=(); _BOTH_TG_BYTES=()
+    _BOTH_TG_ENC=(); _BOTH_TG_VERIFY=(); _BOTH_TG_REMOTE_OK=(); _BOTH_TG_REMOTE_UNVERIFIED=(); _BOTH_TG_IS_REMOTE=(); _BOTH_TG_TYPE=""
+
     # --- Проход 1: primary (рабочие переменные уже зарезолвены на init) ---
     print_message "INFO" "Цель 1/2: ${_p_label}"
     _backup_active_target "$_type" || _rc_p=$?
@@ -9634,6 +9827,10 @@ create_backup_dispatch() {
     print_message "INFO" "Цель 2/2: ${_s_label}"
     _resolve_target_config "$_secondary"
     _backup_active_target "$_type" || _rc_s=$?
+
+    # --- ОДНО TG-уведомление (альбом) по обоим архивам, затем отложенные удаления ---
+    _BOTH_TG_DEFER=""
+    _both_tg_flush
 
     # --- Возврат чистого primary-состояния в память (heal любого клоббера) ---
     _resolve_target_config "$_primary"
@@ -9940,13 +10137,20 @@ _backup_remote_target() {
     fi
 
     # --- Доставка (remote storage + Telegram), как у локального бэкапа ---
-    upload_to_remote "$BACKUP_DIR/$FILE_FINAL" || true
-    local _who="бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _who="панель"
-    send_telegram_document "$BACKUP_DIR/$FILE_FINAL" \
-        "💾 #remote_backup ($_who)
+    upload_to_remote "$BACKUP_DIR/$FILE_FINAL"; local _rup=$?
+    local _rok="false"; [[ "$REMOTE_STORAGE_TYPE" != "off" && "$SEND_TO_REMOTE" == "true" && $_rup -eq 0 ]] && _rok="true"
+    if [[ -n "$_BOTH_TG_DEFER" ]]; then
+        # both-режим: единое уведомление шлёт dispatch (_both_tg_flush) — здесь только запись.
+        local _rbytes; _rbytes=$(stat -c%s "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG" || echo 0)
+        _both_tg_record "$FILE_FINAL" "$SIZE" "$_rbytes" "$ENC_STATUS" "$VERIFY_OK" "$_rok" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "true"
+    else
+        local _who="бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _who="панель"
+        send_telegram_document "$BACKUP_DIR/$FILE_FINAL" \
+            "💾 #remote_backup ($_who)
 📦 $FILE_FINAL
 📏 $SIZE
 $ENC_STATUS" "plain" || true
+    fi
     return 0
 }
 
