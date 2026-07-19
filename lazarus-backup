@@ -5480,8 +5480,28 @@ panel_migrate_in() {
     local _rdb_st
     _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' $(_shq "$_src_db")" 2> "$SILENT_LOG")
     if [[ "$_rdb_st" != "running" ]]; then
-        local _detcmd="docker ps --filter label=com.docker.compose.project.working_dir=$_rdir_q --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '\$2 ~ /postgres/ {print \$1; exit}'"
-        local _det; _det=$(timeout 20 $_ssh "$_detcmd" 2> "$SILENT_LOG" | tr -d '\r')
+        # #review#1: авто-детект — АВТОРИТЕТНО через DATABASE_URL приложения панели (образ
+        # remnawave/backend), а не «первый postgres в проекте» (мог схватить infra-billing/kb,
+        # если они в ТОМ ЖЕ compose-проекте → дамп чужой БД под видом панели). Хост из
+        # DATABASE_URL = имя DB-сервиса; маппим сервис→контейнер по compose-меткам.
+        local _det=""
+        local _appcmd="docker ps --filter label=com.docker.compose.project.working_dir=$_rdir_q --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '\$2 ~ /remnawave.*backend/ {print \$1; exit}'"
+        local _app; _app=$(timeout 20 $_ssh "$_appcmd" 2> "$SILENT_LOG" | tr -d '\r')
+        if [[ -n "$_app" ]]; then
+            local _dburl; _dburl=$(timeout 20 $_ssh "docker exec $(_shq "$_app") printenv DATABASE_URL 2>/dev/null" 2> "$SILENT_LOG" | tr -d '\r')
+            if [[ "$_dburl" =~ @([A-Za-z0-9_.-]+)[:/] ]]; then
+                local _dbsvc="${BASH_REMATCH[1]}"
+                local _s2c="docker ps --filter label=com.docker.compose.project.working_dir=$_rdir_q --filter label=com.docker.compose.service=$(_shq "$_dbsvc") --format '{{.Names}}' 2>/dev/null"
+                _det=$(timeout 20 $_ssh "$_s2c" 2> "$SILENT_LOG" | tr -d '\r' | head -1)
+                [[ -z "$_det" ]] && _det="$_dbsvc"   # канон remnawave: сервис == container_name
+            fi
+        fi
+        # Fallback: ЕДИНСТВЕННЫЙ postgres проекта, ИСКЛЮЧАЯ billing/kb. Ноль/несколько → не гадаем.
+        if [[ -z "$_det" ]]; then
+            local _pgls="docker ps --filter label=com.docker.compose.project.working_dir=$_rdir_q --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '\$2 ~ /postgres/ && \$1 !~ /billing|kb/ {print \$1}'"
+            local _cands; _cands=$(timeout 20 $_ssh "$_pgls" 2> "$SILENT_LOG" | tr -d '\r' | sed '/^$/d')
+            [[ "$(printf '%s\n' "$_cands" | sed '/^$/d' | wc -l)" -eq 1 ]] && _det="$_cands"
+        fi
         if [[ -n "$_det" ]]; then
             _src_db="$_det"; PANEL_DB_CONTAINER="$_det"; PANEL_DB_SERVICE="$_det"
             _rdb_st=$(timeout 20 $_ssh "docker inspect --format '{{.State.Status}}' $(_shq "$_det")" 2> "$SILENT_LOG")
@@ -9794,6 +9814,8 @@ _backup_remote_target() {
     if [[ $HAS_ERROR -eq 1 ]]; then
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_GLOBALS"
         [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
+        # #review#2: снять регистрацию удалённых plaintext-дампов (уже rm'нуты) — чтобы SENSITIVE_TMP_PATHS не рос.
+        unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"
         return 1
     fi
 
@@ -9819,6 +9841,7 @@ _backup_remote_target() {
             log_message "ERROR" "remote tar failed (rc=$_trc, ${_tb}b)"
             rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_GLOBALS" "$BACKUP_DIR/$FILE_DIR"
             [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
+            unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"   # #review#2
             return 1
         fi
     fi
@@ -9843,6 +9866,8 @@ _backup_remote_target() {
     local _crc=$?
     rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR" "$BACKUP_DIR/$FILE_GLOBALS" "$BACKUP_DIR/$FILE_VERSION"
     [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
+    # #review#2: дампы rm'нуты (вошли в combine) → снимаем их регистрацию (plaintext-combine _plain_final остаётся под защитой до шифрования).
+    unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"
     if [[ $_crc -ne 0 ]]; then
         print_message "ERROR" "Combine удалённого архива провален (rc=$_crc)."
         rm -f "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1
