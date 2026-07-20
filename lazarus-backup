@@ -5910,6 +5910,8 @@ select_backup_target_firstrun() {
         echo -e " 2. Telegram-бот rwp_shop ${GRAY}(вторичная цель)${RESET}$_rec2$_bhint"
         echo -e " 3. ${CYAN}${BOLD}Панель + Бот${RESET} ${GRAY}(обе цели, один прогон)${RESET}$_rec3"
         echo ""
+        _print_projects_note
+        echo ""
         local _choice
         safe_read -erp "Выбор ($_def_label): " _choice
         [[ -z "$_choice" ]] && _choice="$_def_num"
@@ -13356,6 +13358,8 @@ menu_settings() {
         printf '   2.  KB ИИ-саппорта     %-20s ' "${BOT_KB_DB_CONTAINER:-—}"; echo -e "${_kb_disp}      ${GRAY}${_kb_ctx}${RESET}"
         echo ""
         echo -e "  ${GRAY}1 / 2 — переключить ДА⇄НЕТ. «ДА» бэкапит, когда контейнер запущен.${RESET}"
+        echo ""
+        _print_projects_note
         fi  # /addons
 
         # Футер говорит правду в обоих режимах входа: из standard-меню (_sdirect) «назад» —
@@ -14049,6 +14053,16 @@ _target_status_line() {
 }
 
 # _print_targets_summary: блок «что бэкапим» — панель-callout с левым рельсом (primary + secondary).
+# Сноска «что это за проекты»: LAZARUS бэкапит сторонние продукты — даём ссылки, чтобы
+# пользователь понимал компоненты и мог установить недостающие. Показывается в меню выбора
+# цели (first-run + Настройки), в «Доп. компонентах» и в `lazarus stacks`.
+_print_projects_note() {
+    echo -e "  ${GRAY}Проекты (что это · где взять):${RESET}"
+    echo -e "  ${GRAY}  Remnawave — панель управления:       github.com/remnawave/backend${RESET}"
+    echo -e "  ${GRAY}  RWP Shop — Telegram-бот-магазин:     rwp.rw${RESET}"
+    echo -e "  ${GRAY}  Infra-billing — биллинг инфраструктуры: github.com/mishkatik/infra-billing${RESET}"
+}
+
 _print_targets_summary() {
     local _rail="  ${CYAN}│${RESET}  "
     echo -e "  ${CYAN}┌─${RESET}${BOLD} Что бэкапим${RESET}"
@@ -14370,6 +14384,8 @@ menu_backup_target() {
         echo    " 2. Бот магазина (Telegram)"
         echo -e " 3. Панель + бот   ${GRAY}— оба архива за один запуск, папка: ${BACKUP_DIR}${RESET}"
         echo    " 0. Назад"
+        echo ""
+        _print_projects_note
         echo ""
         local _w; safe_read -erp "Выбор (Enter — назад): " _w
         local _prim="" _sec=""
@@ -15093,6 +15109,8 @@ case "$1" in
             [[ "$_CANON_BOT_PATH" != "$DISC_BOT_DIR" && -n "$_CANON_BOT_PATH" ]] \
                 && echo -e "${YELLOW}  ⚠ Конфиг бота ('$_CANON_BOT_PATH') ≠ обнаруженному ('$DISC_BOT_DIR')${RESET}"
         fi
+        echo ""
+        _print_projects_note
         # Ложный [[ ]] условной подсветки выше — не ошибка: успешный вывод = exit 0.
         exit 0
         ;;
