@@ -47,6 +47,7 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 - **Panel migration to another server** — `lazarus migrate panel`: pulls the panel from the old server over SSH (read-only), deploys it on the new one, and provides a cutover checklist. An SSH key is **not required** — you can enter a root password or paste the key directly into the wizard.
 - **Sidecars** — infra-billing, the AI-support knowledge base (pgvector), and arbitrary paths outside the panel directory (e.g. `certwarden`) are included in the backup automatically, each with its own rollback point on restore.
 - **Two menu modes** — Simple (4 items) and Advanced, with a unified design system (the "0 = Back" invariant, destructive actions always on "9", statuses `✓` / `— off`).
+- **One Telegram notification when backing up both targets.** If both the panel and the bot are backed up, you get a **single** album message with both archives and a combined summary (targets, sizes, versions, encryption, cloud upload status) instead of two separate ones.
 - ⚠️ **Bot update removed.** LAZARUS only handles backup / restore / migration. Update the bot with its own tooling.
 
 ---

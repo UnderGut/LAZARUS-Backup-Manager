@@ -15093,6 +15093,8 @@ case "$1" in
             [[ "$_CANON_BOT_PATH" != "$DISC_BOT_DIR" && -n "$_CANON_BOT_PATH" ]] \
                 && echo -e "${YELLOW}  ⚠ Конфиг бота ('$_CANON_BOT_PATH') ≠ обнаруженному ('$DISC_BOT_DIR')${RESET}"
         fi
+        # Ложный [[ ]] условной подсветки выше — не ошибка: успешный вывод = exit 0.
+        exit 0
         ;;
     migrate)
         case "$2" in
