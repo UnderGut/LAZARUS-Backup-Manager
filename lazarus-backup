@@ -2576,7 +2576,8 @@ scan_system_for_bot() {
         done
         
         # Исключаем контейнеры панели по image
-        if [[ "$c_image" == *"remnawave/backend"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (remnawave/backend)"; fi
+        # remnawave[/-]backend: official remnawave/backend + кастомные пересборки вида local/remnawave-backend:*
+        if [[ "$c_image" == *"remnawave/backend"* || "$c_image" == *"remnawave-backend"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (remnawave backend)"; fi
         if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (subscription-page)"; fi
         if [[ "$c_image" == *"remnawave-telegram-sub-mini-app"* ]]; then is_panel=true; fi
         if [[ "$c_image" == *"certwarden-client"* ]]; then is_panel=true; fi
@@ -2686,7 +2687,7 @@ scan_system_for_bot() {
         while IFS= read -r file; do
             [[ -z "$file" ]] && continue
             # Пропускаем compose файлы панели управления
-            if grep -q "remnawave/backend" "$file"; then continue; fi
+            if grep -qE "remnawave[/-]backend" "$file"; then continue; fi
             if grep -q "remnawave/subscription-page" "$file"; then continue; fi
             
             # Ищем по ключевым словам БОТА
@@ -4641,7 +4642,7 @@ load_or_create_config() {
         _live_panel_dir > /dev/null 2>&1; _panel_db_service > /dev/null 2>&1; _billing_db_service > /dev/null 2>&1
         # + имя app-контейнера панели (кастомные имена: resolve подставит его вместо 'remnawave')
         if [[ -z "$DISC_PANEL_APP" ]]; then
-            local _pa; _pa=$(_app_by_image 'remnawave/backend' 2>/dev/null) && DISC_PANEL_APP="${_pa%%|*}"
+            local _pa; _pa=$(_app_by_image 'remnawave[/-]backend' 2>/dev/null) && DISC_PANEL_APP="${_pa%%|*}"
         fi
         local _ph_changed=0 _lpd_h
         if ! _compose_declares_panel "$PANEL_PATH" 2>/dev/null; then
@@ -4813,7 +4814,9 @@ SCAN_ALLOW_LABEL_FALLBACK=0; FOUND_VIA_FALLBACK=0
 _compose_declares_panel() {
     local _d="$1" _cf
     _cf=$(_compose_in "$_d") || return 1
-    grep -qE 'image:[[:space:]]*[^[:space:]]*remnawave/backend|container_name:[[:space:]]*remnawave-db([[:space:]]|$)' "$_cf" 2> "$SILENT_LOG"
+    # remnawave[/-]backend = official + кастомные пересборки (local/remnawave-backend:*);
+    # container_name допускает YAML-кавычки ('remnawave-db' / "remnawave-db").
+    grep -qE "image:[[:space:]]*[^[:space:]]*remnawave[/-]backend|container_name:[[:space:]]*['\"]?remnawave-db['\"]?([[:space:]]|\$)" "$_cf" 2> "$SILENT_LOG"
 }
 
 # _live_panel_dir: working_dir ЖИВОГО контейнера remnawave/backend (docker labels) — единственный
@@ -4826,7 +4829,7 @@ _live_panel_dir() {
         # RUNNING приоритетно: exited-останки теста (docker compose up в /root/test) не должны
         # затенять живую панель — иначе ложные отказы гарда и неверный PANEL-HEAL.
         _d=$(timeout 15 docker ps -a --format '{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project.working_dir"}}' 2> "$SILENT_LOG" \
-            | awk -F'|' '$1 ~ /remnawave\/backend/ && $3 != "" { if ($2=="running") {print $3; found=1; exit}; if (!alt) alt=$3 } END { if (!found && alt) print alt }')
+            | awk -F'|' '$1 ~ /remnawave[\/-]backend/ && $3 != "" { if ($2=="running") {print $3; found=1; exit}; if (!alt) alt=$3 } END { if (!found && alt) print alt }')
         if [[ -n "$_d" && -d "$_d" ]]; then
             _LPD_CACHE="$_d"
         elif timeout 10 docker info > /dev/null 2>&1; then
@@ -4901,12 +4904,12 @@ _svc_resolver_common() { # $1=image-regex, echo "svc|dir" | "-"
     echo "${_svc}|${_dir}"
 }
 _panel_db_service() {
-    [[ -z "$_PANEL_DBSVC_CACHE" ]] && _PANEL_DBSVC_CACHE=$(_svc_resolver_common 'remnawave/backend')
+    [[ -z "$_PANEL_DBSVC_CACHE" ]] && _PANEL_DBSVC_CACHE=$(_svc_resolver_common 'remnawave[/-]backend')
     [[ -z "$_PANEL_DBSVC_CACHE" || "$_PANEL_DBSVC_CACHE" == "-" ]] && return 1
     echo "${_PANEL_DBSVC_CACHE%%|*}"
 }
 _panel_app_dir() {
-    [[ -z "$_PANEL_DBSVC_CACHE" ]] && _PANEL_DBSVC_CACHE=$(_svc_resolver_common 'remnawave/backend')
+    [[ -z "$_PANEL_DBSVC_CACHE" ]] && _PANEL_DBSVC_CACHE=$(_svc_resolver_common 'remnawave[/-]backend')
     [[ -z "$_PANEL_DBSVC_CACHE" || "$_PANEL_DBSVC_CACHE" == "-" || "$_PANEL_DBSVC_CACHE" != *"|"* ]] && return 1
     echo "${_PANEL_DBSVC_CACHE#*|}"
 }
@@ -5122,7 +5125,7 @@ _container_role() {
     local _img="${_ins%%|*}" _rest="${_ins#*|}"
     local _dir="${_rest%%|*}" _svc="${_rest#*|}"
     case "$_img" in
-        *remnawave/backend*)        echo "panel-app";   return 0 ;;
+        *remnawave/backend*|*remnawave-backend*) echo "panel-app";   return 0 ;;
         *mishkatik/infra-billing*)  echo "billing-app"; return 0 ;;
     esac
     # ИМЯ-НЕЗАВИСИМО (authoritative): compose-сервис БД, к которому реально подключено
@@ -5171,7 +5174,7 @@ discover_stacks() {
     while IFS='|' read -r _n _img _dir _svc; do
         [[ -z "$_n" ]] && continue
         case "$_img" in
-            *remnawave/backend*)
+            *remnawave/backend*|*remnawave-backend*)
                 DISC_PANEL_APP="$_n"
                 [[ -n "$_dir" && -d "$_dir" ]] && DISC_PANEL_DIR="$_dir" ;;
             *mishkatik/infra-billing*) DISC_BILLING_APP="$_n" ;;
@@ -5453,7 +5456,7 @@ panel_migrate_in() {
         # ИМЯ/ПУТЬ-НЕЗАВИСИМО: источник сам знает, где панель — labels контейнера с образом
         # remnawave/backend (пользователю не нужно знать каталог установки).
         _rdir=$(timeout 25 $_ssh "docker ps -a --format '{{.Image}}|{{.Label \"com.docker.compose.project.working_dir\"}}'" 2> "$SILENT_LOG" \
-            | awk -F'|' '$1 ~ /remnawave\/backend/ && $2 != "" {print $2; exit}')
+            | awk -F'|' '$1 ~ /remnawave[\/-]backend/ && $2 != "" {print $2; exit}')
         [[ -n "$_rdir" ]] && print_message "INFO" "Панель на источнике обнаружена автоматически: $_rdir"
     fi
     if [[ -z "$_rdir" ]]; then
