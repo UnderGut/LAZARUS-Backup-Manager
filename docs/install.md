@@ -10,7 +10,7 @@
 
 1. Поставьте `lazarus` одной командой (от root):
    ```bash
-   curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus
+   curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus
    ```
 2. Запустите:
    ```bash

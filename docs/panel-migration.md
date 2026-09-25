@@ -12,7 +12,7 @@ SSH-ключи и S3 **не нужны** — достаточно root-паро�
 
 1. На **новом** сервере установите lazarus (Docker и `docker compose` должны быть запущены):
    ```bash
-   curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus
+   curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus
    ```
 2. Запустите мастер:
    ```bash

@@ -9789,6 +9789,7 @@ create_backup() {
         done
         if [[ ${#_extra_rel[@]} -gt 0 ]]; then
             FILE_EXTRA="extra_${TIMESTAMP}.tar.${_ext}"
+            register_sensitive_tmp "$BACKUP_DIR/$FILE_EXTRA"   # ключи/секреты вне каталога панели
             print_message "INFO" "Архивация доп. путей (${#_extra_rel[@]}) в extra-sidecar..."
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-extra" \
                 tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_EXTRA" -C / "${_extra_rel[@]}" 2> "$_tar_err"
@@ -9851,6 +9852,7 @@ create_backup() {
         debug_log "TAR" "Creating files archive: $FILE_FINAL (compression: $(_compress_current))"
         debug_log "TAR" "Running: tar $_tar_compress_args -cf $BACKUP_DIR/$FILE_DIR ${EXCLUDE_FLAGS[*]} -C $(dirname "$BOT_PATH") $(basename "$BOT_PATH")"
         # Сначала архивируем файлы бота с исключениями
+        register_sensitive_tmp "$BACKUP_DIR/$FILE_DIR"   # .env стека с секретами: TERM → shred, не до sweep
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files" \
             tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_DIR" "${_tar_progress[@]}" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
@@ -9879,6 +9881,7 @@ create_backup() {
         print_message "INFO" "Архивация файлов (это может занять время)..."
         [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
         debug_log "TAR" "Creating full archive: $FILE_FINAL (compression: $(_compress_current))"
+        register_sensitive_tmp "$BACKUP_DIR/$FILE_DIR"   # .env стека с секретами: TERM → shred, не до sweep
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full" \
             tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_DIR" "${_tar_progress[@]}" "${EXCLUDE_FLAGS[@]}" -C "$(dirname "$BOT_PATH")" "$(basename "$BOT_PATH")" 2> "$_tar_err"
         _tar_rc=$?
@@ -11404,6 +11407,7 @@ create_incremental_backup() {
             return 1
         fi
         print_message "INFO" "Дамп БД..."
+        register_sensitive_tmp "$BACKUP_DIR/$FILE_DB"   # открытый дамп: TERM → shred, как в create_backup
         _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-inc" \
             'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
             "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$BACKUP_DIR/$FILE_DB" "$_compress_pipe_cmd"
@@ -11441,6 +11445,7 @@ create_incremental_backup() {
         # AUDIT v2: $_bot_dirname шёл в sed-replacement (спецсимволы &/\/| ломали префикс) —
         # awk с переменной безопасен (в print переменная берётся литералом).
         awk -v _p="$_bot_dirname/" '{print _p $0}' "$_diff_list" > "$_work_dir/changed_prefixed.txt"
+        register_sensitive_tmp "$BACKUP_DIR/$_inc_files_archive"
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-inc" \
             tar $_tar_compress_args -cf "$BACKUP_DIR/$_inc_files_archive" \
             -C "$(dirname "$BOT_PATH")" -T "$_work_dir/changed_prefixed.txt" 2>> "$_tar_err"
@@ -12550,7 +12555,7 @@ execute_restore() {
         local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
         local _dec_attempt=0
         local _dec_max=3
-        local _dec_ok=false
+        local _dec_ok=false _dec_io_fail=0
         # №4/№9: проверенный (успешно расшифровавший) пароль сохраняем в _verified_pass ДО
         # зануления decrypt_pass — он нужен ниже для _resolve_incremental_chain (fresh-сервер:
         # BACKUP_PASSWORD пуст, без этого restore зашифрованного inc был невозможен). Wipe — после chain.
@@ -12612,7 +12617,7 @@ execute_restore() {
                         # а не «MAC прошёл» и не неверный пароль — повторять тот же пароль бессмысленно.
                         print_message "ERROR" "Расшифровка не выполнена: сбой ввода-вывода/openssl или нет места в TMPDIR (${TMPDIR:-/tmp}) — это не признак неверного пароля, см. лог."
                         log_message "ERROR" "restore decrypt rc=2 (I/O/openssl/space) for v2 archive: $FILE"
-                        decrypt_pass=""
+                        decrypt_pass=""; _dec_io_fail=1
                         break
                     fi
                     ;;
@@ -12625,8 +12630,13 @@ execute_restore() {
             decrypt_pass=""
         done
         if [[ "$_dec_ok" != "true" ]]; then
-            print_message "ERROR" "Расшифровка не удалась после $_dec_max попыток. Восстановление отменено."
-            log_message "ERROR" "Decryption failed after $_dec_max attempts (file: $(basename "$FILE"))"
+            if [[ "${_dec_io_fail:-0}" == "1" ]]; then
+                print_message "ERROR" "Восстановление отменено: расшифровка не выполнена (см. выше)."
+                log_message "ERROR" "Decryption not performed (I/O/openssl/space) after $_dec_attempt attempt(s) (file: $(basename "$FILE"))"
+            else
+                print_message "ERROR" "Расшифровка не удалась после $_dec_max попыток. Восстановление отменено."
+                log_message "ERROR" "Decryption failed after $_dec_max attempts (file: $(basename "$FILE"))"
+            fi
             rm -rf "$TMP_DIR"
             unregister_sensitive_tmp "$TMP_DIR"
             return 1

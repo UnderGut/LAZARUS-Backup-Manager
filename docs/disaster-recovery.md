@@ -10,7 +10,7 @@
 
 1. На **новом** сервере поставьте Docker и lazarus:
    ```bash
-   curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus
+   curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus
    ```
 2. Положите файл бэкапа в каталог `backup/` рядом с lazarus (или настройте S3 и скачайте архив им).
 3. Запустите восстановление:

@@ -255,11 +255,13 @@ create_backup "files_only" > "$T/o1" 2>&1; rc=$?
 arc=$(_last_arc 'lazarus_files_*.tar.gz')
 [[ $rc -eq 0 && -n "$arc" && "$(n_arch '*.part')" -eq 0 ]] && ok || bad "1j files_only → rc=0, архив есть, *.part нет (rc=$rc): $(ls "$BACKUP_DIR")"
 [[ -n "$arc" ]] && has_sens "$arc.part" && ok || bad "1k files_only: .part в SENSITIVE_TMP_PATHS: ${SENSITIVE_TMP_PATHS[*]}"
+has_sens "$BACKUP_DIR/bot_files_*" && ok || bad "1k2 files_only: архив файлов (.env стека) в SENSITIVE_TMP_PATHS: ${SENSITIVE_TMP_PATHS[*]}"
 reset_bk
 create_backup "full" > "$T/o1" 2>&1; rc=$?
 arc=$(_last_arc 'lazarus_full_*.tar.gz')
 [[ $rc -eq 0 && -n "$arc" && "$(n_arch '*.part')" -eq 0 ]] && ok || bad "1l full → rc=0, архив есть, *.part нет (rc=$rc): $(ls "$BACKUP_DIR")"
 [[ -n "$arc" ]] && has_sens "$arc.part" && ok || bad "1m full: .part в SENSITIVE_TMP_PATHS: ${SENSITIVE_TMP_PATHS[*]}"
+has_sens "$BACKUP_DIR/dir_*" && ok || bad "1m2 full: dir-архив (.env стека) в SENSITIVE_TMP_PATHS: ${SENSITIVE_TMP_PATHS[*]}"
 # 1n) инкремент: _inc_part регистрируется, после прогона .part нет
 BASE_TS="2026-09-01_04_10_00"
 _bot_env; BACKUP_PASSWORD=""; DB_CONTAINER_NAME=""; reset_bk
@@ -274,6 +276,9 @@ create_incremental_backup > "$T/o1" 2>&1; rc=$?
 inc=$(_last_arc 'lazarus_inc_*.tar.gz')
 [[ $rc -eq 0 && -n "$inc" && "$(n_arch '*.part')" -eq 0 ]] && ok || bad "1n inc → rc=0, архив есть, *.part нет (rc=$rc): $(grep -E 'ERROR' "$T/o1" | head -2) $(ls "$BACKUP_DIR")"
 [[ -n "$inc" ]] && has_sens "$inc.part" && ok || bad "1o inc: _inc_part в SENSITIVE_TMP_PATHS: ${SENSITIVE_TMP_PATHS[*]}"
+has_sens "$BACKUP_DIR/bot_files_inc_*" && ok || bad "1o2 inc: файловый кусок инкремента в SENSITIVE_TMP_PATHS: ${SENSITIVE_TMP_PATHS[*]}"
+grep -qF 'register_sensitive_tmp "$BACKUP_DIR/$FILE_DB"   # открытый дамп: TERM → shred, как в create_backup' "$SCRIPT" \
+    && ok || bad "1o3 inc: дамп БД регистрируется до pg_dump-inc"
 BACKUP_PASSWORD=""; MOCK_BILL_STATE=""; MOCK_KB_STATE=""
 fi
 
@@ -333,6 +338,11 @@ PANEL_EXTRA_PATHS="$T/nope-a,$T/extra-dir"; reset_bk
 out=$(create_backup "full" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(cnt 'Без PANEL' < "$TGLOG")" -eq 1 ]] && ok || bad "11g пропавший путь + сбой tar-extra: маркер ровно 1 раз (rc=$rc), got $(cnt 'Без PANEL' < "$TGLOG")"
 unset -f tar
+# 11h) путь есть, tar-extra успешен: extra-архив (ключи вне каталога панели) — в SENSITIVE_TMP_PATHS, маркера нет
+PANEL_EXTRA_PATHS="$T/extra-dir"; reset_bk
+create_backup "full" > "$T/o11h" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && has_sens "$BACKUP_DIR/extra_*" && ok || bad "11h extra-архив в SENSITIVE_TMP_PATHS (rc=$rc): ${SENSITIVE_TMP_PATHS[*]}"
+[[ "$(cnt 'Без PANEL' < "$TGLOG")" -eq 0 ]] && ok || bad "11i extra в порядке → маркера нет"
 TAR_TIMEOUT_SEC=60; PANEL_EXTRA_PATHS=""
 fi
 
@@ -521,6 +531,8 @@ out=$(printf 'p1\np2\np3\n' | _t_restore_dec "$R12/v2.tar.gz.enc" "$R12/tmp" 2>&
 [[ "$(wc -l < "$T/dec_calls" | tr -d ' ')" -eq 1 ]] && ok || bad "12c v2 rc=2 → ровно одна попытка, got $(wc -l < "$T/dec_calls")"
 [[ "$out" != *"MAC прошёл"* ]] && ok || bad "12d без ложного «MAC прошёл»"
 grep -q 'restore decrypt rc=2' "$LOG_FILE" && ok || bad "12e в логе «restore decrypt rc=2»"
+[[ "$out" != *"после 3 попыток"* && "$out" == *"расшифровка не выполнена (см. выше)"* ]] \
+    && ok || bad "12e2 итог без ложного «после 3 попыток»: $out"
 # 12f) v1, rc=2 → прежний повтор ввода (3 попытки, «Неверный пароль или повреждённый файл»)
 mkdir -p "$R12/tmp"; : > "$T/dec_calls"
 out=$(printf 'p1\np2\np3\n' | _t_restore_dec "$R12/v1.tar.gz.enc" "$R12/tmp" 2>&1); rc=$?

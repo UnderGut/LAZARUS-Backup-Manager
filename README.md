@@ -33,7 +33,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manag
 Или установить в систему:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus && lazarus
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o "$f" && bash "$f"; rm -f "$f"
 ```
 
 > 💡 Скрипт установится как `/opt/lazarus-backup/lazarus-backup` и создаст symlink `/usr/local/bin/lazarus` (команда `lazarus`). Конфиг можно **не заполнять** — при первом запуске мастер спросит только необходимое, а всё остальное найдётся автоматически. Проверить, что нашлось: `lazarus stacks`.
@@ -278,7 +278,8 @@ lazarus update        # обновить сам скрипт LAZARUS (прове
 Если авто-проверка не срабатывает (кэш CDN) — обновите вручную:
 
 ```bash
-curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o /opt/lazarus-backup/lazarus-backup && chmod +x /opt/lazarus-backup/lazarus-backup
+f=$(mktemp -p /opt/lazarus-backup) && curl -fsSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o "$f" \
+  && head -1 "$f" | grep -q "^#!" && chmod 755 "$f" && mv -f "$f" /opt/lazarus-backup/lazarus-backup || rm -f "$f"
 ```
 
 > ⚠️ Обновление **бота** из LAZARUS удалено (начиная с 6.0) — обновляйте бота его собственными средствами. `lazarus update` обновляет только сам LAZARUS.

@@ -33,7 +33,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manag
 Or install into the system:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o /usr/local/bin/lazarus && chmod +x /usr/local/bin/lazarus && lazarus
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup -o "$f" && bash "$f"; rm -f "$f"
 ```
 
 > 💡 The script installs to `/opt/lazarus-backup/lazarus-backup` and creates a symlink `/usr/local/bin/lazarus` (the `lazarus` command). You can leave the config **empty** — on first run the wizard asks only for what's necessary, and everything else is discovered automatically. To check what was found: `lazarus stacks`.
@@ -278,7 +278,8 @@ lazarus update        # update the LAZARUS script itself (check + install the ne
 If the auto-check doesn't trigger (CDN cache) — update manually:
 
 ```bash
-curl -sSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o /opt/lazarus-backup/lazarus-backup && chmod +x /opt/lazarus-backup/lazarus-backup
+f=$(mktemp -p /opt/lazarus-backup) && curl -fsSL "https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main/lazarus-backup" -o "$f" \
+  && head -1 "$f" | grep -q "^#!" && chmod 755 "$f" && mv -f "$f" /opt/lazarus-backup/lazarus-backup || rm -f "$f"
 ```
 
 > ⚠️ Updating the **bot** from LAZARUS was removed (as of 6.0) — update the bot with its own tooling. `lazarus update` updates only LAZARUS itself.
