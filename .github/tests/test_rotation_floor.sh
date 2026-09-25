@@ -27,6 +27,12 @@ FUNCS="$TMP_DIR/funcs.sh"
     echo ""
     sed -n '/^_delete_orphan_inc_for_full() {$/,/^}$/p' "$SCRIPT"
     echo ""
+    # 6.0.3: rotate_backups_by_size считает объём архивов хелпером _size_rot_bytes и
+    # предупреждает о не-архивных файлах через _size_rot_warn_nonarchive.
+    sed -n '/^_size_rot_bytes() {$/,/^}$/p' "$SCRIPT"
+    echo ""
+    sed -n '/^_size_rot_warn_nonarchive() {$/,/^}$/p' "$SCRIPT"
+    echo ""
     sed -n '/^rotate_backups_by_size() {$/,/^}$/p' "$SCRIPT"
     echo ""
     sed -n '/^rotate_backups_by_age() {$/,/^}$/p' "$SCRIPT"
