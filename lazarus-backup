@@ -1956,6 +1956,16 @@ acquire_lock() {
     debug_log "LOCK" "=== acquire_lock ==="
     debug_log "LOCK" "Lock file: $LOCK_FILE"
     
+    # Без flock `! flock …` (rc=127) неотличим от «занято»: вызывающие писали «Другой процесс
+    # бэкапа уже запущен (PID: )», и бэкап молча не делался. check_dependencies ловит это на
+    # старте (flock — обязательная зависимость), здесь — страховка для LIB-режима и прямых
+    # вызовов: явная ERROR с именем пакета. rc прежний (1) — вызывающие не меняются.
+    if ! command -v flock > "$SILENT_LOG" 2>&1; then
+        print_message "ERROR" "flock не найден (пакет util-linux) — блокировка невозможна, операция не выполнена."
+        log_message "ERROR" "acquire_lock: flock not installed (package util-linux)"
+        return 1
+    fi
+
     # Создаём директорию для lock-файла если не существует
     local lock_dir=$(dirname "$LOCK_FILE")
     if [[ ! -d "$lock_dir" ]]; then
@@ -2016,17 +2026,35 @@ check_lock_owner() {
 
 check_dependencies() {
     # Required at startup. Without these the script cannot work at all.
-    local required=("tar" "gzip" "openssl" "docker" "find" "du" "date")
+    #   flock -> ОБЯЗАТЕЛЕН: без него acquire_lock всегда «занято» — бэкап, инкремент, remote-бэкап
+    #            и очистка не выполняются вовсе (раньше был в optional и давал только WARN).
+    local required=("tar" "gzip" "openssl" "docker" "find" "du" "date" "flock")
     # Optional: needed only for specific features. Missing -> warn, do not exit.
     #   rsync    -> rsync-mode restore (folder sync)
     #   zstd     -> COMPRESSION="zstd" — иначе fallback на gzip (хотя config может требовать zstd)
-    #   flock    -> предотвращение параллельного запуска (acquire_lock)
     #   realpath -> install_script для миграции legacy lazarus → lazarus-backup
     #   sha256sum-> auto-update integrity verification (H3)
     # L2 audit fix: явный warn вместо runtime сюрприза.
-    local optional=("rsync" "zstd" "flock" "realpath" "sha256sum")
+    local optional=("rsync" "zstd" "realpath" "sha256sum")
     local missing=()
     local missing_optional=()
+
+    # Подсказка apt — по ИМЕНАМ ПАКЕТОВ, не команд: пакетов flock/realpath/sha256sum в Debian нет,
+    # и `apt install rsync flock` падал целиком («Unable to locate package»), не ставя даже rsync.
+    # Повторы схлопываются (realpath+sha256sum → один coreutils).
+    _dep_apt_pkgs() {
+        local _c _p _out=()
+        for _c in "$@"; do
+            case "$_c" in
+                flock) _p="util-linux" ;;
+                realpath|sha256sum) _p="coreutils" ;;
+                "curl (or wget)") _p="curl" ;;
+                *) _p="$_c" ;;
+            esac
+            [[ " ${_out[*]} " == *" $_p "* ]] || _out+=("$_p")
+        done
+        echo "${_out[*]}"
+    }
 
     # Check for curl OR wget (required for self-update / network ops)
     if ! command -v curl > "$SILENT_LOG" 2>&1 && ! command -v wget > "$SILENT_LOG" 2>&1; then
@@ -2056,13 +2084,13 @@ check_dependencies() {
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${RED}[ERROR]${RESET} Missing dependencies: ${missing[*]}"
-        echo -e "${CYAN}[ACTION]${RESET} Please install them (e.g., apt install ${missing[*]})"
+        echo -e "${CYAN}[ACTION]${RESET} Please install them (e.g., apt install $(_dep_apt_pkgs "${missing[@]}"))"
         exit 1
     fi
 
     if [[ ${#missing_optional[@]} -gt 0 ]]; then
         echo -e "${YELLOW}[WARN]${RESET} Optional tools not found: ${missing_optional[*]}"
-        echo -e "${CYAN}[HINT]${RESET} Install if нужны соответствующие фичи: apt install ${missing_optional[*]}"
+        echo -e "${CYAN}[HINT]${RESET} Install if нужны соответствующие фичи: apt install $(_dep_apt_pkgs "${missing_optional[@]}")"
         # L2 audit fix: если COMPRESSION=zstd, но zstd нет — это hard error.
         # Конфиг прямо требует zstd, fallback на gzip = silent data behavior change.
         for _miss in "${missing_optional[@]}"; do
@@ -2349,9 +2377,19 @@ perform_update() {
         print_message "INFO" "Создана резервная копия: ${SCRIPT_NAME}.backup"
     fi
     
-    # Записываем новую версию
-    if echo "$CONTENT" > "$SCRIPT_PATH"; then
-        chmod +x "$SCRIPT_PATH"
+    # Записываем новую версию АТОМАРНО: временный файл в том же каталоге → chmod/chown → mv -f.
+    # Раньше `echo > $SCRIPT_PATH` переписывал на месте inode, который в этот момент может читать
+    # cron-экземпляр bash (bash читает скрипт по ходу исполнения) — тот продолжил бы с середины
+    # нового текста; а владелец и права наследовались от старого файла (чужой владелец/0777
+    # переживали любое обновление). rename подменяет только запись каталога: живые процессы
+    # дочитывают старый inode, новый файл сразу root:root 755. Провал на любом шаге оставляет
+    # текущую версию нетронутой; временный файл снимает EXIT-trap, если выход случится раньше rm.
+    local _new=""
+    _new=$(umask 077 && mktemp "$INSTALL_DIR/.${SCRIPT_NAME}.update.XXXXXX" 2> "$SILENT_LOG") || _new=""
+    [[ -n "$_new" ]] && register_sensitive_tmp "$_new"
+    if [[ -n "$_new" ]] && printf '%s\n' "$CONTENT" > "$_new" && chmod 755 "$_new" \
+        && { chown root:root "$_new" 2> "$SILENT_LOG" || true; } && mv -f "$_new" "$SCRIPT_PATH"; then
+        unregister_sensitive_tmp "$_new"
         print_message "SUCCESS" "Обновление завершено!"
         log_message "SUCCESS" "Script updated to new version"
         echo ""
@@ -2359,12 +2397,8 @@ perform_update() {
         sleep 1
         exec "$SCRIPT_PATH"
     else
-        print_message "ERROR" "Не удалось записать файл обновления!"
-        # Восстанавливаем из бэкапа
-        if [[ -f "$BACKUP_PATH" ]]; then
-            mv "$BACKUP_PATH" "$SCRIPT_PATH"
-            print_message "WARN" "Восстановлена предыдущая версия из бэкапа."
-        fi
+        if [[ -n "$_new" ]]; then rm -f "$_new"; unregister_sensitive_tmp "$_new"; fi
+        print_message "ERROR" "Не удалось записать файл обновления! Текущая версия не изменена."
         read -erp "Enter..." dummy
         return 1
     fi
@@ -2416,6 +2450,11 @@ install_script() {
     fi
 
     if [[ "$CURRENT_SCRIPT_PATH" == "$INSTALLED_SCRIPT_PATH" ]]; then
+        # Штатный старт (cron, CLI): нормализуем владельца/права установленного файла — дёшево, а
+        # файл исполняет root. Лечит установку до 6.0.3: через предсказуемый /tmp-файл владелец мог
+        # остаться чужим, а perform_update писал поверх и наследовал старые права.
+        [[ -O "$INSTALLED_SCRIPT_PATH" ]] || chown root:root "$INSTALLED_SCRIPT_PATH" 2> "$SILENT_LOG" || true
+        chmod go-w "$INSTALLED_SCRIPT_PATH" 2> "$SILENT_LOG" || true
         return
     fi
 
@@ -2426,30 +2465,52 @@ install_script() {
     fi
 
     local DOWNLOAD_SUCCESS=false
-    local TEMP_FILE="/tmp/lazarus_install_tmp"
+    local TEMP_FILE="" TEMP_SHA=""
 
     if [[ -f "$0" && "$0" != "bash" && "$0" != "/dev/fd/"* ]]; then
         cp "$(realpath "$0")" "$INSTALLED_SCRIPT_PATH"
         DOWNLOAD_SUCCESS=true
     else
         print_message "INFO" "Загрузка последней версии..."
+        # Временные файлы — только mktemp (O_EXCL, 0600, случайное имя) в TMPDIR: _setup_tmpdir
+        # отработал раньше install_script, это $INSTALL_DIR/tmp (0700, та же ФС → mv = rename).
+        # Раньше были фиксированные /tmp/lazarus_install_tmp(.sha256): локальный пользователь
+        # заранее клал туда свой «скрипт» и совпадающий .sha256, curl не мог их перезаписать
+        # (protected_regular → rc=23, rc не проверялся) или перезаписывал с сохранением чужого
+        # владельца — и root исполнял подложенный код через exec. register_sensitive_tmp: EXIT-trap
+        # уберёт файлы на любом выходе (ошибка, Ctrl+C); перед exec они уже удалены/перенесены.
+        TEMP_FILE=$(umask 077 && mktemp "${TMPDIR:-/tmp}/lazarus_install.XXXXXX" 2> "$SILENT_LOG") || TEMP_FILE=""
+        [[ -n "$TEMP_FILE" ]] && register_sensitive_tmp "$TEMP_FILE"
+        TEMP_SHA=$(umask 077 && mktemp "${TMPDIR:-/tmp}/lazarus_install_sha.XXXXXX" 2> "$SILENT_LOG") || TEMP_SHA=""
+        [[ -n "$TEMP_SHA" ]] && register_sensitive_tmp "$TEMP_SHA"
+        if [[ -z "$TEMP_FILE" || -z "$TEMP_SHA" ]]; then
+            [[ -n "$TEMP_FILE" ]] && rm -f "$TEMP_FILE"
+            [[ -n "$TEMP_SHA" ]] && rm -f "$TEMP_SHA"
+            print_message "ERROR" "Не удалось создать временный файл для загрузки (mktemp в ${TMPDIR:-/tmp})."
+            exit 1
+        fi
         # Добавляем timestamp для обхода кэша GitHub
         local FETCH_URL="${REMOTE_URL}?t=$(date +%s)"
         local SHA_URL="${REMOTE_URL}.sha256?t=$(date +%s)"
-        local TEMP_SHA="/tmp/lazarus_install_tmp.sha256"
+        # rc загрузки проверяется; --fail: 404/5xx GitHub → ошибка, а не страница ошибки под видом
+        # скрипта (и не «невалидный» .sha256 вместо «не опубликован»). Сбой .sha256 → файл
+        # обнуляется: недокачанный manifest не должен участвовать в проверке.
+        local _dl_rc=0
         if command -v curl > "$SILENT_LOG" 2>&1; then
-            curl $CURL_SILENT -L --connect-timeout 15 --max-time 60 "$FETCH_URL" -o "$TEMP_FILE"
+            curl $CURL_SILENT --fail -L --connect-timeout 15 --max-time 60 "$FETCH_URL" -o "$TEMP_FILE" || _dl_rc=$?
             # SHA256 manifest опционален (graceful если не опубликован).
-            curl $CURL_SILENT -L --connect-timeout 10 --max-time 20 "$SHA_URL" -o "$TEMP_SHA" 2> "$SILENT_LOG" || true
+            curl $CURL_SILENT --fail -L --connect-timeout 10 --max-time 20 "$SHA_URL" -o "$TEMP_SHA" 2> "$SILENT_LOG" || : > "$TEMP_SHA"
         elif command -v wget > "$SILENT_LOG" 2>&1; then
-            wget $WGET_SILENT -O "$TEMP_FILE" --timeout=15 "$FETCH_URL"
-            wget $WGET_SILENT -O "$TEMP_SHA" --timeout=10 "$SHA_URL" 2> "$SILENT_LOG" || true
+            wget $WGET_SILENT -O "$TEMP_FILE" --timeout=15 "$FETCH_URL" || _dl_rc=$?
+            wget $WGET_SILENT -O "$TEMP_SHA" --timeout=10 "$SHA_URL" 2> "$SILENT_LOG" || : > "$TEMP_SHA"
         else
+            rm -f "$TEMP_FILE" "$TEMP_SHA"
             print_message "ERROR" "Для установки нужен curl или wget!"
             exit 1
         fi
 
-        if [[ -f "$TEMP_FILE" ]]; then
+        # -s, не -f: mktemp уже создал файл, «существует» ничего не говорит о загрузке.
+        if [[ $_dl_rc -eq 0 && -s "$TEMP_FILE" ]]; then
             # Проверяем что это bash-скрипт
             if head -n 1 "$TEMP_FILE" | grep -q "^#!/bin/bash"; then
                 # Проверяем минимальный размер
@@ -2487,7 +2548,12 @@ install_script() {
                 fi
                 rm -f "$TEMP_SHA"
 
-                mv "$TEMP_FILE" "$INSTALLED_SCRIPT_PATH"
+                if ! mv -f "$TEMP_FILE" "$INSTALLED_SCRIPT_PATH"; then
+                    rm -f "$TEMP_FILE"
+                    print_message "ERROR" "Не удалось установить файл в $INSTALLED_SCRIPT_PATH."
+                    exit 1
+                fi
+                unregister_sensitive_tmp "$TEMP_FILE"; unregister_sensitive_tmp "$TEMP_SHA"
                 DOWNLOAD_SUCCESS=true
             else
                 print_message "ERROR" "Ошибка загрузки! Сервер вернул неверный файл."
@@ -2495,14 +2561,17 @@ install_script() {
                 exit 1
             fi
         else
-            rm -f "$TEMP_SHA"
-            print_message "ERROR" "Не удалось скачать файл."
+            rm -f "$TEMP_FILE" "$TEMP_SHA"
+            print_message "ERROR" "Не удалось скачать файл${_dl_rc:+ (rc=$_dl_rc)}."
             exit 1
         fi
     fi
 
     if [[ "$DOWNLOAD_SUCCESS" == "true" ]]; then
-        chmod +x "$INSTALLED_SCRIPT_PATH"
+        # Явно root:root 755, не `chmod +x`: ветка cp наследует владельца/права уже лежащего
+        # файла, файл из mktemp — 0600; исполняет его root (cron), запись только владельцу.
+        chown root:root "$INSTALLED_SCRIPT_PATH" 2> "$SILENT_LOG" || true
+        chmod 755 "$INSTALLED_SCRIPT_PATH"
         if [[ -L "$SYMLINK_PATH" || -f "$SYMLINK_PATH" ]]; then rm -f "$SYMLINK_PATH"; fi
         ln -s "$INSTALLED_SCRIPT_PATH" "$SYMLINK_PATH"
 
@@ -6385,6 +6454,33 @@ _remote_allow_insecure_tls() {
     return 0
 }
 
+# _remote_creds_ok <user> <pass>: CR/LF в логине/пароле ломают строку конфига curl (и дали бы
+# дописать в неё свои опции) — такие креды отклоняем явно, а не отправляем молча без авторизации.
+_remote_creds_ok() {
+    [[ "$1$2" != *[$'\r\n']* ]] && return 0
+    print_message "ERROR" "Логин или пароль хранилища содержит перевод строки (CR/LF) — такие креды не поддерживаются." >&2
+    log_message "ERROR" "remote storage credentials contain CR/LF — rejected"
+    return 1
+}
+
+# _curl_with_auth <user> <pass> <аргументы curl…>: FTP/WebDAV-креды — через конфиг curl на stdin
+# (`-K -`), а не `--user user:pass` в argv: argv любого процесса виден всем локальным
+# пользователям (ps, /proc/<pid>/cmdline), а аплоад держит curl живым до 30 минут. Эквивалентно
+# --user (CURLOPT_USERPWD); в строке конфига экранируются \ и ". stdin curl больше ни для чего не
+# нужен: аплоад читает архив через -T <файл>, не -T -. Пустой user — вызов без авторизации, как раньше.
+_curl_with_auth() {
+    local _u="$1" _p="$2"; shift 2
+    if [[ -z "$_u" ]]; then
+        curl "$@"
+        return $?
+    fi
+    _remote_creds_ok "$_u" "$_p" || return 2
+    local _up="$_u:$_p"
+    _up=${_up//\\/\\\\}
+    _up=${_up//\"/\\\"}
+    curl -K - "$@" <<< "user = \"$_up\""
+}
+
 validate_remote_connection() {
     local type="$1"; local url="$2"; local user="$3"; local pass="$4"
     
@@ -6396,11 +6492,15 @@ validate_remote_connection() {
     
     local base_url="${url%/}"
     
+    if [[ ( "$type" == "ftp" || "$type" == "webdav" ) && -n "$user" ]] && ! _remote_creds_ok "$user" "$pass"; then
+        return 1
+    fi
+
     if [[ "$type" == "ftp" ]]; then
         debug_log "REMOTE" "Testing FTP connection..."
         # FTP: проверяем листинг директории
+        # Креды — не в curl_cmd (argv и debug-строка ниже), а через _curl_with_auth (конфиг на stdin).
         local curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only)
-        [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
         
         # H7: TLS со СТРОГОЙ проверкой сертификата (без молчаливого --insecure).
         if [[ "$base_url" == ftps://* ]]; then
@@ -6412,8 +6512,8 @@ validate_remote_connection() {
         fi
         [[ "${_REMOTE_TLS_INSECURE_SESSION:-}" == "1" ]] && curl_cmd+=(--insecure)
 
-        debug_log "REMOTE" "Running: ${curl_cmd[*]} $base_url/"
-        if "${curl_cmd[@]}" "$base_url/" > "$SILENT_LOG" 2>&1; then
+        debug_log "REMOTE" "Running: ${curl_cmd[*]} $base_url/${user:+ (auth: -K stdin)}"
+        if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" "$base_url/" > "$SILENT_LOG" 2>&1; then
             debug_log "REMOTE" "FTP connection SUCCESS"
             return 0
         else
@@ -6421,8 +6521,7 @@ validate_remote_connection() {
             # Повторная попытка без TLS для обычного FTP
             if [[ "$base_url" == ftp://* ]]; then
                 curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only)
-                [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
-                if "${curl_cmd[@]}" "$base_url/" > "$SILENT_LOG" 2>&1; then
+                if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" "$base_url/" > "$SILENT_LOG" 2>&1; then
                     debug_log "REMOTE" "FTP without TLS SUCCESS"
                     return 0
                 fi
@@ -6430,8 +6529,7 @@ validate_remote_connection() {
             # H7: FTPS-провал мог быть из-за непроверенного сертификата — спросим явно и повторим.
             if [[ "$base_url" == ftps://* ]] && _remote_allow_insecure_tls; then
                 curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only --ssl-reqd --insecure)
-                [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
-                if "${curl_cmd[@]}" "$base_url/" > "$SILENT_LOG" 2>&1; then
+                if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" "$base_url/" > "$SILENT_LOG" 2>&1; then
                     debug_log "REMOTE" "FTPS insecure SUCCESS (user-approved)"
                     return 0
                 fi
@@ -6443,13 +6541,14 @@ validate_remote_connection() {
     elif [[ "$type" == "webdav" ]]; then
         debug_log "REMOTE" "Testing WebDAV connection..."
         # WebDAV: PROPFIND с Depth: 0. H7: HTTPS со СТРОГОЙ проверкой сертификата.
+        # Креды — через _curl_with_auth во ВСЕХ трёх запросах (PROPFIND, GET-fallback, insecure-PROPFIND),
+        # не в curl_cmd: иначе они видны в argv, а пропущенный вызов молча ушёл бы без авторизации.
         local curl_cmd=(curl $CURL_SILENT -m 15 -L)
-        [[ -n "$user" ]] && curl_cmd+=(--user "$user:$pass")
         [[ "$base_url" == https://* && "${_REMOTE_TLS_INSECURE_SESSION:-}" == "1" ]] && curl_cmd+=(--insecure)
 
         local http_code
         debug_log "REMOTE" "Sending PROPFIND request..."
-        http_code=$("${curl_cmd[@]}" -o "$SILENT_LOG" -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2> "$SILENT_LOG")
+        http_code=$(_curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" -o "$SILENT_LOG" -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2> "$SILENT_LOG")
         debug_log "REMOTE" "PROPFIND HTTP code: $http_code"
 
         # 207 Multi-Status — стандартный успешный ответ WebDAV
@@ -6461,7 +6560,7 @@ validate_remote_connection() {
         else
             debug_log "REMOTE" "PROPFIND failed, trying GET fallback..."
             # Fallback: попробуем простой GET
-            http_code=$("${curl_cmd[@]}" -o "$SILENT_LOG" -w "%{http_code}" "$base_url/" 2> "$SILENT_LOG")
+            http_code=$(_curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" -o "$SILENT_LOG" -w "%{http_code}" "$base_url/" 2> "$SILENT_LOG")
             debug_log "REMOTE" "GET HTTP code: $http_code"
             if [[ "$http_code" =~ ^(200|207|401)$ ]]; then
                 # 401 означает что сервер отвечает, но нужна авторизация
@@ -6471,7 +6570,7 @@ validate_remote_connection() {
             # H7: HTTPS-провал (http_code=000) мог быть из-за непроверенного сертификата — спросим явно.
             if [[ "$base_url" == https://* && "$http_code" == "000" ]] && _remote_allow_insecure_tls; then
                 curl_cmd+=(--insecure)
-                http_code=$("${curl_cmd[@]}" -o "$SILENT_LOG" -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2> "$SILENT_LOG")
+                http_code=$(_curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" -o "$SILENT_LOG" -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2> "$SILENT_LOG")
                 if [[ "$http_code" =~ ^(200|207|401)$ ]]; then
                     debug_log "REMOTE" "WebDAV insecure SUCCESS (user-approved)"
                     return 0
@@ -7082,6 +7181,13 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
     local http_code=""
     local upload_success=false
     
+    # CR/LF в кредах — явный отказ до попыток (stderr curl в цикле уходит в SILENT_LOG).
+    if [[ -n "$REMOTE_STORAGE_USER" ]] && ! _remote_creds_ok "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS"; then
+        local _cl="WebDAV"; [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && _cl="FTP"
+        REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_cl"': Ошибка (креды)'
+        return 1
+    fi
+
     # Расчёт таймаута на основе размера файла (минимум 120 сек, +60 сек на каждые 50MB)
     local timeout=$((120 + (file_size / 50000000) * 60))
     [[ $timeout -gt 1800 ]] && timeout=1800  # Максимум 30 минут
@@ -7102,8 +7208,7 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
             curl_opts+=(-s)
         fi
         
-        # Аутентификация
-        [[ -n "$REMOTE_STORAGE_USER" ]] && curl_opts+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
+        # Аутентификация — не в curl_opts (argv виден в ps весь аплоад): _curl_with_auth, конфиг на stdin.
         
         if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then
             # FTP специфичные опции
@@ -7122,7 +7227,7 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
             
             curl_opts+=("$upload_url")
             debug_log "UPLOAD" "Executing FTP upload..."
-            http_code=$(curl "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
+            http_code=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
             debug_log "UPLOAD" "FTP response code: $http_code"
             
             # FTP коды успеха: 226 (Transfer complete), 250 (Requested file action okay)
@@ -7147,7 +7252,7 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
             
             curl_opts+=("$upload_url")
             debug_log "UPLOAD" "Executing WebDAV upload..."
-            http_code=$(curl "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
+            http_code=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
             debug_log "UPLOAD" "WebDAV response code: $http_code"
             
             # WebDAV коды успеха: 200 OK, 201 Created, 202 Accepted (async commit), 204 No Content.
@@ -7174,12 +7279,11 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
         # обрезанный transfer (quota/диск). Без проверки false success → delete-local
         # терял единственную копию. HEAD/SIZE → Content-Length, сверяем с локальным.
         local _vopts=(-sI -m 60)
-        [[ -n "$REMOTE_STORAGE_USER" ]] && _vopts+=(--user "$REMOTE_STORAGE_USER:$REMOTE_STORAGE_PASS")
         [[ "$upload_url" == ftp://*  ]] && _vopts+=(--ftp-pasv)
         [[ "$upload_url" == ftps://* ]] && _vopts+=(--ftp-pasv --ssl-reqd --insecure)
         [[ "$upload_url" == https://* ]] && _vopts+=(--insecure)
         local _rmt_clen _head_rc
-        _rmt_clen=$(curl "${_vopts[@]}" "$upload_url" 2> "$SILENT_LOG" | grep -iE '^Content-Length:' | tail -1 | tr -dc '0-9')
+        _rmt_clen=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${_vopts[@]}" "$upload_url" 2> "$SILENT_LOG" | grep -iE '^Content-Length:' | tail -1 | tr -dc '0-9')
         _head_rc=${PIPESTATUS[0]}   # AUDIT v2: сам curl-HEAD (не grep/tr) — отличаем «сеть упала» от «нет Content-Length»
         local _label="WebDAV"; [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && _label="FTP"
         if [[ "$_rmt_clen" =~ ^[0-9]+$ && "$_rmt_clen" -ne "$file_size" ]]; then
@@ -7384,14 +7488,24 @@ configure_remote_storage() {
                         continue
                     fi
                     print_message "INFO" "Устанавливаю AWS CLI ($_aws_arch)..."
-                    if curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-${_aws_arch}.zip" -o /tmp/awscliv2.zip && \
-                       unzip -q /tmp/awscliv2.zip -d /tmp && \
-                       sudo /tmp/aws/install --update 2> "$SILENT_LOG"; then
-                        rm -rf /tmp/awscliv2.zip /tmp/aws
+                    # Рабочий каталог — mktemp -d (0700, случайное имя) в TMPDIR, а не фиксированные
+                    # /tmp/awscliv2.zip и /tmp/aws: локальный пользователь мог заранее создать /tmp/aws
+                    # со своим install, и root запустил бы его. Префикс lazarus_ — брошенный каталог
+                    # подметёт _setup_tmpdir. --fail: 404/5xx → ошибка, а не HTML вместо zip.
+                    # sudo только не под root: скрипт и так работает от root, а в минимальном образе
+                    # sudo может не быть вовсе.
+                    local _aws_tmp="" _aws_sudo=""
+                    [[ "$EUID" -ne 0 ]] && _aws_sudo="sudo"
+                    _aws_tmp=$(mktemp -d "${TMPDIR:-/tmp}/lazarus_awscli.XXXXXX" 2> "$SILENT_LOG") || _aws_tmp=""
+                    if [[ -n "$_aws_tmp" ]] && \
+                       curl -sL --fail "https://awscli.amazonaws.com/awscli-exe-linux-${_aws_arch}.zip" -o "$_aws_tmp/awscliv2.zip" && \
+                       unzip -q "$_aws_tmp/awscliv2.zip" -d "$_aws_tmp" && \
+                       $_aws_sudo "$_aws_tmp/aws/install" --update 2> "$SILENT_LOG"; then
+                        rm -rf "$_aws_tmp"
                         print_message "SUCCESS" "AWS CLI установлен!"
                         _AWS_CLI_MAJOR_CACHED=""  # сбрасываем кэш — пересчитаем при первом вызове.
                     else
-                        rm -rf /tmp/awscliv2.zip /tmp/aws
+                        [[ -n "$_aws_tmp" ]] && rm -rf "$_aws_tmp"
                         print_message "ERROR" "Ошибка установки AWS CLI"
                         echo -e "Установите вручную: ${GRAY}https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html${RESET}"
                         read -erp "Enter..." dummy
@@ -9172,7 +9286,7 @@ create_backup() {
     # stderr → SILENT_LOG чтобы не спамить console «Cannot stat» от файлов,
     # которые бот пишет/удаляет в собственной директории (race). Запишем в log_message.
     local _tar_rc=0 _tar_err
-    _tar_err=$(mktemp 2> "$SILENT_LOG") || _tar_err="/tmp/lazarus_tar_err.$$"
+    _tar_err=$(mktemp 2> "$SILENT_LOG") || _tar_err=$(mktemp /tmp/lazarus_tar_err.XXXXXX 2> "$SILENT_LOG") || _tar_err=/dev/null  # не предсказуемое /tmp/…$$; /dev/null — rm ниже пропускает
 
     # Progress-индикатор: tar --checkpoint=N печатает точку каждые N records
     # (1 record = 512 байт, checkpoint=2000 ≈ 1 MB). Активен только в interactive
@@ -9333,7 +9447,7 @@ create_backup() {
         log_message "ERROR" "tar failed (rc=$_tar_rc) during $TYPE backup: $(cat "$_tar_err" 2>/dev/null | head -5 | tr '\n' ' ')"
         HAS_ERROR=1
     fi
-    rm -f "$_tar_err"
+    [[ "$_tar_err" == /dev/null ]] || rm -f "$_tar_err"
 
     if [[ $HAS_ERROR -eq 1 ]]; then
         rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_FINAL"
@@ -12815,7 +12929,9 @@ show_skipped_report() {
 
     # Группируем по причине + сортируем внутри группы по размеру
     local _tmp
-    _tmp=$(mktemp 2> "$SILENT_LOG") || _tmp="/tmp/lazarus_skipped_view.$$"
+    # Запасной путь — вторая попытка mktemp в /tmp, а не предсказуемое /tmp/…$$; не вышло — /dev/null
+    # (отчёт не покажется, но и rm /dev/null от root ниже не случится).
+    _tmp=$(mktemp 2> "$SILENT_LOG") || _tmp=$(mktemp /tmp/lazarus_skipped_view.XXXXXX 2> "$SILENT_LOG") || _tmp=/dev/null
     local _total_bytes
     _total_bytes=$(awk -F'\t' '{s+=$1} END{print s+0}' "$report")
     # Полные пути НЕ обрезаем — show_skipped_report детальный, без потерь префикса.
@@ -12869,7 +12985,7 @@ show_skipped_report() {
             safe_read -rp "Enter — продолжить " dummy
         fi
     fi
-    rm -f "$_tmp"
+    [[ "$_tmp" == /dev/null ]] || rm -f "$_tmp"
     return 0
 }
 
