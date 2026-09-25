@@ -14,6 +14,8 @@
 #  5) write_password_file: сбой printf/сверки/chmod/mv — прежний файл пароля цел.
 #  6) create_backup_dispatch: форс BACKUP_LOG_FILES ask→false и авто-найденное имя billing —
 #     транзиентны (проходы видят, после возврата глобал прежний, save_config их не пишет).
+#  7) сеть: send_telegram_document/_send_telegram_text — журнал, curl/wget/aws/rclone — PATH-блокираторы;
+#     итоговая проверка — ни одного сетевого вызова.
 # Счётчики n_ok/n_err (НЕ PASS= — скраббер секретов переписывает его на диске). Секреты фиктивные.
 
 set -o pipefail
@@ -54,6 +56,9 @@ get_db_user() { echo "postgres"; }; get_db_name() { echo "appdb"; }
 ensure_bot_path() { return 0; }
 : > "$T/tg_caption.txt"
 send_telegram_document() { printf '%s\n' "$2" >> "$T/tg_caption.txt"; return 0; }
+# Текст-сводка альбома (_both_tg_flush при 0 подходящих файлах) — тоже журнал, не sendMessage:
+# иначе расширение сценариев both ушло бы в реальный api.telegram.org.
+_send_telegram_text() { printf 'TEXT|%s\n' "$1" >> "$T/tg_caption.txt"; return 0; }
 
 # --- мок docker в PATH: реальный create_backup зовёт его и через `timeout`, и из `bash -c`,
 # поэтому функция не подходит. Состояние сайдкаров — экспортируемые MOCK_BILL_STATE/MOCK_KB_STATE
@@ -96,6 +101,16 @@ case "$1" in
 esac
 MOCKEOF
 chmod +x "$MOCK/docker"
+# PATH-блокираторы сети: любой curl/wget/aws/rclone (в т.ч. из незаглушённой TG-функции) — журнал и отказ.
+: > "$T/net_blocked.log"
+for _nb in curl wget aws rclone; do
+    cat > "$MOCK/$_nb" <<NBEOF
+#!/usr/bin/env bash
+echo "BLOCKED $_nb \$*" >> "$T/net_blocked.log"
+exit 97
+NBEOF
+    chmod +x "$MOCK/$_nb"
+done
 export PATH="$MOCK:$PATH"
 export MOCK_BILL_STATE="" MOCK_KB_STATE="" MOCK_KB_DUMP_FAIL=""
 
@@ -409,6 +424,8 @@ _pw_kept "5f сбой rename" "$rc"
   [[ "$_seen" == "panel:true:infra-billing-db;bot:true:infra-billing-db;" && "$BACKUP_LOG_FILES" == "true" ]] || { echo "SUB-FAIL 6g контроль true: '$_seen'"; exit 1; }
   exit 0
 ) && ok || bad "6 create_backup_dispatch: форсы транзиентны"
+
+[[ ! -s "$T/net_blocked.log" ]] && ok || bad "7 ни одного сетевого вызова: $(head -3 "$T/net_blocked.log")"
 
 echo "---"
 echo "ok=$n_ok err=$n_err"
