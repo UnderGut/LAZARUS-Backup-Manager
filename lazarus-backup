@@ -2538,13 +2538,12 @@ add_candidate() {
     FOUND_BOTS+=("$bot")
 }
 
-scan_system_for_bot() {
-    FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
-    FOUND_PATHS=(); FOUND_BOTS=()
-    debug_log "SCAN" "=== scan_system_for_bot ==="
-    local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}')
-    debug_log "SCAN" "Running containers: $(echo "$running_containers" | wc -l)"
-    
+# _scan_is_panel_entry <name> <image>: rc=0 — контейнер панели или её инфраструктуры, в поиске бота
+# его пропускаем. Один предикат на оба контейнерных прохода scan_system_for_bot: раньше проход по
+# остановленным исключений не имел, и любой exited-контейнер панели (remnawave-migrate-old с образом
+# remnawave/backend) становился «ботом» с путём /opt/remnawave.
+_scan_is_panel_entry() {
+    local c_name="$1" c_image="$2" panel_c
     # Список контейнеров панели управления (ИСКЛЮЧАЕМ из поиска)
     local PANEL_CONTAINERS=(
         "remnawave"              # Основной контейнер панели
@@ -2555,41 +2554,89 @@ scan_system_for_bot() {
         "remnawave-telegram-mini-app"   # Mini App панели
         "certwardenclient"       # Cert Warden
     )
-    
+    for panel_c in "${PANEL_CONTAINERS[@]}"; do
+        if [[ "$c_name" == "$panel_c" ]]; then
+            debug_log "SCAN" "  -> Skip (panel container: $panel_c)"
+            return 0
+        fi
+    done
+    # Исключаем контейнеры панели по image
+    # remnawave[/-]backend: official remnawave/backend + кастомные пересборки вида local/remnawave-backend:*
+    if [[ "$c_image" == *"remnawave/backend"* || "$c_image" == *"remnawave-backend"* ]]; then debug_log "SCAN" "  -> Skip (remnawave backend)"; return 0; fi
+    if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then debug_log "SCAN" "  -> Skip (subscription-page)"; return 0; fi
+    [[ "$c_image" == *"remnawave-telegram-sub-mini-app"* ]] && return 0
+    [[ "$c_image" == *"certwarden-client"* ]] && return 0
+    if [[ "$c_image" == "nginx"* || "$c_image" == "postgres"* || "$c_image" == "redis"* ]]; then
+        # Пропускаем только если имя контейнера содержит "remnawave" БЕЗ "shop"/"bot"
+        if [[ "$c_name" == *"remnawave"* && "$c_name" != *"shop"* && "$c_name" != *"bot"* ]]; then
+            debug_log "SCAN" "  -> Skip (panel infra)"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Токены имени, по которым контейнер проекта бота — НЕ сам бот (БД, KB-база, forecast, xray-checker,
+# выдача подписок, nginx). Только по границам слова ('-', '_', '.', края), чтобы 'dbot' или
+# 'shop-database-bot' не отсекались по подстроке.
+_BOT_INFRA_NAME_RE='(^|[-_.])(db|kb_db|postgres|postgresql|redis|valkey|forecast|xray-checker|checker|subscription|nginx)([-_.]|$)'
+
+# _is_bot_infra_container <name> [image] [oneoff]: rc=0 — контейнер не может быть app-контейнером бота:
+# образ БД (_is_db_image) или redis/valkey/nginx, инфраструктурный токен в имени, одноразовый
+# `docker compose run` (метка com.docker.compose.oneoff=True или '-run-' в имени). Нужен потому, что
+# в /opt/rwp-shop все соседи совпадают с ключом rwp_shop: без отсева первым «ботом» становился
+# новейший из rwp_shop_db / rwp_shop_kb_db / rwp_shop_forecast.
+_is_bot_infra_container() {
+    local _n="$1" _img="${2:-}" _one="${3:-}"
+    [[ -z "$_n" ]] && return 1
+    if [[ -n "$_img" ]]; then
+        _is_db_image "$_img" && return 0
+        case "$_img" in nginx*|*/nginx*|*redis*|*valkey*) return 0 ;; esac
+    fi
+    [[ "$_one" == "True" || "$_n" == *"-run-"* ]] && return 0
+    [[ "$_n" =~ $_BOT_INFRA_NAME_RE ]] && return 0
+    return 1
+}
+
+# _is_bot_infra_live <name>: то же по живому контейнеру (образ и метка oneoff из docker inspect).
+# Контейнера нет / docker недоступен — проверка только по имени.
+_is_bot_infra_live() {
+    local _n="$1" _ii
+    [[ -z "$_n" ]] && return 1
+    _ii=$(docker inspect --format '{{.Config.Image}}|{{ index .Config.Labels "com.docker.compose.oneoff" }}' "$_n" 2> "$SILENT_LOG")
+    if [[ "$_ii" == *"|"* ]]; then
+        _is_bot_infra_container "$_n" "${_ii%%|*}" "${_ii#*|}"
+    else
+        _is_bot_infra_container "$_n" "$_ii"
+    fi
+}
+
+scan_system_for_bot() {
+    FOUND_PATH=""; FOUND_BOT=""; FOUND_DB=""
+    FOUND_PATHS=(); FOUND_BOTS=()
+    # FOUND_VIA_COMPOSE=1 — кандидаты найдены ТОЛЬКО по compose-файлам (контейнеров нет): это догадка,
+    # в cron её молча не применяем (может оказаться устаревшая копия compose).
+    FOUND_VIA_COMPOSE=0
+    debug_log "SCAN" "=== scan_system_for_bot ==="
+    local running_containers=$(docker ps --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.oneoff"}}')
+    debug_log "SCAN" "Running containers: $(echo "$running_containers" | wc -l)"
+    # Каталоги проектов, где ключ совпал только у БД/инфраструктуры (сам бот не найден): путь
+    # реальный — кандидат без имени app, если бот не найдётся ни среди живых, ни среди остановленных.
+    local _infra_dirs=()
+
     # C1 audit fix: while-read вместо for in $var — корректная обработка
     # путей/имён с whitespace (теоретически может встретиться в private registry).
     while IFS= read -r container; do
         [[ -z "$container" ]] && continue
         # Parameter expansion вместо cut: быстрее (без fork) и безопасно с пробелами
         local c_name="${container%%|*}"
-        local c_image="${container#*|}"
+        local _c_rest="${container#*|}"
+        local c_image="${_c_rest%%|*}" c_oneoff=""
+        [[ "$_c_rest" == *"|"* ]] && c_oneoff="${_c_rest#*|}"
         debug_log "SCAN" "Checking: $c_name ($c_image)"
-        
+
         # Проверяем что это не контейнер панели
-        local is_panel=false
-        for panel_c in "${PANEL_CONTAINERS[@]}"; do
-            if [[ "$c_name" == "$panel_c" ]]; then
-                is_panel=true
-                debug_log "SCAN" "  -> Skip (panel container: $panel_c)"
-                break
-            fi
-        done
-        
-        # Исключаем контейнеры панели по image
-        # remnawave[/-]backend: official remnawave/backend + кастомные пересборки вида local/remnawave-backend:*
-        if [[ "$c_image" == *"remnawave/backend"* || "$c_image" == *"remnawave-backend"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (remnawave backend)"; fi
-        if [[ "$c_image" == *"remnawave/subscription-page"* ]]; then is_panel=true; debug_log "SCAN" "  -> Skip (subscription-page)"; fi
-        if [[ "$c_image" == *"remnawave-telegram-sub-mini-app"* ]]; then is_panel=true; fi
-        if [[ "$c_image" == *"certwarden-client"* ]]; then is_panel=true; fi
-        if [[ "$c_image" == "nginx"* || "$c_image" == "postgres"* || "$c_image" == "redis"* ]]; then
-            # Пропускаем только если имя контейнера содержит "remnawave" БЕЗ "shop"/"bot"
-            if [[ "$c_name" == *"remnawave"* && "$c_name" != *"shop"* && "$c_name" != *"bot"* ]]; then
-                is_panel=true
-                debug_log "SCAN" "  -> Skip (panel infra)"
-            fi
-        fi
-        
-        if [[ "$is_panel" == true ]]; then continue; fi
+        if _scan_is_panel_entry "$c_name" "$c_image"; then continue; fi
 
         # Ищем контейнер БОТА по ключевым словам
         for key in "${KEYWORDS[@]}"; do
@@ -2598,7 +2645,13 @@ scan_system_for_bot() {
                 local work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name")
                 debug_log "SCAN" "  -> working_dir=$work_dir"
                 if [[ -n "$work_dir" && -d "$work_dir" && "$work_dir" != "/opt" ]]; then
-                    add_candidate "$work_dir" "$c_name"
+                    # БД/инфраструктура/одноразовый run — не бот, но каталог проекта запоминаем
+                    if _is_bot_infra_container "$c_name" "$c_image" "$c_oneoff"; then
+                        debug_log "SCAN" "  -> Skip as app (bot-project infra/db/oneoff)"
+                        _infra_dirs+=("$work_dir")
+                    else
+                        add_candidate "$work_dir" "$c_name"
+                    fi
                 fi
                 break
             fi
@@ -2610,27 +2663,45 @@ scan_system_for_bot() {
     if [[ ${#FOUND_PATHS[@]} -eq 0 ]]; then
         debug_log "SCAN" "No running matches, checking stopped containers (docker ps -a)..."
         local stopped_containers
-        stopped_containers=$(docker ps -a --format '{{.Names}}|{{.Image}}|{{.State}}' 2> "$SILENT_LOG")
+        stopped_containers=$(docker ps -a --format '{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.oneoff"}}' 2> "$SILENT_LOG")
         while IFS= read -r container; do
             [[ -z "$container" ]] && continue
             local c_name="${container%%|*}"
             local rest="${container#*|}"
             local c_image="${rest%%|*}"
-            local c_state="${rest##*|}"
+            local _rest2="${rest#*|}"
+            local c_state="${_rest2%%|*}" c_oneoff=""
+            [[ "$_rest2" == *"|"* ]] && c_oneoff="${_rest2#*|}"
             # Skip running (уже обработали выше), оставляем exited/stopped/dead
             [[ "$c_state" == "running" ]] && continue
+            # Те же панельные исключения, что у прохода по работающим
+            if _scan_is_panel_entry "$c_name" "$c_image"; then continue; fi
             for key in "${KEYWORDS[@]}"; do
                 if [[ "$c_image" == *"$key"* || "$c_name" == *"$key"* ]]; then
                     debug_log "SCAN" "  -> Stopped match: $c_name (state=$c_state)"
                     local work_dir
                     work_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c_name" 2> "$SILENT_LOG")
                     if [[ -n "$work_dir" && -d "$work_dir" && "$work_dir" != "/opt" ]]; then
-                        add_candidate "$work_dir" "$c_name"
+                        if _is_bot_infra_container "$c_name" "$c_image" "$c_oneoff"; then
+                            debug_log "SCAN" "  -> Skip as app (bot-project infra/db/oneoff)"
+                            _infra_dirs+=("$work_dir")
+                        else
+                            add_candidate "$work_dir" "$c_name"
+                        fi
                     fi
                     break
                 fi
             done
         done <<< "$stopped_containers"
+    fi
+
+    # Бот не найден ни среди живых, ни среди остановленных, но проект известен по соседям
+    # (например, контейнер бота удалён, БД жива) — кандидат с пустым app: имя подберёт
+    # resolve_bot_runtime, а detect_bot_installation не перезапишет BOT_CONTAINER_NAME.
+    if [[ ${#FOUND_PATHS[@]} -eq 0 && ${#_infra_dirs[@]} -gt 0 ]]; then
+        local _idir
+        for _idir in "${_infra_dirs[@]}"; do add_candidate "$_idir" ""; done
+        debug_log "SCAN" "Bot app not found; project dirs from infra containers: ${FOUND_PATHS[*]}"
     fi
 
     if [[ ${#FOUND_PATHS[@]} -gt 0 ]]; then
@@ -2645,7 +2716,6 @@ scan_system_for_bot() {
     # cron/resolve не должны молча принять чужой проект за бота и забэкапить/персистнуть его.
     FOUND_VIA_FALLBACK=0
     if [[ "${SCAN_ALLOW_LABEL_FALLBACK:-0}" == "1" && ${#FOUND_PATHS[@]} -eq 0 ]]; then
-        FOUND_VIA_FALLBACK=1
         debug_log "SCAN" "keyword scan empty — label-based project fallback"
         local _proot_sc; _proot_sc=$(_panel_root_now)
         local _lines_sc _ln _li _ld _seen_sc=""
@@ -2660,14 +2730,17 @@ scan_system_for_bot() {
             local _app_sc
             _app_sc=$(printf '%s\n' "$_lines_sc" | awk -F'|' -v d="$_ld" '$3==d {print $1"|"$2}' \
                 | while IFS='|' read -r _n2 _i2; do
-                    _is_db_image "$_i2" && continue
-                    case "$_i2" in nginx*|*redis*|*valkey*) continue ;; esac
+                    # БД, redis/valkey/nginx, инфраструктурные имена и одноразовые run — не app
+                    _is_bot_infra_container "$_n2" "$_i2" && continue
                     echo "$_n2"; break
                   done)
             debug_log "SCAN" "  label-fallback candidate: $_ld (app=${_app_sc:-?})"
             add_candidate "$_ld" "${_app_sc:-}"
         done <<< "$_lines_sc"
         if [[ ${#FOUND_PATHS[@]} -gt 0 ]]; then
+            # метка догадки — только если fallback что-то нашёл (иначе пустой fallback помечал
+            # догадкой и кандидатов последующего compose-прохода)
+            FOUND_VIA_FALLBACK=1
             FOUND_PATH="${FOUND_PATHS[0]}"
             FOUND_BOT="${FOUND_BOTS[0]}"
         fi
@@ -2681,8 +2754,19 @@ scan_system_for_bot() {
         # без скобок `find -maxdepth 4 -name A -o -name B` парсится как
         # `(-maxdepth 4 AND -name A) OR -name B` и compose.yaml ищется
         # рекурсивно по всей FS под /opt, /home, /root.
+        # Все 4 канонических имени compose — общий список с _compose_in (LZ_COMPOSE_NAMES); раньше
+        # здесь было 2 из 4 и docker-compose.yaml / compose.yml не находились.
+        local _fexpr=() _cfn
+        for _cfn in "${LZ_COMPOSE_NAMES[@]}"; do
+            [[ ${#_fexpr[@]} -gt 0 ]] && _fexpr+=(-o)
+            _fexpr+=(-name "$_cfn")
+        done
+        # Каталоги самого LAZARUS (tmp, распакованные архивы, бэкапы) — не установки бота: -prune,
+        # а не -not -path (тот всё равно обходит каталог и находит копии compose на глубине 4).
+        local _lz_inst="${INSTALL_DIR%/}" _lz_bk="${BACKUP_DIR%/}"
         local compose_files
-        compose_files=$(find "${search_dirs[@]}" -maxdepth 4 \( -name "docker-compose.yml" -o -name "compose.yaml" \) 2> "$SILENT_LOG")
+        compose_files=$(find "${search_dirs[@]}" -maxdepth 4 \( -path "${_lz_inst:-/nonexistent-lazarus}" -o -path "${_lz_bk:-/nonexistent-lazarus}" \) -prune \
+            -o \( "${_fexpr[@]}" \) -print 2> "$SILENT_LOG")
         # C1 audit fix: while-read для путей с whitespace
         while IFS= read -r file; do
             [[ -z "$file" ]] && continue
@@ -2697,7 +2781,9 @@ scan_system_for_bot() {
                 [[ "$candidate_path" == "/opt" ]] && continue
                 # Сначала пытаемся найти container_name
                 local candidate_bot
-                candidate_bot=$(grep -E "container_name:" "$file" | grep -E "($(IFS="|"; echo "${KEYWORDS[*]}"))" | head -1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                # первый container_name по ключу, который не БД/инфраструктура (rwp_shop_db и т.п.)
+                candidate_bot=$(grep -E "container_name:" "$file" | grep -E "($(IFS="|"; echo "${KEYWORDS[*]}"))" | awk '{print $2}' | tr -d '"' | tr -d "'" \
+                    | while IFS= read -r _cbn; do _is_bot_infra_container "$_cbn" && continue; echo "$_cbn"; break; done)
                 
                 # Если container_name не найден, используем docker compose для получения имени контейнера
                 # subshell: cd локален и не оставляет побочных эффектов в вызывающем shell
@@ -2723,6 +2809,17 @@ scan_system_for_bot() {
                 add_candidate "$candidate_path" "$candidate_bot"
             fi
         done <<< "$compose_files"
+        # Раньше compose-проход только пополнял FOUND_PATHS, и одиночный кандидат не доходил до
+        # FOUND_PATH (ветка detect_bot_installation для одного кандидата была мёртвой). Выставляем,
+        # но с меткой догадки: контейнеров нет, и файл может оказаться устаревшей копией.
+        if [[ ${#FOUND_PATHS[@]} -gt 0 ]]; then
+            FOUND_VIA_COMPOSE=1
+            if [[ ${#FOUND_PATHS[@]} -eq 1 ]]; then
+                FOUND_PATH="${FOUND_PATHS[0]}"
+                FOUND_BOT="${FOUND_BOTS[0]}"
+            fi
+            debug_log "SCAN" "Compose-only candidates (guess): ${FOUND_PATHS[*]}"
+        fi
     fi
 
     # Поиск контейнера БД
@@ -3598,6 +3695,53 @@ show_bot_startup_logs() {
 # BOT COMMANDS - Управление контейнером бота из командной строки
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# _bot_compose_service <container>: compose-сервис контейнера бота в проекте $BOT_PATH — чтобы
+# up/stop касались ТОЛЬКО бота: в /opt/rwp-shop рядом живут выдача подписок (subscription-page),
+# xray-checker, forecast и обе БД. Порядок: (1) метка com.docker.compose.service, если контейнер из
+# проекта $BOT_PATH; (2) `compose ps -a` в $BOT_PATH по имени контейнера; (3) контейнера нет вовсе
+# (удалён прежним `compose down`) — compose-файл: сервис с таким container_name или с таким именем.
+# rc=1 и пусто — сервис не определён: вызывающий отказывает, а не трогает весь проект.
+_bot_compose_service() {
+    local _c="$1" _ins _svc="" _dir
+    [[ -z "$_c" || -z "$BOT_PATH" ]] && return 1
+    _ins=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}|{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$_c" 2> "$SILENT_LOG")
+    if [[ "$_ins" == *"|"* ]]; then
+        _svc="${_ins%%|*}"; _dir="${_ins#*|}"
+        # контейнер чужого проекта: stop/up в $BOT_PATH ударили бы по одноимённому сервису бота
+        if [[ -n "$_dir" ]] && ! _same_path "$_dir" "$BOT_PATH"; then
+            debug_log "BOTOPS" "container '$_c' belongs to '$_dir', not '$BOT_PATH' — label ignored"
+            _svc=""
+        fi
+    fi
+    if [[ -z "$_svc" ]]; then
+        _svc=$( cd "$BOT_PATH" 2> "$SILENT_LOG" && docker compose ps -a --format '{{.Service}} {{.Name}}' 2> "$SILENT_LOG" \
+            | awk -v n="$_c" '$2==n {print $1; exit}' )
+    fi
+    if [[ -z "$_svc" && -z "$_ins" ]]; then
+        local _cf; _cf=$(_compose_in "$BOT_PATH") || _cf=""
+        if [[ -n "$_cf" ]]; then
+            # Сервисы — ключи с отступом первого ключа под services:; совпадение по имени сервиса
+            # или по container_name (кавычки YAML снимаем).
+            _svc=$(awk -v n="$_c" '
+                /^services:[[:space:]]*$/ { ins=1; ind=""; svc=""; next }
+                ins && /^[^[:space:]#]/ { ins=0 }
+                !ins { next }
+                /^[[:space:]]+[A-Za-z0-9._-]+:[[:space:]]*$/ {
+                    lead=$0; sub(/[^[:space:]].*$/, "", lead)
+                    if (ind == "") ind=lead
+                    if (lead == ind) { svc=$0; sub(/^[[:space:]]+/, "", svc); sub(/:[[:space:]]*$/, "", svc)
+                                       if (svc == n) { print svc; exit }; next }
+                }
+                svc != "" && /^[[:space:]]+container_name:/ {
+                    v=$0; sub(/^[[:space:]]+container_name:[[:space:]]*/, "", v); gsub(/["\047[:space:]]/, "", v)
+                    if (v == n) { print svc; exit }
+                }' "$_cf" 2> "$SILENT_LOG")
+        fi
+    fi
+    [[ -z "$_svc" ]] && return 1
+    echo "$_svc"
+}
+
 # lazarus bot up - Запустить контейнер бота (если не запущен)
 bot_up() {
     echo -e "${GREEN}${BOLD}[BOT UP]${RESET} Проверка контейнера бота..."
@@ -3607,28 +3751,41 @@ bot_up() {
     fi
 
     cd "$BOT_PATH" || return 1
-    
-    # Проверяем статус контейнера
-    local bot_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
-    
-    if [[ "$bot_status" == *"Up"* ]]; then
-        local bot_ver=$(get_current_bot_version 2>/dev/null)
-        print_message "SUCCESS" "Бот уже запущен (v${bot_ver:-?})"
-        echo -e "Статус: ${GREEN}$bot_status${RESET}"
+
+    # Статус КОНКРЕТНОГО контейнера бота. Раньше `compose ps | head -1` брал первую живую строку
+    # проекта: при остановленном rwp_shop и живой БД/forecast команда отвечала «уже запущен».
+    local _bc="$BOT_CONTAINER_NAME" bot_status
+    bot_status=$(docker inspect --format '{{.State.Status}}' "$_bc" 2> "$SILENT_LOG")
+
+    if [[ "$bot_status" == "running" ]]; then
+        local bot_ver; bot_ver=$(get_current_bot_version 2>/dev/null)
+        print_message "SUCCESS" "Бот уже запущен: $_bc (v${bot_ver:-?})"
+        echo -e "Статус: ${GREEN}$_bc: $bot_status${RESET}"
         return 0
     fi
-    
-    print_message "INFO" "Запуск контейнера..."
-    if docker compose up -d 2>/dev/null || docker-compose up -d 2>/dev/null; then
+
+    local _svc
+    if ! _svc=$(_bot_compose_service "$_bc"); then
+        print_message "ERROR" "Не удалось определить compose-сервис контейнера '$_bc' в $BOT_PATH — запуск отклонён (весь проект не поднимаем)."
+        echo "  Запустите вручную только сервис бота: cd $BOT_PATH && docker compose up -d --no-recreate <сервис>" >&2
+        log_message "ERROR" "bot_up: compose service of '$_bc' not resolved in $BOT_PATH — refuse"
+        return 1
+    fi
+
+    print_message "INFO" "Запуск контейнера $_bc (сервис $_svc, статус: ${bot_status:-не создан})..."
+    # Только сервис бота и без пересоздания: у бота подвижный тег :dev, пересоздание = апгрейд
+    # с миграциями. Зависимости (БД) compose поднимет сам, если они остановлены.
+    if docker compose up -d --no-recreate "$_svc" 2> "$SILENT_LOG" || docker-compose up -d --no-recreate "$_svc" 2> "$SILENT_LOG"; then
         sleep 2
-        bot_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
-        if [[ "$bot_status" == *"Up"* ]]; then
-            print_message "SUCCESS" "Бот запущен"
+        bot_status=$(docker inspect --format '{{.State.Status}}' "$_bc" 2> "$SILENT_LOG")
+        if [[ "$bot_status" == "running" ]]; then
+            print_message "SUCCESS" "Бот запущен: $_bc"
         else
-            print_message "WARN" "Контейнер запущен, статус: $bot_status"
+            print_message "WARN" "Команда запуска выполнена, но контейнер $_bc: ${bot_status:-не найден}"
+            return 1
         fi
     else
-        print_message "ERROR" "Ошибка запуска контейнера"
+        print_message "ERROR" "Ошибка запуска контейнера $_bc (сервис $_svc)"
         return 1
     fi
 }
@@ -3643,20 +3800,40 @@ bot_down() {
     echo -e "${YELLOW}${BOLD}[BOT DOWN]${RESET} Остановка контейнера бота..."
 
     cd "$BOT_PATH" || return 1
-    
-    # Проверяем запущен ли
-    local bot_status=$(docker compose ps --format "{{.Status}}" 2>/dev/null | head -1)
-    
-    if [[ -z "$bot_status" || "$bot_status" != *"Up"* ]]; then
-        print_message "INFO" "Бот уже остановлен"
+
+    # Статус конкретного контейнера бота (не первой строки проекта)
+    local _bc="$BOT_CONTAINER_NAME" bot_status
+    bot_status=$(docker inspect --format '{{.State.Status}}' "$_bc" 2> "$SILENT_LOG")
+
+    if [[ "$bot_status" != "running" ]]; then
+        print_message "INFO" "Бот уже остановлен: $_bc (${bot_status:-контейнер не найден})"
         return 0
     fi
-    
-    print_message "INFO" "Остановка..."
-    if docker compose down 2>/dev/null || docker-compose down 2>/dev/null; then
-        print_message "SUCCESS" "Бот остановлен"
+
+    # Останавливаем ТОЛЬКО сервис бота. Прежний `compose down` без списка сервисов клал весь
+    # проект: выдачу подписок (subscription-page), xray-checker и обе БД (AGENTS §3.2).
+    if _is_bot_infra_live "$_bc"; then
+        print_message "ERROR" "Контейнер '$_bc' — БД или инфраструктура проекта, а не бот. Остановка отклонена."
+        log_message "ERROR" "bot_down: '$_bc' looks like db/infra — refuse"
+        return 1
+    fi
+    local _svc
+    if ! _svc=$(_bot_compose_service "$_bc"); then
+        print_message "ERROR" "Не удалось определить compose-сервис контейнера '$_bc' в $BOT_PATH — остановка отклонена (весь проект не останавливаем)."
+        log_message "ERROR" "bot_down: compose service of '$_bc' not resolved in $BOT_PATH — refuse"
+        return 1
+    fi
+
+    print_message "INFO" "Остановка $_bc (сервис $_svc)..."
+    if docker compose stop "$_svc" 2> "$SILENT_LOG" || docker-compose stop "$_svc" 2> "$SILENT_LOG"; then
+        bot_status=$(docker inspect --format '{{.State.Status}}' "$_bc" 2> "$SILENT_LOG")
+        if [[ "$bot_status" == "running" ]]; then
+            print_message "ERROR" "Контейнер $_bc всё ещё работает после остановки"
+            return 1
+        fi
+        print_message "SUCCESS" "Бот остановлен: $_bc (${bot_status:-контейнер не найден})"
     else
-        print_message "ERROR" "Ошибка остановки"
+        print_message "ERROR" "Ошибка остановки $_bc (сервис $_svc)"
         return 1
     fi
 }
@@ -3678,17 +3855,26 @@ bot_status() {
     local bot_ver=$(get_current_bot_version 2>/dev/null)
     echo -e "Версия бота:     ${CYAN}${bot_ver:-не определена}${RESET}"
     
-    # Статус контейнера бота
-    local bot_container=$(docker compose ps --format "{{.Name}}" 2>/dev/null | grep -E "bot|shop" | head -1)
-    local bot_status=$(docker inspect --format='{{.State.Status}}' "$bot_container" 2>/dev/null)
-    local bot_health=$(docker inspect --format='{{.State.Health.Status}}' "$bot_container" 2>/dev/null)
-    
+    # Статус контейнера бота: берём привязанные bind'ом имена. Прежний grep 'bot|shop' по живым
+    # строкам `compose ps` при остановленном rwp_shop находил rwp_shop_db и показывал «● Running».
+    # Эвристика — только если имя пусто: с -a, без одноразовых `compose run`, без БД в роли бота.
+    local bot_container="$BOT_CONTAINER_NAME"
+    if [[ -z "$bot_container" ]]; then
+        bot_container=$(docker compose ps -a --format "{{.Name}}" 2> "$SILENT_LOG" \
+            | grep -vxF "${DB_CONTAINER_NAME:-__none__}" | grep -E "bot|shop" \
+            | while IFS= read -r _n; do _is_bot_infra_container "$_n" && continue; echo "$_n"; break; done)
+    fi
+    local bot_status bot_health
+    bot_status=$(docker inspect --format='{{.State.Status}}' "$bot_container" 2> "$SILENT_LOG")
+    bot_health=$(docker inspect --format='{{.State.Health.Status}}' "$bot_container" 2> "$SILENT_LOG")
+    local _bc_lbl="${bot_container:+ ${GRAY}(${bot_container})${RESET}}"
+
     if [[ "$bot_status" == "running" ]]; then
-        echo -e "Контейнер бота:  ${GREEN}● Running${RESET}"
+        echo -e "Контейнер бота:  ${GREEN}● Running${RESET}${_bc_lbl}"
     elif [[ -n "$bot_status" ]]; then
-        echo -e "Контейнер бота:  ${RED}○ $bot_status${RESET}"
+        echo -e "Контейнер бота:  ${RED}○ $bot_status${RESET}${_bc_lbl}"
     else
-        echo -e "Контейнер бота:  ${RED}○ не найден${RESET}"
+        echo -e "Контейнер бота:  ${RED}○ не найден${RESET}${_bc_lbl}"
     fi
     
     if [[ -n "$bot_health" && "$bot_health" != "none" ]]; then
@@ -3699,18 +3885,24 @@ bot_status() {
         fi
     fi
     
-    # Статус БД
-    local db_container=$(docker compose ps --format "{{.Name}}" 2>/dev/null | grep -E "db|postgres" | head -1)
-    local db_status=$(docker inspect --format='{{.State.Status}}' "$db_container" 2>/dev/null)
-    local db_health=$(docker inspect --format='{{.State.Health.Status}}' "$db_container" 2>/dev/null)
-    
+    # Статус БД: DB_CONTAINER_NAME (bind: find_db_container_for_path, видит и остановленную БД).
+    # Эвристика — только если пусто, с -a: иначе при остановленной rwp_shop_db «● Running» показывала KB-база.
+    local db_container="$DB_CONTAINER_NAME"
+    if [[ -z "$db_container" ]]; then
+        db_container=$(docker compose ps -a --format "{{.Name}}" 2> "$SILENT_LOG" | grep -E "db|postgres" | grep -v -- '-run-' | head -1)
+    fi
+    local db_status db_health
+    db_status=$(docker inspect --format='{{.State.Status}}' "$db_container" 2> "$SILENT_LOG")
+    db_health=$(docker inspect --format='{{.State.Health.Status}}' "$db_container" 2> "$SILENT_LOG")
+    local _db_lbl="${db_container:+ ${GRAY}(${db_container})${RESET}}"
+
     echo ""
     if [[ "$db_status" == "running" ]]; then
-        echo -e "Контейнер БД:    ${GREEN}● Running${RESET}"
+        echo -e "Контейнер БД:    ${GREEN}● Running${RESET}${_db_lbl}"
     elif [[ -n "$db_status" ]]; then
-        echo -e "Контейнер БД:    ${RED}○ $db_status${RESET}"
+        echo -e "Контейнер БД:    ${RED}○ $db_status${RESET}${_db_lbl}"
     else
-        echo -e "Контейнер БД:    ${GRAY}○ не найден${RESET}"
+        echo -e "Контейнер БД:    ${GRAY}○ не найден${RESET}${_db_lbl}"
     fi
     
     if [[ -n "$db_health" && "$db_health" != "none" ]]; then
@@ -3806,10 +3998,19 @@ detect_bot_installation() {
     [[ "$IS_INTERACTIVE" == "true" && "$AUTO_CONFIRM" != "true" ]] && SCAN_ALLOW_LABEL_FALLBACK=1
     scan_system_for_bot
     SCAN_ALLOW_LABEL_FALLBACK="$_sv_fb"
+    # Кандидаты только из compose-файлов (контейнеров нет) — догадка: это может быть устаревшая
+    # копия compose (/root/rwp-shop-old и т.п.). Cron/auto-confirm её молча не применяет.
+    local _compose_guess=0
+    [[ "${FOUND_VIA_COMPOSE:-0}" == "1" ]] && _compose_guess=1
     if [[ ${#FOUND_PATHS[@]} -gt 1 ]]; then
         # H4 audit fix: в неинтерактивном режиме (cron) — берём первый кандидат
         # вместо подвешивания на read. Логируем выбор для аудита.
         if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+            if [[ "$_compose_guess" == "1" ]]; then
+                print_message "WARN" "Найдено ${#FOUND_PATHS[@]} compose-файлов бота без контейнеров — в неинтерактивном режиме не применяю (возможна устаревшая копия). Укажите путь: Настройки → «Цель бэкапа»."
+                log_message "WARN" "detect_bot_installation: ${#FOUND_PATHS[@]} compose-only candidates, not auto-applied (non-interactive)"
+                return 1
+            fi
             debug_log "SCAN" "Non-interactive: auto-selecting first candidate ${FOUND_PATHS[0]}"
             print_message "WARN" "Найдено ${#FOUND_PATHS[@]} установок, в неинтерактивном режиме выбран первый: ${FOUND_PATHS[0]}"
             BOT_PATH="${FOUND_PATHS[0]}"
@@ -3822,6 +4023,7 @@ detect_bot_installation() {
         # а по любому не-панельному compose-проекту с БД) — честно помечаем в списке.
         local _fb_mark=""
         [[ "${FOUND_VIA_FALLBACK:-0}" == "1" ]] && _fb_mark=" ${YELLOW}[догадка по labels]${RESET}"
+        [[ "$_compose_guess" == "1" ]] && _fb_mark=" ${YELLOW}[догадка: compose-файл без контейнеров]${RESET}"
         local idx=1
         for path in "${FOUND_PATHS[@]}"; do
             local bot="${FOUND_BOTS[$((idx-1))]}"
@@ -3842,6 +4044,11 @@ detect_bot_installation() {
         debug_log "SCAN" "Found installation: PATH=$FOUND_PATH, BOT=$FOUND_BOT, DB=$FOUND_DB"
         # H4 audit fix: в неинтерактивном режиме — auto-apply без подтверждения
         if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
+            if [[ "$_compose_guess" == "1" ]]; then
+                print_message "WARN" "Найден только compose-файл бота без контейнеров ($FOUND_PATH) — в неинтерактивном режиме не применяю. Укажите путь: Настройки → «Цель бэкапа»."
+                log_message "WARN" "detect_bot_installation: compose-only candidate $FOUND_PATH not auto-applied (non-interactive)"
+                return 1
+            fi
             debug_log "SCAN" "Non-interactive: auto-applying single candidate"
             BOT_PATH="$FOUND_PATH"
             [[ -n "$FOUND_BOT" ]] && BOT_CONTAINER_NAME="$FOUND_BOT"
@@ -3849,7 +4056,9 @@ detect_bot_installation() {
             save_config; print_message "SUCCESS" "Настройки применены автоматически: $FOUND_PATH"; return 0
         fi
         # №18: single-кандидат из label-fallback — не «установка», а ВОЗМОЖНЫЙ проект (догадка).
-        if [[ "${FOUND_VIA_FALLBACK:-0}" == "1" ]]; then
+        if [[ "$_compose_guess" == "1" ]]; then
+            echo ""; print_message "WARN" "Найден ВОЗМОЖНЫЙ проект бота (догадка: compose-файл без контейнеров, может быть устаревшей копией):"
+        elif [[ "${FOUND_VIA_FALLBACK:-0}" == "1" ]]; then
             echo ""; print_message "WARN" "Найден ВОЗМОЖНЫЙ проект бота (догадка по compose-labels, не по ключевым словам):"
         else
             echo ""; print_message "SUCCESS" "Обнаружена установка!"
@@ -3897,9 +4106,18 @@ check_config_mismatch() {
             scan_system_for_bot
             if [[ -n "$FOUND_BOT" && "$FOUND_BOT" != "$BOT_CONTAINER_NAME" ]]; then
                 debug_log "CONFIG" "Found alternative: $FOUND_BOT (was: $BOT_CONTAINER_NAME)"
+                # Замена найдена только по compose-файлу (контейнера нет) — догадка: в cron молча
+                # не применяем, иначе бэкап мог бы уйти на устаревшую копию compose.
+                local _cm_guess=0
+                [[ "${FOUND_VIA_COMPOSE:-0}" == "1" ]] && _cm_guess=1
                 # H4 audit fix: non-interactive — авто-применяем найденную замену
                 # (alternative — это backup-восстановление работоспособности при
                 # переименовании контейнера, безопасно).
+                if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]] && [[ "$_cm_guess" == "1" ]]; then
+                    print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден; '$FOUND_BOT' найден только в compose-файле ($FOUND_PATH) — авто-замену в неинтерактивном режиме не делаю."
+                    log_message "WARN" "check_config_mismatch: compose-only replacement '$FOUND_BOT' not auto-applied (non-interactive)"
+                    return 0
+                fi
                 if [[ "$IS_INTERACTIVE" != "true" || "$AUTO_CONFIRM" == "true" ]]; then
                     debug_log "CONFIG" "Non-interactive: auto-applying replacement container"
                     print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден — авто-замена на '$FOUND_BOT'"
@@ -3910,6 +4128,7 @@ check_config_mismatch() {
                     return 0
                 fi
                 echo ""; print_message "WARN" "Контейнер '$BOT_CONTAINER_NAME' не найден, но найден '$FOUND_BOT'."
+                [[ "$_cm_guess" == "1" ]] && echo -e " ${YELLOW}Догадка: найден только compose-файл ($FOUND_PATH), контейнера нет — возможно, устаревшая копия.${RESET}"
                 echo -e " ${GREEN}Предлагаю обновить настройки.${RESET}"
                 read -erp "Обновить? (Y/n): " upd
                 if [[ -z "$upd" || "$upd" =~ ^[Yy]$ ]]; then
@@ -4612,6 +4831,15 @@ load_or_create_config() {
         select_backup_target_firstrun
     fi
 
+    # Bot-режим: панельное имя в рабочем BOT_CONTAINER_NAME (порча от прежнего перехода panel→bot
+    # в меню «Цель бэкапа») сбрасываем ДО авто-поиска. Иначе bot-ветка save_config каждый запуск,
+    # включая cron, заново писала бы 'remnawave', а гард бэкапа отказывал бы каждому проходу.
+    # Пустое имя запускает detect_bot_installation ниже; вычистку персистим один раз (_bc_sanitized).
+    local _bc_sanitized=0
+    if [[ "$BACKUP_TARGET" != "panel" ]] && _is_panel_container "$BOT_CONTAINER_NAME"; then
+        debug_log "CONFIG" "bot mode: panel container '$BOT_CONTAINER_NAME' in BOT_CONTAINER_NAME — reset"
+        BOT_CONTAINER_NAME=""; _bc_sanitized=1
+    fi
     # Panel-режим: bot-auto-discovery НЕ запускаем (на panel-сервере бота нет;
     # рабочие переменные ставит resolve_backup_target из PANEL_*).
     if [[ "$BACKUP_TARGET" != "panel" ]] \
@@ -4628,6 +4856,7 @@ load_or_create_config() {
     # прохода (panel-затёртое) и отравил бы второй проход/heal. Дальше снимок ведут правки настроек
     # и refresh при включении «обе» (опция 27).
     local _healed_bot=0 _sanitized_bot=0
+    [[ "$_bc_sanitized" == "1" ]] && _sanitized_bot=1
     if [[ -z "${_CANON_SNAPSHOT_TAKEN:-}" ]]; then
         local _snap_path="$BOT_PATH" _snap_app="$BOT_CONTAINER_NAME" _snap_db="$DB_CONTAINER_NAME"
         local _snap_svc="$DB_SERVICE_NAME" _snap_dbname="$DB_NAME" _snap_dbuser="$DB_USER"
@@ -4986,10 +5215,14 @@ _same_path() {
     [[ -n "$a" && "$a" == "$b" ]]
 }
 
+# Канонические имена compose-файла в порядке приоритета — общий список для _compose_in и
+# find в scan_system_for_bot (иначе списки снова разойдутся).
+LZ_COMPOSE_NAMES=(docker-compose.yml docker-compose.yaml compose.yml compose.yaml)
+
 # Эхо первого compose-файла в каталоге $1 (все 4 канонических имени); rc=1 если нет.
 _compose_in() {
     local d="$1" f
-    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    for f in "${LZ_COMPOSE_NAMES[@]}"; do
         [[ -f "$d/$f" ]] && { echo "$d/$f"; return 0; }
     done
     return 1
@@ -5061,15 +5294,29 @@ resolve_bot_runtime() {
     # Compose v2 default-именами '<proj>-db-1' end-anchor '-db$' не срабатывал и db мог стать app).
     RB_DB=$(find_db_container_for_path "$RB_PATH" 2> "$SILENT_LOG")
     [[ -z "$RB_DB" ]] && ! _is_panel_container "$DB_CONTAINER_NAME" && RB_DB="$DB_CONTAINER_NAME"
-    # app-контейнер: если пуст/панельный — берём НЕ-инфраструктурный сервис из compose ps.
+    # app-контейнер: если пуст/панельный/совпал с БД/инфраструктурный — берём НЕ-инфраструктурный
+    # сервис из compose ps. Вторая линия после отсева в scan_system_for_bot: RB_APP мог прийти из
+    # конфига (кандидат-1) или из старого снимка (rwp_shop_forecast, rwp_shop_db).
     # DB-токен по границам слова (ловит и 'x_db', 'x-db', 'x-db-1'); плюс явное исключение RB_DB.
-    if [[ -z "$RB_APP" ]] || _is_panel_container "$RB_APP"; then
-        local _rbdb_re="${RB_DB:-__none__}"
-        RB_APP=$( cd "$RB_PATH" 2> "$SILENT_LOG" && \
-            docker compose ps --format '{{.Name}}' 2> "$SILENT_LOG" \
-            | grep -vxF "$_rbdb_re" \
-            | grep -viE 'remnawave|postgres|(^|[-_])db([-_]|$)|redis|nginx|forecast|kb_db|xray|checker|subscription|mini-app|proxy' \
-            | head -1 )
+    if [[ -z "$RB_APP" || "$RB_APP" == "$RB_DB" ]] || _is_panel_container "$RB_APP" || _is_bot_infra_live "$RB_APP"; then
+        local _rbdb_re="${RB_DB:-__none__}" _psa
+        # прежний отсев по подстроке (панель, xray-checker, subscription-page, прокси) — сохраняем
+        local _rb_legacy_re='remnawave|postgres|redis|nginx|xray|checker|subscription|mini-app|proxy'
+        RB_APP=""
+        # Сначала работающие, затем -a (остановленный бот остаётся кандидатом); одноразовые
+        # `compose run` (-run-, oneoff) и инфраструктура отсекаются предикатом.
+        for _psa in "" "-a"; do
+            RB_APP=$( cd "$RB_PATH" 2> "$SILENT_LOG" && \
+                docker compose ps ${_psa:+"$_psa"} --format '{{.Name}}|{{.Image}}' 2> "$SILENT_LOG" \
+                | while IFS='|' read -r _cn _ci; do
+                    [[ -z "$_cn" || "$_cn" == "$_rbdb_re" ]] && continue
+                    [[ "${_cn,,}" =~ $_rb_legacy_re ]] && continue
+                    _is_bot_infra_container "$_cn" "$_ci" && continue
+                    _is_bot_infra_live "$_cn" && continue
+                    echo "$_cn"; break
+                  done )
+            [[ -n "$RB_APP" ]] && break
+        done
         [[ -z "$RB_APP" ]] && RB_APP="rwp_shop"
     fi
     debug_log "BOTRT" "resolved real bot: path=$RB_PATH app=$RB_APP db=$RB_DB (panel=$_panel)"
@@ -14646,19 +14893,60 @@ _ask_target_location() {
             print_message "INFO" "Панель локально: ${PANEL_PATH} · контейнер БД: ${PANEL_DB_CONTAINER}"
         else
             BOT_TRANSPORT="local"
-            # Локальный бот: пробуем автодетект, иначе спрашиваем путь.
-            local _save_t="$BACKUP_TARGET"; BACKUP_TARGET="bot"
-            scan_system_for_bot
-            BACKUP_TARGET="$_save_t"
-            if [[ -n "$FOUND_PATH" ]]; then
-                BOT_PATH="$FOUND_PATH"; [[ -n "$FOUND_DB" ]] && DB_CONTAINER_NAME="$FOUND_DB"; [[ -n "$FOUND_BOT" ]] && BOT_CONTAINER_NAME="$FOUND_BOT"
-                print_message "SUCCESS" "Найден бот: $BOT_PATH"
+            # Локальный бот: панель-независимый резолвер, иначе спрашиваем путь. Прямой скан здесь
+            # шёл с KEYWORDS панели (после panel-resolve = remnawave) и не видел бота либо принимал
+            # за него чужой remnawave*-контейнер; resolve_bot_runtime сам берёт бот-набор ключей,
+            # отсеивает панельные пути и возвращает вызывателю KEYWORDS и FOUND_*.
+            if resolve_bot_runtime; then
+                BOT_PATH="$RB_PATH"
+                [[ -n "$RB_APP" ]] && BOT_CONTAINER_NAME="$RB_APP"
+                [[ -n "$RB_DB" ]] && DB_CONTAINER_NAME="$RB_DB"
+                if [[ -n "${_CANON_BOT_PATH:-}" ]] && _same_path "$RB_PATH" "$_CANON_BOT_PATH"; then
+                    print_message "SUCCESS" "Бот: используется текущий путь $BOT_PATH (контейнер ${BOT_CONTAINER_NAME:-?})"
+                else
+                    print_message "SUCCESS" "Найден бот: $BOT_PATH (контейнер ${BOT_CONTAINER_NAME:-?})"
+                fi
             else
-                safe_read -erp "  Путь к каталогу бота: " BOT_PATH
-                safe_read -erp "  Контейнер БД бота (Enter = rwp_shop_db): " DB_CONTAINER_NAME; DB_CONTAINER_NAME="${DB_CONTAINER_NAME:-rwp_shop_db}"
+                # Enter = прежний путь бота, если он всё ещё валиден; пустой ввод не затирает канон.
+                local _bp_def="" _bp _bp_rc
+                _dir_is_bot "${_CANON_BOT_PATH:-}" && _bp_def="$_CANON_BOT_PATH"
+                while true; do
+                    _bp=""
+                    if [[ -n "$_bp_def" ]]; then
+                        safe_read -erp "  Путь к каталогу бота (Enter = $_bp_def): " _bp; _bp_rc=$?
+                    else
+                        safe_read -erp "  Путь к каталогу бота: " _bp; _bp_rc=$?
+                    fi
+                    # EOF/ошибка ввода — выходим, ничего не меняя (иначе бесконечный переспрос)
+                    [[ $_bp_rc -ne 0 && -z "$_bp" ]] && break
+                    [[ "$_bp" == "0" ]] && { _bp=""; break; }
+                    _bp="${_bp:-$_bp_def}"
+                    if [[ -z "$_bp" ]]; then
+                        print_message "ERROR" "Укажите путь к каталогу бота (0 — оставить как есть)"; continue
+                    fi
+                    if _dir_is_panel "$_bp"; then
+                        print_message "ERROR" "Это каталог панели, а не бота: $_bp"; continue
+                    fi
+                    _dir_is_bot "$_bp" || print_message "WARN" "В $_bp нет compose-файла — путь сохранён как есть, проверьте перед бэкапом."
+                    break
+                done
+                if [[ -n "$_bp" ]]; then
+                    BOT_PATH="$_bp"
+                    safe_read -erp "  Контейнер БД бота (Enter = rwp_shop_db): " DB_CONTAINER_NAME; DB_CONTAINER_NAME="${DB_CONTAINER_NAME:-rwp_shop_db}"
+                else
+                    # путь не введён: рабочий BOT_PATH (в panel-режиме = путь панели) возвращаем к канону
+                    BOT_PATH="${_CANON_BOT_PATH:-}"
+                    print_message "WARN" "Путь бота не изменён${BOT_PATH:+: $BOT_PATH}"
+                fi
             fi
-            _CANON_BOT_PATH="$BOT_PATH"; _CANON_DB_CONTAINER="$DB_CONTAINER_NAME"
-            [[ -n "$BOT_CONTAINER_NAME" ]] && _CANON_BOT_CONTAINER="$BOT_CONTAINER_NAME"
+            [[ -n "$BOT_PATH" ]] && _CANON_BOT_PATH="$BOT_PATH"
+            # В канон не переносим панельные имена (остаток panel-resolve: remnawave / remnawave-db)
+            if [[ -n "$DB_CONTAINER_NAME" ]] && ! _is_panel_container "$DB_CONTAINER_NAME"; then
+                _CANON_DB_CONTAINER="$DB_CONTAINER_NAME"
+            fi
+            if [[ -n "$BOT_CONTAINER_NAME" ]] && ! _is_panel_container "$BOT_CONTAINER_NAME"; then
+                _CANON_BOT_CONTAINER="$BOT_CONTAINER_NAME"
+            fi
         fi
     fi
 }
@@ -14697,6 +14985,19 @@ menu_backup_target() {
         _ask_target_location "$_prim"; [[ "$_ASK_TARGET_CONN_OK" == "false" ]] && _conn_all_ok=false
         if [[ -n "$_sec" ]]; then _ask_target_location "$_sec"; [[ "$_ASK_TARGET_CONN_OK" == "false" ]] && _conn_all_ok=false; fi
         BACKUP_TARGET="$_prim"; BACKUP_SECONDARY="$_sec"
+        # Переход на одиночную цель «бот»: bot-ветка save_config пишет РАБОЧИЕ переменные, а в процессе,
+        # стартовавшем с панелью, в них остаток panel-resolve (MAX_FILE_SIZE_MB=0, DB_NAME=PANEL_DB_NAME,
+        # BOT_CONTAINER_NAME=remnawave, DB_CONTAINER_NAME=remnawave-db). Контракт resolve_backup_target
+        # требует снять его здесь — возвращаем канон бота, панельные имена → канон или пусто
+        # (пустое имя на следующем старте заполнит detect_bot_installation).
+        if [[ "$_prim" == "bot" && -z "$_sec" ]]; then
+            MAX_FILE_SIZE_MB="${_CANON_MAX_FILE_SIZE_MB:-1}"
+            DB_NAME="${_CANON_DB_NAME:-}"
+            _is_panel_container "$BOT_CONTAINER_NAME" && BOT_CONTAINER_NAME="${_CANON_BOT_CONTAINER:-}"
+            _is_panel_container "$BOT_CONTAINER_NAME" && BOT_CONTAINER_NAME=""
+            _is_panel_container "$DB_CONTAINER_NAME" && DB_CONTAINER_NAME="${_CANON_DB_CONTAINER:-}"
+            _is_panel_container "$DB_CONTAINER_NAME" && DB_CONTAINER_NAME=""
+        fi
         save_config            # сохраняем ДО resolve (panel-resolve затрёт BOT_PATH в памяти)
         resolve_backup_target
         echo ""
