@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.2-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.3-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** is a backup system for **Remnawave Panel** and the **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: panel, bot, infra-billing, and the AI-support knowledge base — all in a single tool. Everything is discovered **automatically** (by images and Docker labels — container names and paths do not matter), destructive operations are protected against data loss, there is **panel migration to a new server**, and two menu modes — **Simple** (for newcomers: 4 items + a step-by-step wizard) and **Advanced** (full control).
@@ -70,17 +70,18 @@ Step-by-step guides for each scenario live in **[docs/](docs/README.md)** (writt
 ### 🛡️ Data-loss protection
 The script is designed to **not lose data** even on failures:
 - **Restore with a rollback point** — before destroying the database, a snapshot of the LIVE database is taken (with a content check). The destructive step runs only when the snapshot is valid; the target path and containers are checked BEFORE the stack is stopped. On import failure, or on any guard failure after the volume is dropped — auto-rollback of the DB from the snapshot + containers brought back up. Any early guard failure brings the stack back up (panel/bot are never left offline or on an empty database).
-- **Verify before delete** — every archive (full and incremental) is verified (for `.enc` — a full decrypt round-trip) BEFORE the plaintext is deleted and success is reported.
+- **Verify before delete** — every archive (full and incremental) is verified (for `.enc` — a full decrypt round-trip) BEFORE the plaintext is deleted and success is reported. "Corrupted" (MAC or compression check failed) and "not verified" (I/O error, no space in the temp directory) are reported differently — on screen and in Telegram.
+- **Whole archive or nothing** — an archive is written under a temporary `*.part` name and gets its final name only when complete (after packing and encryption). An interrupted run leaves only `*.part` files — the next backup removes them; rotation, stats and restore never see them.
 - **Encryption is mandatory** — if a password is set and encryption failed, the unencrypted archive is NOT uploaded (cron — abort; interactive — explicit confirmation). Intermediate plaintext dumps (including during remote backup) are wiped with `shred` on exit/interrupt, and those left behind by a killed process (SIGKILL/OOM/reboot) are cleaned up on the next run. Temporary archive copies are written to disk (`/opt/lazarus-backup/tmp`), not to `/tmp`, which lives in RAM on many servers.
-- **Rotation never zeroes out** — size-rotation never deletes the newest backup and cascades to clean up orphaned incrementals.
+- **Rotation never zeroes out** — size-rotation never deletes the newest backup and cascades to clean up orphaned incrementals. The limit counts only `lazarus_*` archives: rollback snapshots (`pre_restore_snapshot_*`) are not included and never cause archives to be deleted (they get a separate warning).
 - **Upload with verify** — S3/FTP/WebDAV/rclone check the size on the remote BEFORE `delete-local` removes the local copy; if the size is unverified, the local copy is left untouched.
 - **Identification by role, not by name** — containers are identified by image/label/`DATABASE_URL`, and a destructive action on a "foreign" stack is rejected fail-closed.
 - **Serialization under flock** — parallel backups (cron + manual) don't corrupt each other.
 
 ### 💾 Backup
 - **Auto-discovery** — panel, bot, infra-billing, and the knowledge base database are discovered on their own (images + Docker labels); names don't matter.
-- **4 backup types** — Full (DB + files), DB only, Files only, **Incremental** (changed files + a fresh DB dump relative to the last full).
-- **Sidecars** — cluster roles (`globals`), infra-billing (`billing_*.sql`), the AI-support knowledge base (`kb_*.sql`, pgvector), additional paths outside the panel directory (`extra_*.tar`, e.g. `certwarden`).
+- **4 backup types** — Full (DB + files), DB only, Files only, **Incremental** (changed files + a fresh DB dump relative to the last LOCAL full; kept locally only — not uploaded to storage or Telegram).
+- **Sidecars** — cluster roles (`globals`), infra-billing (`billing_*.sql`), the AI-support knowledge base (`kb_*.sql`, pgvector), additional paths outside the panel directory (`extra_*.tar`, e.g. `certwarden`). An installed but stopped sidecar in `auto` mode never drops out silently: a warning and a "no infra-billing / no KB" mark in Telegram.
 - **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2), detects a wrong password and byte tampering BEFORE decryption.
 - **gzip / zstd** — gzip (everywhere), zstd (opt-in, smaller and faster on SQL dumps). Old archives are restored regardless of the current format (detected by magic bytes).
 - **Version in the filename** — the component version is added to the archive name (`__vX.Y.Z`): the image tag if it is itself a version (`3.4.4-trafficfmt`), otherwise the exact version from the image — for a bot on the moving `:dev` tag this is its real version (`7.1.0.x`), not `dev`.
@@ -103,7 +104,7 @@ The script is designed to **not lose data** even on failures:
 ### ☁️ Storage and delivery
 - **Telegram** — files and notifications with premium emoji + retry × 3.
 - **S3-compatible** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2** (`region=auto`), **Backblaze B2**, custom endpoint. After upload — `head-object` verify (size + ETag), cleanup of dangling multipart uploads on failure.
-- **FTP / FTPS / WebDAV / Rclone** — with retry and a step-by-step setup; post-upload size verify.
+- **FTP / FTPS / WebDAV / Rclone** — with retry and a step-by-step setup; post-upload size verify. The login and password are passed to curl via stdin, not on the command line (not visible in `ps`).
 - **Rotation** — by time (days) or count; a separate rotation on S3 (`S3_RETENTION_DAYS`, touches only its own archives).
 
 ### 🔔 Telegram alerts
@@ -112,10 +113,10 @@ The script is designed to **not lose data** even on failures:
 
 ### ⚙️ Automation
 - **Cron from the menu** — schedule Full / DB only / Files only, including "every N minutes".
-- **flock** — protection against parallel runs (cron + manual).
+- **flock** — protection against parallel runs (cron + manual). A required dependency (`util-linux` package).
 - **Timeout wrappers** — a hard limit on pg_dump / tar / encrypt / restore (60 min by default, configurable; `0` = no limit).
 - **Logrotate** — `/etc/logrotate.d/lazarus` (weekly, rotate 8, compress).
-- **Self-update** — `lazarus update` (updates the LAZARUS script itself).
+- **Self-update** — `lazarus update` (updates the LAZARUS script itself; the replacement is atomic — a cron run in progress never reads half of the new version).
 
 ### 🩺 Diagnostics
 - **`lazarus stacks`** — the server's discovered stacks (panel / infra-billing / bot) + config↔reality discrepancies.
@@ -176,7 +177,7 @@ lazarus migrate panel [--from user@host] [--port 22] [--key /path] [--path /opt/
 
 # Bot container management
 lazarus bot status            # status + version + healthcheck   ·  -b -s
-lazarus bot up | down         # start / stop the bot containers
+lazarus bot up | down         # start / stop only the bot container (the DB and neighbouring services of the project are left alone)
 lazarus bot logs [N]          # last N log lines                 ·  -b -l
 
 # S3 and script update

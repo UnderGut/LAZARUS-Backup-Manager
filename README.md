@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.2-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.3-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — система резервного копирования для **Remnawave Panel** и **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: панель, бот, infra-billing и база знаний ИИ-саппорта — одним инструментом. Всё находится **само** (по образам и docker-меткам, имена контейнеров и пути не важны), деструктивные операции защищены от потери данных, есть **перенос панели на новый сервер** и два режима меню — **Простой** (для новичков: 4 пункта + пошаговый мастер) и **Расширенный** (полный контроль).
@@ -70,17 +70,18 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 ### 🛡️ Защита от потери данных
 Скрипт спроектирован так, чтобы **не терять данные** даже при сбоях:
 - **Restore с точкой отката** — перед уничтожением БД снимается snapshot ЖИВОЙ БД (с контент-проверкой). Деструктив выполняется только при валидном snapshot; путь и контейнеры цели проверяются ДО остановки стека. При провале импорта или любого гарда после удаления volume — авто-откат БД из snapshot + подъём контейнеров. Любой ранний отказ гарда поднимает стек обратно (панель/бот не остаются offline и не остаются на пустой БД).
-- **Verify до удаления** — каждый архив (full и incremental) проверяется (для `.enc` — полным decrypt round-trip) ПЕРЕД удалением plaintext и репортом об успехе.
+- **Verify до удаления** — каждый архив (full и incremental) проверяется (для `.enc` — полным decrypt round-trip) ПЕРЕД удалением plaintext и репортом об успехе. «Повреждён» (не сошёлся MAC или контроль сжатия) и «не проверен» (ошибка ввода-вывода, нет места во временном каталоге) различаются — в сообщении и в Telegram.
+- **Целый архив или ничего** — архив пишется под временным именем `*.part` и получает штатное имя только целым (после упаковки и шифрования). Прерванный прогон оставляет лишь `*.part` — следующий бэкап их убирает; ротация, статистика и restore их не видят.
 - **Шифрование обязательно** — если задан пароль и шифрование провалилось, незашифрованный архив НЕ отправляется (cron — abort; интерактив — явное подтверждение). Промежуточные plaintext-дампы (в т.ч. при удалённом бэкапе) затираются `shred` при выходе/прерывании, а брошенные убитым процессом (SIGKILL/OOM/ребут) — зачищаются при следующем прогоне. Временные копии архивов пишутся на диск (`/opt/lazarus-backup/tmp`), а не в `/tmp`, который на многих серверах живёт в RAM.
-- **Ротация не обнуляет** — size-rotation никогда не удаляет новейший бэкап и каскадно чистит orphan-инкременты.
+- **Ротация не обнуляет** — size-rotation никогда не удаляет новейший бэкап и каскадно чистит orphan-инкременты. Лимит считает только архивы `lazarus_*`: снапшоты отката (`pre_restore_snapshot_*`) в него не входят и архивы из-за них не удаляются (о них — отдельное предупреждение).
 - **Upload с verify** — S3/FTP/WebDAV/rclone сверяют размер на remote ПЕРЕД тем, как `delete-local` удалит локальную копию; при несверенном размере локаль не трогается.
 - **Идентификация по роли, не по имени** — контейнеры определяются по образу/метке/`DATABASE_URL`, деструктив над «чужим» стеком отклоняется fail-closed.
 - **Сериализация под flock** — параллельные бэкапы (cron + ручной) не портят друг друга.
 
 ### 💾 Резервное копирование
 - **Авто-обнаружение** — панель, бот, infra-billing и БД знаний находятся сами (образы + docker-метки), имена не важны.
-- **4 типа бэкапов** — Full (БД + файлы), Только БД, Только файлы, **Incremental** (изменённые файлы + свежий дамп БД относительно последнего full).
-- **Сайдкары** — роли кластера (`globals`), infra-billing (`billing_*.sql`), база знаний ИИ-саппорта (`kb_*.sql`, pgvector), доп. пути вне каталога панели (`extra_*.tar`, напр. `certwarden`).
+- **4 типа бэкапов** — Full (БД + файлы), Только БД, Только файлы, **Incremental** (изменённые файлы + свежий дамп БД относительно последнего ЛОКАЛЬНОГО full; хранится только локально — в хранилище и Telegram не отправляется).
+- **Сайдкары** — роли кластера (`globals`), infra-billing (`billing_*.sql`), база знаний ИИ-саппорта (`kb_*.sql`, pgvector), доп. пути вне каталога панели (`extra_*.tar`, напр. `certwarden`). Установленный, но остановленный сайдкар в режиме `auto` не выпадает молча: предупреждение и пометка «без infra-billing / без KB» в Telegram.
 - **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2), обнаружение неверного пароля и подмены байтов ДО расшифровки.
 - **gzip / zstd** — gzip (везде), zstd (opt-in, меньше и быстрее на SQL-дампах). Старые архивы восстанавливаются независимо от текущего формата (детект по magic bytes).
 - **Версия в имени файла** — в имя архива добавляется версия компонента (`__vX.Y.Z`): тег образа, если он сам версия (`3.4.4-trafficfmt`), иначе точная версия из образа — для бота на подвижном теге `:dev` это его настоящая версия (`7.1.0.x`), а не `dev`.
@@ -103,7 +104,7 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 ### ☁️ Хранение и доставка
 - **Telegram** — файлы и уведомления с premium emoji + retry × 3.
 - **S3-совместимые** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2** (`region=auto`), **Backblaze B2**, custom endpoint. После upload — `head-object` verify (size + ETag), очистка висящих multipart при сбое.
-- **FTP / FTPS / WebDAV / Rclone** — с retry и пошаговой настройкой; post-upload verify размера.
+- **FTP / FTPS / WebDAV / Rclone** — с retry и пошаговой настройкой; post-upload verify размера. Логин и пароль передаются curl через stdin, а не в командной строке (не видны в `ps`).
 - **Ротация** — по времени (дни) или количеству; отдельная ротация на S3 (`S3_RETENTION_DAYS`, трогает только свои архивы).
 
 ### 🔔 Алерты в Telegram
@@ -112,10 +113,10 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 
 ### ⚙️ Автоматизация
 - **Cron из меню** — расписание Full / Только БД / Только файлы, включая «каждые N минут».
-- **flock** — защита от параллельного запуска (cron + ручной).
+- **flock** — защита от параллельного запуска (cron + ручной). Обязательная зависимость (пакет `util-linux`).
 - **Таймаут-обёртки** — hard-limit на pg_dump / tar / encrypt / restore (60 мин по умолчанию, настраивается; `0` = без лимита).
 - **Logrotate** — `/etc/logrotate.d/lazarus` (weekly, rotate 8, compress).
-- **Самообновление** — `lazarus update` (обновляет сам скрипт LAZARUS).
+- **Самообновление** — `lazarus update` (обновляет сам скрипт LAZARUS; замена атомарная — идущий по cron прогон не прочитает половину новой версии).
 
 ### 🩺 Диагностика
 - **`lazarus stacks`** — обнаруженные стеки сервера (панель / infra-billing / бот) + расхождения конфиг↔реальность.
@@ -176,7 +177,7 @@ lazarus migrate panel [--from user@host] [--port 22] [--key /path] [--path /opt/
 
 # Управление контейнерами бота
 lazarus bot status            # статус + версия + healthcheck   ·  -b -s
-lazarus bot up | down         # запустить / остановить контейнеры бота
+lazarus bot up | down         # запустить / остановить только контейнер бота (БД и соседние сервисы проекта не трогаются)
 lazarus bot logs [N]          # последние N строк логов          ·  -b -l
 
 # S3 и обновление скрипта

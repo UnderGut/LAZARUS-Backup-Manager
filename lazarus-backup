@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="6.0.2"
+VERSION="6.0.3"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -2496,8 +2496,21 @@ install_script() {
     local TEMP_FILE="" TEMP_SHA=""
 
     if [[ -f "$0" && "$0" != "bash" && "$0" != "/dev/fd/"* ]]; then
-        cp "$(realpath "$0")" "$INSTALLED_SCRIPT_PATH"
-        DOWNLOAD_SUCCESS=true
+        # Копия во временный файл рядом с целью + атомарный mv: `cp` поверх установленного файла
+        # писал в тот же inode — идущий по cron экземпляр bash дочитывал бы новую версию со старого
+        # смещения, а сбой cp (ENOSPC) оставлял обрезанный скрипт под рабочим именем (rc не читался).
+        local _inst_new=""
+        _inst_new=$(umask 077 && mktemp "$INSTALL_DIR/.lazarus-backup.install.XXXXXX" 2> "$SILENT_LOG") || _inst_new=""
+        [[ -n "$_inst_new" ]] && register_sensitive_tmp "$_inst_new"
+        if [[ -n "$_inst_new" ]] && cp -- "$(realpath "$0")" "$_inst_new" 2> "$SILENT_LOG" \
+                && chmod 755 "$_inst_new" && mv -f "$_inst_new" "$INSTALLED_SCRIPT_PATH"; then
+            unregister_sensitive_tmp "$_inst_new"
+            DOWNLOAD_SUCCESS=true
+        else
+            [[ -n "$_inst_new" ]] && { rm -f "$_inst_new"; unregister_sensitive_tmp "$_inst_new"; }
+            print_message "ERROR" "Не удалось установить $INSTALLED_SCRIPT_PATH (нет места/прав?) — установленная версия не изменена."
+            exit 1
+        fi
     else
         print_message "INFO" "Загрузка последней версии..."
         # Временные файлы — только mktemp (O_EXCL, 0600, случайное имя) в TMPDIR: _setup_tmpdir
@@ -3920,10 +3933,13 @@ bot_down() {
     local _bc="$BOT_CONTAINER_NAME" bot_status
     bot_status=$(docker inspect --format '{{.State.Status}}' "$_bc" 2> "$SILENT_LOG")
 
-    if [[ "$bot_status" != "running" ]]; then
-        print_message "INFO" "Бот уже остановлен: $_bc (${bot_status:-контейнер не найден})"
-        return 0
-    fi
+    # restarting/paused — тоже «работает»: иначе цикл перезапусков (restart: always после неудачного
+    # апдейта :dev) через `bot down` не остановить — команда рапортовала «уже остановлен».
+    case "$bot_status" in
+        running|restarting|paused) ;;
+        *) print_message "INFO" "Бот уже остановлен: $_bc (${bot_status:-контейнер не найден})"
+           return 0 ;;
+    esac
 
     # Останавливаем ТОЛЬКО сервис бота. Прежний `compose down` без списка сервисов клал весь
     # проект: выдачу подписок (subscription-page), xray-checker и обе БД (AGENTS §3.2).
@@ -3940,9 +3956,10 @@ bot_down() {
     fi
 
     print_message "INFO" "Остановка $_bc (сервис $_svc)..."
+    [[ "$bot_status" == "paused" ]] && docker unpause "$_bc" > "$SILENT_LOG" 2>&1
     if docker compose stop "$_svc" 2> "$SILENT_LOG" || docker-compose stop "$_svc" 2> "$SILENT_LOG"; then
         bot_status=$(docker inspect --format '{{.State.Status}}' "$_bc" 2> "$SILENT_LOG")
-        if [[ "$bot_status" == "running" ]]; then
+        if [[ "$bot_status" == "running" || "$bot_status" == "restarting" ]]; then
             print_message "ERROR" "Контейнер $_bc всё ещё работает после остановки"
             return 1
         fi
@@ -5468,8 +5485,10 @@ resolve_bot_runtime() {
     # DB-токен по границам слова (ловит и 'x_db', 'x-db', 'x-db-1'); плюс явное исключение RB_DB.
     if [[ -z "$RB_APP" || "$RB_APP" == "$RB_DB" ]] || _is_panel_container "$RB_APP" || _is_bot_infra_live "$RB_APP"; then
         local _rbdb_re="${RB_DB:-__none__}" _psa
-        # прежний отсев по подстроке (панель, xray-checker, subscription-page, прокси) — сохраняем
-        local _rb_legacy_re='remnawave|postgres|redis|nginx|xray|checker|subscription|mini-app|proxy'
+        # прежний отсев по подстроке (xray-checker, subscription-page, прокси) — сохраняем. Без 'remnawave':
+        # подстрока выкидывала и публичного бота remnawave-telegram-shop-bot (→ несуществующий rwp_shop
+        # в config.env и падающий full-проход); панель отсекается точным _is_panel_container ниже.
+        local _rb_legacy_re='postgres|redis|nginx|xray|checker|subscription|mini-app|proxy'
         RB_APP=""
         # Сначала работающие, затем -a (остановленный бот остаётся кандидатом); одноразовые
         # `compose run` (-run-, oneoff) и инфраструктура отсекаются предикатом.
@@ -5479,6 +5498,7 @@ resolve_bot_runtime() {
                 | while IFS='|' read -r _cn _ci; do
                     [[ -z "$_cn" || "$_cn" == "$_rbdb_re" ]] && continue
                     [[ "${_cn,,}" =~ $_rb_legacy_re ]] && continue
+                    _is_panel_container "$_cn" && continue
                     _is_bot_infra_container "$_cn" "$_ci" && continue
                     _is_bot_infra_live "$_cn" && continue
                     echo "$_cn"; break
@@ -7653,9 +7673,12 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
         [[ "$upload_url" == ftp://*  ]] && _vopts+=(--ftp-pasv)
         [[ "$upload_url" == ftps://* ]] && _vopts+=(--ftp-pasv --ssl-reqd --insecure)
         [[ "$upload_url" == https://* ]] && _vopts+=(--insecure)
-        local _rmt_clen _head_rc
-        _rmt_clen=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${_vopts[@]}" "$upload_url" 2> "$SILENT_LOG" | grep -iE '^Content-Length:' | tail -1 | tr -dc '0-9')
-        _head_rc=${PIPESTATUS[0]}   # AUDIT v2: сам curl-HEAD (не grep/tr) — отличаем «сеть упала» от «нет Content-Length»
+        local _rmt_clen _head_rc _hdr
+        # rc самого curl-HEAD — отдельным шагом: после `var=$(конвейер)` PIPESTATUS содержит один
+        # элемент (rc подстановки = rc tr, всегда 0), и ветка «HEAD не выполнился → локаль не
+        # удаляем» была недостижима — delete-local удалял копию при неподтверждённом размере.
+        _hdr=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${_vopts[@]}" "$upload_url" 2> "$SILENT_LOG"); _head_rc=$?
+        _rmt_clen=$(printf '%s\n' "$_hdr" | grep -iE '^Content-Length:' | tail -1 | tr -dc '0-9')
         local _label="WebDAV"; [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && _label="FTP"
         if [[ "$_rmt_clen" =~ ^[0-9]+$ && "$_rmt_clen" -ne "$file_size" ]]; then
             print_message "ERROR" "$_label: размер на remote не совпал (local=$file_size, remote=$_rmt_clen) — загрузка повреждена" >&2
@@ -9480,6 +9503,7 @@ create_backup() {
                 # валиден; провал НЕ роняет бэкап, но логируем. Restore импортирует первым.
                 if [[ -n "$FILE_GLOBALS" ]]; then
                     debug_log "DB" "panel: dumping globals (pg_dumpall --globals-only)"
+                    register_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"   # открытые роли/хеши: TERM на полпути → shred
                     _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dumpall-globals" \
                         'docker exec "$1" pg_dumpall --globals-only -U "$2" 2> "$3" | $5 > "$4"' \
                         "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$SILENT_LOG" "$BACKUP_DIR/$FILE_GLOBALS" "$_compress_pipe_cmd"
@@ -9515,6 +9539,7 @@ create_backup() {
                     _bill_creds=$(_billing_db_creds)
                     _bill_u="${_bill_creds%% *}"; _bill_d="${_bill_creds##* }"
                     print_message "INFO" "Дамп infra-billing (${PANEL_BILLING_DB_CONTAINER}, db=${_bill_d})..."
+                    register_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"
                     _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-billing" \
                         'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
                         "$PANEL_BILLING_DB_CONTAINER" "$_bill_u" "$_bill_d" "$SILENT_LOG" "$BACKUP_DIR/$FILE_BILLING" "$_compress_pipe_cmd"
@@ -9566,6 +9591,7 @@ create_backup() {
                     _kb_creds=$(_kb_db_creds)
                     _kb_u="${_kb_creds%% *}"; _kb_d="${_kb_creds##* }"
                     print_message "INFO" "Дамп KB (${BOT_KB_DB_CONTAINER}, db=${_kb_d})..."
+                    register_sensitive_tmp "$BACKUP_DIR/$FILE_KB"
                     _run_pipe_with_timeout "$PG_DUMP_TIMEOUT_SEC" "pg_dump-kb" \
                         'docker exec "$1" pg_dump -U "$2" "$3" 2> "$4" | $6 > "$5"' \
                         "$BOT_KB_DB_CONTAINER" "$_kb_u" "$_kb_d" "$SILENT_LOG" "$BACKUP_DIR/$FILE_KB" "$_compress_pipe_cmd"
@@ -9755,6 +9781,8 @@ create_backup() {
             if [[ ! -e "$_ep" ]]; then
                 print_message "WARN" "PANEL_EXTRA_PATHS: путь не найден, пропущен — $_ep"
                 log_message "WARN" "extra path missing: $_ep"
+                # маркер неполноты в Telegram — как у удалённой панели (один раз на архив)
+                [[ "$_SIDECAR_MISS" == *"без PANEL_EXTRA_PATHS"* ]] || { SKIP_INFO+=$'\n⚠️ Без PANEL_EXTRA_PATHS'; _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без PANEL_EXTRA_PATHS"; }
                 continue
             fi
             _extra_rel+=("${_ep#/}")   # относительно / (strip leading slash)
@@ -9769,6 +9797,7 @@ create_backup() {
                 print_message "WARN" "extra-sidecar не создан (rc=$_ex_rc) — доп. пути НЕ вошли в архив."
                 log_message "WARN" "extra sidecar tar failed (rc=$_ex_rc)"
                 rm -f "$BACKUP_DIR/$FILE_EXTRA"; FILE_EXTRA=""
+                [[ "$_SIDECAR_MISS" == *"без PANEL_EXTRA_PATHS"* ]] || { SKIP_INFO+=$'\n⚠️ Без PANEL_EXTRA_PATHS'; _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без PANEL_EXTRA_PATHS"; }
             else
                 debug_log "TAR" "extra sidecar OK: $FILE_EXTRA (${#_extra_rel[@]} paths)"
             fi
@@ -9796,6 +9825,7 @@ create_backup() {
     fi
     if [[ "$TYPE" == "db_only" ]]; then
         FILE_FINAL="${BACKUP_PREFIX}_db_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
+        register_sensitive_tmp "$BACKUP_DIR/${FILE_FINAL}.part"   # открытый combine: TERM до rename/шифрования → shred, не 60+ мин до sweep
         debug_log "TAR" "Creating DB archive: $FILE_FINAL (compression: $(_compress_current))"
         # DB archive — version + dump (+ globals + infra-billing sidecars для panel). Timeout мизерный,
         # но обёртка стандартизирует поведение и логирование.
@@ -9814,6 +9844,7 @@ create_backup() {
         [[ -n "$FILE_KB" ]] && rm -f "$BACKUP_DIR/$FILE_KB"
     elif [[ "$TYPE" == "files_only" ]]; then
         FILE_FINAL="${BACKUP_PREFIX}_files_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
+        register_sensitive_tmp "$BACKUP_DIR/${FILE_FINAL}.part"   # открытый combine: TERM до rename/шифрования → shred, не 60+ мин до sweep
         local FILE_DIR="bot_files_${TIMESTAMP}.tar.${_ext}"
         print_message "INFO" "Архивация файлов (это может занять время)..."
         [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
@@ -9844,6 +9875,7 @@ create_backup() {
         [[ -n "$FILE_MANIFEST" ]] && rm -f "$BACKUP_DIR/$FILE_MANIFEST"
     else
         FILE_FINAL="${BACKUP_PREFIX}_full_${TIMESTAMP}${VER_SUFFIX}.tar.${_ext}"
+        register_sensitive_tmp "$BACKUP_DIR/${FILE_FINAL}.part"   # открытый combine: TERM до rename/шифрования → shred, не 60+ мин до sweep
         print_message "INFO" "Архивация файлов (это может занять время)..."
         [[ ${#_tar_progress[@]} -gt 0 ]] && printf "  ${GRAY}["
         debug_log "TAR" "Creating full archive: $FILE_FINAL (compression: $(_compress_current))"
@@ -10113,6 +10145,9 @@ create_backup() {
         if [[ "$REMOTE_STORAGE_TYPE" != "off" && "$SEND_TO_REMOTE" == "true" && $_remote_rc -eq 0 ]]; then
             _UPLOAD_REMOTE_OK="true"
         fi
+    elif [[ "$_verify_state" == "unverified" ]]; then
+        print_message "WARN" "Загрузка/отправка пропущены: проверка архива не выполнена — непроверенный архив не распространяем."
+        log_message "WARN" "Upload+TG skipped: verify not performed ($FILE_FINAL)"
     else
         print_message "WARN" "Загрузка/отправка пропущены: архив не прошёл verify (битый не распространяем)."
         log_message "WARN" "Upload+TG skipped: VERIFY_OK=false ($FILE_FINAL)"
@@ -10232,7 +10267,7 @@ _delete_local_after_send() {
         # единственная (хоть и битая) копия теряется. AUDIT v2: то же при неподтверждённом размере
         # remote (HEAD после FTP/WebDAV upload не выполнился) — размер не сверен, локаль сохраняем.
         print_message "WARN" "Локальный бэкап СОХРАНЁН: verify/размер не подтверждён, авто-удаление пропущено"
-        log_message "WARN" "Local backup kept: $FILE_FINAL (verify failed, delete-after-upload skipped)"
+        log_message "WARN" "Local backup kept: $FILE_FINAL (verify/size not confirmed, delete-after-upload skipped)"
     elif [[ "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" != "false" && -n "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" ]]; then
         local _can_delete="false"
         local _delete_reason=""
@@ -10923,11 +10958,14 @@ _backup_remote_target() {
         _both_tg_record "$FILE_FINAL" "$SIZE" "$_rbytes" "$ENC_STATUS" "$VERIFY_OK" "$_rok" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "true" "" "${REMOTE_UPLOAD_STATUS_TEXT:-}" "" "0"
     else
         local _who="бот"; [[ "$BACKUP_TARGET" == "panel" ]] && _who="панель"
+        # Маркер неполноты (_SIDECAR_MISS: без infra-billing / PANEL_EXTRA_PATHS) — и в одиночной
+        # подписи, не только в альбоме both: иначе неполный удалённый архив выглядел полным.
         send_telegram_document "$BACKUP_DIR/$FILE_FINAL" \
             "💾 #remote_backup ($_who)
 📦 $FILE_FINAL
 📏 $SIZE
-$ENC_STATUS" "plain" || true
+$ENC_STATUS${_SIDECAR_MISS:+
+⚠️ Неполный архив: ${_SIDECAR_MISS}}" "plain" || true
     fi
     return 0
 }
@@ -11422,6 +11460,7 @@ create_incremental_backup() {
     [[ -f "$BACKUP_DIR/$_inc_files_archive" ]] && _combine+=("$_inc_files_archive")
     # 6.0.3 (#11): combine → .part; штатное имя — только после rc (без пароля) или verify шифра.
     local _inc_part="$BACKUP_DIR/${FILE_FINAL}.part"
+    register_sensitive_tmp "$_inc_part"   # открытый combine инкремента: TERM → shred, а не до sweep
     _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-inc-combine" \
         tar $_tar_compress_args -cf "$_inc_part" -C "$BACKUP_DIR" "${_combine[@]}" 2>> "$_tar_err"
     local _combine_rc=$?
@@ -12564,9 +12603,18 @@ execute_restore() {
                     rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
                     ;;
                 2)
-                    # MAC OK, но decrypt упал — крайне редко (corrupted ciphertext после MAC verify)
-                    print_message "WARN" "MAC прошёл, но decrypt упал (попытка $_dec_attempt/$_dec_max)"
                     rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                    if [[ "$_archive_format" == "v1" ]]; then
+                        # legacy v1 без MAC: rc=2 даёт и неверный пароль — повтор ввода имеет смысл
+                        print_message "WARN" "Неверный пароль или повреждённый файл (попытка $_dec_attempt/$_dec_max)"
+                    else
+                        # v2: rc=2 = расшифровка/проверка не выполнена (I/O, openssl, нет места, mktemp),
+                        # а не «MAC прошёл» и не неверный пароль — повторять тот же пароль бессмысленно.
+                        print_message "ERROR" "Расшифровка не выполнена: сбой ввода-вывода/openssl или нет места в TMPDIR (${TMPDIR:-/tmp}) — это не признак неверного пароля, см. лог."
+                        log_message "ERROR" "restore decrypt rc=2 (I/O/openssl/space) for v2 archive: $FILE"
+                        decrypt_pass=""
+                        break
+                    fi
                     ;;
                 *)
                     print_message "WARN" "Неверный пароль или повреждённый файл (попытка $_dec_attempt/$_dec_max)"
@@ -15377,6 +15425,16 @@ _ask_target_location() {
             # за него чужой remnawave*-контейнер; resolve_bot_runtime сам берёт бот-набор ключей,
             # отсеивает панельные пути и возвращает вызывателю KEYWORDS и FOUND_*.
             if resolve_bot_runtime; then
+                # Резолвер принимает путь из конфига, если там есть compose, — даже когда живой бот
+                # работает из другого каталога (перенос копированием). Мастер для того и открыт, чтобы
+                # поправить путь: сверяем с working_dir живого контейнера (только здесь, не в cron-heal).
+                local _live_wd
+                _live_wd=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$RB_APP" 2> "$SILENT_LOG")
+                if [[ -n "$_live_wd" ]] && ! _same_path "$_live_wd" "$RB_PATH" && _dir_is_bot "$_live_wd"; then
+                    print_message "WARN" "Живой бот $RB_APP работает из $_live_wd, а в конфиге $RB_PATH — берём путь живого."
+                    RB_PATH="$_live_wd"
+                    RB_DB=$(find_db_container_for_path "$RB_PATH" 2> "$SILENT_LOG") || RB_DB=""
+                fi
                 BOT_PATH="$RB_PATH"
                 [[ -n "$RB_APP" ]] && BOT_CONTAINER_NAME="$RB_APP"
                 [[ -n "$RB_DB" ]] && DB_CONTAINER_NAME="$RB_DB"
@@ -15411,7 +15469,16 @@ _ask_target_location() {
                 done
                 if [[ -n "$_bp" ]]; then
                     BOT_PATH="$_bp"
-                    safe_read -erp "  Контейнер БД бота (Enter = rwp_shop_db): " DB_CONTAINER_NAME; DB_CONTAINER_NAME="${DB_CONTAINER_NAME:-rwp_shop_db}"
+                    # Enter = прежний контейнер БД (тот же путь) или найденный в каталоге, а не жёсткий
+                    # rwp_shop_db: иначе Enter «оставить как есть» ломал бэкап бота с другими именами.
+                    local _dbc_def="rwp_shop_db" _dbc_f=""
+                    if _same_path "$_bp" "${_CANON_BOT_PATH:-}" && [[ -n "${_CANON_DB_CONTAINER:-}" ]] \
+                            && ! _is_panel_container "$_CANON_DB_CONTAINER"; then
+                        _dbc_def="$_CANON_DB_CONTAINER"
+                    elif _dbc_f=$(find_db_container_for_path "$_bp" 2> "$SILENT_LOG") && [[ -n "$_dbc_f" ]]; then
+                        _dbc_def="$_dbc_f"
+                    fi
+                    safe_read -erp "  Контейнер БД бота (Enter = $_dbc_def): " DB_CONTAINER_NAME; DB_CONTAINER_NAME="${DB_CONTAINER_NAME:-$_dbc_def}"
                 else
                     # путь не введён: рабочий BOT_PATH (в panel-режиме = путь панели) возвращаем к канону
                     BOT_PATH="${_CANON_BOT_PATH:-}"
@@ -16633,7 +16700,8 @@ case "$1" in
             _sec_n=0
             if [[ "$_both_mode" == true ]]; then
                 _sec_prefix="lazarus"; [[ "$BACKUP_SECONDARY" == "panel" ]] && _sec_prefix="lazarus_panel"
-                _sec_n=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) 2> "$SILENT_LOG" | wc -l | tr -d ' ')
+                # только штатные архивы: недописанные *.part (идущий/убитый проход) бэкапами не считаем
+                _sec_n=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) \( -name '*.tar.gz' -o -name '*.tar.gz.enc' -o -name '*.tar.zst' -o -name '*.tar.zst.enc' \) 2> "$SILENT_LOG" | wc -l | tr -d ' ')
             fi
             # Выровненные метки (Бэкапы / Последний / Авто) — колонка значений на одном уровне
             # с «Что бэкапим/Защита». Логика подсчёта не меняется.
@@ -16649,7 +16717,7 @@ case "$1" in
                 _last_line=""
                 [[ -n "$STATS_LAST" ]] && _last_line="$([[ "$BACKUP_TARGET" == panel ]] && echo панель || echo бот) ${STATS_LAST} (${STATS_LAST_AGO})"
                 if [[ "$_both_mode" == true && "$_sec_n" -gt 0 ]]; then
-                    _sec_last_f=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) -printf '%T@\t%p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -f2-)
+                    _sec_last_f=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${_sec_prefix}_full_*" -o -name "${_sec_prefix}_db_*" -o -name "${_sec_prefix}_files_*" \) \( -name '*.tar.gz' -o -name '*.tar.gz.enc' -o -name '*.tar.zst' -o -name '*.tar.zst.enc' \) -printf '%T@\t%p\n' 2> "$SILENT_LOG" | sort -rn | head -1 | cut -f2-)
                     if [[ -n "$_sec_last_f" ]]; then
                         _sec_last=$(date -r "$_sec_last_f" '+%d.%m %H:%M' 2> "$SILENT_LOG")
                         _last_line="${_last_line:+$_last_line · }$([[ "$BACKUP_SECONDARY" == panel ]] && echo панель || echo бот) ${_sec_last}"
