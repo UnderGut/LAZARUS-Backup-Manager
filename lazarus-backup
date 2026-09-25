@@ -605,20 +605,34 @@ _hmac_envelope_create() {
     # outfile усекался (битый/недешифруемый .enc), а функция возвращала 0 → caller
     # (особенно create_incremental_backup) удалял plaintext и отгружал нерабочий .enc.
     # Теперь ловим rc записи И сверяем итоговый размер = 4(magic)+cipher+32(HMAC).
+    # 6.0.3 (#11): пишем в "${outfile}.part" и переименовываем ТОЛЬКО после сверки размера.
+    # Раньше envelope писался сразу в штатное имя: kill/ребут посреди записи оставлял обрезанный
+    # .enc (без MAC), который ротация/статистика/restore считали новейшим бэкапом, а floor-защита
+    # держала бессрочно. Теперь штатное имя появляется только целым (mv в том же каталоге атомарен);
+    # брошенный .part подберёт _sweep_stale_intermediates. .part — ciphertext, но регистрируем,
+    # чтобы TERM не оставлял мусор до следующего прогона.
+    local _part="${outfile}.part"
+    register_sensitive_tmp "$_part"
     local _wrc=0
     {
         printf 'LAZ2' \
         && cat "$cipher_tmp" \
         && openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp"
-    } > "$outfile" || _wrc=1
+    } > "$_part" || _wrc=1
     local _want=$((4 + _cipher_sz + 32))
     local _got
-    _got=$(stat -c%s "$outfile" 2>/dev/null || echo 0)
+    _got=$(stat -c%s "$_part" 2>/dev/null || echo 0)
     if [[ "$_wrc" -ne 0 || "$_got" -ne "$_want" || "$_want" -lt 68 ]]; then
         debug_log "ENC" "envelope write failed/truncated: wrc=$_wrc got=$_got want=$_want"
-        rm -f "$outfile" "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+        rm -f "$_part" "$outfile" "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"; unregister_sensitive_tmp "$_part"
         return 1
     fi
+    if ! mv -f "$_part" "$outfile" 2> "$SILENT_LOG"; then
+        debug_log "ENC" "envelope rename .part -> outfile failed"
+        rm -f "$_part" "$outfile" "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"; unregister_sensitive_tmp "$_part"
+        return 1
+    fi
+    unregister_sensitive_tmp "$_part"
 
     rm -f "$cipher_tmp"
     unregister_sensitive_tmp "$cipher_tmp"
@@ -704,7 +718,9 @@ _hmac_envelope_verify() {
 }
 
 # Verify + decrypt v2 envelope. Принимает outfile для decrypted plaintext.
-# Returns: 0 — OK; 1 — MAC mismatch / unknown format; 2 — decrypt failed (после MAC OK).
+# Returns: 0 — OK; 1 — MAC mismatch / unknown format (порча или неверный пароль);
+#          2 — НЕ удалось проверить: ошибка ввода-вывода/нет места/сбой openssl (архив не признан
+#              битым) или decrypt упал после MAC OK. Для v1 (без MAC) неверный пароль тоже даёт 2.
 # umask 077 + сразу chmod 600 на outfile (для restore-сценария где outfile в /tmp).
 #
 # OPTIMIZATION: extract ciphertext ОДИН РАЗ (не вызываем _hmac_envelope_verify, который
@@ -741,16 +757,24 @@ _hmac_envelope_decrypt() {
         fi
 
         # Compute MAC over extracted ciphertext
+        # 6.0.3 (#4): пустой ключ или пустой computed — сбой openssl/чтения, а НЕ порча архива:
+        # rc=2 («не удалось проверить»), иначе вызывающий назвал бы исправный архив «ПОВРЕЖДЁН».
         k_mac=$(_derive_hmac_key "$password")
         if [[ -z "$k_mac" ]]; then
+            log_message "ERROR" "HMAC decrypt: не удалось вычислить ключ MAC (сбой openssl, не порча) — $infile"
             rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
-            return 1
+            return 2
         fi
         local computed stored
         computed=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp" | _to_hex)
         stored=$(tail -c 32 "$infile" | _to_hex)
+        if [[ -z "$computed" ]]; then
+            log_message "ERROR" "HMAC decrypt: MAC не вычислен (ошибка чтения/openssl, не порча) — $infile"
+            rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
+            return 2
+        fi
 
-        if [[ "$computed" != "$stored" || -z "$computed" ]]; then
+        if [[ "$computed" != "$stored" ]]; then
             debug_log "HMAC" "v2 MAC mismatch"
             rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
             return 1
@@ -1215,7 +1239,9 @@ _resolve_incremental_chain() {
     if [[ -z "$_base_path" ]]; then
         local _inc_name; _inc_name=$(basename "$_inc_path")
         local _base_ts=""
-        [[ "$_inc_name" =~ __base_([0-9_-]+)__v ]] && _base_ts="${BASH_REMATCH[1]}"
+        # 6.0.3 (#29): и имя без версионного суффикса (…__base_<ts>.tar.*) — иначе печаталось «Base full ''».
+        if [[ "$_inc_name" =~ __base_([0-9_-]+)__v ]]; then _base_ts="${BASH_REMATCH[1]}"
+        elif [[ "$_inc_name" =~ __base_([0-9_-]+)\.tar\. ]]; then _base_ts="${BASH_REMATCH[1]}"; fi
         print_message "ERROR" "Base full '$_base_ts' не найден — incremental orphaned, restore невозможен" >&2
         log_message "ERROR" "Restore-chain: base full for $_inc_name not found"
         return 1
@@ -2900,10 +2926,28 @@ get_app_version() {
 get_backup_version() {
     local _tag; _tag=$(get_raw_bot_version)
     [[ -z "$_tag" ]] && { echo ""; return; }
-    if [[ "$_tag" =~ [0-9]+\.[0-9]+ ]]; then echo "$_tag"; return; fi
+    # 6.0.3 (#30): «тег» со '/' — это хвост пути реестра у образа БЕЗ тега (registry.local:5000/rwp
+    # → «5000/rwp», ghcr.io/owner/bot → «ghcr.io/owner/bot», 10.0.0.5/rwp), а не версия. Считаем
+    # тег отсутствующим: берём версию из образа (лейбл/env), иначе пусто. Иначе слэш уходил в имя
+    # архива (inc падал «tar combine failed»), в bot_version.txt и в меню restore.
+    [[ "$_tag" == */* ]] && _tag=""
+    if [[ -n "$_tag" && "$_tag" =~ [0-9]+\.[0-9]+ ]]; then echo "$_tag"; return; fi
     local _app; _app=$(get_app_version "$BOT_CONTAINER_NAME")
-    if [[ -n "$_app" && "$_app" =~ [0-9] ]]; then echo "$_app"; return; fi
+    # fallback get_app_version — тоже «последнее после ':'» (для registry:5000/rwp это «5000/rwp»)
+    if [[ -n "$_app" && "$_app" != */* && "$_app" =~ [0-9] ]]; then echo "$_app"; return; fi
     echo "$_tag"
+}
+
+# _ver_suffix <версия>: версионный суффикс имени архива «__v<safe>» или пусто. Общий для
+# create_backup и create_incremental_backup (6.0.3 #30: inc подставлял версию без санитизации).
+# Оставляем только [A-Za-z0-9._-], остальное → '-', схлопываем/обрезаем дефисы. Пусто для
+# пустой версии и «Unknown». Всегда rc=0 (пустой суффикс — не ошибка).
+_ver_suffix() {
+    local _v="$1" _s
+    [[ -z "$_v" || "$_v" == "Unknown" ]] && return 0
+    _s=$(printf '%s' "$_v" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')
+    [[ -n "$_s" ]] && printf '__v%s' "$_s"
+    return 0
 }
 
 # Получение статуса контейнера бота
@@ -7939,10 +7983,18 @@ _delete_orphan_inc_for_full() {
     _full_ts="${_full_ts%.tar.zst.enc}"
     [[ -z "$_full_ts" ]] && return 0
     local orphan
+    # 6.0.3 (#29): + 4 глоба inc БЕЗ версионного суффикса (контейнер бота не задан/не запущен при
+    # создании inc → имя …__base_<ts>.tar.*). _find_base_for_inc их base находит, а каскад — нет:
+    # асимметрия оставляла невосстановимый inc после ротации его full. Пересечений нет: у старых
+    # глобов после ts обязателен «__», у новых сразу «.tar.».
     for orphan in "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz \
                   "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.gz.enc \
                   "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst \
-                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst.enc; do
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts"__*.tar.zst.enc \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts".tar.gz \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts".tar.gz.enc \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts".tar.zst \
+                  "$BACKUP_DIR"/lazarus_inc_*__base_"$_full_ts".tar.zst.enc; do
         if [[ -f "$orphan" ]]; then
             rm -f "$orphan" "$orphan.version"
             echo "  - Orphan inc удалён:$(basename "$orphan")"
@@ -8157,7 +8209,50 @@ _mb_to_human() {
     echo "${gb_int}.${gb_frac} GB"
 }
 
-# Ротация по размеру - удаляет старые бэкапы пока общий размер не станет <= лимита
+# _size_rot_bytes: суммарный видимый размер ТОЛЬКО архивов lazarus_* (4 формата gz/zst × plain/enc)
+# в BACKUP_DIR — ровно то множество, которое rotate_backups_by_size удаляет. 6.0.3 (#5): раньше
+# мерили du -sb всего каталога, и снапшоты pre_restore_snapshot_* (их ротация не трогает)
+# «съедали» лимит: удалялись валидные архивы, хотя сами архивы в лимит укладывались. -printf '%s'
+# = тот же видимый размер, что du -sb. printf %.0f — mawk печатает большие суммы в e-нотации.
+_size_rot_bytes() {
+    find "$BACKUP_DIR" -maxdepth 1 -type f \( \
+            -name 'lazarus_*.tar.gz'      -o -name 'lazarus_*.tar.gz.enc' \
+         -o -name 'lazarus_*.tar.zst'  -o -name 'lazarus_*.tar.zst.enc' \) \
+        -printf '%s\n' 2> "$SILENT_LOG" | awk '{s+=$1} END {printf "%.0f\n", s+0}'
+}
+
+# _size_rot_warn_nonarchive <limit_bytes> [log=true|false]: каталог целиком больше лимита из-за
+# НЕархивных файлов (pre_restore_snapshot_* — plaintext-дампы-точки отката, infra_replaced_* и т.п.).
+# Ротация их НЕ удаляет (снапшот нужен после провального restore) — только WARN с именами и
+# размерами и советом ручной чистки, чтобы рост каталога сверх лимита не был незаметным.
+_size_rot_warn_nonarchive() {
+    local _limit="$1" _do_log="${2:-true}" _arc_b _other=0 _entries _b _p _list="" _k=0
+    [[ "$_limit" =~ ^[0-9]+$ ]] || return 0
+    # Всё верхнего уровня, КРОМЕ архивов lazarus_* (файлы и каталоги), крупные первыми.
+    _entries=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 ! \( -type f \( \
+                    -name 'lazarus_*.tar.gz'      -o -name 'lazarus_*.tar.gz.enc' \
+                 -o -name 'lazarus_*.tar.zst'  -o -name 'lazarus_*.tar.zst.enc' \) \) \
+                 -exec du -sb {} + 2> "$SILENT_LOG" | sort -rn)
+    while IFS=$'\t' read -r _b _p; do
+        [[ "$_b" =~ ^[0-9]+$ && -n "$_p" ]] || continue
+        _other=$(( _other + _b ))
+        if [[ $_k -lt 5 ]]; then
+            _list+="${_list:+, }${_p##*/} ($(numfmt --to=iec "$_b" 2> "$SILENT_LOG" || echo "${_b}B"))"
+            _k=$(( _k + 1 ))
+        fi
+    done <<< "$_entries"
+    # < 1 МиБ — служебные мелочи (bot_version.txt, skipped_files.txt): не шумим.
+    [[ $_other -ge 1048576 ]] || return 0
+    _arc_b=$(_size_rot_bytes)
+    [[ $(( ${_arc_b:-0} + _other )) -gt $_limit ]] || return 0
+    local _other_h; _other_h=$(numfmt --to=iec "$_other" 2> "$SILENT_LOG" || echo "${_other}B")
+    echo -e "${YELLOW}Каталог бэкапов больше лимита из-за НЕархивных файлов (${_other_h}): ${_list:-?}. Ротация их не удаляет — проверьте и удалите ненужное вручную (pre_restore_snapshot_* — точка отката после restore).${RESET}"
+    [[ "$_do_log" == "true" ]] && log_message "WARN" "Size rotation: BACKUP_DIR exceeds limit due to NON-archive files (${_other} bytes, not rotated): ${_list:-?}"
+    return 0
+}
+
+# Ротация по размеру - удаляет старые бэкапы пока объём АРХИВОВ lazarus_* не станет <= лимита
+# (6.0.3 #5: лимит — на архивы, не на каталог; прочие файлы не считаются и не удаляются).
 # Использование: rotate_backups_by_size "true" для удаления, без аргумента - только проверка
 rotate_backups_by_size() {
     local PERFORM_DELETE="$1"
@@ -8175,8 +8270,9 @@ rotate_backups_by_size() {
     local limit_bytes=$((limit_mb * 1024 * 1024))
     debug_log "SIZE" "Limit: $limit_mb MB ($limit_bytes bytes)"
 
-    # Получаем текущий размер папки бэкапов в байтах
-    local current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+    # Текущий объём АРХИВОВ lazarus_* в байтах (то же множество, что удаляем ниже — #5).
+    local current_size_bytes
+    current_size_bytes=$(_size_rot_bytes)
     # ROT-6 fix: на stale-mount/FUSE du может вернуть пусто/нечисло → арифметика
     # упала бы или дала ложное сравнение. Невалидное значение → пропускаем ротацию.
     if [[ ! "$current_size_bytes" =~ ^[0-9]+$ ]]; then
@@ -8199,6 +8295,8 @@ rotate_backups_by_size() {
         if [[ "$PERFORM_DELETE" != "true" ]]; then
             echo -e " Размер бэкапов: ${GREEN}$current_display${RESET} / $limit_display -> ${GREEN}OK${RESET}"
         fi
+        # Архивы в лимите, но каталог может раздуть не-архивное (снапшоты) — предупредить.
+        _size_rot_warn_nonarchive "$limit_bytes" "$PERFORM_DELETE"
         return 0
     fi
     
@@ -8222,7 +8320,7 @@ rotate_backups_by_size() {
     fi
     
     debug_log "SIZE" "Starting deletion loop..."
-    echo -e "${YELLOW}Очистка по лимиту размера (текущий: $current_display, лимит: $limit_display):${RESET}"
+    echo -e "${YELLOW}Очистка по лимиту на архивы (объём архивов: $current_display, лимит: $limit_display):${RESET}"
     
     # Получаем список всех бэкапов отсортированный по времени (старые первыми).
     # Все 4 формата (gz/zst × plain/enc) — иначе при COMPRESSION=zstd size-based
@@ -8259,8 +8357,9 @@ rotate_backups_by_size() {
     # даже если лимит меньше одного архива. Иначе size-rotation могла снести ВСЁ,
     # включая только что созданную и проверенную копию → ноль бэкапов.
     if [[ $_n -le 1 ]]; then
-        echo -e "${YELLOW}Лимит размера меньше одного бэкапа — оставлена 1 копия (защита от полной очистки).${RESET}"
+        echo -e "${YELLOW}Лимит на архивы меньше одного бэкапа — оставлена 1 копия (защита от полной очистки).${RESET}"
         log_message "WARN" "Size rotation: <=1 backup, kept despite exceeding limit"
+        _size_rot_warn_nonarchive "$limit_bytes" "true"
         return 0
     fi
 
@@ -8274,8 +8373,8 @@ rotate_backups_by_size() {
         # Namespace-floor: пропускаем новейший бэкап каждой цели (защита другой цели в both-режиме).
         [[ -n "$_newest_bot"   && "$file" == "$_newest_bot"   ]] && { debug_log "SIZE" "keep newest bot: $(basename "$file")"; continue; }
         [[ -n "$_newest_panel" && "$file" == "$_newest_panel" ]] && { debug_log "SIZE" "keep newest panel: $(basename "$file")"; continue; }
-        # Пересчитываем текущий размер
-        current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+        # Пересчитываем текущий объём архивов (сам учтёт и каскад orphan-inc)
+        current_size_bytes=$(_size_rot_bytes)
         [[ "$current_size_bytes" =~ ^[0-9]+$ ]] || break
         debug_log "SIZE" "Current: $current_size_bytes bytes, limit: $limit_bytes bytes"
 
@@ -8302,13 +8401,15 @@ rotate_backups_by_size() {
         fi
     done
 
-    # Если после удаления всех, КРОМЕ новейшего, размер всё ещё > лимита — новейший
-    # НЕ трогаем (floor). Предупреждаем оператора, что лимит мал.
-    current_size_bytes=$(du -sb "$BACKUP_DIR" 2> "$SILENT_LOG" | awk '{print $1}')
+    # Если после удаления всех, КРОМЕ новейшего, объём АРХИВОВ всё ещё > лимита — новейший
+    # НЕ трогаем (floor). Предупреждаем оператора, что лимит мал. #5: только по самим архивам —
+    # раньше этот WARN с неверной причиной срабатывал из-за снапшотов в каталоге.
+    current_size_bytes=$(_size_rot_bytes)
     if [[ "$current_size_bytes" =~ ^[0-9]+$ && $current_size_bytes -gt $limit_bytes ]]; then
-        echo -e "${YELLOW}Лимит меньше новейшего бэкапа — он сохранён (защита от полной очистки). Увеличьте MAX_BACKUP_SIZE_MB.${RESET}"
+        echo -e "${YELLOW}Лимит на архивы меньше новейшего бэкапа — он сохранён (защита от полной очистки). Увеличьте MAX_BACKUP_SIZE_MB.${RESET}"
         log_message "WARN" "Size rotation: limit smaller than newest backup; newest kept"
     fi
+    _size_rot_warn_nonarchive "$limit_bytes" "true"
 
     local deleted_display
     local deleted_mb=$((deleted_size / 1024 / 1024))
@@ -9077,13 +9178,9 @@ create_backup() {
     debug_log "BACKUP" "Bot version saved: ${CURRENT_VER:-Unknown}"
 
     # Версионный суффикс для имени архива — чтобы не плодить .version файлы-спутники.
-    # Безопасно: оставляем только [A-Za-z0-9.-_], остальное заменяем на '-'.
-    local VER_SUFFIX=""
-    if [[ -n "$CURRENT_VER" && "$CURRENT_VER" != "Unknown" ]]; then
-        local _safe_ver
-        _safe_ver=$(printf '%s' "$CURRENT_VER" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')
-        [[ -n "$_safe_ver" ]] && VER_SUFFIX="__v${_safe_ver}"
-    fi
+    # Безопасно: оставляем только [A-Za-z0-9.-_], остальное заменяем на '-' (_ver_suffix, общий с inc).
+    local VER_SUFFIX
+    VER_SUFFIX=$(_ver_suffix "$CURRENT_VER")
     debug_log "BACKUP" "Version suffix for filename: '${VER_SUFFIX}'"
 
     if [[ "$TYPE" == "full" || "$TYPE" == "db_only" ]]; then
@@ -9496,8 +9593,10 @@ create_backup() {
         [[ -n "$FILE_GLOBALS" && -f "$BACKUP_DIR/$FILE_GLOBALS" ]] && _db_inputs+=("$FILE_GLOBALS")
         [[ -n "$FILE_BILLING" && -f "$BACKUP_DIR/$FILE_BILLING" ]] && _db_inputs+=("$FILE_BILLING")
         [[ -n "$FILE_KB" && -f "$BACKUP_DIR/$FILE_KB" ]] && _db_inputs+=("$FILE_KB")
+        # 6.0.3 (#11): combine пишет в .part — штатное имя появляется только после разбора rc
+        # (без пароля) или шифрования (с паролем), см. блок после HAS_ERROR.
         _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-db" \
-            tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_db_inputs[@]}" 2> "$_tar_err"
+            tar $_tar_compress_args -cf "$BACKUP_DIR/${FILE_FINAL}.part" -C "$BACKUP_DIR" "${_db_inputs[@]}" 2> "$_tar_err"
         _tar_rc=$?
         rm -f "$BACKUP_DIR/$FILE_DB"
         [[ -n "$FILE_GLOBALS" ]] && rm -f "$BACKUP_DIR/$FILE_GLOBALS"
@@ -9525,7 +9624,7 @@ create_backup() {
             [[ -n "$FILE_EXTRA" && -f "$BACKUP_DIR/$FILE_EXTRA" ]] && _combine_inputs+=("$FILE_EXTRA")
             [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-files-combine" \
-                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
+                tar $_tar_compress_args -cf "$BACKUP_DIR/${FILE_FINAL}.part" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
             _tar_rc=$?
             # Если combine OK (0) но первый tar был warning (1) — финальный статус = warning.
             [[ $_tar_rc -eq 0 && $_first_rc -eq 1 ]] && _tar_rc=1
@@ -9553,7 +9652,7 @@ create_backup() {
             [[ -n "$FILE_EXTRA" && -f "$BACKUP_DIR/$FILE_EXTRA" ]] && _combine_inputs+=("$FILE_EXTRA")
             [[ -n "$FILE_MANIFEST" && -f "$BACKUP_DIR/$FILE_MANIFEST" ]] && _combine_inputs+=("$FILE_MANIFEST")
             _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-full-combine" \
-                tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
+                tar $_tar_compress_args -cf "$BACKUP_DIR/${FILE_FINAL}.part" -C "$BACKUP_DIR" "${_combine_inputs[@]}" 2>> "$_tar_err"
             _tar_rc=$?
             # Sticky warning: если первый tar дал rc=1 (warning), а combine — 0,
             # финальный статус остаётся 1, чтобы пользователь увидел WARN в логе.
@@ -9583,12 +9682,28 @@ create_backup() {
     rm -f "$_tar_err"
 
     if [[ $HAS_ERROR -eq 1 ]]; then
-        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_FINAL"
+        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.part"
         [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
 
     rm -f "$SKIP_FILE"
+
+    # 6.0.3 (#11): combine лежит в ${FILE_FINAL}.part (plaintext). Без пароля — переименовываем
+    # в штатное имя сразу после разбора rc; с паролем — шифруем ИЗ .part, а .part удаляем после
+    # успеха. Kill в любой момент оставляет только *.part (их чистит _sweep_stale_intermediates),
+    # а не огрызок/открытый архив под штатным именем. КАЖДАЯ ветка ниже обязана либо переименовать
+    # .part, либо удалить его: свежий .part через час снёс бы sweep (потеря бэкапа).
+    local _plain_part="$BACKUP_DIR/${FILE_FINAL}.part"
+    if [[ -z "$BACKUP_PASSWORD" ]]; then
+        if ! mv -f "$_plain_part" "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
+            print_message "ERROR" "Не удалось переименовать архив в штатное имя: $FILE_FINAL"
+            log_message "ERROR" "rename ${FILE_FINAL}.part -> $FILE_FINAL failed"
+            rm -f "$_plain_part" "$BACKUP_DIR/$FILE_VERSION"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
+        fi
+    fi
 
     local ENC_STATUS="🔓 Unencrypted"
     if [[ -z "$BACKUP_PASSWORD" && "$IS_INTERACTIVE" == "false" ]]; then ENC_STATUS="⚠️ NO PASSWORD"; fi
@@ -9600,13 +9715,13 @@ create_backup() {
         # public S3 / FTP). Wrong-password detect ДО decrypt через MAC pre-check.
         # Старые v1 архивы (без MAC) остаются совместимыми при restore.
         _hmac_envelope_create \
-            "$BACKUP_DIR/$FILE_FINAL" \
+            "$_plain_part" \
             "$BACKUP_DIR/${FILE_FINAL}.enc" \
             "$BACKUP_PASSWORD"
         local enc_res=$?
         
         if [[ $enc_res -eq 0 ]]; then
-            rm "$BACKUP_DIR/$FILE_FINAL"
+            rm -f "$_plain_part"
             FILE_FINAL="${FILE_FINAL}.enc"
             ENC_STATUS="🔒 Encrypted"
             print_message "SUCCESS" "Архив зашифрован."
@@ -9629,13 +9744,21 @@ create_backup() {
                 [[ "$_pc" == "PLAINTEXT" ]] && _ship_plain=true
             fi
             if [[ "$_ship_plain" != "true" ]]; then
-                rm -f "$BACKUP_DIR/$FILE_FINAL"
+                rm -f "$_plain_part" "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/$FILE_VERSION"
                 if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
                     send_telegram_alert "ERROR" "Бэкап отменён" \
                         "🔒 Шифрование задано, но провалилось
 📦 <code>$FILE_FINAL</code>" \
                         "Незашифрованный бэкап НЕ отправлен. Проверьте openssl/свободное место и повторите."
                 fi
+                [[ "${LOCK_ACQUIRED:-}" == "true" ]] && release_lock
+                return 1
+            fi
+            # Явное PLAINTEXT: .part становится штатным незашифрованным архивом.
+            if ! mv -f "$_plain_part" "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
+                print_message "ERROR" "Не удалось переименовать архив в штатное имя: $FILE_FINAL"
+                log_message "ERROR" "rename ${FILE_FINAL}.part -> $FILE_FINAL failed (plaintext ship)"
+                rm -f "$_plain_part" "$BACKUP_DIR/$FILE_VERSION"
                 [[ "${LOCK_ACQUIRED:-}" == "true" ]] && release_lock
                 return 1
             fi
@@ -9654,21 +9777,30 @@ create_backup() {
     print_message "INFO" "Проверка целостности архива..."
     debug_log "VERIFY" "Verifying archive integrity..."
     local VERIFY_OK="false"
+    # 6.0.3 (#4): код проверки различает «повреждён» (1: MAC/сжатие) и «не удалось проверить»
+    # (2: I/O, ENOSPC в TMPDIR, mktemp упал). Решения те же (VERIFY_OK=false → без выгрузки и
+    # ротации), но отчёт честный: исправный архив на почти полном диске не зовём «ПОВРЕЖДЁН».
+    local _vrc=1
     if [[ "$FILE_FINAL" == *".enc" ]]; then
         # Verify v2 envelope: HMAC pre-check + decrypt → detect format → verify.
         # MAC проверяется ДО decrypt, gadget-protected.
         debug_log "VERIFY" "Running: _hmac_envelope_verify + decrypt | $(_compress_current) -t"
         local _verify_decrypted
-        _verify_decrypted=$(mktemp "${TMPDIR:-/tmp}/lazarus_verify.XXXXXX") || _verify_decrypted=""
+        _vrc=2   # mktemp упал — проверка не выполнялась
+        _verify_decrypted=$(mktemp "${TMPDIR:-/tmp}/lazarus_verify.XXXXXX" 2> "$SILENT_LOG") || _verify_decrypted=""
         if [[ -n "$_verify_decrypted" ]]; then
             register_sensitive_tmp "$_verify_decrypted"
-            if _hmac_envelope_decrypt "$BACKUP_DIR/$FILE_FINAL" "$_verify_decrypted" "$BACKUP_PASSWORD"; then
+            _hmac_envelope_decrypt "$BACKUP_DIR/$FILE_FINAL" "$_verify_decrypted" "$BACKUP_PASSWORD"
+            _vrc=$?
+            if [[ $_vrc -eq 0 ]]; then
                 # Decrypt OK → определяем формат по magic + verify соответствующим cmd.
                 local _decrypted_fmt
                 _decrypted_fmt=$(_compress_detect_format "$_verify_decrypted")
                 debug_log "VERIFY" "decrypted format detected: $_decrypted_fmt"
                 if _verify_compressed "$_verify_decrypted" "$_decrypted_fmt"; then
                     VERIFY_OK="true"
+                else
+                    _vrc=1
                 fi
             fi
             rm -f "$_verify_decrypted"
@@ -9680,16 +9812,35 @@ create_backup() {
         _f_fmt=$(_compress_detect_format "$BACKUP_DIR/$FILE_FINAL")
         debug_log "VERIFY" "Running: verify $_f_fmt $BACKUP_DIR/$FILE_FINAL"
         if _verify_compressed "$BACKUP_DIR/$FILE_FINAL" "$_f_fmt"; then
-             VERIFY_OK="true"
+             VERIFY_OK="true"; _vrc=0
         fi
     fi
-    debug_log "VERIFY" "Result: $VERIFY_OK"
+    debug_log "VERIFY" "Result: $VERIFY_OK (rc=$_vrc)"
+    # Статус для альбома both-режима: true | false (повреждён) | unverified (не проверен).
+    local _verify_state="$VERIFY_OK"
+    [[ "$VERIFY_OK" != "true" && $_vrc -eq 2 ]] && _verify_state="unverified"
 
     local SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" | awk '{print $1}')
     if [[ "$VERIFY_OK" == "true" ]]; then
         print_message "SUCCESS" "Архив валиден."
         print_message "SUCCESS" "Бэкап создан: $FILE_FINAL ($SIZE)"
         log_message "SUCCESS" "Backup created: $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS, verify=ok)"
+    elif [[ "$_verify_state" == "unverified" ]]; then
+        # Проверка не выполнена (I/O / нет места). Жёсткого предполёта по месту нет — сообщаем факт
+        # и свободное место по обоим каталогам, чтобы оператору не гадать «битый или диск».
+        local _df_tmp _df_bk
+        _df_tmp=$(df -Ph "${TMPDIR:-/tmp}" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}')
+        _df_bk=$(df -Ph "$BACKUP_DIR" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}')
+        local _df_line="свободно: TMPDIR ${TMPDIR:-/tmp} — ${_df_tmp:-?}, BACKUP_DIR — ${_df_bk:-?}"
+        print_message "ERROR" "Проверка архива НЕ выполнена (ошибка ввода-вывода / нет места в TMPDIR) — архив не признан битым: $FILE_FINAL ($SIZE); $_df_line"
+        log_message "ERROR" "Backup verification NOT PERFORMED (I/O error / no space in TMPDIR): $FILE_FINAL (type=$TYPE, size=$SIZE, enc_status=$ENC_STATUS) — kept, upload+rotation skipped; $_df_line"
+        if [[ "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+            send_telegram_alert "ERROR" "Бэкап не проверен" \
+                "📦 Файл: <code>$FILE_FINAL</code>
+📏 Размер: $SIZE
+💾 TMPDIR: ${_df_tmp:-?} свободно, BACKUP_DIR: ${_df_bk:-?}" \
+                "Проверка целостности НЕ выполнена (ошибка ввода-вывода или нет места во временном каталоге) — архив не признан битым. Он сохранён локально, но не отправлен; ротация пропущена. Освободите место и повторите бэкап."
+        fi
     else
         # VERIFY-1 fix: НЕ репортим SUCCESS на повреждённый архив. Раньше код
         # безусловно писал SUCCESS+create в лог → битый backup шёл в upload+rotation,
@@ -9800,7 +9951,9 @@ ${ENC_STATUS}${REMOTE_UPLOAD_STATUS_TEXT}${SKIP_INFO}"
         # both-режим: единое уведомление (альбом) шлёт create_backup_dispatch после ОБОИХ
         # проходов (_both_tg_flush). Здесь только записываем результат прохода в аккумулятор;
         # отправку документа и удаление-после-доставки откладываем до flush.
-        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$VERIFY_OK" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "false" "$(get_app_version "$BOT_CONTAINER_NAME")" "$REMOTE_UPLOAD_STATUS_TEXT" "$SKIP_INFO" "0"
+        # $5 — tri-state (true|false|unverified): альбом покажет «не проверен», а не голое «⚠️»;
+        # для удаления-после-доставки любое != true = «локаль сохранить», как раньше.
+        _both_tg_record "$FILE_FINAL" "$SIZE" "$_backup_bytes" "$ENC_STATUS" "$_verify_state" "$_UPLOAD_REMOTE_OK" "${REMOTE_UPLOAD_SIZE_UNVERIFIED:-false}" "false" "$(get_app_version "$BOT_CONTAINER_NAME")" "$REMOTE_UPLOAD_STATUS_TEXT" "$SKIP_INFO" "0"
     else
         local _tg_rc=1
         if [[ "$VERIFY_OK" == "true" ]]; then
@@ -9942,7 +10095,8 @@ _delete_local_after_send() {
 # текст-сводка. Затем — отложенные удаления-после-доставки per target.
 # =============================================================================
 _both_tg_record() {
-    # $1 FILE_FINAL, $2 size_h, $3 bytes, $4 ENC_STATUS, $5 VERIFY_OK, $6 remote_ok, $7 remote_unverified,
+    # $1 FILE_FINAL, $2 size_h, $3 bytes, $4 ENC_STATUS, $5 VERIFY_OK (true|false|unverified — 6.0.3:
+    # unverified = проверка не выполнена из-за I/O/нехватки места, в альбоме «не проверен»), $6 remote_ok, $7 remote_unverified,
     # $8 is_remote, $9 VER_MSG (" | 🏷 v..."), $10 REMOTE_UPLOAD_STATUS_TEXT ("\n☁️ ..."), $11 SKIP_INFO ("\n⚠️ Skip...")
     local _lbl="RWP Shop"; [[ "$BACKUP_TARGET" == "panel" ]] && _lbl="Remnawave"
     _BOTH_TG_FILES+=("$BACKUP_DIR/$1")
@@ -10061,7 +10215,9 @@ _both_tg_flush() {
         local _rs="${_BOTH_TG_RSTATUS[$i]}" _ver="${_BOTH_TG_VER[$i]}"
         local _line="• ${_lbl} — ${_sz}"
         [[ -n "$_ver" ]] && _line+=" | ${_ver}"   # точная версия без эмодзи: «• Remnawave — 20M | 2.8.1»
-        [[ "$_vok" != "true" ]] && _line+=" ⚠️"
+        # 6.0.3 (#4): «не проверен» (I/O/нет места при verify) отличаем от «повреждён» (голое ⚠️).
+        if [[ "$_vok" == "unverified" ]]; then _line+=" ⚠️ не проверен"
+        elif [[ "$_vok" != "true" ]]; then _line+=" ⚠️"; fi
         _lines+="${_line}"$'\n'
         # детальный статус загрузки (☁️ S3: OK и т.п.) — без дублей (обе цели идут в то же хранилище)
         if [[ -n "$_rs" && -z "${_seen_rs[$_rs]:-}" ]]; then _footer+="$_rs"; _seen_rs["$_rs"]=1; fi
@@ -10359,7 +10515,8 @@ _backup_remote_target() {
         fi
     fi
     if [[ $HAS_ERROR -eq 1 ]]; then
-        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_GLOBALS"
+        # ${FILE_GLOBALS:+...}: у bot-цели FILE_GLOBALS пуст → rm -f "$BACKUP_DIR/" сыпал «Is a directory».
+        rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" ${FILE_GLOBALS:+"$BACKUP_DIR/$FILE_GLOBALS"}
         [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
         # #review#2: снять регистрацию удалённых plaintext-дампов (уже rm'нуты) — чтобы SENSITIVE_TMP_PATHS не рос.
         unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"
@@ -10386,7 +10543,7 @@ _backup_remote_target() {
         if [[ $_trc -ge 2 || "$_tb" -lt 100 ]]; then
             print_message "ERROR" "Удалённый tar провален (rc=$_trc, ${_tb}b)."
             log_message "ERROR" "remote tar failed (rc=$_trc, ${_tb}b)"
-            rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_GLOBALS" "$BACKUP_DIR/$FILE_DIR"
+            rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" ${FILE_GLOBALS:+"$BACKUP_DIR/$FILE_GLOBALS"} "$BACKUP_DIR/$FILE_DIR"
             [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
             unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"   # #review#2
             return 1
@@ -10406,18 +10563,24 @@ _backup_remote_target() {
     # #ultra-HIGH3: комбинированный plaintext-архив (содержит db+globals+billing) до шифрования —
     # тоже sensitive. Регистрируем до combine; unregister ПОСЛЕ блока шифрования (там он либо
     # rm'нут в пользу .enc, либо осознанно оставлен как unencrypted-артефакт — оба случая покрыты).
-    local _plain_final="$BACKUP_DIR/$FILE_FINAL"
+    # 6.0.3 (#11): combine пишет в .part (регистрируем именно его) — штатное имя появляется только
+    # после mv (без пароля / PLAINTEXT) или шифрования; kill оставит лишь .part для sweep.
+    local _plain_final="$BACKUP_DIR/${FILE_FINAL}.part"
     register_sensitive_tmp "$_plain_final"
     _run_with_timeout "$TAR_TIMEOUT_SEC" "remote-combine" \
-        tar $_tar_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_inputs[@]}" 2> "$SILENT_LOG"
+        tar $_tar_args -cf "$BACKUP_DIR/${FILE_FINAL}.part" -C "$BACKUP_DIR" "${_inputs[@]}" 2> "$SILENT_LOG"
     local _crc=$?
-    rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR" "$BACKUP_DIR/$FILE_GLOBALS" "$BACKUP_DIR/$FILE_VERSION"
+    rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_DIR" ${FILE_GLOBALS:+"$BACKUP_DIR/$FILE_GLOBALS"} "$BACKUP_DIR/$FILE_VERSION"
     [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
     # #review#2: дампы rm'нуты (вошли в combine) → снимаем их регистрацию (plaintext-combine _plain_final остаётся под защитой до шифрования).
     unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"
     if [[ $_crc -ne 0 ]]; then
         print_message "ERROR" "Combine удалённого архива провален (rc=$_crc)."
-        rm -f "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1
+        rm -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1
+    fi
+    if [[ -z "$BACKUP_PASSWORD" ]] && ! mv -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Не удалось переименовать удалённый архив в штатное имя: $FILE_FINAL"
+        rm -f "$_plain_final"; unregister_sensitive_tmp "$_plain_final"; return 1
     fi
 
     # --- Шифрование (encrypt-then-MAC) — ТОЛЬКО локально. Те же гарантии, что в create_backup. ---
@@ -10427,8 +10590,8 @@ _backup_remote_target() {
     [[ -z "$BACKUP_PASSWORD" ]] && ENC_STATUS="⚠️ NO PASSWORD"
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         print_message "INFO" "Шифрование удалённого архива..."
-        if _hmac_envelope_create "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
-            rm -f "$BACKUP_DIR/$FILE_FINAL"; FILE_FINAL="${FILE_FINAL}.enc"; ENC_STATUS="🔒 Encrypted"
+        if _hmac_envelope_create "$_plain_final" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
+            rm -f "$_plain_final"; FILE_FINAL="${FILE_FINAL}.enc"; ENC_STATUS="🔒 Encrypted"
         else
             rm -f "$BACKUP_DIR/${FILE_FINAL}.enc"
             print_message "ERROR" "Ошибка шифрования!"
@@ -10439,7 +10602,11 @@ _backup_remote_target() {
                 echo -e "${RED}${BOLD}Архив содержит дамп БД. Отправить НЕЗАШИФРОВАННЫМ? Введите PLAINTEXT:${RESET}"
                 local _pc=""; read -erp "> " _pc; [[ "$_pc" == "PLAINTEXT" ]] && _ship=true
             fi
-            if [[ "$_ship" != "true" ]]; then rm -f "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1; fi
+            if [[ "$_ship" != "true" ]]; then rm -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1; fi
+            if ! mv -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
+                print_message "ERROR" "Не удалось переименовать удалённый архив в штатное имя: $FILE_FINAL"
+                rm -f "$_plain_final"; unregister_sensitive_tmp "$_plain_final"; return 1
+            fi
             ENC_STATUS="⚠️ UNENCRYPTED"
         fi
     fi
@@ -10450,20 +10617,33 @@ _backup_remote_target() {
 
     # --- Verify (MAC pre-check + decrypt + compressed-test) — verify-before-rotate ---
     local VERIFY_OK="false"
+    # 6.0.3 (#4): _rvrc 1 = повреждён, 2 = проверка не выполнена (I/O / нет места / mktemp).
+    local _rvrc=1
     if [[ "$FILE_FINAL" == *".enc" ]]; then
-        local _vd; _vd=$(mktemp "${TMPDIR:-/tmp}/lazarus_rverify.XXXXXX") || _vd=""
+        _rvrc=2
+        local _vd; _vd=$(mktemp "${TMPDIR:-/tmp}/lazarus_rverify.XXXXXX" 2> "$SILENT_LOG") || _vd=""
         if [[ -n "$_vd" ]]; then
             register_sensitive_tmp "$_vd"
-            if _hmac_envelope_decrypt "$BACKUP_DIR/$FILE_FINAL" "$_vd" "$BACKUP_PASSWORD"; then
-                _verify_compressed "$_vd" "$(_compress_detect_format "$_vd")" && VERIFY_OK="true"
+            _hmac_envelope_decrypt "$BACKUP_DIR/$FILE_FINAL" "$_vd" "$BACKUP_PASSWORD"
+            _rvrc=$?
+            if [[ $_rvrc -eq 0 ]]; then
+                if _verify_compressed "$_vd" "$(_compress_detect_format "$_vd")"; then VERIFY_OK="true"; else _rvrc=1; fi
             fi
             rm -f "$_vd"; unregister_sensitive_tmp "$_vd"
         fi
     else
-        _verify_compressed "$BACKUP_DIR/$FILE_FINAL" "$(_compress_detect_format "$BACKUP_DIR/$FILE_FINAL")" && VERIFY_OK="true"
+        _verify_compressed "$BACKUP_DIR/$FILE_FINAL" "$(_compress_detect_format "$BACKUP_DIR/$FILE_FINAL")" && { VERIFY_OK="true"; _rvrc=0; }
     fi
 
     local SIZE; SIZE=$(du -h "$BACKUP_DIR/$FILE_FINAL" 2>/dev/null | awk '{print $1}')
+    if [[ "$VERIFY_OK" != "true" && $_rvrc -eq 2 ]]; then
+        local _rdf_tmp _rdf_bk
+        _rdf_tmp=$(df -Ph "${TMPDIR:-/tmp}" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}')
+        _rdf_bk=$(df -Ph "$BACKUP_DIR" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}')
+        print_message "ERROR" "Проверка удалённого архива НЕ выполнена (ошибка ввода-вывода / нет места в TMPDIR) — архив не признан битым: $FILE_FINAL; свободно: TMPDIR ${TMPDIR:-/tmp} — ${_rdf_tmp:-?}, BACKUP_DIR — ${_rdf_bk:-?}. Ротация пропущена."
+        log_message "ERROR" "remote backup verify NOT PERFORMED (I/O / no space in TMPDIR): $FILE_FINAL (kept, rotation skipped; free TMPDIR=${_rdf_tmp:-?} BACKUP_DIR=${_rdf_bk:-?})"
+        return 1
+    fi
     if [[ "$VERIFY_OK" != "true" ]]; then
         print_message "ERROR" "Удалённый архив ПОВРЕЖДЁН (verify failed): $FILE_FINAL — ротация пропущена."
         log_message "ERROR" "remote backup verify FAILED: $FILE_FINAL (kept, rotation skipped)"
@@ -10775,7 +10955,15 @@ create_incremental_backup() {
                        "$BACKUP_DIR"/lazarus_full_*.tar.zst "$BACKUP_DIR"/lazarus_full_*.tar.zst.enc \
                        2>/dev/null | head -1)
     if [[ -z "$_last_full" ]]; then
-        print_message "ERROR" "Нет существующего full backup. Запустите 'lazarus backup full' для создания base."
+        # 6.0.3 (#12): inc строится только от ЛОКАЛЬНОГО full. При удалении локальных копий после
+        # отправки (DELETE_LOCAL_AFTER_REMOTE_UPLOAD) full живёт только в хранилище/Telegram —
+        # голое «нет full» вводило в заблуждение: новый full тоже уедет и будет удалён.
+        if [[ -n "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" && "$DELETE_LOCAL_AFTER_REMOTE_UPLOAD" != "false" ]]; then
+            print_message "ERROR" "Incremental требует локально хранимый full, а включено удаление локальных копий после отправки (DELETE_LOCAL_AFTER_REMOTE_UPLOAD=${DELETE_LOCAL_AFTER_REMOTE_UPLOAD}) — локального base нет. Отключите удаление (Настройки → Ротация → «Удалять локально») или используйте full/db."
+            log_message "ERROR" "Incremental refused: no local base full (DELETE_LOCAL_AFTER_REMOTE_UPLOAD=${DELETE_LOCAL_AFTER_REMOTE_UPLOAD} removes local fulls; inc needs a locally kept full)"
+        else
+            print_message "ERROR" "Нет существующего full backup. Запустите 'lazarus backup full' для создания base."
+        fi
         [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
@@ -10891,9 +11079,11 @@ create_incremental_backup() {
     local TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
     local _ext
     _ext=$(_compress_ext)
-    local VER_SUFFIX=""
+    # 6.0.3 (#30): та же санитизация, что у create_backup (раньше «5000/rwp» из тега давал '/' в имени
+    # → tar писал в несуществующий подкаталог и inc падал «tar combine failed»).
     local CURRENT_VER=$(get_backup_version 2>/dev/null)
-    [[ -n "$CURRENT_VER" ]] && VER_SUFFIX="__v${CURRENT_VER}"
+    local VER_SUFFIX
+    VER_SUFFIX=$(_ver_suffix "$CURRENT_VER")
     local FILE_FINAL="lazarus_inc_${TIMESTAMP}__base_${_base_ts}${VER_SUFFIX}.tar.${_ext}"
     local FILE_DB="db_${TIMESTAMP}.sql.${_ext}"
     local FILE_VERSION="bot_version.txt"
@@ -10982,8 +11172,10 @@ create_incremental_backup() {
     local _combine=("$FILE_VERSION" "$FILE_MANIFEST_INC" "$FILE_DELETIONS")
     [[ -f "$BACKUP_DIR/$FILE_DB" ]] && _combine+=("$FILE_DB")
     [[ -f "$BACKUP_DIR/$_inc_files_archive" ]] && _combine+=("$_inc_files_archive")
+    # 6.0.3 (#11): combine → .part; штатное имя — только после rc (без пароля) или verify шифра.
+    local _inc_part="$BACKUP_DIR/${FILE_FINAL}.part"
     _run_with_timeout "$TAR_TIMEOUT_SEC" "tar-inc-combine" \
-        tar $_tar_compress_args -cf "$BACKUP_DIR/$FILE_FINAL" -C "$BACKUP_DIR" "${_combine[@]}" 2>> "$_tar_err"
+        tar $_tar_compress_args -cf "$_inc_part" -C "$BACKUP_DIR" "${_combine[@]}" 2>> "$_tar_err"
     local _combine_rc=$?
     rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" "$BACKUP_DIR/$FILE_MANIFEST_INC" "$BACKUP_DIR/$FILE_DELETIONS" "$BACKUP_DIR/$_inc_files_archive"
 
@@ -10991,7 +11183,13 @@ create_incremental_backup() {
 
     if [[ $_combine_rc -ne 0 ]]; then
         print_message "ERROR" "tar combine failed (rc=$_combine_rc)"
-        rm -f "$BACKUP_DIR/$FILE_FINAL"
+        rm -f "$_inc_part" "$BACKUP_DIR/$FILE_FINAL"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+        return 1
+    fi
+    if [[ -z "$BACKUP_PASSWORD" ]] && ! mv -f "$_inc_part" "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Не удалось переименовать inc-архив в штатное имя: $FILE_FINAL"
+        rm -f "$_inc_part"
         [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
@@ -11006,25 +11204,38 @@ create_incremental_backup() {
     # source — боте и БД — целы, потери нет).
     if [[ -n "$BACKUP_PASSWORD" ]]; then
         print_message "INFO" "Шифрование архива..."
-        if ! _hmac_envelope_create "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
+        if ! _hmac_envelope_create "$_inc_part" "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_PASSWORD"; then
             print_message "ERROR" "Ошибка шифрования"
-            rm -f "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc"
+            rm -f "$_inc_part" "$BACKUP_DIR/$FILE_FINAL" "$BACKUP_DIR/${FILE_FINAL}.enc"
             [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
             return 1
         fi
         # Verify: decrypt round-trip + целостность сжатия ДО удаления plaintext.
-        local _incv
-        _incv=$(mktemp "${TMPDIR:-/tmp}/lazarus_incverify.XXXXXX" 2>/dev/null)
-        register_sensitive_tmp "$_incv"
-        if [[ -n "$_incv" ]] \
-           && _hmac_envelope_decrypt "$BACKUP_DIR/${FILE_FINAL}.enc" "$_incv" "$BACKUP_PASSWORD" \
-           && _verify_compressed "$_incv" "$(_compress_detect_format "$_incv")"; then
+        # 6.0.3 (#4): 0 = ок, 1 = повреждён (удаляем, inc воспроизводим), 2 = проверка НЕ выполнена
+        # (I/O / нет места / mktemp) — .enc не признан битым: оставляем с WARN, без ротации, rc=1.
+        local _incv _ivrc=2
+        _incv=$(mktemp "${TMPDIR:-/tmp}/lazarus_incverify.XXXXXX" 2>/dev/null) || _incv=""
+        if [[ -n "$_incv" ]]; then
+            register_sensitive_tmp "$_incv"
+            _hmac_envelope_decrypt "$BACKUP_DIR/${FILE_FINAL}.enc" "$_incv" "$BACKUP_PASSWORD"
+            _ivrc=$?
+            if [[ $_ivrc -eq 0 ]] && ! _verify_compressed "$_incv" "$(_compress_detect_format "$_incv")"; then
+                _ivrc=1
+            fi
             rm -f "$_incv"; unregister_sensitive_tmp "$_incv"
-            rm -f "$BACKUP_DIR/$FILE_FINAL"   # plaintext — ТОЛЬКО после успешного verify
+        fi
+        # plaintext .part в любом исходе больше не нужен (шифр уже записан) — не оставляем открытым.
+        rm -f "$_inc_part"
+        if [[ $_ivrc -eq 0 ]]; then
             FILE_FINAL="${FILE_FINAL}.enc"
             print_message "SUCCESS" "Архив зашифрован и проверен."
+        elif [[ $_ivrc -eq 2 ]]; then
+            local _idf_tmp; _idf_tmp=$(df -Ph "${TMPDIR:-/tmp}" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}')
+            print_message "WARN" "Inc-архив зашифрован, но проверка НЕ выполнена (ошибка ввода-вывода / нет места в TMPDIR ${TMPDIR:-/tmp}, свободно ${_idf_tmp:-?}) — архив не признан битым и оставлен: ${FILE_FINAL}.enc. Ротация пропущена; повторите inc после освобождения места."
+            log_message "WARN" "Incremental verify NOT PERFORMED (I/O / no space in TMPDIR, free=${_idf_tmp:-?}): ${FILE_FINAL}.enc kept unverified, rotation skipped"
+            [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+            return 1
         else
-            rm -f "$_incv"; unregister_sensitive_tmp "$_incv"
             print_message "ERROR" "Зашифрованный inc-архив не прошёл verify — отменён."
             log_message "ERROR" "Incremental encrypted archive verify FAILED: ${FILE_FINAL}.enc"
             rm -f "$BACKUP_DIR/${FILE_FINAL}.enc" "$BACKUP_DIR/$FILE_FINAL"
@@ -11046,6 +11257,13 @@ create_incremental_backup() {
     _size=$(stat -c%s "$BACKUP_DIR/$FILE_FINAL" 2>/dev/null | numfmt --to=iec 2>/dev/null || echo "?")
     print_message "SUCCESS" "Incremental создан: $FILE_FINAL ($_size, $_changed_count изменённых)"
     log_message "SUCCESS" "Incremental backup: $FILE_FINAL (base=$_base_ts, changed=$_changed_count, size=$_size)"
+    # 6.0.3 (#12): доставки inc нет (отдельная фича) — при настроенных каналах говорим прямо,
+    # чтобы оператор не считал inc-цепочку продублированной в хранилище/чате.
+    if [[ ( "$REMOTE_STORAGE_TYPE" != "off" && -n "$REMOTE_STORAGE_TYPE" && "$SEND_TO_REMOTE" == "true" ) \
+          || ( "$SEND_TO_TELEGRAM" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ) ]]; then
+        print_message "WARN" "Инкремент хранится только локально (в R2/Telegram не отправляется): $FILE_FINAL"
+        log_message "WARN" "Incremental kept local only (not uploaded to remote/Telegram): $FILE_FINAL"
+    fi
 
     # ROT-2 fix: ротируем inc-бэкапы (раньше росли безгранично между full-бэкапами —
     # count/age ротации их не трогали, только size). Каждый inc независим (diff от
@@ -11866,9 +12084,17 @@ _sweep_stale_intermediates() {
     local _dir="${BACKUP_DIR:-}" _f _base _sz _n=0
     [[ -n "$_dir" && -d "$_dir" ]] || return 0
     local _re='^(db|dir|globals|billing|kb|extra|bot_files)_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}\.(sql|tar)\.(gz|zst)$'
+    # 6.0.3 (#11): ещё три шаблона тула. (1) Недописанные архивы: combine/шифрование пишут в
+    # lazarus_*.tar.*[.enc].part и переименовывают только целыми — .part старше 60 мин = брошен
+    # убитым прогоном (живой писатель обновляет mtime, sweep идёт под блокировкой). (2) Файловый
+    # кусок inc bot_files_inc_<ts> (не ловился шаблоном выше: после «bot_files_» идёт «inc_»).
+    # (3) Временные файлы миграции v1→v2 (.lazarus_mig_v2.XXXXXX[.part]) в BACKUP_DIR.
+    local _re_inc='^bot_files_inc_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}\.tar\.(gz|zst)$'
+    local _re_part='^lazarus_[A-Za-z0-9._-]+\.tar\.(gz|zst)(\.enc)?\.part$'
+    local _re_mig='^\.lazarus_mig_v2\.[A-Za-z0-9]+(\.part)?$'
     while IFS= read -r -d '' _f; do
         _base="${_f##*/}"
-        [[ "$_base" =~ $_re ]] || continue
+        [[ "$_base" =~ $_re || "$_base" =~ $_re_inc || "$_base" =~ $_re_part || "$_base" =~ $_re_mig ]] || continue
         _sz=$(stat -c%s "$_f" 2> "$SILENT_LOG" || echo 0)
         if [[ "$_sz" -lt 1073741824 ]] && command -v shred > /dev/null 2>&1; then
             shred -n 1 -fu "$_f" 2> "$SILENT_LOG" || rm -f "$_f"
@@ -13833,7 +14059,7 @@ menu_settings() {
             echo -e "   2.  Срок хранения        ${GRAY}${RETENTION_DAYS} дней${RESET}"
         fi
         # Значения настроек — GRAY (справка, не тревога); YELLOW/RED тут были ложным сигналом.
-        echo -e "   3.  Лимит на папку       ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
+        echo -e "   3.  Лимит на архивы      ${GRAY}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
         echo -e "   4.  Порог WARN диска     ${GRAY}${DISK_WARN_PERCENT}% — уведомление${RESET}"
         echo -e "   5.  Порог CRITICAL       ${GRAY}${DISK_CRITICAL_PERCENT}% — стоп бэкапов${RESET}"
         # Жаргон any/all/remote_only — русская метка, ключ конфига серым в скобках.
@@ -13857,7 +14083,7 @@ menu_settings() {
         if [[ -n "$_disk_cur_pct" ]]; then
             echo -e "  ${GRAY}Диск: занято ${_disk_color}${_disk_cur_pct}%${RESET}${GRAY}, свободно ${_disk_cur_free} (${BACKUP_DIR})${RESET}"
         fi
-        echo -e "  ${GRAY}Лимит на папку — весь каталог бэкапов. WARN — уведомление, CRITICAL — остановка бэкапов.${RESET}"
+        echo -e "  ${GRAY}Лимит на архивы — объём архивов lazarus_* (снапшоты и прочие файлы не входят). WARN — уведомление, CRITICAL — остановка бэкапов.${RESET}"
         fi  # /rotation
         if [[ "$_sview" == "misc" ]]; then
         _group_hdr "Настройки → Компрессия и бэкап логов"
@@ -14206,9 +14432,10 @@ menu_settings() {
                     fi
                 fi ;;
                 
-            rotation:3) # Лимит размера бэкапов
+            rotation:3) # Лимит на архивы (объём архивов lazarus_*)
                 echo ""
-                echo "Лимит размера папки с бэкапами (в MB)"
+                echo "Лимит на архивы (в MB): суммарный объём архивов lazarus_* в папке бэкапов"
+                echo "Снапшоты pre_restore_snapshot_* и прочие файлы в лимит не входят и ротацией не удаляются"
                 echo "Введите 0 для отключения лимита"
                 echo ""
                 local current_mb="$MAX_BACKUP_SIZE_MB"
@@ -14404,7 +14631,7 @@ cleanup_old_backups() {
         else
             echo -e "Срок хранения: ${YELLOW}$RETENTION_DAYS дней${RESET}"
         fi
-        echo -e "Лимит размера: ${YELLOW}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
+        echo -e "Лимит на архивы: ${YELLOW}$(format_size_mb "$MAX_BACKUP_SIZE_MB")${RESET}"
         echo ""
     fi
     
@@ -14430,8 +14657,10 @@ cleanup_old_backups() {
     done
     
     # Проверка лимита размера (показываем статус)
-    if [[ -n "$MAX_BACKUP_SIZE_MB" && "$MAX_BACKUP_SIZE_MB" != "0" ]]; then
-        local current_size_bytes=$(du -sb "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    if [[ "$MAX_BACKUP_SIZE_MB" =~ ^[0-9]+$ && "$MAX_BACKUP_SIZE_MB" != "0" ]]; then
+        # #5: тот же расчёт, что у rotate_backups_by_size (только архивы lazarus_*) — иначе меню
+        # обещало «Превышен лимит! Старые файлы будут удалены», а ротация ничего не удаляла.
+        local current_size_bytes; current_size_bytes=$(_size_rot_bytes)
         local limit_bytes=$((MAX_BACKUP_SIZE_MB * 1024 * 1024))
         if [[ $current_size_bytes -gt $limit_bytes ]]; then
             size_exceeded=true
@@ -14457,7 +14686,7 @@ cleanup_old_backups() {
         print_message "WARN" "[DRY-RUN] Кандидатов на удаление: $total_del"
     else
         if [[ "$size_exceeded" == "true" ]]; then
-            print_message "WARN" "Превышен лимит размера! Старые файлы будут удалены."
+            print_message "WARN" "Превышен лимит на архивы! Старые архивы будут удалены."
         fi
         if [[ "$total_del" -gt 0 ]]; then
             print_message "WARN" "Будет удалено старых архивов: $total_del"
@@ -15291,7 +15520,10 @@ diag_command() {
     if [[ -d "$BACKUP_DIR" ]]; then
         local _b_total _b_v1=0 _b_v2=0 _b_unenc=0 _b_size
         # AUDIT fix: учитываем и zstd (.tar.zst*), иначе на zstd-боксах diag показывает 0 бэкапов.
-        _b_total=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz*' -o -name '*.tar.zst*' \) 2>/dev/null | wc -l)
+        # 6.0.3 (#11): только 4 штатных формата — недописанные *.part (брошенные kill'ом) не бэкапы,
+        # их считаем отдельно (иначе .part попадал в Total и «Latest»).
+        _b_total=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' -o -name '*.tar.zst' -o -name '*.tar.zst.enc' \) 2>/dev/null | wc -l)
+        local _b_part; _b_part=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'lazarus_*.part' 2>/dev/null | wc -l)
         for f in "$BACKUP_DIR"/*.enc; do
             [[ ! -f "$f" ]] && continue
             local _m; _m=$(head -c 4 "$f" 2>/dev/null)
@@ -15304,8 +15536,9 @@ diag_command() {
         echo "  v2 (LAZ2):   $_b_v2 (с HMAC)"
         echo "  v1 (legacy): $_b_v1 (без HMAC)"
         echo "  Unencrypted: $_b_unenc"
+        [[ "$_b_part" -gt 0 ]] && echo "  Незавершённые (.part): $_b_part (брошены прерванным прогоном; sweep удалит старше 60 мин)"
         local _latest
-        _latest=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz*' -o -name '*.tar.zst*' \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+        _latest=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' -o -name '*.tar.zst' -o -name '*.tar.zst.enc' \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
         if [[ -n "$_latest" ]]; then
             local _latest_ts=$(stat -c%y "$_latest" 2>/dev/null | cut -d. -f1)
             local _latest_size=$(stat -c%s "$_latest" 2>/dev/null | numfmt --to=iec 2>/dev/null)
