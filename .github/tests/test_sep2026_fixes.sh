@@ -174,7 +174,9 @@ out=$(_t6c 2>&1); rc=$?
 grep -q 'psql -U "$expected_user" -d "$expected_db" -tAc "SELECT current_database()"' "$SCRIPT" \
     && ok || bad "7a assert_safe_db_target без -d"
 [[ $(grep -c 'psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA' "$SCRIPT") -eq 0 ]] && ok || bad "7b остался DROP SCHEMA без -d"
-[[ $(grep -c 'psql -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" -c "DROP SCHEMA' "$SCRIPT") -eq 2 ]] && ok || bad "7c ожидалось 2 DROP SCHEMA с -d"
+# основной DROP (с ON_ERROR_STOP, перенос строки) + DROP в автооткате
+[[ $(grep -c 'psql -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" -v ON_ERROR_STOP=1 \\$' "$SCRIPT") -eq 1 ]] && ok || bad "7c основной DROP SCHEMA без -d/ON_ERROR_STOP"
+[[ $(grep -c 'psql -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" -c "DROP SCHEMA' "$SCRIPT") -eq 1 ]] && ok || bad "7c DROP SCHEMA автоотката без -d"
 # Тело функции — в переменную, а не `sed | grep -q`: при pipefail grep -q выходит на первом
 # совпадении, sed ловит SIGPIPE на остатке (~60 КБ) — и проверка краснеет СЛУЧАЙНО (гонка буфера).
 ER_START=$(grep -n '^execute_restore() {' "$SCRIPT" | cut -d: -f1)

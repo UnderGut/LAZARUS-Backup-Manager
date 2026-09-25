@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.1-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.2-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — система резервного копирования для **Remnawave Panel** и **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: панель, бот, infra-billing и база знаний ИИ-саппорта — одним инструментом. Всё находится **само** (по образам и docker-меткам, имена контейнеров и пути не важны), деструктивные операции защищены от потери данных, есть **перенос панели на новый сервер** и два режима меню — **Простой** (для новичков: 4 пункта + пошаговый мастер) и **Расширенный** (полный контроль).
@@ -259,9 +259,9 @@ Rclone         gdrive:backups   (требует настроенный rclone)
 
 1. Снимается snapshot ЖИВОЙ БД (точка отката).
 2. Останавливаются контейнеры (для db-only — только приложение, БД остаётся для импорта).
-3. Файлы синхронизируются из архива; при конфликте версий (архив старше свежеустановленной панели) — явный выбор: только данные / сохранить текущую инфру / точная копия.
-4. `DROP SCHEMA` + импорт БД; при провале — авто-откат из snapshot и подъём стека.
-5. Опционально — импорт infra-billing и базы знаний (каждый со своей точкой отката).
+3. Файлы синхронизируются из архива (распаковка проверяется ДО остановки стека: хватает ли места и чем кончился `tar` — обрезанная копия не уходит в `rsync --delete`); при конфликте версий (архив старше свежеустановленной панели) — явный выбор: только данные / сохранить текущую инфру / точная копия.
+4. `DROP SCHEMA` + импорт БД; при провале — авто-откат из snapshot и подъём стека. Без подтверждённого `DROP SCHEMA` импорт идёт только в пустую БД — иначе отказ до изменений.
+5. Опционально — импорт infra-billing и базы знаний (каждый со своей точкой отката). Если сайдкар не восстановился, итог — «выполнено не полностью» (код 4), а не «успешно».
 6. Стек поднимается заново (свежий пул соединений).
 
 Восстановление доступно только для **локальной** цели (удалённую SSH-цель восстанавливают на её сервере).

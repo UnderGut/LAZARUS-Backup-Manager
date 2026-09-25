@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Конфликт версий при restore: на сервере СВЕЖАЯ панель (новый docker-compose),
 # архив — со старой. Проверяем:
-# (1) _restore_rsync_flags: обычный режим = --delete + exclude .env;
+# (1) _restore_rsync_flags: обычный режим = --delete-delay + exclude .env;
 #     RESTORE_KEEP_INFRA=1 = БЕЗ --delete + exclude всех compose-имён и .env;
 # (2) rsync-поведение keep-infra на реальных файлах: compose/.env живые НЕ трогаются,
 #     новые файлы свежей версии НЕ удаляются, остальное приходит из архива;
@@ -31,7 +31,7 @@ RESTORE_INCLUDE_ENV="false"
 declare -a _RS_DEL _RS_EXCL
 RESTORE_KEEP_INFRA=0
 _restore_rsync_flags
-[[ "${_RS_DEL[*]}" == "--delete" ]] && ok || bad "обычный режим: ждали --delete, got '${_RS_DEL[*]}'"
+[[ "${_RS_DEL[*]}" == "--delete-delay" ]] && ok || bad "обычный режим: ждали --delete-delay, got '${_RS_DEL[*]}'"
 [[ "${_RS_EXCL[*]}" == *".env"* ]] && ok || bad "обычный режим: .env должен быть в exclude"
 [[ "${_RS_EXCL[*]}" == *"docker-compose"* ]] && bad "обычный режим: compose НЕ должен исключаться" || ok
 

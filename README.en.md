@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.1-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.2-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** is a backup system for **Remnawave Panel** and the **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: panel, bot, infra-billing, and the AI-support knowledge base — all in a single tool. Everything is discovered **automatically** (by images and Docker labels — container names and paths do not matter), destructive operations are protected against data loss, there is **panel migration to a new server**, and two menu modes — **Simple** (for newcomers: 4 items + a step-by-step wizard) and **Advanced** (full control).
@@ -259,9 +259,9 @@ Rclone         gdrive:backups   (requires a configured rclone)
 
 1. A snapshot of the LIVE database is taken (a rollback point).
 2. Containers are stopped (for db-only — only the application; the DB stays up for the import).
-3. Files are synced from the archive; on a version conflict (the archive is older than a freshly installed panel) — an explicit choice: data only / keep the current infra / an exact copy.
-4. `DROP SCHEMA` + DB import; on failure — auto-rollback from the snapshot and the stack brought back up.
-5. Optionally — importing infra-billing and the knowledge base (each with its own rollback point).
+3. Files are synced from the archive (extraction is checked BEFORE the stack is stopped: enough free space and a clean `tar` exit — a truncated copy never reaches `rsync --delete`); on a version conflict (the archive is older than a freshly installed panel) — an explicit choice: data only / keep the current infra / an exact copy.
+4. `DROP SCHEMA` + DB import; on failure — auto-rollback from the snapshot and the stack brought back up. Without a confirmed `DROP SCHEMA` the import runs only into an empty database — otherwise it refuses before changing anything.
+5. Optionally — importing infra-billing and the knowledge base (each with its own rollback point). If a sidecar is not restored, the result is "completed partially" (exit code 4), not "success".
 6. The stack is brought back up (a fresh connection pool).
 
 Restore is available only for a **local** target (a remote SSH target is restored on its own server).
