@@ -9,12 +9,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # apt-версия (0.9) на скрипте ~16.7k строк съедает ~21 ГБ (data-flow анализ) при 16 ГБ у
+      # раннера — шаг снимается (так случилось на 6.0.3). Берём официальный релиз ≥0.10 и выключаем
+      # extended analysis: проверки уровня error (синтаксис и пр.) остаются, память — в разы меньше.
       - name: Install shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+        run: |
+          v=v0.10.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/$v/shellcheck-$v.linux.x86_64.tar.xz" | tar -xJ
+          sudo install -m 755 "shellcheck-$v/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
       - name: Bash syntax check
         run: bash -n lazarus-backup
       - name: Shellcheck (errors only)
-        run: shellcheck -S error -x lazarus-backup
+        run: shellcheck -S error -x --extended-analysis=false lazarus-backup
 
   tests:
     runs-on: ubuntu-latest
