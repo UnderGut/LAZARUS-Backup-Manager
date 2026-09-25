@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.1-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** is a backup system for **Remnawave Panel** and the **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: panel, bot, infra-billing, and the AI-support knowledge base — all in a single tool. Everything is discovered **automatically** (by images and Docker labels — container names and paths do not matter), destructive operations are protected against data loss, there is **panel migration to a new server**, and two menu modes — **Simple** (for newcomers: 4 items + a step-by-step wizard) and **Advanced** (full control).
@@ -69,9 +69,9 @@ Step-by-step guides for each scenario live in **[docs/](docs/README.md)** (writt
 
 ### 🛡️ Data-loss protection
 The script is designed to **not lose data** even on failures:
-- **Restore with a rollback point** — before destroying the database, a snapshot of the LIVE database is taken (with a content check). The destructive step runs only when the snapshot is valid; on import failure — auto-rollback + containers brought back up. Any early guard failure brings the stack back up (panel/bot are never left offline).
+- **Restore with a rollback point** — before destroying the database, a snapshot of the LIVE database is taken (with a content check). The destructive step runs only when the snapshot is valid; the target path and containers are checked BEFORE the stack is stopped. On import failure, or on any guard failure after the volume is dropped — auto-rollback of the DB from the snapshot + containers brought back up. Any early guard failure brings the stack back up (panel/bot are never left offline or on an empty database).
 - **Verify before delete** — every archive (full and incremental) is verified (for `.enc` — a full decrypt round-trip) BEFORE the plaintext is deleted and success is reported.
-- **Encryption is mandatory** — if a password is set and encryption failed, the unencrypted archive is NOT uploaded (cron — abort; interactive — explicit confirmation). Intermediate plaintext dumps (including during remote backup) are wiped with `shred` on exit/interrupt.
+- **Encryption is mandatory** — if a password is set and encryption failed, the unencrypted archive is NOT uploaded (cron — abort; interactive — explicit confirmation). Intermediate plaintext dumps (including during remote backup) are wiped with `shred` on exit/interrupt, and those left behind by a killed process (SIGKILL/OOM/reboot) are cleaned up on the next run. Temporary archive copies are written to disk (`/opt/lazarus-backup/tmp`), not to `/tmp`, which lives in RAM on many servers.
 - **Rotation never zeroes out** — size-rotation never deletes the newest backup and cascades to clean up orphaned incrementals.
 - **Upload with verify** — S3/FTP/WebDAV/rclone check the size on the remote BEFORE `delete-local` removes the local copy; if the size is unverified, the local copy is left untouched.
 - **Identification by role, not by name** — containers are identified by image/label/`DATABASE_URL`, and a destructive action on a "foreign" stack is rejected fail-closed.
@@ -83,7 +83,7 @@ The script is designed to **not lose data** even on failures:
 - **Sidecars** — cluster roles (`globals`), infra-billing (`billing_*.sql`), the AI-support knowledge base (`kb_*.sql`, pgvector), additional paths outside the panel directory (`extra_*.tar`, e.g. `certwarden`).
 - **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2), detects a wrong password and byte tampering BEFORE decryption.
 - **gzip / zstd** — gzip (everywhere), zstd (opt-in, smaller and faster on SQL dumps). Old archives are restored regardless of the current format (detected by magic bytes).
-- **Version in the filename** — if a bot is present on the server, its version is added to the name (`__vX.Y.Z`); on a panel-only server the suffix is omitted.
+- **Version in the filename** — the component version is added to the archive name (`__vX.Y.Z`): the image tag if it is itself a version (`3.4.4-trafficfmt`), otherwise the exact version from the image — for a bot on the moving `:dev` tag this is its real version (`7.1.0.x`), not `dev`.
 - **v1→v2 migration** — `lazarus migrate-v2` to convert old archives.
 
 ### 🖥️ Backup targets

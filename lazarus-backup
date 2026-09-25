@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="6.0.0"
+VERSION="6.0.1"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -2795,6 +2795,20 @@ get_app_version() {
     echo "$_v"
 }
 
+# get_backup_version: версия для ИМЕНИ архива (__vX), bot_version.txt и меню восстановления.
+# Тег образа, если он сам похож на версию (панель 3.4.4-trafficfmt — несёт маркер кастомной
+# сборки); иначе — точная версия из образа (get_app_version). Бот живёт на ПОДВИЖНОМ теге :dev —
+# по тегу все бэкапы назывались «__vdev», и в меню restore нельзя было понять, до какой миграции
+# снят дамп (у бота бывают необратимые миграции). Пусто — контейнер не запущен.
+get_backup_version() {
+    local _tag; _tag=$(get_raw_bot_version)
+    [[ -z "$_tag" ]] && { echo ""; return; }
+    if [[ "$_tag" =~ [0-9]+\.[0-9]+ ]]; then echo "$_tag"; return; fi
+    local _app; _app=$(get_app_version "$BOT_CONTAINER_NAME")
+    if [[ -n "$_app" && "$_app" =~ [0-9] ]]; then echo "$_app"; return; fi
+    echo "$_tag"
+}
+
 # Получение статуса контейнера бота
 get_container_status() {
     if [[ -z "$BOT_CONTAINER_NAME" ]]; then
@@ -4349,7 +4363,12 @@ save_config() {
     # Во время активного bind (bot-команда форсит BACKUP_TARGET=bot) на диск пишем ИСХОДНУЮ цель,
     # а не транзиентный bot-only — иначе save в этот момент навсегда демотнул бы both→bot.
     local _persist_target="$BACKUP_TARGET" _persist_secondary="${BACKUP_SECONDARY:-}"
-    if [[ "${_BOTRT_FORCED:-0}" == "1" ]]; then
+    if [[ -n "${_PERSIST_TARGET_PAIR:-}" ]]; then
+        # Временное переключение цели в menu_restore — на диск идёт исходная пара (см. там).
+        # Первой: пара снята ДО переключения и всегда каноническая; bind внутри restore запомнил
+        # бы как «исходную» уже транзиентную bot/bot.
+        _persist_target="${_PERSIST_TARGET_PAIR%%|*}"; _persist_secondary="${_PERSIST_TARGET_PAIR#*|}"
+    elif [[ "${_BOTRT_FORCED:-0}" == "1" ]]; then
         _persist_target="$_BOTRT_PREV_TARGET"; _persist_secondary="$_BOTRT_PREV_SECONDARY"
     fi
     BACKUP_TARGET_ESC=$(env_escape "$_persist_target")
@@ -4797,6 +4816,7 @@ RB_PATH=""; RB_APP=""; RB_DB=""
 # Форс-состояние bind_bot_runtime_or_fail: при активном форсе (=1) save_config пишет ПРЕЖНЮЮ цель,
 # а unbind_bot_runtime восстанавливает both-контекст (см. bind/unbind ниже).
 _BOTRT_FORCED=0; _BOTRT_PREV_TARGET=""; _BOTRT_PREV_SECONDARY=""
+_PERSIST_TARGET_PAIR=""   # "target|secondary" — ставит menu_restore (local) на время временной смены цели
 # Полный путь ПОСЛЕДНЕГО успешно созданного архива (ставит _backup_remote_target) — детерминированная
 # передача вызывателю (migrate) вместо гоночного поиска по mtime.
 LAZ_LAST_BACKUP_FILE=""
@@ -8584,6 +8604,7 @@ create_backup() {
     # только на возврате самой create_backup. Двойной release безопасен (release_lock
     # глушит ошибки на уже закрытом FD). Существующие явные release_lock оставлены.
     trap '[[ "$LOCK_ACQUIRED" == "true" ]] && release_lock' RETURN
+    _sweep_stale_intermediates   # под блокировкой: убрать брошенные куски прошлых прогонов
 
     # === ГАРД ИДЕНТИЧНОСТИ ЦЕЛИ ===
     # Бэкап read-only, но АРХИВ С ЧУЖИМ СОДЕРЖИМЫМ (напр. дамп панели под именем lazarus_* бота
@@ -8778,7 +8799,7 @@ create_backup() {
         fi
     fi
 
-    local CURRENT_VER=$(get_raw_bot_version)
+    local CURRENT_VER=$(get_backup_version)
     echo "${CURRENT_VER:-Unknown}" > "$BACKUP_DIR/$FILE_VERSION"
     debug_log "BACKUP" "Bot version saved: ${CURRENT_VER:-Unknown}"
 
@@ -9701,14 +9722,28 @@ _send_telegram_album() {
     done
     media+="]"
     [[ -n "$TG_MESSAGE_THREAD_ID" ]] && form+=(-F "message_thread_id=$TG_MESSAGE_THREAD_ID")
-    local http_code
-    http_code=$(curl $CURL_SILENT --max-time 300 -o "$SILENT_LOG" -w "%{http_code}" -X POST \
+    local _resp http_code
+    _resp=$(curl $CURL_SILENT --max-time 300 -w '\n%{http_code}' -X POST \
         "https://api.telegram.org/bot$BOT_TOKEN/sendMediaGroup" \
         -F "chat_id=$CHAT_ID" -F "media=$media" "${form[@]}" 2> "$SILENT_LOG")
+    http_code="${_resp##*$'\n'}"
     debug_log "TG" "sendMediaGroup HTTP $http_code (${#files[@]} docs)"
     [[ "$http_code" == "200" ]] && return 0
-    log_message "WARN" "sendMediaGroup failed HTTP $http_code"
+    _tg_log_failure "sendMediaGroup" "$http_code" "${_resp%$'\n'*}"
     return 1
+}
+
+# _tg_log_failure: отказ Telegram Bot API → WARN в лог с HTTP-кодом и полем description ответа.
+# Раньше ответ шёл в /dev/null, и текст-сводка (TG_SEND_FILE=false) проваливалась молча:
+# «0 WARN в логе» ничего не говорил о доставке. WARN, а не ERROR: print_message ERROR сам
+# шлёт в Telegram — при сломанном канале это бессмысленно. Токен/URL в лог НЕ попадают.
+# $1 метод API, $2 http-код, $3 тело ответа (может быть пустым).
+_tg_log_failure() {
+    local _m="$1" _code="${2:-000}" _body="$3" _desc
+    _desc=$(printf '%s' "$_body" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p' | head -c 200)
+    [[ -z "$_desc" && ( -z "$_code" || "$_code" == "000" ) ]] && _desc="нет ответа (сеть/таймаут)"
+    print_message "WARN" "Telegram: $_m не доставлено (HTTP ${_code:-000}${_desc:+ — $_desc})"
+    log_message "WARN" "telegram $_m failed: HTTP ${_code:-000}${_desc:+ — $_desc}"
 }
 
 # Текст-сводка (fallback когда файлов в TG нет). $1=текст (pre-escaped MarkdownV2).
@@ -9716,13 +9751,15 @@ _send_telegram_text() {
     local text="$1"
     [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
     local thread=(); [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread=(-d "message_thread_id=$TG_MESSAGE_THREAD_ID")
-    local http_code
-    http_code=$(curl $CURL_SILENT --max-time 120 -o "$SILENT_LOG" -w "%{http_code}" -X POST \
+    local _resp http_code
+    _resp=$(curl $CURL_SILENT --max-time 120 -w '\n%{http_code}' -X POST \
         "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d chat_id="$CHAT_ID" -d parse_mode="MarkdownV2" \
         --data-urlencode text="$text" "${thread[@]}" 2> "$SILENT_LOG")
+    http_code="${_resp##*$'\n'}"
     debug_log "TG" "album text-summary HTTP $http_code"
     [[ "$http_code" == "200" ]] && return 0
+    _tg_log_failure "sendMessage" "$http_code" "${_resp%$'\n'*}"
     return 1
 }
 
@@ -9927,6 +9964,7 @@ _backup_remote_target() {
     fi
     LOCK_ACQUIRED="true"
     trap '[[ "$LOCK_ACQUIRED" == "true" ]] && release_lock' RETURN
+    _sweep_stale_intermediates   # под блокировкой: убрать брошенные куски прошлых прогонов
 
     # Проверка SSH-доступности (быстрый no-op).
     if ! timeout 20 $_ssh "true" 2> "$SILENT_LOG"; then
@@ -10243,7 +10281,7 @@ select_backup_file() {
         IFS=$'\n' sorted_backups=($(sort -r <<<"${valid_files[*]}"))
         unset IFS
         
-        local CURRENT_VER=$(get_raw_bot_version)
+        local CURRENT_VER=$(get_backup_version)
 
         clear_screen; echo -e "${GREEN}${BOLD}Восстановление: ${TITLE}${RESET}"
         if [[ -n "$date_filter" ]]; then
@@ -10456,6 +10494,7 @@ create_incremental_backup() {
     LOCK_ACQUIRED="true"
     # CSC-3 fix: RETURN-trap гарантирует release на любом возврате.
     trap '[[ "$LOCK_ACQUIRED" == "true" ]] && release_lock' RETURN
+    _sweep_stale_intermediates   # под блокировкой: убрать брошенные куски прошлых прогонов
 
     # Step 1: найти последний full backup (с manifest)
     local _last_full
@@ -10580,7 +10619,7 @@ create_incremental_backup() {
     local _ext
     _ext=$(_compress_ext)
     local VER_SUFFIX=""
-    local CURRENT_VER=$(get_raw_bot_version 2>/dev/null)
+    local CURRENT_VER=$(get_backup_version 2>/dev/null)
     [[ -n "$CURRENT_VER" ]] && VER_SUFFIX="__v${CURRENT_VER}"
     local FILE_FINAL="lazarus_inc_${TIMESTAMP}__base_${_base_ts}${VER_SUFFIX}.tar.${_ext}"
     local FILE_DB="db_${TIMESTAMP}.sql.${_ext}"
@@ -11336,7 +11375,9 @@ assert_safe_db_target() {
 
     # 3) PostgreSQL доступен и current_database совпадает
     local actual_db
-    actual_db=$(docker exec "$container" psql -U "$expected_user" -tAc "SELECT current_database()" 2> "$SILENT_LOG")
+    # -d обязателен: без него psql идёт в БД с именем ЮЗЕРА — при POSTGRES_DB≠POSTGRES_USER гард
+    # ложно отказывал (и уже ПОСЛЕ удаления volume в full-restore).
+    actual_db=$(docker exec "$container" psql -U "$expected_user" -d "$expected_db" -tAc "SELECT current_database()" 2> "$SILENT_LOG")
     if [[ -z "$actual_db" ]]; then
         print_message "ERROR" "Не удалось подключиться к PostgreSQL в контейнере '$container'"
         return 1
@@ -11483,9 +11524,93 @@ confirm_drop_schema() {
 # _CRITICAL_SECTION (мы больше не в критической мутации) и чистим temp. BOT_PATH может быть
 # невалиден (провал ensure_bot_path) → подъём под guard `-d`.
 _restore_abort() {
+    # Провал ПОСЛЕ docker volume rm (_vol_dropped — local execute_restore, виден по dynamic scope):
+    # свежий volume = ПУСТАЯ БД. Раньше стек просто поднимался на пустой базе (сервис без данных).
+    # Теперь сначала откат из snapshot живой БД, снятого до разрушения (_live_snap).
+    if [[ "${_vol_dropped:-0}" == "1" ]]; then
+        _rollback_after_volume_drop || true
+    fi
     [[ -n "${BOT_PATH:-}" && -d "${BOT_PATH:-}" ]] && ( cd "$BOT_PATH" && docker compose up -d 2> "$SILENT_LOG" ) || true
     _CRITICAL_SECTION=0
     rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"
+}
+
+# _sweep_stale_intermediates: удалить в BACKUP_DIR брошенные промежуточные файлы ПРОШЛЫХ прогонов.
+# Промежуточные дампы/tar — НЕЗАШИФРОВАННЫЕ куски, которые штатный прогон склеивает в lazarus_* и
+# удаляет. Прогон, убитый на полпути (SIGKILL/OOM/ребут), оставлял их навсегда: ротация видит только
+# lazarus_*, зачистки при старте не было (на панели с 12.07 лежали 17 ГБ, в т.ч. открытые дампы БД
+# и биллинга). Вызывать ТОЛЬКО под блокировкой (живого чужого прогона нет) — плюс запас по возрасту
+# 60 мин. Имя — строго по шаблону тула, остальное в каталоге не трогаем. <1 ГБ — shred (plaintext),
+# крупнее — rm (гигабайты перезаписи по диску с живой БД ради VPS-диска не оправданы).
+_sweep_stale_intermediates() {
+    local _dir="${BACKUP_DIR:-}" _f _base _sz _n=0
+    [[ -n "$_dir" && -d "$_dir" ]] || return 0
+    local _re='^(db|dir|globals|billing|kb|extra|bot_files)_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}\.(sql|tar)\.(gz|zst)$'
+    while IFS= read -r -d '' _f; do
+        _base="${_f##*/}"
+        [[ "$_base" =~ $_re ]] || continue
+        _sz=$(stat -c%s "$_f" 2> "$SILENT_LOG" || echo 0)
+        if [[ "$_sz" -lt 1073741824 ]] && command -v shred > /dev/null 2>&1; then
+            shred -n 1 -fu "$_f" 2> "$SILENT_LOG" || rm -f "$_f"
+        else
+            rm -f "$_f"
+        fi
+        log_message "WARN" "sweep: удалён брошенный промежуточный файл прошлого прогона: $_base (${_sz} байт)"
+        _n=$((_n + 1))
+    done < <(find "$_dir" -maxdepth 1 -type f -mmin +60 -print0 2> "$SILENT_LOG")
+    [[ $_n -gt 0 ]] && print_message "WARN" "Удалено брошенных промежуточных файлов прошлых прогонов: $_n (см. лог)."
+    return 0
+}
+
+# _wait_pg_ready: ждать готовности PostgreSQL в контейнере $1 до $2 секунд (дефолт 90).
+# Вместо голого `sleep 5`: на медленном сервере/свежем volume 5 с не хватало, и следующий psql
+# ложно валил гард уже ПОСЛЕ удаления volume. Проверка по TCP (-h 127.0.0.1) и два успеха подряд:
+# временный сервер docker-entrypoint во время initdb слушает только unix-сокет и затем
+# перезапускается — по сокету он выглядел бы «готовым» раньше времени. Fallback — unix-сокет
+# (TCP мог быть закрыт своим listen_addresses).
+_wait_pg_ready() {
+    local _c="$1" _t="${2:-90}" _i=0 _ok=0
+    [[ -z "$_c" ]] && return 1
+    while (( _i < _t )); do
+        if docker exec "$_c" pg_isready -h 127.0.0.1 -q > /dev/null 2>&1; then
+            _ok=$((_ok + 1)); (( _ok >= 2 )) && return 0
+        else
+            _ok=0
+        fi
+        sleep 1; _i=$((_i + 1))
+    done
+    docker exec "$_c" pg_isready -q > /dev/null 2>&1
+}
+
+# _rollback_after_volume_drop: откат БД из snapshot живой БД после провала, случившегося ПОСЛЕ
+# docker volume rm. Использует переменные execute_restore (dynamic scope): _live_snap, DB_*,
+# ACTUAL_DB_USER/NAME (если уже резолвлены после rsync) либо _du/_dn (резолв до разрушения).
+_rollback_after_volume_drop() {
+    local _c="${DB_CONTAINER_NAME:-}" _u="${ACTUAL_DB_USER:-${_du:-}}" _d="${ACTUAL_DB_NAME:-${_dn:-}}"
+    if [[ -z "${_live_snap:-}" || ! -f "${_live_snap:-}" ]] || ! gzip -t "$_live_snap" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Restore прерван ПОСЛЕ удаления volume БД, а точки отката нет — БД ПУСТАЯ, восстановите вручную из бэкапа."
+        log_message "ERROR" "restore aborted AFTER volume drop, no live snapshot — DB is EMPTY"
+        return 1
+    fi
+    print_message "WARN" "Restore прерван ПОСЛЕ удаления volume БД — откат из snapshot живой БД: $_live_snap"
+    log_message "WARN" "restore aborted after volume drop — rolling back from $_live_snap"
+    ( cd "$BOT_PATH" && docker compose up -d ${DB_SERVICE_NAME:+"$DB_SERVICE_NAME"} 2> "$SILENT_LOG" ) || true
+    if ! _wait_pg_ready "$_c" 90; then
+        print_message "ERROR" "БД не поднялась для отката. Snapshot сохранён: $_live_snap (восстановите вручную)."
+        log_message "ERROR" "rollback after volume drop: db not ready, snapshot kept: $_live_snap"
+        return 1
+    fi
+    if _run_pipe_with_timeout "$RESTORE_TIMEOUT_SEC" "psql-rollback-drop" \
+            'gzip -dc "$5" | docker exec -i "$1" psql -U "$2" -d "$3" -v ON_ERROR_STOP=1 > "$4" 2>&1' \
+            "$_c" "$_u" "$_d" "$SILENT_LOG" "$_live_snap"; then
+        print_message "SUCCESS" "Откат выполнен — БД возвращена к состоянию до restore."
+        log_message "SUCCESS" "rollback after volume drop OK from $_live_snap"
+        _vol_dropped=0
+        return 0
+    fi
+    print_message "ERROR" "Автооткат не удался. Snapshot сохранён: $_live_snap (восстановите вручную)."
+    log_message "ERROR" "rollback after volume drop FAILED, snapshot kept: $_live_snap"
+    return 1
 }
 
 execute_restore() {
@@ -11493,6 +11618,9 @@ execute_restore() {
     # M3: _live_snap объявляем на уровне ФУНКЦИИ (не внутри full-блока) — иначе при db_only она
     # не переинициализируется и утекает глобально между двумя restore за сессию, ломая автооткат.
     local _live_snap=""
+    # _vol_dropped=1 — volume БД реально удалён (дальше любой _restore_abort откатывает из _live_snap).
+    # _restore_preflight=1 — ensure_bot_path пройден ДО compose down (после down не повторяем).
+    local _vol_dropped=0 _restore_preflight=0
     # #3: флаг «приложение остановлено ради db_only-импорта» (см. блок импорта). На уровне функции,
     # т.к. читается в пост-блоке запуска контейнеров ПОСЛЕ закрытия if-блока импорта.
     local _dbonly_app_stopped=0
@@ -11910,6 +12038,21 @@ execute_restore() {
         # пустой свежесозданной БД → откат был невозможен (catastrophic data loss).
         _live_snap=""   # (объявлена на уровне функции — M3; здесь только сброс для full-пути)
         if [[ "$MODE" == "full" && -n "$DB_DUMP" ]]; then
+            # 0) Предполётная проверка пути/контейнеров цели, пока стек ЖИВ. Раньше ensure_bot_path и
+            # assert_safe_bot_path шли только ПОСЛЕ compose down/volume rm: ensure_bot_path там всегда
+            # уходил в интерактивный recovery (контейнеры удалены самим down), а провал любого гарда
+            # оставлял сервис на ПУСТОЙ БД. Здесь отказ ничего не разрушает.
+            # Только для ЖИВОГО стека: на чистом сервере (перенос панели) контейнеров и каталога ещё
+            # нет — там прежний путь (bootstrap в ensure_bot_path после rsync), без изменений.
+            # unknown (docker лежит) — тоже пропуск: ниже compose down безопасно откажет ДО разрушения.
+            local _pf_role; _pf_role=$(_container_role "$DB_CONTAINER_NAME")
+            if [[ "$_pf_role" != "absent" && "$_pf_role" != "unknown" ]]; then
+                if ! ensure_bot_path || ! assert_safe_bot_path "$BOT_PATH"; then
+                    print_message "ERROR" "Restore прерван ДО разрушительных действий (путь/контейнеры цели не прошли проверку)."
+                    rm -rf "$TMP_DIR"; unregister_sensitive_tmp "$TMP_DIR"; return 1
+                fi
+                _restore_preflight=1
+            fi
             # 1) Новый дамп ОБЯЗАН быть валиден ДО разрушения текущей БД.
             local _dd_fmt
             _dd_fmt=$(_compress_detect_format "$DB_DUMP")
@@ -12036,7 +12179,12 @@ execute_restore() {
                     _CRITICAL_SECTION=1
                     print_message "INFO" "Удаление старого volume: $volume_name"
                     debug_log "RESTORE" "Running: docker volume rm $volume_name"
-                    docker volume rm "$volume_name" 2> "$SILENT_LOG" || true
+                    if docker volume rm "$volume_name" 2> "$SILENT_LOG"; then
+                        _vol_dropped=1
+                    else
+                        print_message "WARN" "docker volume rm '$volume_name' не удался — БД остаётся на старом volume (дальше DROP SCHEMA)."
+                        log_message "WARN" "restore: docker volume rm failed for $volume_name — continuing on existing volume"
+                    fi
                 else
                     print_message "INFO" "Пропускаем удаление volume БД."
                 fi
@@ -12048,7 +12196,11 @@ execute_restore() {
             debug_log "RESTORE" "Running: docker compose up -d ${DB_SERVICE_NAME:-<all>}"
             # Пустой DB_SERVICE_NAME → поднимаем весь проект (quoted "" дал бы 'no such service').
             docker compose up -d ${DB_SERVICE_NAME:+"$DB_SERVICE_NAME"}
-            sleep 5
+            if ! _wait_pg_ready "$DB_CONTAINER_NAME" 90; then
+                print_message "ERROR" "БД '$DB_CONTAINER_NAME' не стала готова за 90 с — restore прерван."
+                log_message "ERROR" "restore: db not ready after up (90s)"
+                _restore_abort; return 1
+            fi
         fi
     fi
 
@@ -12062,7 +12214,9 @@ execute_restore() {
         print_message "INFO" "Импорт базы данных..."
         # #ultra-HIGH1: эти гарды выполняются, когда стек уже погашен (full corridor / db_only stop
         # ниже) → на провале поднимаем стек обратно (_restore_abort), а не оставляем offline.
-        if ! ensure_bot_path; then _restore_abort; return 1; fi
+        # full: ensure_bot_path уже пройден в предполётной проверке — после compose down он
+        # детерминированно уходил в интерактивный recovery (контейнеры удалены down'ом).
+        if [[ "$_restore_preflight" != "1" ]] && ! ensure_bot_path; then _restore_abort; return 1; fi
         if ! assert_safe_bot_path "$BOT_PATH"; then _restore_abort; return 1; fi
         if ! assert_db_container_matches_bot; then _restore_abort; return 1; fi
 
@@ -12136,8 +12290,10 @@ execute_restore() {
             # чтобы автооткат ниже сработал (раньше провал db_only-импорта оставлял БД пустой).
             [[ -z "${_live_snap:-}" && -n "${_LAST_DROP_SNAPSHOT:-}" && -f "${_LAST_DROP_SNAPSHOT}" ]] && _live_snap="$_LAST_DROP_SNAPSHOT"
             print_message "INFO" "Очистка схемы БД (DROP SCHEMA public CASCADE)..."
-            debug_log "RESTORE" "Running: docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER -c 'DROP SCHEMA...'"
-            docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+            debug_log "RESTORE" "Running: docker exec $DB_CONTAINER_NAME psql -U $ACTUAL_DB_USER -d $ACTUAL_DB_NAME -c 'DROP SCHEMA...'"
+            # -d обязателен: без него DROP шёл в БД с именем юзера (при POSTGRES_DB≠POSTGRES_USER —
+            # чужая база, напр. дефолтная `postgres`), а целевая оставалась с таблицами.
+            docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
         else
             print_message "WARN" "DROP SCHEMA пропущен. Импорт может завершиться с ошибками из-за существующих таблиц."
         fi
@@ -12168,7 +12324,7 @@ execute_restore() {
             if [[ -n "${_live_snap:-}" && -f "${_live_snap:-}" ]] && gzip -t "${_live_snap}" 2> "$SILENT_LOG"; then
                 print_message "WARN" "Автооткат БД из snapshot живой БД: $_live_snap"
                 log_message "WARN" "Restore failed — auto-rollback from live snapshot $_live_snap"
-                docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
+                docker exec -i "$DB_CONTAINER_NAME" psql -U "$ACTUAL_DB_USER" -d "$ACTUAL_DB_NAME" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" > "$SILENT_LOG" 2>&1
                 # AUDIT fix: gzip ВНУТРИ pipefail-пайпа (_run_pipe_with_timeout) — иначе провал
                 # распаковки (битый snapshot) маскировался: пустой ввод → psql exit 0 → «откат OK»,
                 # а БД осталась пустой. Плюс gzip -t выше как ранний guard.
@@ -12191,6 +12347,7 @@ execute_restore() {
             return 1
         fi
         _CRITICAL_SECTION=0   # импорт завершён — окно закрыто
+        _vol_dropped=0        # БД уже с восстановленными данными: откат к pre-restore здесь недопустим
         debug_log "RESTORE" "DB import complete (psql exit 0)"
     fi
 
@@ -12792,6 +12949,12 @@ menu_restore() {
         return
     fi
     local _prim="$BACKUP_TARGET" _sec="$BACKUP_SECONDARY"
+    # Переключение на цель restore — ВРЕМЕННОЕ. Для вторичной _resolve_target_config ставит только
+    # BACKUP_TARGET, и в памяти SECONDARY==TARGET. Любой save_config внутри restore (ensure_bot_path
+    # после compose down спрашивает контейнер и сохраняет) записал бы эту пару, а следующий старт
+    # схлопнул бы её в одну цель — панель тихо выпала бы из всех бэкапов. save_config персистит
+    # эту пару вместо рабочей; local виден всей цепочке вызовов и исчезает на любом выходе.
+    local _PERSIST_TARGET_PAIR="${_prim}|${_sec}"
     local _pl="Telegram-бот"; [[ "$_prim" == "panel" ]] && _pl="Remnawave Panel"
     local _sl="Telegram-бот"; [[ "$_sec" == "panel" ]] && _sl="Remnawave Panel"
     local _pt _st; _pt=$(_transport_of "$_prim"); _st=$(_transport_of "$_sec")
@@ -14421,7 +14584,24 @@ menu_backup_target() {
 }
 
 # --- MAIN LOOP ---
+# _setup_tmpdir: временные файлы lazarus — на ДИСК ($INSTALL_DIR/tmp), а не в /tmp.
+# Шифрование и verify пишут ПОЛНУЮ копию архива во временный файл (иногда две). Там, где /tmp —
+# tmpfs (панель: 7.9 ГБ RAM без swap, /tmp = tmpfs 3.9 ГБ), это оперативная память: крупный архив
+# уводит в OOM весь хост вместе с сервисами. Явно заданный TMPDIR (не /tmp) уважаем.
+# Брошенные убитыми прогонами lazarus_* здесь чистим, если им больше суток: это не под блокировкой,
+# и долгий живой restore не должен лишиться своего рабочего каталога.
+_setup_tmpdir() {
+    [[ -n "${TMPDIR:-}" && "${TMPDIR%/}" != "/tmp" ]] && return 0
+    local _d="$INSTALL_DIR/tmp"
+    if mkdir -p "$_d" 2> "$SILENT_LOG" && chmod 700 "$_d" 2> "$SILENT_LOG" && [[ -w "$_d" ]]; then
+        export TMPDIR="$_d"
+        find "$_d" -mindepth 1 -maxdepth 1 -name 'lazarus_*' -mmin +1440 -exec rm -rf {} + 2> "$SILENT_LOG" || true
+    fi
+    return 0
+}
+
 if [[ "${LAZARUS_LIB}" != "true" ]]; then
+    _setup_tmpdir        # до любой работы: временные копии архивов — на диск, не в RAM-tmpfs
     rotate_internal_log
     install_script
     install_logrotate    # idempotent — no-op если /etc/logrotate.d/lazarus уже есть

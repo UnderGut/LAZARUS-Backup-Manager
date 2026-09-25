@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.0-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.1-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — система резервного копирования для **Remnawave Panel** и **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: панель, бот, infra-billing и база знаний ИИ-саппорта — одним инструментом. Всё находится **само** (по образам и docker-меткам, имена контейнеров и пути не важны), деструктивные операции защищены от потери данных, есть **перенос панели на новый сервер** и два режима меню — **Простой** (для новичков: 4 пункта + пошаговый мастер) и **Расширенный** (полный контроль).
@@ -69,9 +69,9 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 
 ### 🛡️ Защита от потери данных
 Скрипт спроектирован так, чтобы **не терять данные** даже при сбоях:
-- **Restore с точкой отката** — перед уничтожением БД снимается snapshot ЖИВОЙ БД (с контент-проверкой). Деструктив выполняется только при валидном snapshot; при провале импорта — авто-откат + подъём контейнеров. Любой ранний отказ гарда поднимает стек обратно (панель/бот не остаются offline).
+- **Restore с точкой отката** — перед уничтожением БД снимается snapshot ЖИВОЙ БД (с контент-проверкой). Деструктив выполняется только при валидном snapshot; путь и контейнеры цели проверяются ДО остановки стека. При провале импорта или любого гарда после удаления volume — авто-откат БД из snapshot + подъём контейнеров. Любой ранний отказ гарда поднимает стек обратно (панель/бот не остаются offline и не остаются на пустой БД).
 - **Verify до удаления** — каждый архив (full и incremental) проверяется (для `.enc` — полным decrypt round-trip) ПЕРЕД удалением plaintext и репортом об успехе.
-- **Шифрование обязательно** — если задан пароль и шифрование провалилось, незашифрованный архив НЕ отправляется (cron — abort; интерактив — явное подтверждение). Промежуточные plaintext-дампы (в т.ч. при удалённом бэкапе) затираются `shred` при выходе/прерывании.
+- **Шифрование обязательно** — если задан пароль и шифрование провалилось, незашифрованный архив НЕ отправляется (cron — abort; интерактив — явное подтверждение). Промежуточные plaintext-дампы (в т.ч. при удалённом бэкапе) затираются `shred` при выходе/прерывании, а брошенные убитым процессом (SIGKILL/OOM/ребут) — зачищаются при следующем прогоне. Временные копии архивов пишутся на диск (`/opt/lazarus-backup/tmp`), а не в `/tmp`, который на многих серверах живёт в RAM.
 - **Ротация не обнуляет** — size-rotation никогда не удаляет новейший бэкап и каскадно чистит orphan-инкременты.
 - **Upload с verify** — S3/FTP/WebDAV/rclone сверяют размер на remote ПЕРЕД тем, как `delete-local` удалит локальную копию; при несверенном размере локаль не трогается.
 - **Идентификация по роли, не по имени** — контейнеры определяются по образу/метке/`DATABASE_URL`, деструктив над «чужим» стеком отклоняется fail-closed.
@@ -83,7 +83,7 @@ curl -sSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Backup-Manager/main
 - **Сайдкары** — роли кластера (`globals`), infra-billing (`billing_*.sql`), база знаний ИИ-саппорта (`kb_*.sql`, pgvector), доп. пути вне каталога панели (`extra_*.tar`, напр. `certwarden`).
 - **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2), обнаружение неверного пароля и подмены байтов ДО расшифровки.
 - **gzip / zstd** — gzip (везде), zstd (opt-in, меньше и быстрее на SQL-дампах). Старые архивы восстанавливаются независимо от текущего формата (детект по magic bytes).
-- **Версия в имени файла** — если на сервере есть бот, в имя добавляется его версия (`__vX.Y.Z`); на сервере только с панелью суффикс опускается.
+- **Версия в имени файла** — в имя архива добавляется версия компонента (`__vX.Y.Z`): тег образа, если он сам версия (`3.4.4-trafficfmt`), иначе точная версия из образа — для бота на подвижном теге `:dev` это его настоящая версия (`7.1.0.x`), а не `dev`.
 - **v1→v2 миграция** — `lazarus migrate-v2` для конверсии старых архивов.
 
 ### 🖥️ Цели бэкапа
