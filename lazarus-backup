@@ -215,13 +215,15 @@ PANEL_EXTRA_PATHS=""              # доп. АБСОЛЮТНЫЕ пути ВНЕ
 # infra-billing (mishkatik/infra-billing): standalone-биллинг в стеке панели — ОТДЕЛЬНЫЙ postgres.
 # Финансовые данные. Его БД дампится sidecar'ом в panel-бэкап (billing_*.sql.*); файлы
 # (.env-infra-billing, compose) уже входят в files-бэкап панели, т.к. лежат в PANEL_PATH.
-PANEL_BILLING_DB_CONTAINER="infra-billing-db"  # контейнер БД infra-billing (пусто = выключить)
-PANEL_BILLING_BACKUP="auto"       # auto: контейнер запущен → бэкапим, нет → тихо пропускаем;
+PANEL_BILLING_DB_CONTAINER="infra-billing-db"  # контейнер БД infra-billing (пусто = авто-поиск в проекте панели при бэкапе)
+PANEL_BILLING_BACKUP="auto"       # auto: запущен → бэкапим; не установлен → тихо пропускаем;
+                                  # установлен, но не запущен → WARN + маркер «без infra-billing» в TG;
                                   # true: обязателен (нет контейнера = провал бэкапа); false: выкл
 # KB ИИ-саппорта (rwp_shop_kb_db, отдельный pgvector в стеке бота). Его БД (knowledge) дампится
 # sidecar'ом в BOT-бэкап (kb_*.sql.*). Режим как у billing.
 BOT_KB_DB_CONTAINER="rwp_shop_kb_db"  # контейнер БД KB (пусто = выключить)
-BOT_KB_BACKUP="auto"              # auto: запущен → бэкапим, нет → пропуск; true: обязателен; false: выкл
+BOT_KB_BACKUP="auto"              # auto: запущен → бэкапим, не установлен → пропуск, остановлен → WARN
+                                  # + маркер «без KB» в TG; true: обязателен; false: выкл
 # Ключевые слова для поиска контейнера панели (инверсия bot-исключений в scan)
 PANEL_KEYWORDS=("remnawave")
 
@@ -4209,33 +4211,55 @@ write_password_file() {
     fi
 
     mkdir -p "$(dirname "$file")"
-    # SECURITY 3: создаём файл с правильными правами с самого начала.
-    # umask 077 + touch гарантирует chmod 600 даже если chmod ниже упадёт.
-    ( umask 077 && : > "$file" ) || {
-        print_message "ERROR" "Не удалось создать файл пароля: $file"
+    # №25: пишем во temp РЯДОМ с файлом (та же ФС → rename атомарен) и подменяем только после всех
+    # проверок. Раньше `: > file` обнулял ПРЕЖНИЙ пароль до записи нового, а сбой printf/сверки/chmod
+    # делал rm -f — старый файл пароля пропадал: после рестарта (и в cron) бэкапы шли бы без
+    # шифрования. Теперь при любом сбое прежний файл пароля цел, удаляется только temp.
+    local _pw_tmp="${file}.tmp.$$" _pw_stale _pw_spid
+    # Уборка брошенных temp (SIGKILL/OOM между записью и rename): только точный шаблон <file>.tmp.<PID>
+    # и только если процесса-владельца уже нет (живой параллельный writer пишет свой). Внутри пароль.
+    # Цикл inline, не хелпером: тесты извлекают эту функцию sed'ом по одной.
+    for _pw_stale in "$file".tmp.*; do
+        [[ -f "$_pw_stale" ]] || continue
+        _pw_spid="${_pw_stale##*.tmp.}"
+        [[ "$_pw_spid" =~ ^[0-9]+$ ]] || continue
+        [[ "$_pw_spid" != "$$" ]] && kill -0 "$_pw_spid" 2> "$SILENT_LOG" && continue
+        rm -f "$_pw_stale"
+    done
+    # SECURITY 3: temp создаём с правильными правами с самого начала.
+    # umask 077 гарантирует 600 даже если chmod ниже упадёт.
+    ( umask 077 && : > "$_pw_tmp" ) || {
+        print_message "ERROR" "Не удалось создать файл пароля: $_pw_tmp (прежний файл пароля не тронут)"
+        rm -f "$_pw_tmp"
         return 1
     }
     # AUDIT H fix: раньше запись была без проверки. При ENOSPC/частичной записи файл оставался
     # пустым/обрезанным, функция возвращала 0, а caller (миграция в load_or_create_config) стирал
     # BACKUP_PASSWORD из памяти → пароль ПОТЕРЯН, последующие бэкапы не шифруются / restore невозможен.
-    if ! printf '%s' "$pwd" > "$file"; then
-        print_message "ERROR" "Запись пароля провалилась (ENOSPC?): $file"
-        log_message "ERROR" "write_password_file: printf write failed for $file"
-        rm -f "$file"; return 1
+    if ! printf '%s' "$pwd" > "$_pw_tmp"; then
+        print_message "ERROR" "Запись пароля провалилась (ENOSPC?): $file — прежний файл пароля не тронут."
+        log_message "ERROR" "write_password_file: printf write failed for $_pw_tmp (previous password file kept)"
+        rm -f "$_pw_tmp"; return 1
     fi
     # Подтверждаем побайтно (защита от частичной записи).
-    if [[ "$(cat "$file" 2>/dev/null)" != "$pwd" ]]; then
-        print_message "ERROR" "Записанный пароль не совпал (частичная запись) — файл удалён."
-        log_message "ERROR" "write_password_file: content mismatch after write for $file"
-        rm -f "$file"; return 1
+    if [[ "$(cat "$_pw_tmp" 2>/dev/null)" != "$pwd" ]]; then
+        print_message "ERROR" "Записанный пароль не совпал (частичная запись) — новый не сохранён, прежний файл пароля не тронут."
+        log_message "ERROR" "write_password_file: content mismatch after write for $_pw_tmp (previous password file kept)"
+        rm -f "$_pw_tmp"; return 1
     fi
 
     # SECURITY 4: проверяем что chmod 600 действительно применился.
-    # Если ACL или mount option блокируют — лучше удалить файл, чем оставить читаемым.
-    if ! chmod 600 "$file" 2> "$SILENT_LOG"; then
-        print_message "ERROR" "chmod 600 на $file провалился — удаляем файл (пароль был бы доступен другим)"
-        log_message "ERROR" "chmod 600 failed for $file"
-        rm -f "$file"
+    # Если ACL или mount option блокируют — лучше удалить temp, чем оставить пароль читаемым.
+    if ! chmod 600 "$_pw_tmp" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "chmod 600 на $_pw_tmp провалился — новый пароль не сохранён (был бы доступен другим); прежний файл пароля не тронут"
+        log_message "ERROR" "chmod 600 failed for $_pw_tmp (previous password file kept)"
+        rm -f "$_pw_tmp"
+        return 1
+    fi
+    if ! mv -f "$_pw_tmp" "$file" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Не удалось заменить файл пароля ($file) — новый не сохранён, прежний оставлен без изменений."
+        log_message "ERROR" "write_password_file: rename $_pw_tmp -> $file failed (previous password file kept)"
+        rm -f "$_pw_tmp"
         return 1
     fi
     # Дополнительно проверяем фактические права (на случай ACL override)
@@ -4472,7 +4496,29 @@ save_config() {
     if [[ "${_LEGACY_PWD_UNMIGRATED:-0}" == "1" && -n "$BACKUP_PASSWORD" ]]; then
         _pwd_line="BACKUP_PASSWORD=\"$(env_escape "$BACKUP_PASSWORD")\""
     fi
-    cat > "$CONFIG_FILE" <<EOF
+    # №25: атомарная запись. Ядро и хвост — во temp РЯДОМ с конфигом (та же ФС → rename(2)
+    # атомарен), rc каждой записи проверяется, ядро обязано быть дописано до последней строки, и
+    # только потом temp подменяет config.env. Раньше `cat > config.env` сначала усекал файл:
+    # ENOSPC/SIGKILL/OOM между усечением и записью оставляли огрызок → следующий load брал
+    # дефолты (панель выпадала из бэкапов, TG и S3 выключались молча), а параллельный cron-load
+    # мог прочитать файл без хвоста. Симлинк config.env сохраняем: пишем в его цель.
+    local _cfg_dst="$CONFIG_FILE"
+    if [[ -L "$CONFIG_FILE" ]]; then
+        _cfg_dst=$(readlink -f "$CONFIG_FILE" 2> "$SILENT_LOG") || _cfg_dst=""
+        [[ -n "$_cfg_dst" ]] || _cfg_dst="$CONFIG_FILE"
+    fi
+    local _cfg_tmp="${_cfg_dst}.tmp.$$" _cfg_ok=true _cfg_stale _cfg_spid
+    # Уборка брошенных temp (SIGKILL между записью и rename): только точный шаблон
+    # <config>.tmp.<PID> и только если процесса-владельца уже нет — живой параллельный
+    # save_config (cron-heal) пишет свой temp, его не трогаем. В temp секреты (права 600).
+    for _cfg_stale in "$_cfg_dst".tmp.*; do
+        [[ -f "$_cfg_stale" ]] || continue
+        _cfg_spid="${_cfg_stale##*.tmp.}"
+        [[ "$_cfg_spid" =~ ^[0-9]+$ ]] || continue
+        [[ "$_cfg_spid" != "$$" ]] && kill -0 "$_cfg_spid" 2> "$SILENT_LOG" && continue
+        rm -f "$_cfg_stale"
+    done
+    ( umask 077; cat > "$_cfg_tmp" ) <<EOF || _cfg_ok=false
 # LAZARUS — конфигурация. Отсутствующий ключ = значение по умолчанию.
 # Полный справочник: CONFIG_REFERENCE.md · Настройки удобнее менять через меню lazarus
 BOT_TOKEN="$BOT_TOKEN_ESC"
@@ -4492,14 +4538,23 @@ TG_SEND_FILE="$TG_SEND_FILE_ESC"
 $_pwd_line
 BACKUP_PASSWORD_FILE="$BACKUP_PASSWORD_FILE_ESC"
 EOF
-    if [[ -n "$_ADV_LINES" ]]; then
+    if [[ "$_cfg_ok" == "true" && -n "$_ADV_LINES" ]]; then
         {
             echo "# — ниже только то, что отличается от умолчаний —"
             printf '%s' "$_ADV_LINES"
-        } >> "$CONFIG_FILE"
+        } >> "$_cfg_tmp" || _cfg_ok=false
     fi
-    chmod 600 "$CONFIG_FILE"
-    debug_log "CONFIG" "Config saved, chmod 600 applied"
+    # Sanity: последняя строка ядра на месте — heredoc дописан целиком, это не огрызок.
+    if [[ "$_cfg_ok" == "true" ]] && ! grep -q '^BACKUP_PASSWORD_FILE=' "$_cfg_tmp" 2> "$SILENT_LOG"; then
+        _cfg_ok=false
+    fi
+    if [[ "$_cfg_ok" != "true" ]] || ! chmod 600 "$_cfg_tmp" 2> "$SILENT_LOG" || ! mv -f "$_cfg_tmp" "$_cfg_dst" 2> "$SILENT_LOG"; then
+        rm -f "$_cfg_tmp"
+        print_message "ERROR" "config.env НЕ сохранён (нет места/прав?) — прежний файл оставлен без изменений: $CONFIG_FILE"
+        log_message "ERROR" "save_config: write/rename failed — previous config.env kept ($CONFIG_FILE)"
+        return 1
+    fi
+    debug_log "CONFIG" "Config saved atomically (temp+rename), chmod 600 applied"
     debug_log "CONFIG" "BOT_PATH=$BOT_PATH"
     debug_log "CONFIG" "BOT_CONTAINER=$BOT_CONTAINER_NAME, DB_CONTAINER=$DB_CONTAINER_NAME"
     debug_log "CONFIG" "REMOTE_STORAGE_TYPE=$REMOTE_STORAGE_TYPE"
@@ -5723,10 +5778,15 @@ panel_migrate_in() {
 
 # --- INFRA-BILLING sidecar (mishkatik/infra-billing в стеке панели) ---
 # _billing_sidecar_active [ssh_prefix]: активен ли billing-sidecar для panel-бэкапа.
-# rc=0 — бэкапим; rc=1 — выключен/не найден (auto: тихо пропускаем); rc=2 — PANEL_BILLING_BACKUP=true,
-# но контейнер не запущен → caller ОБЯЗАН провалить бэкап (финансовые данные, молча пропускать нельзя).
+# rc=0 — бэкапим; rc=1 — выключен/не установлен (auto: тихо) ЛИБО установлен, но не запущен
+# (auto: локально — WARN здесь же, а _BILL_SKIP_STATE=<state> — caller ставит маркер неполноты в TG);
+# rc=2 — PANEL_BILLING_BACKUP=true, но контейнер не запущен → caller ОБЯЗАН провалить бэкап
+# (финансовые данные, молча пропускать нельзя).
 # $1 (опц.) — ssh-префикс удалённой цели: проверка выполняется на удалённом хосте.
+# _BILL_SKIP_STATE — глобал (хелпер зовут в родительском шелле, не через $(...)): сброс на КАЖДОМ
+# вызове, непуст только в хвосте «контейнер есть, но не running» — отличает «упал» от «не ставили».
 _billing_sidecar_active() {
+    _BILL_SKIP_STATE=""
     local _ssh="${1:-}"
     [[ "$BACKUP_TARGET" != "panel" ]] && return 1
     [[ "$PANEL_BILLING_BACKUP" == "false" ]] && return 1
@@ -5805,6 +5865,17 @@ _billing_sidecar_active() {
     fi
     [[ "$_st" == "running" ]] && return 0
     [[ "$PANEL_BILLING_BACKUP" == "true" ]] && return 2
+    # auto + контейнер СУЩЕСТВУЕТ (прошёл role-гард), но не running (упал/crash-loop/окно down-up):
+    # раньше это был debug-only пропуск — панельный архив уходил без финансовой БД под зелёным
+    # «успехом». Теперь WARN (stdout/cron-лог + LOG_FILE) и маркер для TG. Пустой _st = контейнера
+    # нет (панель без биллинга) — тишина, как раньше. Remote: WARN печатает caller (_backup_remote_target).
+    if [[ -n "$_st" ]]; then
+        _BILL_SKIP_STATE="$_st"
+        if [[ -z "$_ssh" ]]; then
+            print_message "WARN" "infra-billing '$PANEL_BILLING_DB_CONTAINER' не запущен (state=$_st) — биллинг НЕ входит в этот архив."
+            log_message "WARN" "billing sidecar skipped: '$PANEL_BILLING_DB_CONTAINER' state=$_st (auto)"
+        fi
+    fi
     debug_log "BILLING" "billing container '$PANEL_BILLING_DB_CONTAINER' not running (state='${_st:-absent}') — auto-skip"
     return 1
 }
@@ -5828,10 +5899,12 @@ _billing_db_creds() {
 
 # --- KB-sidecar (knowledge-base ИИ-саппорта: rwp_shop_kb_db, отдельный pgvector в стеке бота) ---
 # _kb_sidecar_active: активен ли KB-sidecar для BOT-бэкапа. Только ЛОКАЛЬНО (бот на этом сервере).
-# rc=0 — бэкапим; rc=1 — выкл/не найден/не запущен (auto: тихий skip); rc=2 — BOT_KB_BACKUP=true,
+# rc=0 — бэкапим; rc=1 — выкл/не установлен (auto: тихо) ЛИБО установлен, но не запущен (auto: WARN
+# здесь же + _KB_SKIP_STATE=<state> для маркера неполноты в TG); rc=2 — BOT_KB_BACKUP=true,
 # но недоступен/не прошёл гард → caller ОБЯЗАН провалить бэкап бота.
 # Проще billing: без remote и без авто-дискавери; гард «контейнер ≠ главная БД бота/панели/billing».
 _kb_sidecar_active() {
+    _KB_SKIP_STATE=""   # глобал, сброс на каждом вызове (контракт как у _BILL_SKIP_STATE)
     [[ "$BACKUP_TARGET" != "bot" ]] && return 1
     [[ "$BOT_KB_BACKUP" == "false" ]] && return 1
     [[ -z "$BOT_KB_DB_CONTAINER" ]] && { [[ "$BOT_KB_BACKUP" == "true" ]] && return 2; return 1; }
@@ -5860,6 +5933,13 @@ _kb_sidecar_active() {
     _st=$(timeout 15 docker inspect --format '{{.State.Status}}' "$BOT_KB_DB_CONTAINER" 2> "$SILENT_LOG")
     [[ "$_st" == "running" ]] && return 0
     [[ "$BOT_KB_BACKUP" == "true" ]] && return 2
+    # auto + KB-контейнер есть, но остановлен — бот-архив уходит без KB: говорим вслух (как billing).
+    # Пустой _st = KB не установлен (дефолтное имя rwp_shop_kb_db у бота без KB) — тишина.
+    if [[ -n "$_st" ]]; then
+        _KB_SKIP_STATE="$_st"
+        print_message "WARN" "KB-БД '$BOT_KB_DB_CONTAINER' не запущена (state=$_st) — KB НЕ входит в этот архив."
+        log_message "WARN" "kb sidecar skipped: '$BOT_KB_DB_CONTAINER' state=$_st (auto)"
+    fi
     debug_log "KB" "kb container '$BOT_KB_DB_CONTAINER' not running (state='${_st:-absent}') — auto-skip"
     return 1
 }
@@ -8809,6 +8889,10 @@ create_backup() {
     local FILE_FINAL=""
     local HAS_ERROR=0
     local SKIP_INFO=""
+    # Маркер неполноты архива («без infra-billing», «без KB»): сайдкар установлен, но не запущен
+    # (auto). Одиночный режим — строкой в SKIP_INFO (подпись), both — через dynamic scope читает
+    # _both_tg_record (строка цели в альбоме). local: каждый проход начинает с чистого.
+    local _SIDECAR_MISS=""
     local SKIP_FILE="$BACKUP_DIR/skipped_files.txt"
     debug_log "BACKUP" "Compression: $(_compress_current) (ext=$_ext)"
 
@@ -8962,6 +9046,11 @@ create_backup() {
                     print_message "ERROR" "infra-billing обязателен (PANEL_BILLING_BACKUP=true), но контейнер '${PANEL_BILLING_DB_CONTAINER:-<не задан/не найден>}' недоступен или не прошёл role-гард — бэкап прерван."
                     log_message "ERROR" "billing sidecar required but unavailable/refused"
                     HAS_ERROR=1
+                elif [[ $_bill_state -eq 1 && -n "${_BILL_SKIP_STATE:-}" ]]; then
+                    # auto: контейнер есть, но не запущен — WARN уже напечатал хелпер; здесь только
+                    # маркер для Telegram, иначе неполный архив выглядел бы полным успехом.
+                    SKIP_INFO+=$'\n⚠️ Без infra-billing (state='"$_BILL_SKIP_STATE"')'
+                    _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без infra-billing"
                 elif [[ $_bill_state -eq 0 ]]; then
                     FILE_BILLING="billing_${TIMESTAMP}.sql.${_ext}"
                     local _bill_creds _bill_u _bill_d
@@ -9009,6 +9098,10 @@ create_backup() {
                     print_message "ERROR" "KB-БД обязательна (BOT_KB_BACKUP=true), но '${BOT_KB_DB_CONTAINER:-<не задан>}' недоступна/не прошла гард — бэкап прерван."
                     log_message "ERROR" "kb sidecar required but unavailable/refused"
                     HAS_ERROR=1
+                elif [[ $_kb_state -eq 1 && -n "${_KB_SKIP_STATE:-}" ]]; then
+                    # auto: KB-контейнер есть, но остановлен — WARN напечатал хелпер; маркер для TG.
+                    SKIP_INFO+=$'\n⚠️ Без KB (state='"$_KB_SKIP_STATE"')'
+                    _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без KB"
                 elif [[ $_kb_state -eq 0 ]]; then
                     FILE_KB="kb_${TIMESTAMP}.sql.${_ext}"
                     local _kb_creds _kb_u _kb_d
@@ -9038,6 +9131,8 @@ create_backup() {
                         else
                             print_message "WARN" "Дамп KB не удался (rc=$_kb_rc, ${_kb_bytes}b) — пропускаю (BOT_KB_BACKUP=auto)."
                             log_message "WARN" "kb dump failed, auto-skip (rc=$_kb_rc, ${_kb_bytes}b)"
+                            SKIP_INFO+=$'\n⚠️ Без KB (дамп не удался)'
+                            _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без KB"
                         fi
                     else
                         debug_log "DB" "kb dump SUCCESS (${_kb_bytes}b, content-verified)"
@@ -9161,7 +9256,8 @@ create_backup() {
             debug_log "TAR" "Skipped files content:"
             if [[ "$DEBUG_MODE" == true ]]; then cat "$SKIP_FILE"; fi
             EXCLUDE_FLAGS+=(--exclude-from="$SKIP_FILE")
-            SKIP_INFO=$'\n⚠️ Skip: '"$SKIP_COUNT"$' (>'"$MAX_FILE_SIZE_MB"$'MB)'
+            # +=, не =: маркер неполноты сайдкаров (db-фаза выше) не должен затираться.
+            SKIP_INFO+=$'\n⚠️ Skip: '"$SKIP_COUNT"$' (>'"$MAX_FILE_SIZE_MB"$'MB)'
         fi
     fi
 
@@ -9698,6 +9794,8 @@ _both_tg_record() {
     # $1 FILE_FINAL, $2 size_h, $3 bytes, $4 ENC_STATUS, $5 VERIFY_OK, $6 remote_ok, $7 remote_unverified,
     # $8 is_remote, $9 VER_MSG (" | 🏷 v..."), $10 REMOTE_UPLOAD_STATUS_TEXT ("\n☁️ ..."), $11 SKIP_INFO ("\n⚠️ Skip...")
     local _lbl="RWP Shop"; [[ "$BACKUP_TARGET" == "panel" ]] && _lbl="Remnawave"
+    # Маркер неполноты (_SIDECAR_MISS — local вызывающего create_backup/_backup_remote_target, dynamic scope).
+    [[ -n "${_SIDECAR_MISS:-}" ]] && _lbl+=" (⚠️ ${_SIDECAR_MISS})"
     _BOTH_TG_FILES+=("$BACKUP_DIR/$1")
     _BOTH_TG_LABELS+=("$_lbl")
     _BOTH_TG_SIZES+=("$2")
@@ -9900,6 +9998,11 @@ _resolve_target_config() {
 
 create_backup_dispatch() {
     local _type="$1"
+    # №26: авто-найденное имя infra-billing (_billing_sidecar_active присваивает его при ПУСТОМ
+    # конфиге) — транзиентно для прогона: local + dynamic scope отдают его проходам, а на return
+    # bash сам вернёт глобал. Иначе следующий save_config в сессии меню записал бы найденное имя
+    # в config.env, и «пусто = авто-поиск» тихо превращалось в жёсткое имя.
+    local PANEL_BILLING_DB_CONTAINER="$PANEL_BILLING_DB_CONTAINER"
     # Одна цель — поведение без изменений (роутер local→create_backup / ssh→remote).
     if [[ -z "$BACKUP_SECONDARY" || "$BACKUP_SECONDARY" == "$BACKUP_TARGET" ]]; then
         _backup_active_target "$_type"; return $?
@@ -9912,6 +10015,10 @@ create_backup_dispatch() {
 
     # Логи в архив: в both-режиме не спрашиваем попроходно (prompt+save загрязнил бы конфиг) —
     # дефолт «исключить» (рекомендуется), пользователь меняет в Настройках (п.6).
+    # №26: форс ТРАНЗИЕНТНЫЙ — local (dynamic scope) видят оба прохода, на return глобал снова
+    # «ask». Раньше «false» оставался в памяти, и следующий save_config в сессии меню записывал
+    # BACKUP_LOG_FILES="false" в config.env — вопрос одиночного режима больше не звучал.
+    local BACKUP_LOG_FILES="$BACKUP_LOG_FILES"
     [[ "$BACKUP_LOG_FILES" == "ask" ]] && BACKUP_LOG_FILES="false"
     # Глушим save_config на время обоих проходов (защита bot-полей config.env от panel-клоббера).
     local _SUPPRESS_SAVE=1
@@ -9981,6 +10088,18 @@ _backup_remote_target() {
     local TYPE="$1"
     local _ssh="$TARGET_SSH"
     if [[ -z "$_ssh" ]]; then print_message "ERROR" "remote backup без TARGET_SSH"; return 1; fi
+    # №16: KB-sidecar дампится только локальным docker (_kb_sidecar_active) — у удалённого бота его
+    # нет. Явный BOT_KB_BACKUP=true = «без KB архив неполный»: раньше remote-путь молча отдавал
+    # «успех» без kb_*. Отказ ДО лока/SSH/дампа — на диске ещё ничего не создано, убирать нечего.
+    # auto — без шума: дефолтное имя rwp_shop_kb_db непустое, WARN звучал бы на каждом прогоне
+    # каждой удалённой установки без KB.
+    if [[ "$BACKUP_TARGET" == "bot" && "$BOT_KB_BACKUP" == "true" && ( "$TYPE" == "db_only" || "$TYPE" == "full" ) ]]; then
+        print_message "ERROR" "BOT_KB_BACKUP=true, но бот удалённый (ssh) — KB-sidecar не поддержан; бэкап прерван. Поставьте BOT_KB_BACKUP=auto или false."
+        log_message "ERROR" "remote bot: BOT_KB_BACKUP=true, KB sidecar unsupported over ssh — backup refused"
+        return 1
+    fi
+    # Маркер неполноты для альбома both-режима (читает _both_tg_record через dynamic scope).
+    local _SIDECAR_MISS=""
 
     local LOCK_ACQUIRED="false"
     if ! acquire_lock; then
@@ -10014,6 +10133,14 @@ _backup_remote_target() {
     local FILE_GLOBALS=""; [[ "$BACKUP_TARGET" == "panel" ]] && FILE_GLOBALS="globals_${TIMESTAMP}.sql.${_ext}"
     local FILE_BILLING=""   # panel: sidecar БД infra-billing (ставится если сайдкар активен на удалённом)
     local FILE_FINAL="" HAS_ERROR=0
+    # PANEL_EXTRA_PATHS (extra_*.tar) собирает только локальный create_backup (tar от / ЭТОГО хоста);
+    # удалённый tar берёт лишь BOT_PATH источника. Раньше доп. пути (certwarden-data и т.п.) молча
+    # выпадали из удалённого full/files панели — говорим вслух и помечаем архив неполным.
+    if [[ "$BACKUP_TARGET" == "panel" && ( "$TYPE" == "full" || "$TYPE" == "files_only" ) && -n "${PANEL_EXTRA_PATHS:-}" ]]; then
+        print_message "WARN" "PANEL_EXTRA_PATHS задан, но панель удалённая (ssh) — доп. пути в этот архив НЕ входят: ${PANEL_EXTRA_PATHS}"
+        log_message "WARN" "remote panel backup: PANEL_EXTRA_PATHS not supported over ssh — not archived"
+        _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без PANEL_EXTRA_PATHS"
+    fi
 
     # --- DB-параметры (remote-aware read_bot_env читает .env по SSH) ---
     local _user _db
@@ -10067,16 +10194,23 @@ _backup_remote_target() {
                 fi
                 # INFRA-BILLING sidecar (remote): тот же контракт, что у локального —
                 # required-but-missing (rc=2) и провал дампа роняют бэкап (финансовые данные).
-                local _rbill_state=0
-                _billing_sidecar_active "$_ssh"; _rbill_state=$?
-                if [[ $_rbill_state -eq 2 ]]; then
+                # Биллинг — сайдкар ПАНЕЛИ: для удалённого бота блок не выполняется вовсе (раньше
+                # хелпер давал rc=1 и ветка ниже печатала ложный WARN «биллинг НЕ входит в архив»).
+                local _rbill_state=1
+                [[ "$BACKUP_TARGET" == "panel" ]] && { _billing_sidecar_active "$_ssh"; _rbill_state=$?; }
+                if [[ "$BACKUP_TARGET" != "panel" ]]; then
+                    :   # bot: billing-sidecar неприменим
+                elif [[ $_rbill_state -eq 2 ]]; then
                     print_message "ERROR" "infra-billing обязателен (PANEL_BILLING_BACKUP=true), но контейнер '${PANEL_BILLING_DB_CONTAINER:-<не задан/не найден>}' на удалённом недоступен или не прошёл role-гард — бэкап прерван."
                     log_message "ERROR" "remote billing sidecar required but unavailable/refused"
                     HAS_ERROR=1
                 elif [[ $_rbill_state -eq 1 && "$PANEL_BILLING_BACKUP" != "false" ]]; then
                     # ЯВНЫЙ warn (не debug-only): при миграции/remote-бэкапе оператор должен видеть,
                     # что биллинг НЕ вошёл в архив, а не узнать об этом при restore.
-                    print_message "WARN" "infra-billing на источнике не найден/не запущен — биллинг НЕ входит в архив."
+                    print_message "WARN" "infra-billing на источнике не найден/не запущен${_BILL_SKIP_STATE:+ (state=$_BILL_SKIP_STATE)} — биллинг НЕ входит в архив."
+                    log_message "WARN" "remote billing sidecar skipped (state=${_BILL_SKIP_STATE:-absent})"
+                    # Маркер в альбом — только «установлен, но не запущен» (как локально), не «не ставили».
+                    [[ -n "${_BILL_SKIP_STATE:-}" ]] && _SIDECAR_MISS+="${_SIDECAR_MISS:+, }без infra-billing"
                 elif [[ $_rbill_state -eq 0 ]]; then
                     FILE_BILLING="billing_${TIMESTAMP}.sql.${_ext}"
                     local _rb_creds _rb_u _rb_d
