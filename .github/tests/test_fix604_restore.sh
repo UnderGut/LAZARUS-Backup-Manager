@@ -285,7 +285,7 @@ GL_BLK=$(awk '/^        if \[\[ -n "\$GLOBALS_DUMP" && -f "\$GLOBALS_DUMP" && "\
     && declare -f execute_restore | grep -q 'psql-globals' && declare -f execute_restore | grep -q 'return 4' ) \
     && ok || bad "4pre2 execute_restore, вырезанная по /^}\$/, загружается целиком"
 eval "_t_globals() {
-    local GLOBALS_DUMP=\"\$1\" MODE=\"\$2\" RESTORE_INCLUDE_ENV=\"\$3\" RESTORE_KEEP_INFRA=\"\$4\" ACTUAL_DB_USER=\"\$5\"
+    local GLOBALS_DUMP=\"\$1\" MODE=\"\$2\" RESTORE_INCLUDE_ENV=\"\$3\" RESTORE_KEEP_INFRA=\"\$4\" ACTUAL_DB_USER=\"\$5\" _env_from_archive=\"\${6:-0}\"
     local BACKUP_TARGET=panel DB_CONTAINER_NAME=remnawave-db ACTUAL_DB_NAME=postgres
 $GL_BLK
 }"
@@ -335,6 +335,15 @@ run_gl full true 1 postgres
 run_gl db_only false 0 postgres
 [[ "$(line_of 'ALTER ROLE postgres WITH')" != *PASSWORD* && "$(line_of 'ALTER ROLE app_ro')" == *PASSWORD* ]] \
     && ok || bad "4j db_only → у postgres без пароля, у app_ro с паролем"
+# 4k) bootstrap на чистом сервере положил .env из архива (флаг поднят) → поток без изменений,
+#     даже без RESTORE_INCLUDE_ENV (меню restore): архивному .env нужен архивный хеш роли
+: > "$LOG_FILE"
+run_gl full false 0 postgres 1
+cmp -s "$G/globals.sql" "$MOCK_GL_CAPTURE" && ! grep -q "PASSWORD stripped" "$LOG_FILE" \
+    && ok || bad "4k .env из архива (bootstrap) → globals без фильтра: '$(line_of 'ALTER ROLE postgres WITH')'"
+# 4l) bootstrap действительно поднимает флаг, когда копирует .env (и только его)
+BS_BLK=$(awk '/for _bsf in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env; do/ {f=1} f {print} f && /done/ {exit}' "$SCRIPT")
+[[ "$BS_BLK" == *'[[ "$_bsf" == ".env" ]] && _env_from_archive=1'* ]] && ok || bad "4l bootstrap поднимает _env_from_archive при копировании .env"
 fi
 
 # ============================================================ 5) [9] пароль restore
@@ -387,7 +396,7 @@ plan_ok && [[ "$(ncalls)" -eq 1 && "$out" == *"попытка не засчит�
 # 5j) BACKUP_PASSWORD не подошёл → обычный ввод, попытки не расходуются (3-я введённая — верная)
 reset_plan; BACKUP_PASSWORD="other-config-pass"
 out=$(printf 'bad1\nbad2\n%s\n' "$PW_TRIM" | execute_restore full "$V2T" 2>&1 | strip)
-plan_ok && [[ "$(ncalls)" -eq 4 && "$out" == *"к этому архиву не подошёл"* && "$(cnt 'HMAC не совпал' <<< "$out")" -eq 2 ]] \
+plan_ok && [[ "$(ncalls)" -eq 4 && "$out" == *"не подошёл ИЛИ архив повреждён"* && "$(cnt 'HMAC не совпал, попытка' <<< "$out")" -eq 2 ]] \
     && ok || bad "5j неподошедший BACKUP_PASSWORD не съел попытку (calls=$(ncalls)): $(tail -n 3 <<< "$out")"
 # 5k) EOF после неподошедшего BACKUP_PASSWORD → прежний выход «ввод недоступен»
 reset_plan

@@ -374,13 +374,17 @@ Q=(":7"); vc ftp "ftps://ftp.example.invalid/bk"; rc=$?
 [[ $rc -eq 1 && $(v_calls) -eq 1 && ! -s "$T/ask.log" ]] && ok || bad "4j FTPS rc=7 (не TLS) → согласие не спрашивается (rc=$rc, ask=$(cat "$T/ask.log"))"
 Q=(":67" ":67"); vc ftp "ftp://ftp.example.invalid/bk"; rc=$?
 [[ $rc -eq 1 ]] && grep -q 'отклонил логин/пароль' "$T/o4" && ok || bad "4k FTP rc=67 → «логин/пароль» (rc=$rc): $(cat "$T/o4")"
-# без согласия (настоящая функция: non-tty → нет) — ftp:// уходит в plain, но с WARN про TLS
+# без согласия (настоящая функция: non-tty → нет) — ftp:// пробует plain, WARN про TLS и rc=1:
+# выгрузка идёт с --ssl и без согласия гарантированно упадёт — мастер не должен сказать «установлено»
 unset -f _remote_allow_insecure_tls
 eval "$(sed -n '/^_remote_allow_insecure_tls() {$/,/^}$/p' "$SCRIPT")"
 Q=(":60" ":0"); vc ftp "ftp://ftp.example.invalid/bk"; rc=$?
-[[ $rc -eq 0 && $(v_calls) -eq 2 ]] && ! tail -1 "$T/v_argv.log" | grep -q -- '--ssl' \
-    && grep -q 'TLS-сертификат сервера не прошёл проверку' "$T/o4" && [[ -z "$_REMOTE_TLS_INSECURE_SESSION" ]] && ok \
-    || bad "4l ftp:// без согласия: plain-повтор + WARN о TLS (rc=$rc): $(cat "$T/o4")"
+[[ $rc -eq 1 && $(v_calls) -eq 2 ]] && ! tail -1 "$T/v_argv.log" | grep -q -- '--ssl' \
+    && grep -q 'сервер отвечает, но его TLS-сертификат не прошёл проверку' "$T/o4" && [[ -z "$_REMOTE_TLS_INSECURE_SESSION" ]] && ok \
+    || bad "4l ftp:// без согласия: plain-повтор + WARN о TLS + rc=1 (rc=$rc): $(cat "$T/o4")"
+# 4l2) plain-FTP без TLS-проблемы (сервер без TLS: первая попытка упала НЕ по сертификату) — успех, как раньше
+Q=(":7" ":0"); vc ftp "ftp://ftp.example.invalid/bk"; rc=$?
+[[ $rc -eq 0 ]] && ok || bad "4l2 ftp:// без TLS у сервера (rc первой попытки не TLS) → успех (rc=$rc): $(cat "$T/o4")"
 unset -f curl
 curl() { printf 'curl %s\n' "$*" >> "$NETLOG"; return 7; }
 fi

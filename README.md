@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.3-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.4-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — система резервного копирования для **Remnawave Panel** и **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: панель, бот, infra-billing и база знаний ИИ-саппорта — одним инструментом. Всё находится **само** (по образам и docker-меткам, имена контейнеров и пути не важны), деструктивные операции защищены от потери данных, есть **перенос панели на новый сервер** и два режима меню — **Простой** (для новичков: 4 пункта + пошаговый мастер) и **Расширенный** (полный контроль).
@@ -82,7 +82,7 @@ f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Bac
 - **Авто-обнаружение** — панель, бот, infra-billing и БД знаний находятся сами (образы + docker-метки), имена не важны.
 - **4 типа бэкапов** — Full (БД + файлы), Только БД, Только файлы, **Incremental** (изменённые файлы + свежий дамп БД относительно последнего ЛОКАЛЬНОГО full; хранится только локально — в хранилище и Telegram не отправляется).
 - **Сайдкары** — роли кластера (`globals`), infra-billing (`billing_*.sql`), база знаний ИИ-саппорта (`kb_*.sql`, pgvector), доп. пути вне каталога панели (`extra_*.tar`, напр. `certwarden`). Установленный, но остановленный сайдкар в режиме `auto` не выпадает молча: предупреждение и пометка «без infra-billing / без KB» в Telegram.
-- **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2), обнаружение неверного пароля и подмены байтов ДО расшифровки.
+- **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2; ни пароль, ни ключ MAC не попадают в командную строку процессов), обнаружение неверного пароля и подмены байтов ДО расшифровки.
 - **gzip / zstd** — gzip (везде), zstd (opt-in, меньше и быстрее на SQL-дампах). Старые архивы восстанавливаются независимо от текущего формата (детект по magic bytes).
 - **Версия в имени файла** — в имя архива добавляется версия компонента (`__vX.Y.Z`): тег образа, если он сам версия (`3.4.4-trafficfmt`), иначе точная версия из образа — для бота на подвижном теге `:dev` это его настоящая версия (`7.1.0.x`), а не `dev`.
 - **v1→v2 миграция** — `lazarus migrate-v2` для конверсии старых архивов.
@@ -104,8 +104,8 @@ f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/UnderGut/LAZARUS-Bac
 ### ☁️ Хранение и доставка
 - **Telegram** — файлы и уведомления с premium emoji + retry × 3.
 - **S3-совместимые** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2** (`region=auto`), **Backblaze B2**, custom endpoint. После upload — `head-object` verify (size + ETag), очистка висящих multipart при сбое.
-- **FTP / FTPS / WebDAV / Rclone** — с retry и пошаговой настройкой; post-upload verify размера. Логин и пароль передаются curl через stdin, а не в командной строке (не видны в `ps`).
-- **Ротация** — по времени (дни) или количеству; отдельная ротация на S3 (`S3_RETENTION_DAYS`, трогает только свои архивы).
+- **FTP / FTPS / WebDAV / Rclone** — с retry и пошаговой настройкой; post-upload verify размера. Логин и пароль передаются curl через stdin, а не в командной строке (не видны в `ps`). TLS-сертификат проверяется и при выгрузке; для самоподписанного — подтверждение в мастере (или `REMOTE_TLS_INSECURE=true`).
+- **Ротация** — по времени (дни) или количеству; отдельная ротация на S3 (`S3_RETENTION_DAYS`, трогает только свои архивы; новейший архив каждого типа — full, db, files, inc — каждой цели не удаляется, так что свежие дампы БД не вытесняют последний полный бэкап).
 
 ### 🔔 Алерты в Telegram
 - **Severity bands** — CRITICAL 🔴 / ERROR ❌ / WARN ⚠️ / INFO ℹ️, хэштеги на первой строке для быстрого поиска.

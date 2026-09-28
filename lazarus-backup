@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="6.0.3"
+VERSION="6.0.4"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -7146,8 +7146,12 @@ validate_remote_connection() {
                     debug_log "REMOTE" "FTP without TLS SUCCESS"
                     # Сервер отвечает, но его TLS не прошёл строгую проверку: выгрузка пробует TLS (--ssl)
                     # и без согласия на работу без проверки сертификата упадёт — предупредим сразу.
+                    # Без согласия это НЕ успех: мастер иначе печатал «Соединение установлено!» и сохранял
+                    # настройки, при которых каждая выгрузка гарантированно падает (curl с --ssl на plain не
+                    # откатывается). rc=1 → мастер предложит сохранить принудительно, с этим же объяснением.
                     if _curl_rc_is_tls "$_vrc" && ! _remote_tls_insecure_on; then
-                        print_message "WARN" "FTP: TLS-сертификат сервера не прошёл проверку — выгрузка (с TLS) не пройдёт, пока не разрешите работу без проверки сертификата (повторите настройку или REMOTE_TLS_INSECURE=true)."
+                        print_message "WARN" "FTP: сервер отвечает, но его TLS-сертификат не прошёл проверку — выгрузка (с TLS) не пройдёт, пока не разрешите работу без проверки сертификата (ответ «y» на вопрос о сертификате или REMOTE_TLS_INSECURE=true)."
+                        return 1
                     fi
                     return 0
                 fi
@@ -7971,7 +7975,9 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
         # Провал проверки сертификата при строгом TLS — отдельное понятное сообщение: молча
         # переходить на --insecure нельзя, а голое «Ошибка» не подсказывает, что делать.
         if _curl_rc_is_tls "$_curl_rc" && ! _remote_tls_insecure_on; then
-            print_message "ERROR" "$_flabel: TLS-сертификат сервера не прошёл проверку (curl rc=$_curl_rc) — загрузка не выполнена. Повторите настройку хранилища (меню → Удалённое хранилище) и разрешите работу без проверки, либо задайте REMOTE_TLS_INSECURE=true в config.env (риск MITM)." >&2
+            # Пояснение про 6.0.4 — прямо здесь: у конфигов ≤6.0.3 с самоподписанным сертификатом выгрузка
+            # работала (--insecure был безусловным) и после обновления впервые падает именно тут.
+            print_message "ERROR" "$_flabel: TLS-сертификат сервера не прошёл проверку (curl rc=$_curl_rc) — загрузка не выполнена. С версии 6.0.4 сертификат проверяется и при выгрузке (раньше — только в мастере настройки). Самоподписанный сертификат: повторите настройку хранилища (меню → Удалённое хранилище) и разрешите работу без проверки, либо задайте REMOTE_TLS_INSECURE=true в config.env (риск MITM)." >&2
             REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_flabel"': ошибка TLS-сертификата — повторите настройку хранилища или REMOTE_TLS_INSECURE=true'
             log_message "ERROR" "Failed upload $filename to $REMOTE_STORAGE_TYPE: TLS verification failed (curl rc=$_curl_rc); re-run storage setup or set REMOTE_TLS_INSECURE=true"
             return 1
@@ -12762,6 +12768,7 @@ execute_restore() {
     # _vol_dropped=1 — volume БД реально удалён (дальше любой _restore_abort откатывает из _live_snap).
     # _restore_preflight=1 — ensure_bot_path пройден ДО compose down (после down не повторяем).
     local _vol_dropped=0 _restore_preflight=0
+    local _env_from_archive=0   # bootstrap положил .env из архива (чистый сервер) — см. фильтр globals
     # [13] Провалы сайдкаров (billing/KB/доп. пути): главное восстановление при них удалось, но итог — rc=4,
     # а не «успешно» (перенос панели иначе печатал чеклист cutover при пустой финансовой БД).
     local -a _sidecar_fail=()
@@ -12884,7 +12891,9 @@ execute_restore() {
                 _dec_io_fail=1
             else
                 rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
-                print_message "INFO" "Пароль из конфигурации к этому архиву не подошёл — требуется ввод."
+                # rc=1 у v2 — HMAC не совпал: это и чужой пароль, и обрезанный/повреждённый архив (недокачан
+                # из хранилища). Не отправляем оператора искать «другой пароль» к исправному.
+                print_message "WARN" "Пароль из конфигурации не подошёл ИЛИ архив повреждён/недокачан (HMAC не совпал) — требуется ввод. Если пароль точно верный — сверьте размер файла с копией в хранилище."
             fi
         fi
         # №4/№9: проверенный (успешно расшифровавший) пароль сохраняем в _verified_pass ДО
@@ -13216,7 +13225,9 @@ execute_restore() {
                 mkdir -p "$BOT_PATH"
                 local _bsf
                 for _bsf in docker-compose.yml docker-compose.yaml compose.yml compose.yaml .env; do
-                    [[ -f "$ROOT_DIR/$_bsf" ]] && cp -f "$ROOT_DIR/$_bsf" "$BOT_PATH/$_bsf"
+                    if [[ -f "$ROOT_DIR/$_bsf" ]] && cp -f "$ROOT_DIR/$_bsf" "$BOT_PATH/$_bsf"; then
+                        [[ "$_bsf" == ".env" ]] && _env_from_archive=1
+                    fi
                 done
                 print_message "INFO" "Bootstrap: compose/.env предпосеяны в $BOT_PATH из архива (чистый сервер)."
                 log_message "INFO" "restore bootstrap: seeded compose/.env into empty $BOT_PATH"
@@ -13501,7 +13512,8 @@ execute_restore() {
             # приходит из архива (RESTORE_INCLUDE_ENV=true, полная замена файлов) — поток без изменений:
             # архивному .env нужен именно архивный хеш. Хеши SCRAM/md5 кавычек не содержат. awk — POSIX/mawk.
             local _gl_awk='{ print }'
-            if [[ ! ( "$RESTORE_INCLUDE_ENV" == "true" && "${RESTORE_KEEP_INFRA:-0}" -ne 1 && "$MODE" != "db_only" ) ]]; then
+            # .env из архива (bootstrap на чистом сервере) — тоже «реально из архива»: фильтр не нужен.
+            if [[ "$_env_from_archive" -ne 1 && ! ( "$RESTORE_INCLUDE_ENV" == "true" && "${RESTORE_KEEP_INFRA:-0}" -ne 1 && "$MODE" != "db_only" ) ]]; then
                 # Строки программы — с отступом: «}» в первой колонке читается инструментами как конец функции.
                 _gl_awk='BEGIN { q = sprintf("%c", 39) }
                     ($1 == "ALTER" && $2 == "ROLE" && ($3 == u || $3 == ("\"" u "\""))) {

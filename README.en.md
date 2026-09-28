@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.3-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.4-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** is a backup system for **Remnawave Panel** and the **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: panel, bot, infra-billing, and the AI-support knowledge base — all in a single tool. Everything is discovered **automatically** (by images and Docker labels — container names and paths do not matter), destructive operations are protected against data loss, there is **panel migration to a new server**, and two menu modes — **Simple** (for newcomers: 4 items + a step-by-step wizard) and **Advanced** (full control).
@@ -82,7 +82,7 @@ The script is designed to **not lose data** even on failures:
 - **Auto-discovery** — panel, bot, infra-billing, and the knowledge base database are discovered on their own (images + Docker labels); names don't matter.
 - **4 backup types** — Full (DB + files), DB only, Files only, **Incremental** (changed files + a fresh DB dump relative to the last LOCAL full; kept locally only — not uploaded to storage or Telegram).
 - **Sidecars** — cluster roles (`globals`), infra-billing (`billing_*.sql`), the AI-support knowledge base (`kb_*.sql`, pgvector), additional paths outside the panel directory (`extra_*.tar`, e.g. `certwarden`). An installed but stopped sidecar in `auto` mode never drops out silently: a warning and a "no infra-billing / no KB" mark in Telegram.
-- **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2), detects a wrong password and byte tampering BEFORE decryption.
+- **AES-256-CBC + HMAC-SHA256** — envelope encrypt-then-MAC (v2; neither the password nor the MAC key ever appears on a process command line), detects a wrong password and byte tampering BEFORE decryption.
 - **gzip / zstd** — gzip (everywhere), zstd (opt-in, smaller and faster on SQL dumps). Old archives are restored regardless of the current format (detected by magic bytes).
 - **Version in the filename** — the component version is added to the archive name (`__vX.Y.Z`): the image tag if it is itself a version (`3.4.4-trafficfmt`), otherwise the exact version from the image — for a bot on the moving `:dev` tag this is its real version (`7.1.0.x`), not `dev`.
 - **v1→v2 migration** — `lazarus migrate-v2` to convert old archives.
@@ -104,8 +104,8 @@ The script is designed to **not lose data** even on failures:
 ### ☁️ Storage and delivery
 - **Telegram** — files and notifications with premium emoji + retry × 3.
 - **S3-compatible** — AWS, MinIO, RustFS, Yandex Cloud, Selectel, **Cloudflare R2** (`region=auto`), **Backblaze B2**, custom endpoint. After upload — `head-object` verify (size + ETag), cleanup of dangling multipart uploads on failure.
-- **FTP / FTPS / WebDAV / Rclone** — with retry and a step-by-step setup; post-upload size verify. The login and password are passed to curl via stdin, not on the command line (not visible in `ps`).
-- **Rotation** — by time (days) or count; a separate rotation on S3 (`S3_RETENTION_DAYS`, touches only its own archives).
+- **FTP / FTPS / WebDAV / Rclone** — with retry and a step-by-step setup; post-upload size verify. The login and password are passed to curl via stdin, not on the command line (not visible in `ps`). The TLS certificate is verified on upload too; for a self-signed one, confirm in the wizard (or set `REMOTE_TLS_INSECURE=true`).
+- **Rotation** — by time (days) or count; a separate rotation on S3 (`S3_RETENTION_DAYS`, touches only its own archives; the newest archive of each type — full, db, files, inc — of each target is never deleted, so fresh DB dumps never push out the last full backup).
 
 ### 🔔 Telegram alerts
 - **Severity bands** — CRITICAL 🔴 / ERROR ❌ / WARN ⚠️ / INFO ℹ️, hashtags on the first line for quick search.
