@@ -51,6 +51,9 @@ FUNC_FILE="$TMP_DIR/funcs.sh"
     sed -n '/^escape_markdown_v2() {$/,/^}$/p' "$SCRIPT"
     echo ""
     sed -n '/^send_telegram_alert() {$/,/^}$/p' "$SCRIPT"
+    echo ""
+    # 6.0.4: запросы к Bot API идут через _tg_curl (URL с токеном — в конфиге curl на stdin)
+    sed -n '/^_tg_curl() {$/,/^}$/p' "$SCRIPT"
 } > "$FUNC_FILE"
 if ! [[ -s "$FUNC_FILE" ]]; then
     echo "FAIL: could not extract send_telegram_alert" >&2

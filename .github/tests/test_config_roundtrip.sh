@@ -72,6 +72,20 @@ printf 'BACKUP_TOKEN="%s"\n' "$evil" > "$cfg"
 load_config_file "$cfg"
 [[ "$DB_USER" == "safe" ]] && ok || bad "T6 injection: DB_USER overwritten to '$DB_USER'"
 
+# T7 (6.0.4): REMOTE_TLS_INSECURE (согласие на FTP(S)/WebDAV без проверки TLS) переживает reload;
+#     отсутствующий ключ = дефолт false (переменная не трогается)
+REMOTE_TLS_INSECURE="false"
+printf 'REMOTE_STORAGE_TYPE="webdav"\nREMOTE_TLS_INSECURE="true"\n' > "$cfg"
+load_config_file "$cfg"
+[[ "$REMOTE_TLS_INSECURE" == "true" ]] && ok || bad "T7 REMOTE_TLS_INSECURE not loaded: '$REMOTE_TLS_INSECURE'"
+REMOTE_TLS_INSECURE="false"
+printf 'REMOTE_STORAGE_TYPE="webdav"\n' > "$cfg"
+load_config_file "$cfg"
+[[ "$REMOTE_TLS_INSECURE" == "false" ]] && ok || bad "T7 absent key must keep default false: '$REMOTE_TLS_INSECURE'"
+# T8: save_config пишет ключ только недефолтным (_cfg_if_nondefault с дефолтом "false")
+grep -qF '_cfg_if_nondefault "REMOTE_TLS_INSECURE" "$(env_escape "${REMOTE_TLS_INSECURE:-false}")" "false"' "$SCRIPT" \
+    && ok || bad "T8 save_config: REMOTE_TLS_INSECURE via _cfg_if_nondefault (default false)"
+
 echo "---"
 echo "ok=$n_ok err=$n_err"
 [[ $n_err -eq 0 ]] || exit 1
