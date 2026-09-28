@@ -87,9 +87,12 @@ _hmac_envelope_create "$T/a.tar.gz" "$T/a.tar.gz.enc" "$PW" >/dev/null 2>&1; rc=
 [[ $rc -eq 0 && -f "$T/a.tar.gz.enc" ]] && ok || bad "A1 envelope создан (rc=$rc)"
 [[ ! -e "$T/a.tar.gz.enc.part" ]] && ok || bad "A2 после успеха .part не остаётся"
 [[ "$(head -c 4 "$T/a.tar.gz.enc")" == "LAZ2" ]] && ok || bad "A3 штатный файл — полный LAZ2-envelope"
-# kill -9 в момент вычисления MAC (шаг 3 — запись envelope) → под штатным именем НИЧЕГО
+# kill -9 в момент вычисления MAC (шаг 3 — запись envelope) → под штатным именем НИЧЕГО.
+# 6.0.4: MAC считает _hmac_sha256_file — openssl dgst БЕЗ -hmac (с -hmac — только вывод K_mac,
+# шаг 2) и внутри конвейера, поэтому убиваем не $BASHPID элемента конвейера, а весь процесс функции.
 { (
-    openssl() { if [[ "$1" == dgst && "$*" == *-macopt* ]]; then kill -9 "$BASHPID"; fi; command openssl "$@"; }
+    _a4_top=$BASHPID
+    openssl() { if [[ "$1" == dgst && "$*" != *-hmac* ]]; then kill -9 "$_a4_top"; fi; command openssl "$@"; }
     _hmac_envelope_create "$T/a.tar.gz" "$T/k.tar.gz.enc" "$PW" >/dev/null 2>&1
 ); } 2>/dev/null
 [[ ! -e "$T/k.tar.gz.enc" ]] && ok || bad "A4 kill посреди записи оставил обрезанный .enc под штатным именем"
@@ -106,7 +109,7 @@ _hmac_envelope_decrypt "$T/bad.enc" "$T/b.out" "$PW" >/dev/null 2>&1; rc=$?
 [[ $rc -eq 2 ]] && ok || bad "B3 нет TMPDIR → rc=2 (не удалось проверить), got $rc"
 ( _derive_hmac_key() { :; }; _hmac_envelope_decrypt "$T/a.tar.gz.enc" "$T/b.out" "$PW" >/dev/null 2>&1 ); rc=$?
 [[ $rc -eq 2 ]] && ok || bad "B4 пустой ключ MAC (сбой openssl) → rc=2, got $rc"
-( openssl() { if [[ "$1" == dgst && "$*" == *-macopt* ]]; then return 1; fi; command openssl "$@"; }
+( openssl() { if [[ "$1" == dgst && "$*" != *-hmac* ]]; then return 1; fi; command openssl "$@"; }   # 6.0.4: сбой openssl в _hmac_sha256_file
   _hmac_envelope_decrypt "$T/a.tar.gz.enc" "$T/b.out" "$PW" >/dev/null 2>&1 ); rc=$?
 [[ $rc -eq 2 ]] && ok || bad "B5 пустой computed MAC (ошибка чтения) → rc=2, got $rc"
 
