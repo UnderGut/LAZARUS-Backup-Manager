@@ -1320,7 +1320,11 @@ _resolve_incremental_chain() {
     # RST-4 fix: validate ДО extract. Раньше inc-chain распаковывал base/inc БЕЗ
     # validate_tar_safety и без --no-same-owner/--no-same-permissions → подделанный
     # backup с symlink/`..`/абсолютным путём писал как root вне sandbox.
-    if ! validate_tar_safety "$_base_tar" "$_stage/.base_list" 2> "$SILENT_LOG"; then
+    # 6.0.4 [5]: validate_tar_safety печатает WARN/ERROR через print_message в STDOUT, а stdout этой
+    # функции — только путь к merged. Безопасный симлинк давал «[WARN] …\n<путь>» → caller отвергал
+    # цепочку (rc=0, «Restore-chain failed»), а причина отказа по опасной ссылке терялась в $(...).
+    # Порядок важен: сначала stdout → текущий stderr (терминал), затем stderr функции → лог.
+    if ! validate_tar_safety "$_base_tar" "$_stage/.base_list" >&2 2> "$SILENT_LOG"; then
         print_message "ERROR" "Base full не прошёл tar-safety" >&2
         rm -f "$_base_tar"; return 1
     fi
@@ -1349,7 +1353,7 @@ _resolve_incremental_chain() {
     local _inc_fmt _inc_tar_args
     _inc_fmt=$(_compress_detect_format "$_inc_tar")
     _inc_tar_args=$(_tar_extract_args_for "$_inc_fmt")
-    if ! validate_tar_safety "$_inc_tar" "$_stage/.inc_list" 2> "$SILENT_LOG"; then
+    if ! validate_tar_safety "$_inc_tar" "$_stage/.inc_list" >&2 2> "$SILENT_LOG"; then
         print_message "ERROR" "Inc не прошёл tar-safety" >&2
         rm -f "$_inc_tar"; return 1
     fi
@@ -1390,7 +1394,7 @@ _resolve_incremental_chain() {
         local _bf_fmt _bf_args
         _bf_fmt=$(_compress_detect_format "$_base_files")
         _bf_args=$(_tar_extract_args_for "$_bf_fmt")
-        if ! validate_tar_safety "$_base_files" "$_stage/.bf_list" 2> "$SILENT_LOG"; then
+        if ! validate_tar_safety "$_base_files" "$_stage/.bf_list" >&2 2> "$SILENT_LOG"; then
             print_message "ERROR" "Base files-архив не прошёл tar-safety" >&2
             return 1
         fi
@@ -1406,7 +1410,7 @@ _resolve_incremental_chain() {
             local _if_fmt _if_args
             _if_fmt=$(_compress_detect_format "$_inc_files")
             _if_args=$(_tar_extract_args_for "$_if_fmt")
-            if ! validate_tar_safety "$_inc_files" "$_stage/.if_list" 2> "$SILENT_LOG"; then
+            if ! validate_tar_safety "$_inc_files" "$_stage/.if_list" >&2 2> "$SILENT_LOG"; then
                 print_message "ERROR" "Inc files-архив не прошёл tar-safety" >&2
                 return 1
             fi
@@ -12260,13 +12264,25 @@ get_restore_stage_root() {
     local entries=("$stage_dir"/*)
     local count=0
     local root=""
+    local names=""
     for entry in "${entries[@]}"; do
         [[ ! -e "$entry" ]] && continue
+        # 6.0.4 [8]: служебные файлы верхнего уровня не считаем. Legacy files-архив ≤4.21 — это
+        # bot_version.txt рядом с каталогом стека (без combine) → «найдено: 2», restore невозможен.
+        # В rsync они и так не попадают: источник — ROOT_DIR (каталог стека).
+        if [[ -f "$entry" ]]; then
+            case "${entry##*/}" in
+                bot_version.txt|manifest.txt|manifest_deletions.txt) continue ;;
+            esac
+        fi
         count=$((count + 1))
         root="$entry"
+        names+="${names:+, }${entry##*/}"
     done
     if [[ $count -ne 1 || ! -d "$root" ]]; then
-        print_message "ERROR" "Ожидалась одна корневая папка в архиве (найдено: $count)"
+        # >&2: вызов идёт через ROOT_DIR=$(...) — в stdout причина отказа попадала в переменную,
+        # и restore завершался после «Распаковка...» без объяснения.
+        print_message "ERROR" "Ожидалась одна корневая папка в архиве (найдено: $count${names:+: $names})" >&2
         return 1
     fi
     echo "$root"
@@ -12775,20 +12791,49 @@ execute_restore() {
             _archive_format="unknown"
         fi
 
-        print_message "INFO" "Файл зашифрован. Требуется пароль."
+        if [[ -n "${BACKUP_PASSWORD:-}" ]]; then
+            print_message "INFO" "Файл зашифрован — пробую пароль шифрования из конфигурации..."
+        else
+            print_message "INFO" "Файл зашифрован. Требуется пароль."
+        fi
         debug_log "RESTORE" "File is encrypted, requesting password..."
         local DECRYPTED_FILE="$TMP_DIR/decrypted.tar.gz"
         local _dec_attempt=0
         local _dec_max=3
         local _dec_ok=false _dec_io_fail=0
+        # 6.0.4 [9]: сначала — пароль из конфигурации (BACKUP_PASSWORD / .password), один раз и без вопроса.
+        # Restore на том же сервере не требует ввода, а пароль с пробелами/табами по краям (ручная правка
+        # .password, легаси BACKUP_PASSWORD="pw " в config.env) проходит байт в байт: ввести его в запрос
+        # было невозможно (read без IFS= срезал края), хотя бэкап и verify проходили. Не подошёл — обычный
+        # ввод, попытки не расходуются. v2 rc=2 — как в цикле: сбой I/O/openssl/места, не неверный пароль.
+        if [[ -n "${BACKUP_PASSWORD:-}" ]]; then
+            debug_log "RESTORE" "Trying configured password first (format=$_archive_format)"
+            _hmac_envelope_decrypt "$FILE" "$DECRYPTED_FILE" "$BACKUP_PASSWORD"
+            local _cfg_rc=$?
+            debug_log "RESTORE" "Configured password: rc=$_cfg_rc"
+            if [[ $_cfg_rc -eq 0 ]] && { [[ "$_archive_format" == "v2" ]] || gzip -t "$DECRYPTED_FILE" 2> "$SILENT_LOG"; }; then
+                _verified_pass="$BACKUP_PASSWORD"
+                _dec_ok=true
+                print_message "INFO" "Подошёл пароль из конфигурации — ввод не нужен."
+            elif [[ $_cfg_rc -eq 2 && "$_archive_format" == "v2" ]]; then
+                rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                print_message "ERROR" "Расшифровка не выполнена: сбой ввода-вывода/openssl или нет места в TMPDIR (${TMPDIR:-/tmp}) — это не признак неверного пароля, см. лог."
+                log_message "ERROR" "restore decrypt rc=2 (I/O/openssl/space) for v2 archive: $FILE"
+                _dec_io_fail=1
+            else
+                rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                print_message "INFO" "Пароль из конфигурации к этому архиву не подошёл — требуется ввод."
+            fi
+        fi
         # №4/№9: проверенный (успешно расшифровавший) пароль сохраняем в _verified_pass ДО
         # зануления decrypt_pass — он нужен ниже для _resolve_incremental_chain (fresh-сервер:
         # BACKUP_PASSWORD пуст, без этого restore зашифрованного inc был невозможен). Wipe — после chain.
-        while [[ $_dec_attempt -lt $_dec_max ]]; do
+        while [[ "$_dec_ok" != "true" && "$_dec_io_fail" -eq 0 && $_dec_attempt -lt $_dec_max ]]; do
             local decrypt_pass=""
             # №14: EOF/провал ввода (non-interactive restore .enc, закрытый stdin) раньше крутил
             # цикл вечно (read мгновенно фейлился, «пустой пароль — попытка не засчитана»).
-            if ! read -s -erp "Пароль (попытка $((_dec_attempt + 1))/${_dec_max}): " decrypt_pass; then
+            # 6.0.4 [9]: IFS= — края ввода сохраняем (обрезанный вариант пробуется ниже при несовпадении).
+            if ! IFS= read -s -erp "Пароль (попытка $((_dec_attempt + 1))/${_dec_max}): " decrypt_pass; then
                 echo ""
                 print_message "ERROR" "Ввод пароля недоступен (EOF/non-interactive) — восстановление отменено."
                 log_message "ERROR" "Password read failed (EOF) in execute_restore"
@@ -12797,7 +12842,9 @@ execute_restore() {
                 return 1
             fi
             echo ""
-            if [[ -z "$decrypt_pass" ]]; then
+            # Только пробелы — как пустой (раньше read их срезал до пустой строки): попытка не засчитана.
+            if [[ -z "${decrypt_pass//[[:space:]]/}" ]]; then
+                decrypt_pass=""
                 print_message "WARN" "Пустой пароль — попробуйте снова (попытка не засчитана)."
                 continue
             fi
@@ -12806,6 +12853,28 @@ execute_restore() {
 
             _hmac_envelope_decrypt "$FILE" "$DECRYPTED_FILE" "$decrypt_pass"
             local dec_res=$?
+            # 6.0.4 [9]: мастер и меню сохраняют пароль уже обрезанным (их read срезает края), и вставка
+            # такого пароля с лишним пробелом раньше «работала» за счёт среза. Несовпадение (v2: HMAC rc=1;
+            # v1: rc=2 или не gzip) при отличающемся обрезанном варианте — повтор с ним в ТОЙ ЖЕ попытке.
+            local _pass_trim="$decrypt_pass"
+            _pass_trim="${_pass_trim#"${_pass_trim%%[![:space:]]*}"}"
+            _pass_trim="${_pass_trim%"${_pass_trim##*[![:space:]]}"}"
+            if [[ "$_pass_trim" != "$decrypt_pass" ]]; then
+                local _mm=0
+                case "$dec_res" in
+                    1) _mm=1 ;;
+                    2) [[ "$_archive_format" == "v1" ]] && _mm=1 ;;
+                    0) [[ "$_archive_format" == "v1" ]] && ! gzip -t "$DECRYPTED_FILE" 2> "$SILENT_LOG" && _mm=1 ;;
+                esac
+                if [[ $_mm -eq 1 ]]; then
+                    rm -f "$DECRYPTED_FILE" 2> "$SILENT_LOG"
+                    debug_log "RESTORE" "Attempt $_dec_attempt: retry with edge-trimmed input"
+                    decrypt_pass="$_pass_trim"
+                    _hmac_envelope_decrypt "$FILE" "$DECRYPTED_FILE" "$decrypt_pass"
+                    dec_res=$?
+                fi
+            fi
+            _pass_trim=""
             debug_log "RESTORE" "Decryption attempt $_dec_attempt: rc=$dec_res"
 
             case $dec_res in
@@ -12900,6 +12969,8 @@ execute_restore() {
         chmod 600 "$WORK_FILE" 2> "$SILENT_LOG" || true
         debug_log "RESTORE" "Chain resolved → $WORK_FILE"
     fi
+    # Не-inc: проверенный пароль дальше не нужен (в т.ч. взятый из конфигурации, [9]) — затираем.
+    _verified_pass=""
 
     local DB_DUMP=""
     local DIR_ARC=""
@@ -12988,9 +13059,11 @@ execute_restore() {
         if [[ -n "$_live_cmp" ]]; then
             local _pk_args _pk_member _arc_cmp_tmp=""
             _pk_args=$(_tar_extract_args_for "$(_compress_detect_format "$DIR_ARC")")
-            # только верхний уровень каталога цели: "<dir>/docker-compose.yml" или голый корень
+            # только верхний уровень каталога цели: "<dir>/docker-compose.yml" или голый корень.
+            # 6.0.4 [7]: и с ведущим «./» — merged-архив инкремента собирается `tar -cf … .`, его члены
+            # «./<dir>/docker-compose.yml»; без этого гард в inc-restore молча не срабатывал.
             _pk_member=$(tar $_pk_args -tf "$DIR_ARC" 2> "$SILENT_LOG" \
-                | grep -m1 -E '^([^/]+/)?(docker-compose\.ya?ml|compose\.ya?ml)$')
+                | grep -m1 -E '^(\./)?([^/]+/)?(docker-compose\.ya?ml|compose\.ya?ml)$')
             if [[ -n "$_pk_member" ]]; then
                 _arc_cmp_tmp="$TMP_DIR/arc_compose_peek"
                 tar $_pk_args -xOf "$DIR_ARC" "$_pk_member" > "$_arc_cmp_tmp" 2> "$SILENT_LOG" || _arc_cmp_tmp=""
@@ -13357,9 +13430,29 @@ execute_restore() {
             _gl_fmt=$(_compress_detect_format "$GLOBALS_DUMP")
             _gl_decompress=$(_decompress_cmd_for "$_gl_fmt")
             debug_log "RESTORE" "Globals import: $_gl_fmt → '$_gl_decompress' (no ON_ERROR_STOP)"
+            # 6.0.4 [6]: globals снят без --no-role-passwords → в потоке «ALTER ROLE <user> … PASSWORD '<хеш>'»
+            # и для роли, под которой ходит само приложение. Если .env остаётся ТЕКУЩИМ (по умолчанию .env
+            # исключён из rsync; keep-infra; db_only), старый хеш перезаписал бы пароль из текущего .env →
+            # после рестарта бэкенд получает «password authentication failed» (lazarus этого не видит:
+            # docker exec идёт через локальный trust). Поэтому у ALTER ROLE для ACTUAL_DB_USER (и "в кавычках")
+            # убираем только « PASSWORD '…'», остальные роли и атрибуты — как в архиве. Когда .env реально
+            # приходит из архива (RESTORE_INCLUDE_ENV=true, полная замена файлов) — поток без изменений:
+            # архивному .env нужен именно архивный хеш. Хеши SCRAM/md5 кавычек не содержат. awk — POSIX/mawk.
+            local _gl_awk='{ print }'
+            if [[ ! ( "$RESTORE_INCLUDE_ENV" == "true" && "${RESTORE_KEEP_INFRA:-0}" -ne 1 && "$MODE" != "db_only" ) ]]; then
+                # Строки программы — с отступом: «}» в первой колонке читается инструментами как конец функции.
+                _gl_awk='BEGIN { q = sprintf("%c", 39) }
+                    ($1 == "ALTER" && $2 == "ROLE" && ($3 == u || $3 == ("\"" u "\""))) {
+                        p = index($0, " PASSWORD " q)
+                        if (p) { r = substr($0, p + 11); e = index(r, q); if (e) $0 = substr($0, 1, p - 1) substr(r, e + 1) }
+                    }
+                    { print }'
+                print_message "INFO" "Пароль роли '$ACTUAL_DB_USER' из архива (если он там есть) не применяется: .env остаётся текущим, пароль БД — из него."
+                log_message "INFO" "panel globals import: PASSWORD stripped for ALTER ROLE $ACTUAL_DB_USER (.env not restored from archive)"
+            fi
             _run_pipe_with_timeout "$RESTORE_TIMEOUT_SEC" "psql-globals" \
-                '$6 "$1" | docker exec -i "$2" psql -U "$3" "$4" > "$5" 2>&1' \
-                "$GLOBALS_DUMP" "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$_gl_decompress"
+                '$6 "$1" | awk -v u="$3" "$7" | docker exec -i "$2" psql -U "$3" "$4" > "$5" 2>&1' \
+                "$GLOBALS_DUMP" "$DB_CONTAINER_NAME" "$ACTUAL_DB_USER" "$ACTUAL_DB_NAME" "$SILENT_LOG" "$_gl_decompress" "$_gl_awk"
             local _gl_rc=$?
             # psql без ON_ERROR_STOP кодирует только fatal/коннект как rc!=0 — обычно 0.
             # Любой rc!=0 best-effort: логируем, restore продолжается (роли вторичны к данным).
