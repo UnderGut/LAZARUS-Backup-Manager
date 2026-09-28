@@ -15,7 +15,7 @@
 
 [![Bash](https://img.shields.io/badge/Language-Bash_5+-4EAA25?style=flat-square&logo=gnubash&logoColor=white)](https://www.gnu.org/software/bash/)
 [![License](https://img.shields.io/github/license/UnderGut/LAZARUS-Backup-Manager?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-6.0.4-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
+[![Version](https://img.shields.io/badge/version-6.0.5-green?style=flat-square)](https://github.com/UnderGut/LAZARUS-Backup-Manager/releases)
 [![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED?style=flat-square&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
 **LAZARUS** — система резервного копирования для **Remnawave Panel** и **[Remnawave Telegram Shop Bot](https://remnawave-telegram-shop-bot-doc.vercel.app/ru/private/overview/)**: панель, бот, infra-billing и база знаний ИИ-саппорта — одним инструментом. Всё находится **само** (по образам и docker-меткам, имена контейнеров и пути не важны), деструктивные операции защищены от потери данных, есть **перенос панели на новый сервер** и два режима меню — **Простой** (для новичков: 4 пункта + пошаговый мастер) и **Расширенный** (полный контроль).

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- НАСТРОЙКИ ---
-VERSION="6.0.4"
+VERSION="6.0.5"
 
 # Сохраняем оригинальные CLI args ДО любой обработки — нужно для re-exec
 # после install_script (иначе теряются "$@" при первой установке через cron).
@@ -740,9 +740,12 @@ _hmac_envelope_verify() {
 
     # Извлекаем ciphertext (без LAZ2 и без последних 32 байт MAC).
     # ВНИМАНИЕ: `dd bs=1` КАТАСТРОФИЧЕСКИ медленный (31 сек на 35 МБ → 15 мин на 1 GB).
-    # `tail -c +N | head -c M` использует buffered I/O, для 35 МБ ~ 0.1 сек.
-    # +N в `tail -c` это 1-based: пропустить 4 байта = начать с +5.
-    tail -c +5 "$file" 2>/dev/null | head -c "$cipher_len" > "$cipher_tmp" 2> "$SILENT_LOG"
+    # Порядок `head -c <LAZ2+ciphertext> файл | tail -c +5` — не наоборот: в `tail -c +5 | head -c N`
+    # head закрывал трубу, прочитав N байт, и если хвост MAC tail дописывал отдельной записью (его буфер —
+    # 8 КиБ; остаток (size-4) mod 8192 в 1..32, ~1 архив из 256), tail получал SIGPIPE (rc 141) → ложное
+    # «INCOMPLETE» на ЦЕЛОМ архиве (27.09.2026: бэкап бота не ушёл в R2). Здесь head — производитель и
+    # читает файл сам, tail дочитывает трубу до конца: раннего закрытия нет. +5 — 1-based: пропустить 4 байта.
+    head -c "$((cipher_len + 4))" "$file" 2>/dev/null | tail -c +5 > "$cipher_tmp" 2> "$SILENT_LOG"
     local _ps=("${PIPESTATUS[@]}")
     # AUDIT fix: короткий read (ENOSPC/прерывание при записи cipher_tmp) дал бы ОБРЕЗАННЫЙ ciphertext
     # → MAC не сойдётся → ложный «corrupt» на ИСПРАВНОМ бэкапе (в аварии оператор решит, что данные
@@ -800,8 +803,9 @@ _hmac_envelope_decrypt() {
 
         cipher_tmp=$(mktemp "${TMPDIR:-/tmp}/lazarus_dec.XXXXXX") || return 2
         register_sensitive_tmp "$cipher_tmp"
-        # Один read: ciphertext в tmp файл (тот же используется для MAC compute и openssl decrypt)
-        tail -c +5 "$infile" 2>/dev/null | head -c "$cipher_len" > "$cipher_tmp" 2> "$SILENT_LOG"
+        # Один read: ciphertext в tmp файл (тот же используется для MAC compute и openssl decrypt).
+        # head — производитель, tail дочитывает до конца: без SIGPIPE (см. _hmac_envelope_verify).
+        head -c "$((cipher_len + 4))" "$infile" 2>/dev/null | tail -c +5 > "$cipher_tmp" 2> "$SILENT_LOG"
         local _dps=("${PIPESTATUS[@]}")
         # AUDIT fix: короткий read = I/O-ошибка, НЕ порча/неверный пароль. Не маскируем под MAC mismatch.
         if [[ "${_dps[0]}" -ne 0 || "${_dps[1]}" -ne 0 || "$(stat -c%s "$cipher_tmp" 2>/dev/null || echo 0)" -ne "$cipher_len" ]]; then
