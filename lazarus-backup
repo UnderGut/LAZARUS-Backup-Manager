@@ -98,6 +98,7 @@ REMOTE_STORAGE_TYPE="off" # off, ftp, webdav, rclone, s3
 REMOTE_STORAGE_URL=""
 REMOTE_STORAGE_USER=""
 REMOTE_STORAGE_PASS=""
+REMOTE_TLS_INSECURE="false"  # true = FTP(S)/WebDAV без проверки TLS-сертификата (пишет мастер после явного согласия)
 REMOTE_UPLOAD_STATUS_TEXT=""
 REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
 
@@ -1738,7 +1739,7 @@ emoji_command() {
             local _url_enc
             _url_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$_ids_json" 2>/dev/null) || _url_enc="$_ids_json"
             local _resp
-            _resp=$(curl $CURL_SILENT "https://api.telegram.org/bot${BOT_TOKEN}/getCustomEmojiStickers?custom_emoji_ids=${_url_enc}")
+            _resp=$(_tg_curl "getCustomEmojiStickers?custom_emoji_ids=${_url_enc}" $CURL_SILENT)
             if [[ -z "$_resp" ]]; then
                 print_message "ERROR" "Нет ответа от Telegram API"
                 return 1
@@ -1777,7 +1778,7 @@ for s in result:
             print_message "INFO" "затем запусти 'lazarus emoji scan' — извлечёт ID."
             echo ""
             local _resp
-            _resp=$(curl $CURL_SILENT "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=${_limit}&allowed_updates=%5B%22message%22%2C%22channel_post%22%5D")
+            _resp=$(_tg_curl "getUpdates?limit=${_limit}&allowed_updates=%5B%22message%22%2C%22channel_post%22%5D" $CURL_SILENT)
             if ! command -v python3 > "$SILENT_LOG" 2>&1; then
                 print_message "ERROR" "python3 required для парсинга JSON"
                 return 1
@@ -1854,6 +1855,25 @@ EOF
             return 1
             ;;
     esac
+}
+
+# _tg_curl <метод[?query]> <аргументы curl…>: запрос к Telegram Bot API без токена в argv.
+# URL https://api.telegram.org/bot<TOKEN>/<метод> — строкой конфига curl на stdin (`-K -`), как
+# креды хранилища в _curl_with_auth: argv любого процесса виден всем локальным пользователям
+# (ps, /proc/<pid>/cmdline), а отправка документа/альбома держит curl живым минутами. В строке
+# конфига экранируются \ и ". stdin curl больше ни для чего не занят: данные идут через
+# -d/--data-urlencode name=… и -F name=@<файл>, не через @- / -T -.
+_tg_curl() {
+    local _m="$1"; shift
+    local _u="https://api.telegram.org/bot${BOT_TOKEN}/${_m}"
+    # CR/LF (токен из config.env, аргумент emoji scan) дописали бы в конфиг curl свои опции.
+    if [[ "$_u" == *[$'\r\n']* ]]; then
+        log_message "WARN" "telegram ${_m%%\?*}: CR/LF in token/method — request refused"
+        return 2
+    fi
+    _u=${_u//\\/\\\\}
+    _u=${_u//\"/\\\"}
+    curl -K - "$@" <<< "url = \"$_u\""
 }
 
 send_telegram_notification() {
@@ -4481,6 +4501,7 @@ load_config_file() {
             REMOTE_STORAGE_URL) REMOTE_STORAGE_URL="$val" ;;
             REMOTE_STORAGE_USER) REMOTE_STORAGE_USER="$val" ;;
             REMOTE_STORAGE_PASS) REMOTE_STORAGE_PASS="$val" ;;
+            REMOTE_TLS_INSECURE) REMOTE_TLS_INSECURE="$val" ;;
             SEND_TO_TELEGRAM) SEND_TO_TELEGRAM="$val" ;;
             TG_SEND_FILE) TG_SEND_FILE="$val" ;;
             SEND_TO_REMOTE) SEND_TO_REMOTE="$val" ;;
@@ -4799,6 +4820,7 @@ save_config() {
     _cfg_if_nondefault "REMOTE_STORAGE_URL" "$REMOTE_STORAGE_URL_ESC" ""
     _cfg_if_nondefault "REMOTE_STORAGE_USER" "$REMOTE_STORAGE_USER_ESC" ""
     _cfg_if_nondefault "REMOTE_STORAGE_PASS" "$REMOTE_STORAGE_PASS_ESC" ""
+    _cfg_if_nondefault "REMOTE_TLS_INSECURE" "$(env_escape "${REMOTE_TLS_INSECURE:-false}")" "false"
     _cfg_if_nondefault "SEND_TO_REMOTE" "$SEND_TO_REMOTE_ESC" "true"
     _cfg_if_nondefault "MAX_BACKUP_SIZE_MB" "$MAX_BACKUP_SIZE_MB_ESC" "0"
     _cfg_if_nondefault "S3_ENDPOINT" "$S3_ENDPOINT_ESC" ""
@@ -6535,7 +6557,7 @@ ${escaped_caption}"
         [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param=(-d "message_thread_id=$TG_MESSAGE_THREAD_ID")
         
         local http_code
-        http_code=$(curl $CURL_SILENT -o "$SILENT_LOG" -w "%{http_code}" -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        http_code=$(_tg_curl sendMessage $CURL_SILENT -o "$SILENT_LOG" -w "%{http_code}" -X POST \
             -d chat_id="$CHAT_ID" \
             -d parse_mode="MarkdownV2" \
             --data-urlencode text="$notify_text" \
@@ -6619,8 +6641,8 @@ S3/R2/FTP/WebDAV/Rclone поддерживаются"
     while [[ $_tg_attempt -le $_tg_max ]]; do
         [[ $_tg_attempt -gt 1 ]] && print_message "INFO" "TG retry $_tg_attempt/$_tg_max через ${_tg_delay}с..."
         # --max-time 120 защищает от висящего соединения на конкретной попытке.
-        http_code=$(curl $CURL_SILENT --max-time 120 -o "$SILENT_LOG" -w "%{http_code}" \
-            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendDocument" "${form_params[@]}")
+        http_code=$(_tg_curl sendDocument $CURL_SILENT --max-time 120 -o "$SILENT_LOG" -w "%{http_code}" \
+            -X POST "${form_params[@]}")
         debug_log "TG" "Attempt $_tg_attempt/$_tg_max: HTTP $http_code"
         # Success или non-retryable client error → выходим из retry-loop.
         case "$http_code" in
@@ -6657,7 +6679,7 @@ S3/R2/FTP/WebDAV/Rclone поддерживаются"
         local thread_param=()
         [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread_param=(-d "message_thread_id=$TG_MESSAGE_THREAD_ID")
 
-        curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        _tg_curl sendMessage $CURL_SILENT -X POST \
             -d chat_id="$CHAT_ID" \
             --data-urlencode text="$error_msg" \
             -d parse_mode="MarkdownV2" \
@@ -6786,7 +6808,7 @@ send_telegram_alert() {
 
     # disable_notification=false (default) — звук для CRITICAL обязателен.
     # Для INFO можно тихо, но не делаем разделение чтобы пользователь точно увидел.
-    curl $CURL_SILENT -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    _tg_curl sendMessage $CURL_SILENT -X POST \
         -d chat_id="$CHAT_ID" \
         --data-urlencode text="$_full_text" \
         -d parse_mode="MarkdownV2" \
@@ -6803,7 +6825,7 @@ test_telegram_connection() {
         return
     fi
     print_message "INFO" "Проверка связи с Telegram API..."
-    local res=$(curl $CURL_SILENT "https://api.telegram.org/bot$BOT_TOKEN/getMe")
+    local res=$(_tg_curl getMe $CURL_SILENT)
     if [[ "$res" != *'"ok":true'* ]]; then
         print_message "ERROR" "Ошибка: токен неверный или нет сети (getMe)."
         [[ -t 0 && -t 1 ]] && safe_read -rp "Enter — назад " dummy
@@ -6818,7 +6840,7 @@ test_telegram_connection() {
     else
         local _sform=(--data-urlencode "chat_id=$CHAT_ID" --data-urlencode "text=✅ LAZARUS: проверка связи — уведомления о бэкапах работают.")
         [[ -n "$TG_MESSAGE_THREAD_ID" ]] && _sform+=(--data-urlencode "message_thread_id=$TG_MESSAGE_THREAD_ID")
-        local _sres; _sres=$(curl $CURL_SILENT "${_sform[@]}" "https://api.telegram.org/bot$BOT_TOKEN/sendMessage")
+        local _sres; _sres=$(_tg_curl sendMessage $CURL_SILENT "${_sform[@]}")
         if [[ "$_sres" == *'"ok":true'* ]]; then
             print_message "SUCCESS" "Тестовое сообщение доставлено — доставка уведомлений работает."
         else
@@ -6843,6 +6865,21 @@ _remote_allow_insecure_tls() {
     _REMOTE_TLS_INSECURE_SESSION=1
     print_message "WARN" "Проверка TLS отключена для этой сессии (MITM-риск)."
     return 0
+}
+
+# _remote_tls_insecure_on: --insecure в выгрузке FTP(S)/WebDAV и HEAD-сверке — ТОЛЬКО с явного
+# согласия: сохранённый REMOTE_TLS_INSECURE=true (мастер хранилища пишет его, когда пользователь
+# разрешил работу без проверки сертификата) или согласие в этой сессии. По умолчанию — строгая
+# проверка: раньше выгрузка ставила --insecure всегда, и MITM получал креды хранилища и архив.
+_remote_tls_insecure_on() {
+    [[ "${REMOTE_TLS_INSECURE:-false}" == "true" || "${_REMOTE_TLS_INSECURE_SESSION:-}" == "1" ]]
+}
+
+# _curl_rc_is_tls <rc>: rc curl — провал TLS-рукопожатия или проверки сертификата (35 handshake,
+# 51/60 сертификат/CA, 58/59 локальный серт/шифр, 77 CA-файл, 80/82/83/90/91 прочие TLS-проверки).
+_curl_rc_is_tls() {
+    case "$1" in 35|51|58|59|60|77|80|82|83|90|91) return 0 ;; esac
+    return 1
 }
 
 # _remote_creds_ok <user> <pass>: CR/LF в логине/пароле ломают строку конфига curl (и дали бы
@@ -6870,6 +6907,16 @@ _curl_with_auth() {
     _up=${_up//\\/\\\\}
     _up=${_up//\"/\\\"}
     curl -K - "$@" <<< "user = \"$_up\""
+}
+
+# _remote_webdav_auth_error <http_code>: понятный отказ validate при 401/403 WebDAV.
+_remote_webdav_auth_error() {
+    if [[ "$1" == "401" ]]; then
+        print_message "ERROR" "WebDAV: сервер отклонил авторизацию (HTTP 401) — неверный логин или пароль (Яндекс.Диск/Nextcloud: нужен пароль приложения)."
+    else
+        print_message "ERROR" "WebDAV: доступ запрещён (HTTP $1) — неверные логин/пароль или нет прав на папку."
+    fi
+    log_message "WARN" "remote validate: WebDAV auth rejected (HTTP $1)"
 }
 
 validate_remote_connection() {
@@ -6904,27 +6951,39 @@ validate_remote_connection() {
         [[ "${_REMOTE_TLS_INSECURE_SESSION:-}" == "1" ]] && curl_cmd+=(--insecure)
 
         debug_log "REMOTE" "Running: ${curl_cmd[*]} $base_url/${user:+ (auth: -K stdin)}"
+        local _vrc=0
         if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" "$base_url/" > "$SILENT_LOG" 2>&1; then
             debug_log "REMOTE" "FTP connection SUCCESS"
             return 0
         else
-            debug_log "REMOTE" "FTP with TLS failed, trying without TLS..."
+            _vrc=$?
+            # H7: сертификат не прошёл проверку (TLS-rc curl) — спросим явно и повторим с --insecure.
+            # И для ftps://, и для ftp:// (выгрузка идёт с --ssl — самоподписанный серт vsftpd без
+            # согласия не пройдёт). Согласие мастер сохранит в REMOTE_TLS_INSECURE для cron.
+            if [[ "$base_url" == ftp*://* ]] && _curl_rc_is_tls "$_vrc" \
+               && [[ "${_REMOTE_TLS_INSECURE_SESSION:-}" != "1" ]] && _remote_allow_insecure_tls; then
+                if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" --insecure "$base_url/" > "$SILENT_LOG" 2>&1; then
+                    debug_log "REMOTE" "FTP(S) insecure SUCCESS (user-approved)"
+                    return 0
+                else
+                    _vrc=$?
+                fi
+            fi
+            debug_log "REMOTE" "FTP with TLS failed (rc=$_vrc), trying without TLS..."
             # Повторная попытка без TLS для обычного FTP
             if [[ "$base_url" == ftp://* ]]; then
                 curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only)
                 if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" "$base_url/" > "$SILENT_LOG" 2>&1; then
                     debug_log "REMOTE" "FTP without TLS SUCCESS"
+                    # Сервер отвечает, но его TLS не прошёл строгую проверку: выгрузка пробует TLS (--ssl)
+                    # и без согласия на работу без проверки сертификата упадёт — предупредим сразу.
+                    if _curl_rc_is_tls "$_vrc" && ! _remote_tls_insecure_on; then
+                        print_message "WARN" "FTP: TLS-сертификат сервера не прошёл проверку — выгрузка (с TLS) не пройдёт, пока не разрешите работу без проверки сертификата (повторите настройку или REMOTE_TLS_INSECURE=true)."
+                    fi
                     return 0
                 fi
             fi
-            # H7: FTPS-провал мог быть из-за непроверенного сертификата — спросим явно и повторим.
-            if [[ "$base_url" == ftps://* ]] && _remote_allow_insecure_tls; then
-                curl_cmd=(curl $CURL_SILENT -m 15 --ftp-pasv --list-only --ssl-reqd --insecure)
-                if _curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" "$base_url/" > "$SILENT_LOG" 2>&1; then
-                    debug_log "REMOTE" "FTPS insecure SUCCESS (user-approved)"
-                    return 0
-                fi
-            fi
+            [[ "$_vrc" -eq 67 ]] && print_message "ERROR" "FTP: сервер отклонил логин/пароль (curl rc=67)."
             debug_log "REMOTE" "FTP connection FAILED"
             return 1
         fi
@@ -6945,26 +7004,37 @@ validate_remote_connection() {
         # 207 Multi-Status — стандартный успешный ответ WebDAV
         # 200 OK — некоторые серверы отвечают так
         # 301/302 — редирект (curl -L обработает)
+        # 401/403 — НЕ успех: сервер отвечает, но логин/пароль отклонены (или нет прав на папку).
+        # Раньше 401 GET-fallback'а и insecure-PROPFIND считался «соединение установлено», мастер
+        # сохранял неверные креды, и каждая выгрузка молча падала с 401.
         if [[ "$http_code" =~ ^(200|207)$ ]]; then
             debug_log "REMOTE" "WebDAV connection SUCCESS"
             return 0
+        elif [[ "$http_code" == "401" ]]; then
+            _remote_webdav_auth_error "$http_code"
+            return 1
         else
             debug_log "REMOTE" "PROPFIND failed, trying GET fallback..."
             # Fallback: попробуем простой GET
             http_code=$(_curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" -o "$SILENT_LOG" -w "%{http_code}" "$base_url/" 2> "$SILENT_LOG")
             debug_log "REMOTE" "GET HTTP code: $http_code"
-            if [[ "$http_code" =~ ^(200|207|401)$ ]]; then
-                # 401 означает что сервер отвечает, но нужна авторизация
+            if [[ "$http_code" =~ ^(200|207)$ ]]; then
                 debug_log "REMOTE" "WebDAV connection SUCCESS (via GET)"
                 return 0
+            elif [[ "$http_code" =~ ^(401|403)$ ]]; then
+                _remote_webdav_auth_error "$http_code"
+                return 1
             fi
             # H7: HTTPS-провал (http_code=000) мог быть из-за непроверенного сертификата — спросим явно.
             if [[ "$base_url" == https://* && "$http_code" == "000" ]] && _remote_allow_insecure_tls; then
                 curl_cmd+=(--insecure)
                 http_code=$(_curl_with_auth "$user" "$pass" "${curl_cmd[@]:1}" -o "$SILENT_LOG" -w "%{http_code}" -X PROPFIND -H "Depth: 0" "$base_url/" 2> "$SILENT_LOG")
-                if [[ "$http_code" =~ ^(200|207|401)$ ]]; then
+                if [[ "$http_code" =~ ^(200|207)$ ]]; then
                     debug_log "REMOTE" "WebDAV insecure SUCCESS (user-approved)"
                     return 0
+                elif [[ "$http_code" =~ ^(401|403)$ ]]; then
+                    _remote_webdav_auth_error "$http_code"
+                    return 1
                 fi
             fi
             debug_log "REMOTE" "WebDAV connection FAILED"
@@ -7279,9 +7349,10 @@ _s3_verify_uploaded() {
 
 # _s3_rotate_old [days] — удаляет из S3/R2 СВОИ архивы старше N дней (S3_RETENTION_DAYS, 0=выкл).
 # ЖЁСТКИЙ скоуп: только ключи вида lazarus(_panel)?_(db|files|full|inc)_* внутри S3_PATH — чужие
-# объекты бакета не трогаются НИКОГДА. Новейший архив КАЖДОГО семейства (бот/панель) не удаляется
-# даже если старше N дней (offsite не может стать пустым из-за сбитых часов/долгого простоя).
-# DRY_RUN=true — только печать. NB: list-objects-v2 отдаёт до 1000 ключей — для наших объёмов ок.
+# объекты бакета не трогаются НИКОГДА. Новейший архив КАЖДОЙ группы (семейство бот/панель × тип
+# db/files/full/inc) не удаляется даже если старше N дней: offsite не может остаться без full
+# (файлы, .env, сертификаты), пока свежие db его «перекрывают» — как floor по PREFIX в локальной
+# rotate_backups_by_age. DRY_RUN=true — только печать. NB: list-objects-v2 отдаёт до 1000 ключей.
 _s3_rotate_old() {
     local _days="${1:-${S3_RETENTION_DAYS:-0}}"
     [[ "$REMOTE_STORAGE_TYPE" != "s3" || -z "$S3_BUCKET" ]] && return 0
@@ -7298,12 +7369,26 @@ _s3_rotate_old() {
     }
     [[ -z "$_list" || "$_list" == "None" ]] && return 0
     local _cutoff; _cutoff=$(date -d "-${_days} days" +%s 2> "$SILENT_LOG") || return 1
-    # Новейший ключ каждого семейства — неприкосновенен (сортировка по LastModified ISO8601)
-    local _newest_bot _newest_panel
-    _newest_bot=$(printf '%s\n' "$_list" | awk -F'\t' -v p="$_pfx" \
-        'index($1, p"lazarus_")==1 && index($1, p"lazarus_panel_")!=1 {print $2"\t"$1}' | sort -r | head -1 | cut -f2)
-    _newest_panel=$(printf '%s\n' "$_list" | awk -F'\t' -v p="$_pfx" \
-        'index($1, p"lazarus_panel_")==1 {print $2"\t"$1}' | sort -r | head -1 | cut -f2)
+    # Новейший ключ каждой ГРУППЫ (семейство × тип) — неприкосновенен. Раньше floor был один на
+    # семейство: свежие *_db_* (каждые 30 мин) «перекрывали» full, и после нескольких суток без
+    # успешного full из R2 удалялись ВСЕ full-архивы (локальных копий после выгрузки уже нет).
+    # Группа и плоскость ключа — ровно как у фильтра удаления ниже. LastModified ISO8601 одного
+    # формата сравнивается строками (как прежний sort -r); ничья — по ключу. mawk-совместимо.
+    # Префикс — через substr, не index(): index(s, "") = 0, и при пустом S3_PATH (корень бакета)
+    # floor не защищал бы ничего.
+    local _protect
+    _protect=$(printf '%s\n' "$_list" | awk -F'\t' -v p="$_pfx" '
+        substr($1, 1, length(p)) == p {
+            r = substr($1, length(p) + 1)
+            if (r ~ /\//) next
+            if (!match(r, /^lazarus(_panel)?_(db|files|full|inc)_/)) next
+            g = substr(r, 1, RLENGTH); lm = $2 ""
+            if (!(g in k) || lm > b[g] || (lm == b[g] && $1 > k[g])) { b[g] = lm; k[g] = $1 }
+        }
+        END { for (g in k) print k[g] }')
+    local -A _keep=()
+    local _pk
+    while IFS= read -r _pk; do [[ -n "$_pk" ]] && _keep["$_pk"]=1; done <<< "$_protect"
     local _key _lm _epoch _rel _deleted=0 _failed=0
     while IFS=$'\t' read -r _key _lm; do
         [[ -z "$_key" || -z "$_lm" ]] && continue
@@ -7314,7 +7399,7 @@ _s3_rotate_old() {
         _rel="${_key#"$_pfx"}"
         [[ "$_rel" == */* ]] && continue
         [[ "$_rel" =~ ^lazarus(_panel)?_(db|files|full|inc)_ ]] || continue
-        [[ "$_key" == "$_newest_bot" || "$_key" == "$_newest_panel" ]] && continue
+        [[ -n "${_keep[$_key]:-}" ]] && continue
         _epoch=$(date -d "$_lm" +%s 2> "$SILENT_LOG") || continue
         (( _epoch >= _cutoff )) && continue
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
@@ -7571,6 +7656,10 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
     local attempt=1
     local http_code=""
     local upload_success=false
+    local _curl_rc=0
+    # TLS: строгая проверка сертификата, --insecure — только с явного согласия (см. _remote_tls_insecure_on).
+    local _ins=()
+    _remote_tls_insecure_on && _ins=(--insecure)
     
     # CR/LF в кредах — явный отказ до попыток (stderr curl в цикле уходит в SILENT_LOG).
     if [[ -n "$REMOTE_STORAGE_USER" ]] && ! _remote_creds_ok "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS"; then
@@ -7609,16 +7698,18 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
             
             # Поддержка FTPS
             if [[ "$upload_url" == ftps://* ]]; then
-                curl_opts+=(--ssl-reqd --insecure)
-                debug_log "UPLOAD" "FTPS: SSL required"
+                curl_opts+=(--ssl-reqd "${_ins[@]}")
+                debug_log "UPLOAD" "FTPS: SSL required${_ins:+ (insecure: user-approved)}"
             elif [[ "$upload_url" == ftp://* ]]; then
-                curl_opts+=(--ssl --insecure)    # Попробовать TLS если доступен
-                debug_log "UPLOAD" "FTP: Try TLS if available"
+                curl_opts+=(--ssl "${_ins[@]}")    # Попробовать TLS если доступен
+                debug_log "UPLOAD" "FTP: Try TLS if available${_ins:+ (insecure: user-approved)}"
             fi
             
             curl_opts+=("$upload_url")
             debug_log "UPLOAD" "Executing FTP upload..."
-            http_code=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
+            # rc curl — отдельно: по нему ниже отличаем провал TLS-проверки от прочих ошибок.
+            http_code=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${curl_opts[@]}" 2> "$SILENT_LOG"); _curl_rc=$?
+            [[ $_curl_rc -ne 0 ]] && http_code="000"
             debug_log "UPLOAD" "FTP response code: $http_code"
             
             # FTP коды успеха: 226 (Transfer complete), 250 (Requested file action okay)
@@ -7635,15 +7726,16 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
             curl_opts+=(--retry-delay 3)
             debug_log "UPLOAD" "WebDAV mode: follow redirects, retry 2"
             
-            # Поддержка HTTPS с самоподписанными сертификатами
-            if [[ "$upload_url" == https://* ]]; then
-                curl_opts+=(--insecure)
-                debug_log "UPLOAD" "WebDAV: HTTPS with insecure"
+            # HTTPS: самоподписанный сертификат — только с явного согласия (REMOTE_TLS_INSECURE/сессия)
+            if [[ "$upload_url" == https://* && ${#_ins[@]} -gt 0 ]]; then
+                curl_opts+=("${_ins[@]}")
+                debug_log "UPLOAD" "WebDAV: HTTPS with insecure (user-approved)"
             fi
             
             curl_opts+=("$upload_url")
             debug_log "UPLOAD" "Executing WebDAV upload..."
-            http_code=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${curl_opts[@]}" 2> "$SILENT_LOG") || http_code="000"
+            http_code=$(_curl_with_auth "$REMOTE_STORAGE_USER" "$REMOTE_STORAGE_PASS" "${curl_opts[@]}" 2> "$SILENT_LOG"); _curl_rc=$?
+            [[ $_curl_rc -ne 0 ]] && http_code="000"
             debug_log "UPLOAD" "WebDAV response code: $http_code"
             
             # WebDAV коды успеха: 200 OK, 201 Created, 202 Accepted (async commit), 204 No Content.
@@ -7657,8 +7749,8 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
         fi
         
         # Логируем неудачную попытку
-        debug_log "UPLOAD" "Attempt $attempt FAILED with HTTP $http_code"
-        log_message "WARN" "Upload attempt $attempt failed: HTTP $http_code for $upload_url"
+        debug_log "UPLOAD" "Attempt $attempt FAILED with HTTP $http_code (curl rc=$_curl_rc)"
+        log_message "WARN" "Upload attempt $attempt failed: HTTP $http_code (curl rc=$_curl_rc) for $upload_url"
         
         ((attempt++))
         [[ $attempt -le $max_retries ]] && sleep $retry_delay
@@ -7669,10 +7761,12 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
         # серверы фиксируют файл по закрытию соединения и отвечают 226/201 даже на
         # обрезанный transfer (quota/диск). Без проверки false success → delete-local
         # терял единственную копию. HEAD/SIZE → Content-Length, сверяем с локальным.
+        # TLS — как у самой выгрузки: ftp:// тоже с --ssl (раньше HEAD шёл без TLS, и креды
+        # уходили открытым текстом при TLS-выгрузке), --insecure — только с явного согласия.
         local _vopts=(-sI -m 60)
-        [[ "$upload_url" == ftp://*  ]] && _vopts+=(--ftp-pasv)
-        [[ "$upload_url" == ftps://* ]] && _vopts+=(--ftp-pasv --ssl-reqd --insecure)
-        [[ "$upload_url" == https://* ]] && _vopts+=(--insecure)
+        [[ "$upload_url" == ftp://*  ]] && _vopts+=(--ftp-pasv --ssl "${_ins[@]}")
+        [[ "$upload_url" == ftps://* ]] && _vopts+=(--ftp-pasv --ssl-reqd "${_ins[@]}")
+        [[ "$upload_url" == https://* ]] && _vopts+=("${_ins[@]}")
         local _rmt_clen _head_rc _hdr
         # rc самого curl-HEAD — отдельным шагом: после `var=$(конвейер)` PIPESTATUS содержит один
         # элемент (rc подстановки = rc tr, всегда 0), и ветка «HEAD не выполнился → локаль не
@@ -7704,13 +7798,18 @@ REMOTE_UPLOAD_SIZE_UNVERIFIED="false"
         log_message "SUCCESS" "Uploaded $filename to $REMOTE_STORAGE_TYPE ($upload_url) HTTP=$http_code remote_size=${_rmt_clen:-?}"
         return 0
     else
-        print_message "ERROR" "Ошибка загрузки после $max_retries попыток (Код: $http_code)" >&2
-        if [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]]; then 
-            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ FTP: Ошибка'
-        else 
-            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ WebDAV: Ошибка'
+        local _flabel="WebDAV"; [[ "$REMOTE_STORAGE_TYPE" == "ftp" ]] && _flabel="FTP"
+        # Провал проверки сертификата при строгом TLS — отдельное понятное сообщение: молча
+        # переходить на --insecure нельзя, а голое «Ошибка» не подсказывает, что делать.
+        if _curl_rc_is_tls "$_curl_rc" && ! _remote_tls_insecure_on; then
+            print_message "ERROR" "$_flabel: TLS-сертификат сервера не прошёл проверку (curl rc=$_curl_rc) — загрузка не выполнена. Повторите настройку хранилища (меню → Удалённое хранилище) и разрешите работу без проверки, либо задайте REMOTE_TLS_INSECURE=true в config.env (риск MITM)." >&2
+            REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_flabel"': ошибка TLS-сертификата — повторите настройку хранилища или REMOTE_TLS_INSECURE=true'
+            log_message "ERROR" "Failed upload $filename to $REMOTE_STORAGE_TYPE: TLS verification failed (curl rc=$_curl_rc); re-run storage setup or set REMOTE_TLS_INSECURE=true"
+            return 1
         fi
-        log_message "ERROR" "Failed upload $filename to $REMOTE_STORAGE_TYPE after $max_retries attempts. Last HTTP=$http_code"
+        print_message "ERROR" "Ошибка загрузки после $max_retries попыток (Код: $http_code)" >&2
+        REMOTE_UPLOAD_STATUS_TEXT=$'\n☁️ '"$_flabel"': Ошибка'
+        log_message "ERROR" "Failed upload $filename to $REMOTE_STORAGE_TYPE after $max_retries attempts. Last HTTP=$http_code curl rc=$_curl_rc"
         return 1
     fi
 }
@@ -7764,6 +7863,7 @@ configure_remote_storage() {
                 REMOTE_STORAGE_URL=""
                 REMOTE_STORAGE_USER=""
                 REMOTE_STORAGE_PASS=""
+                REMOTE_TLS_INSECURE="false"
                 save_config
                 print_message "SUCCESS" "Удалённое хранилище отключено."
                 sleep 1
@@ -8148,12 +8248,19 @@ configure_remote_storage() {
         echo ""
         print_message "INFO" "Проверка подключения..."
         
+        # Согласие на работу без проверки TLS — заново для КАЖДОГО настраиваемого сервера: прежнее
+        # «да» этой сессии (другой сервер/попытка) не должно молча перейти в REMOTE_TLS_INSECURE.
+        _REMOTE_TLS_INSECURE_SESSION=""
         if validate_remote_connection "$new_type" "$input_url" "$input_user" "$input_pass"; then
             print_message "SUCCESS" "Соединение установлено!"
             REMOTE_STORAGE_TYPE="$new_type"
             REMOTE_STORAGE_URL="$input_url"
             REMOTE_STORAGE_USER="$input_user"
             REMOTE_STORAGE_PASS="$input_pass"
+            # Согласие из validate — в конфиг: без него cron-выгрузка (non-tty, спросить некого)
+            # шла бы со строгой проверкой и падала на том же сертификате.
+            REMOTE_TLS_INSECURE="false"
+            [[ "${_REMOTE_TLS_INSECURE_SESSION:-}" == "1" ]] && REMOTE_TLS_INSECURE="true"
             save_config
             print_message "SUCCESS" "Настройки сохранены."
             sleep 1.5
@@ -8167,6 +8274,8 @@ configure_remote_storage() {
                 REMOTE_STORAGE_URL="$input_url"
                 REMOTE_STORAGE_USER="$input_user"
                 REMOTE_STORAGE_PASS="$input_pass"
+                REMOTE_TLS_INSECURE="false"
+                [[ "${_REMOTE_TLS_INSECURE_SESSION:-}" == "1" ]] && REMOTE_TLS_INSECURE="true"
                 save_config
                 print_message "WARN" "Настройки сохранены (соединение не проверено)."
                 sleep 1.5
@@ -10400,8 +10509,7 @@ _send_telegram_album() {
     media+="]"
     [[ -n "$TG_MESSAGE_THREAD_ID" ]] && form+=(-F "message_thread_id=$TG_MESSAGE_THREAD_ID")
     local _resp http_code
-    _resp=$(curl $CURL_SILENT --max-time 300 -w '\n%{http_code}' -X POST \
-        "https://api.telegram.org/bot$BOT_TOKEN/sendMediaGroup" \
+    _resp=$(_tg_curl sendMediaGroup $CURL_SILENT --max-time 300 -w '\n%{http_code}' -X POST \
         -F "chat_id=$CHAT_ID" -F "media=$media" "${form[@]}" 2> "$SILENT_LOG")
     http_code="${_resp##*$'\n'}"
     debug_log "TG" "sendMediaGroup HTTP $http_code (${#files[@]} docs)"
@@ -10429,8 +10537,7 @@ _send_telegram_text() {
     [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && return 1
     local thread=(); [[ -n "$TG_MESSAGE_THREAD_ID" ]] && thread=(-d "message_thread_id=$TG_MESSAGE_THREAD_ID")
     local _resp http_code
-    _resp=$(curl $CURL_SILENT --max-time 120 -w '\n%{http_code}' -X POST \
-        "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    _resp=$(_tg_curl sendMessage $CURL_SILENT --max-time 120 -w '\n%{http_code}' -X POST \
         -d chat_id="$CHAT_ID" -d parse_mode="MarkdownV2" \
         --data-urlencode text="$text" "${thread[@]}" 2> "$SILENT_LOG")
     http_code="${_resp##*$'\n'}"
@@ -16222,19 +16329,23 @@ set -- "${_NEWARGS[@]}"
 case "$1" in
     # Legacy команды (для совместимости с cron — обычно non-interactive)
     # Sentinel-check: создаём marker если есть v1 backup'ы (для следующего interactive run).
-    backup_full)  create_backup_dispatch "full";       _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
-    backup_db)    create_backup_dispatch "db_only";    _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
-    backup_files) create_backup_dispatch "files_only"; _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+    # Код выхода = rc диспетчера (_cli_rc), а не хвостового [[ IS_INTERACTIVE ]]: в cron он ложен,
+    # и процесс ВСЕГДА завершался с 1 — обёртки (&& healthcheck, systemd, monit) не видели ни
+    # успеха, ни провала verify. exit безопасен: после case кода нет, EXIT-trap отработает как обычно.
+    backup_full)  create_backup_dispatch "full";       _cli_rc=$?; _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
+    backup_db)    create_backup_dispatch "db_only";    _cli_rc=$?; _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
+    backup_files) create_backup_dispatch "files_only"; _cli_rc=$?; _v2_migration_sentinel; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
     backup_inc|backup_incremental)
-        create_incremental_backup
+        create_incremental_backup; _cli_rc=$?
         [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt
+        exit "$_cli_rc"
         ;;
     backup|-B)
         case "$2" in
-            create|full|-c)     create_backup_dispatch "full";       [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
-            db|-d)              create_backup_dispatch "db_only";    [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
-            files|-f)           create_backup_dispatch "files_only"; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
-            inc|incremental|-i) create_incremental_backup;  [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt ;;
+            create|full|-c)     create_backup_dispatch "full";       _cli_rc=$?; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
+            db|-d)              create_backup_dispatch "db_only";    _cli_rc=$?; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
+            files|-f)           create_backup_dispatch "files_only"; _cli_rc=$?; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
+            inc|incremental|-i) create_incremental_backup;           _cli_rc=$?; [[ "$IS_INTERACTIVE" == true ]] && _post_backup_prompt; exit "$_cli_rc" ;;
             list|-l)            menu_list_backups ;;
             *)
                 echo "Использование: lazarus backup <команда>"

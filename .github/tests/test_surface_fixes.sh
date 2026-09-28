@@ -283,6 +283,8 @@ printf '%s' "$_remote_body" | grep -q 'NO PASSWORD' && ok \
     print_message() { :; }; log_message() { :; }; debug_log() { :; }
     _s3_aws_run() {
         printf 'backups/lazarus_db_2020-01-01_00_00_00.tar.gz\t2020-01-01T00:00:00.000Z\n'
+        # 6.0.4: floor — новейший в ГРУППЕ (семейство × тип); более новый db, чтобы 2020 не был floor'ом
+        printf 'backups/lazarus_db_2020-06-01_00_00_00.tar.gz\t2020-06-01T00:00:00.000Z\n'
         printf 'backups/sub/lazarus_db_2019-01-01_00_00_00.tar.gz\t2019-01-01T00:00:00.000Z\n'
         printf 'backups/lazarus_full_2099-01-01_00_00_00.tar.gz\t2099-01-01T00:00:00.000Z\n'
     }
@@ -299,6 +301,9 @@ printf '%s' "$_remote_body" | grep -q 'NO PASSWORD' && ok \
     # новейший плоский — под защитой
     printf '%s' "$out" | grep -q 'lazarus_full_2099' \
         && { echo "SUB-FAIL: newest key must be protected"; exit 1; }
+    # новейший db (старше срока) — floor своей группы, не удаляется
+    printf '%s' "$out" | grep -q 'lazarus_db_2020-06-01' \
+        && { echo "SUB-FAIL: newest db of its group must be protected"; exit 1; }
     exit 0
 ) && ok || bad "№16 s3 rotate scope (flat-only, newest protected)"
 
