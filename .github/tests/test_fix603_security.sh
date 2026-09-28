@@ -351,7 +351,8 @@ no_pw && ok || bad "6f WebDAV: пароля нет в argv"
 reset_net; CURL_SCEN=ftp_val; DEBUG_MODE=true
 _dbg=$(validate_remote_connection ftp "ftp://h.example/p" u "$PW" 2>&1 </dev/null); rc=$?
 DEBUG_MODE=false
-[[ $rc -eq 0 ]] && ok || bad "6h validate FTP rc=0 (got $rc)"
+# 6.0.4: TLS упал, сервер ответил только без TLS, согласия нет → rc=1 (выгрузка идёт с --ssl и упадёт)
+[[ $rc -eq 1 && "$_dbg" == *"TLS-сертификат не прошёл проверку"* ]] && ok || bad "6h validate FTP: TLS-провал без согласия → rc=1 с WARN (got $rc)"
 [[ $(calls) -eq 2 && $(calls_k) -eq 2 ]] && no_pw && cfg_ok 2 && ok || bad "6i validate FTP: оба запроса с -K -, пароля нет в argv"
 [[ "$_dbg" != *"S3cr3t"* && "$_dbg" == *"Running: curl"* ]] && ok || bad "6j debug-вывод без пароля"
 
