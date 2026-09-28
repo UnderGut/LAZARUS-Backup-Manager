@@ -42,10 +42,14 @@ UPDATE_REMOTE_VERSION=""  # Версия на сервере
 # --- КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА БОТА (НЕ ПАНЕЛИ!) ---
 # Согласно документации: rwp_shop, rwp_shop_db (+ dash-форма rwp-shop: живой каталог /opt/rwp-shop)
 # Также поддержка legacy: telegram-shop, shop-bot, shopbot
+# 6.0.4: remnawave_bot — публичный бот bedolaga (контейнеры remnawave_bot / remnawave_bot_db /
+# remnawave_bot_redis). Именно с подчёркиванием: у панели дефисы (remnawave-db), а БД и redis бота
+# отсекает как «не app» _is_bot_infra_container (токены _db/_redis). Слово bedolaga не берём: оно
+# шире (им могут называться соседние сервисы проекта, например веб-кабинет), и сосед стал бы «ботом».
 # Порядок важен: сначала более специфичные паттерны.
 # ЕДИНСТВЕННЫЙ источник набора: resolve_backup_target / resolve_bot_runtime /
 # bind_bot_runtime_or_fail берут копию ИЗ ЭТОЙ константы — дрейф литеральных копий исключён.
-BOT_KEYWORDS_DEFAULT=("rwp_shop" "rwp-shop" "telegram-shop" "shop-bot" "shopbot")
+BOT_KEYWORDS_DEFAULT=("rwp_shop" "rwp-shop" "telegram-shop" "shop-bot" "shopbot" "remnawave_bot")
 KEYWORDS=("${BOT_KEYWORDS_DEFAULT[@]}")
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
@@ -2945,8 +2949,8 @@ scan_system_for_bot() {
             for svc in "${db_services[@]}"; do
                 local db_c
                 db_c=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
-                # Исключаем БД панели
-                if [[ -n "$db_c" && "$db_c" != "remnawave-db" && "$db_c" != *"remnawave_"* ]]; then
+                # Исключаем БД панели и infra-billing — по роли (_is_foreign_stack_db), не по имени
+                if [[ -n "$db_c" ]] && ! _is_foreign_stack_db "$db_c"; then
                     echo "$db_c"
                     exit 0
                 fi
@@ -2960,7 +2964,7 @@ scan_system_for_bot() {
                 local _i="${line#*|}"
                 # Образы PostgreSQL-семейства
                 if [[ "$_i" =~ ^(postgres|postgis|timescale/timescaledb|library/postgres) ]]; then
-                    if [[ "$_n" != "remnawave-db" && "$_n" != *"remnawave_"* ]]; then
+                    if ! _is_foreign_stack_db "$_n"; then
                         echo "$_n"
                         exit 0
                     fi
@@ -4070,12 +4074,30 @@ bot_status() {
 
 # --- ОБНАРУЖЕНИЕ УСТАНОВКИ БОТА ---
 
+# _is_foreign_stack_db <name>: rc=0 — кандидат в БД бота принадлежит панели или infra-billing, брать
+# его нельзя (общий фильтр find_db_container_for_path и поиска БД в scan_system_for_bot). 6.0.4: раньше
+# отсекали по подстроке 'remnawave_' — под неё попадала БД публичного бота bedolaga (remnawave_bot_db),
+# и та не находилась никогда, а infra-billing-db (каталог панели, шаг по образу) подстрокой не ловилась.
+# Теперь по идентичности: точные панельные имена, PANEL_DB_CONTAINER, DISC_PANEL_*, роль по образу и
+# проекту (_is_panel_container) и роли billing-*. Роль unknown (docker завис) не отсекаем, как и прежний
+# фильтр: поиск лишь предлагает имя, принадлежность каталогу бота и роль перепроверяют гарды restore.
+_is_foreign_stack_db() {
+    local _n="$1"
+    [[ -z "$_n" || "$_n" == "remnawave-db" ]] && return 0
+    _is_panel_container "$_n" && return 0
+    case "$(_container_role "$_n" 2> /dev/null)" in
+        billing-*) return 0 ;;
+    esac
+    return 1
+}
+
 find_db_container_for_path() {
     local path="$1"
     [[ -z "$path" || ! -d "$path" ]] && return 1
     # M7 audit fix: subshell вместо `cd $path; ... cd -` — изолирует cd,
     # не зависит от OLDPWD, не поломает caller'а при сигналах между cd.
     # M2 audit fix: image-based fallback для кастомных db-сервисов.
+    # Панель/биллинг отсекает _is_foreign_stack_db (по роли, не по подстроке имени).
     local db_name
     db_name=$(
         cd "$path" 2> "$SILENT_LOG" || exit 1
@@ -4084,7 +4106,7 @@ find_db_container_for_path() {
         for svc in "${db_services[@]}"; do
             local n
             n=$(docker compose ps -a --format '{{.Name}}' "$svc" 2> "$SILENT_LOG")
-            if [[ -n "$n" && "$n" != "remnawave-db" && "$n" != *"remnawave_"* ]]; then
+            if [[ -n "$n" ]] && ! _is_foreign_stack_db "$n"; then
                 echo "$n"
                 exit 0
             fi
@@ -4097,7 +4119,7 @@ find_db_container_for_path() {
             local _n="${line%%|*}"
             local _i="${line#*|}"
             if [[ "$_i" =~ ^(postgres|postgis|timescale/timescaledb|library/postgres) ]]; then
-                if [[ "$_n" != "remnawave-db" && "$_n" != *"remnawave_"* ]]; then
+                if ! _is_foreign_stack_db "$_n"; then
                     echo "$_n"
                     exit 0
                 fi
@@ -4560,15 +4582,39 @@ write_password_file() {
     fi
 
     mkdir -p "$(dirname "$file")"
+    # 6.0.4: .password — симлинк (сейф секретов, DR-копия ключей)? rename temp поверх ССЫЛКИ заменял
+    # её обычным файлом, а в цели оставался СТАРЫЙ пароль: восстановление по паролю из сейфа потом не
+    # открывало новые архивы. Пишем в цель ссылки, как save_config. Проверка пути выше — по пути
+    # ссылки, как у read_password_file (ссылка наружу INSTALL_DIR была допустима и в 6.0.2, когда
+    # запись шла через `> file`). Висячая ссылка: readlink -f даёт путь цели — файл создастся там.
+    local _pw_dst="$file"
+    if [[ -L "$file" ]]; then
+        _pw_dst=$(readlink -f "$file" 2> "$SILENT_LOG") || _pw_dst=""
+        if [[ -z "$_pw_dst" ]]; then
+            # цепочка не разрешается (петля, нет каталога цели) — прежнее поведение 6.0.3, но вслух
+            _pw_dst="$file"
+            print_message "WARN" "Ссылка $file не разрешается (нет каталога цели или петля) — она будет заменена обычным файлом пароля."
+            log_message "WARN" "write_password_file: symlink $file unresolvable — replacing link with regular file"
+        fi
+    fi
+    # Путь пароля (или цель ссылки) — каталог: `mv -f temp каталог` положил бы temp ВНУТРЬ каталога
+    # и вернул 0 — «пароль сохранён», а читать нечего. Отказ до записи.
+    if [[ -d "$_pw_dst" ]]; then
+        print_message "ERROR" "Путь файла пароля — каталог ($_pw_dst) — отказ, пароль не сохранён."
+        log_message "ERROR" "write_password_file: target is a directory: $_pw_dst"
+        return 1
+    fi
     # №25: пишем во temp РЯДОМ с файлом (та же ФС → rename атомарен) и подменяем только после всех
     # проверок. Раньше `: > file` обнулял ПРЕЖНИЙ пароль до записи нового, а сбой printf/сверки/chmod
     # делал rm -f — старый файл пароля пропадал: после рестарта (и в cron) бэкапы шли бы без
     # шифрования. Теперь при любом сбое прежний файл пароля цел, удаляется только temp.
-    local _pw_tmp="${file}.tmp.$$" _pw_stale _pw_spid
+    # temp — рядом с ЦЕЛЬЮ (при симлинке — в её каталоге), иначе rename шёл бы между ФС.
+    local _pw_tmp="${_pw_dst}.tmp.$$" _pw_stale _pw_spid
     # Уборка брошенных temp (SIGKILL/OOM между записью и rename): только точный шаблон <file>.tmp.<PID>
     # и только если процесса-владельца уже нет (живой параллельный writer пишет свой). Внутри пароль.
+    # Оба шаблона: у цели (теперь temp там) и у ссылки (там его оставляла 6.0.3 при симлинке).
     # Цикл inline, не хелпером: тесты извлекают эту функцию sed'ом по одной.
-    for _pw_stale in "$file".tmp.*; do
+    for _pw_stale in "$_pw_dst".tmp.* "$file".tmp.*; do
         [[ -f "$_pw_stale" ]] || continue
         _pw_spid="${_pw_stale##*.tmp.}"
         [[ "$_pw_spid" =~ ^[0-9]+$ ]] || continue
@@ -4605,18 +4651,18 @@ write_password_file() {
         rm -f "$_pw_tmp"
         return 1
     fi
-    if ! mv -f "$_pw_tmp" "$file" 2> "$SILENT_LOG"; then
-        print_message "ERROR" "Не удалось заменить файл пароля ($file) — новый не сохранён, прежний оставлен без изменений."
-        log_message "ERROR" "write_password_file: rename $_pw_tmp -> $file failed (previous password file kept)"
+    if ! mv -f "$_pw_tmp" "$_pw_dst" 2> "$SILENT_LOG"; then
+        print_message "ERROR" "Не удалось заменить файл пароля ($_pw_dst) — новый не сохранён, прежний оставлен без изменений."
+        log_message "ERROR" "write_password_file: rename $_pw_tmp -> $_pw_dst failed (previous password file kept)"
         rm -f "$_pw_tmp"
         return 1
     fi
-    # Дополнительно проверяем фактические права (на случай ACL override)
+    # Дополнительно проверяем фактические права (на случай ACL override) — у цели, куда лёг пароль
     local _perms
-    _perms=$(stat -c '%a' "$file" 2> "$SILENT_LOG" || echo "?")
+    _perms=$(stat -c '%a' "$_pw_dst" 2> "$SILENT_LOG" || echo "?")
     if [[ "$_perms" != "600" ]]; then
-        print_message "WARN" "Права на $file: $_perms (ожидалось 600). Проверьте ACL/mount опции."
-        log_message "WARN" "Password file permissions are $_perms (expected 600): $file"
+        print_message "WARN" "Права на $_pw_dst: $_perms (ожидалось 600). Проверьте ACL/mount опции."
+        log_message "WARN" "Password file permissions are $_perms (expected 600): $_pw_dst"
     fi
     return 0
 }
@@ -4647,6 +4693,22 @@ read_password_file() {
     BACKUP_PASSWORD="${BACKUP_PASSWORD%$'\n'}"
     BACKUP_PASSWORD="${BACKUP_PASSWORD%$'\r'}"
     [[ -z "$BACKUP_PASSWORD" ]] && return 1
+    # 6.0.4: края пароля. Бэкап и verify берут пароль из файла КАК ЕСТЬ, а ручной ввод (read без IFS=)
+    # срезает пробелы/табы по краям, BOM от Блокнота вслепую не набрать — пароль при restore «не
+    # совпадает». Сам пароль НЕ меняем: им уже зашифрованы архивы, правка краёв закрыла бы их.
+    local _pw_edge=""
+    if [[ "$BACKUP_PASSWORD" == $'\xEF\xBB\xBF'* ]]; then
+        _pw_edge="BOM (метка UTF-8) в начале"
+    fi
+    if [[ "$BACKUP_PASSWORD" == [[:space:]]* || "$BACKUP_PASSWORD" == *[[:space:]] ]]; then
+        _pw_edge="${_pw_edge:+$_pw_edge; }пробел/таб/перенос по краям"
+    fi
+    if [[ -n "$_pw_edge" ]]; then
+        # stderr: предикаты готовности (_encryption_ready) не должны подмешивать текст в stdout
+        # вызывателя, если его захватят в $(...)
+        print_message "WARN" "В пароле из $file: $_pw_edge. Бэкапы шифруются им как есть, но при ручном вводе (restore) края легко потерять. Пароль не изменён — архивы, созданные им, открываются только им; для новых архивов задайте пароль без пробелов по краям." >&2
+        log_message "WARN" "Password file has leading/trailing whitespace or BOM (password kept as is): $file"
+    fi
     return 0
 }
 
