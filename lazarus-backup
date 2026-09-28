@@ -327,6 +327,9 @@ _read_ssh_key_input() {
 
 # Trap для очистки при завершении: lock + sensitive tmp пути
 cleanup_on_exit() {
+    # 6.0.4: процесс уже завершается — повторный Ctrl+C/TERM во время зачистки не должен оборвать её
+    # (exit 130 из _lazarus_int_handler бросал недочищенные куски с открытыми дампами до sweep).
+    trap '' INT TERM
     # Освобождаем блокировку если была получена
     # NOTE: debug_log может не работать здесь если вызывается после закрытия stdout
     if [[ -n "$LOCK_FD" ]]; then
@@ -341,17 +344,27 @@ cleanup_on_exit() {
     # #ultra-LOW: ЗАТИРАЕМ (shred), а не просто unlink — на журналируемой/CoW ФС (дисковый TMPDIR,
     # когда /dev/shm недоступен) содержимое иначе восстановимо undelete-инструментами. shred
     # выполняет обещание docstring (_read_ssh_key_input: «shred при выходе»). Нет shred → rm-fallback.
+    # 6.0.4: один проход (-n 1) и только < 1 ГиБ, крупнее — rm (как _sweep_stale_intermediates):
+    # трёхпроходный shred многогигабайтных кусков (.part, cipher_tmp, tar стека) при остановке
+    # упирался в TimeoutStopSec → SIGKILL, и зачистка не доходила до остальных путей.
     if [[ ${#SENSITIVE_TMP_PATHS[@]} -gt 0 ]]; then
-        local p _has_shred=""
+        local p _sz _has_shred=""
         command -v shred >/dev/null 2>&1 && _has_shred=1
         for p in "${SENSITIVE_TMP_PATHS[@]}"; do
             [[ -n "$p" && -e "$p" ]] || continue
             if [[ -n "$_has_shred" ]]; then
                 if [[ -f "$p" ]]; then
-                    shred -fu "$p" 2>/dev/null || rm -f "$p" 2>/dev/null || true
+                    _sz=$(stat -c%s "$p" 2>/dev/null || echo 0)
+                    if [[ "$_sz" =~ ^[0-9]+$ && "$_sz" -lt 1073741824 ]]; then
+                        shred -fu -n 1 "$p" 2>/dev/null || rm -f "$p" 2>/dev/null || true
+                    else
+                        rm -f "$p" 2>/dev/null || true
+                    fi
                 else
-                    # каталог: затираем регулярные файлы внутри, затем сносим структуру
-                    find "$p" -type f -exec shred -fu {} + 2>/dev/null || true
+                    # каталог: затираем регулярные файлы < 1 ГиБ, затем сносим структуру целиком.
+                    # -size -1048576k, НЕ -1G: find округляет размер вверх до целых G, и под -1G
+                    # попали бы только пустые файлы.
+                    find "$p" -type f -size -1048576k -exec shred -fu -n 1 {} + 2>/dev/null || true
                     rm -rf "$p" 2>/dev/null || true
                 fi
             else
@@ -560,6 +573,37 @@ _derive_hmac_key() {
     printf '%s' "$password" | openssl dgst -sha256 -hmac "lazarus-hmac-key-v1" -binary | _to_hex
 }
 
+# _hmac_sha256_file <key_hex> <file>: HMAC-SHA256 (RFC 2104) содержимого файла → 32 байта в stdout.
+# Байт-в-байт то же, что `openssl dgst -sha256 -mac HMAC -macopt hexkey:<key_hex> -binary <file>`
+# (формат v2 не меняется, старые архивы проверяются), но ключ НЕ попадает в argv: ipad/opad печатает
+# builtin printf внутри конвейера, openssl видит только поток. 6.0.4: раньше K_mac стоял в argv
+# (-macopt hexkey:…) и читался из /proc/*/cmdline любым локальным процессом, а K_mac — одно HMAC от
+# пароля без соли: по нему пароль подбирается офлайн в обход PBKDF2 (одна HMAC на кандидата).
+# rc≠0 и пустой вывод — ключ не hex/нечётной длины, файл не читается или сбой openssl.
+_hmac_sha256_file() {
+    local _k="$1" _f="$2" _i _b _ip="" _op="" _in="" _ib=""
+    [[ -n "$_k" && $(( ${#_k} % 2 )) -eq 0 && "$_k" != *[!0-9a-fA-F]* && -r "$_f" ]] || return 1
+    # Ключ длиннее блока SHA-256 (64 байта) по RFC 2104 заменяется своим хешем (K_mac — 32 байта,
+    # ветка для общности хелпера и совпадения с openssl на любых ключах).
+    if (( ${#_k} > 128 )); then
+        local _kb=""
+        for (( _i = 0; _i < ${#_k}; _i += 2 )); do _kb+="\\x${_k:_i:2}"; done
+        _k=$(printf '%b' "$_kb" | openssl dgst -sha256 -binary | _to_hex)
+        [[ ${#_k} -eq 64 ]] || return 1
+    fi
+    # ipad/opad: ключ, дополненный нулями до 64 байт, XOR 0x36 / 0x5c — как \xHH-строки для %b.
+    for (( _i = 0; _i < 64; _i++ )); do
+        if (( _i * 2 < ${#_k} )); then _b=$(( 16#${_k:_i*2:2} )); else _b=0; fi
+        printf -v _ip '%s\\x%02x' "$_ip" $(( _b ^ 0x36 ))
+        printf -v _op '%s\\x%02x' "$_op" $(( _b ^ 0x5c ))
+    done
+    # pipefail: сбой чтения файла (cat) не должен дать «хеш обрывка» вместо ошибки.
+    _in=$(set -o pipefail; { printf '%b' "$_ip" && cat -- "$_f"; } | openssl dgst -sha256 -binary | _to_hex) || return 1
+    [[ ${#_in} -eq 64 ]] || return 1
+    for (( _i = 0; _i < 64; _i += 2 )); do _ib+="\\x${_in:_i:2}"; done
+    { printf '%b' "$_op" && printf '%b' "$_ib"; } | openssl dgst -sha256 -binary
+}
+
 # Создаёт v2 envelope: openssl enc → LAZ2 + ciphertext + HMAC
 # Возвращает 0 при успехе, 1 при ошибке. Перезаписывает $2.
 _hmac_envelope_create() {
@@ -574,16 +618,19 @@ _hmac_envelope_create() {
     # Пароль передаём через ОКРУЖЕНИЕ (openssl -pass env:VAR), НЕ через argv bash -c:
     # argv виден в ps//proc/*/cmdline любому юзеру на всё время шифрования, а environ
     # читаем только владельцем процесса (тот же принцип, что sshpass -e в panel_migrate_in).
-    # unset гарантирован trap RETURN (function-local, снимается при выходе из функции).
+    # 6.0.4: unset — ЯВНО на обоих путях, без trap RETURN. RETURN-trap в bash один на весь шелл
+    # (без functrace не function-local): trap, поставленный здесь, заменял trap вызывающего
+    # ('release_lock' в _backup_remote_target/create_backup) и оставался после возврата — блокировка
+    # не снималась, и cron до выхода из меню получал «Другой процесс бэкапа уже запущен».
     export LAZARUS_ENC_PW="$password"
-    trap 'unset LAZARUS_ENC_PW' RETURN
     if ! _run_pipe_with_timeout "${ENCRYPT_TIMEOUT_SEC:-1800}" "encrypt-aes" \
             'openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -in "$1" -out "$2" -pass env:LAZARUS_ENC_PW 2> "$3"' \
             "$infile" "$cipher_tmp" "$SILENT_LOG"; then
+        unset LAZARUS_ENC_PW
         rm -f "$cipher_tmp"; unregister_sensitive_tmp "$cipher_tmp"
         return 1
     fi
-    unset LAZARUS_ENC_PW   # не ждём RETURN — окно жизни секрета в env минимальное
+    unset LAZARUS_ENC_PW   # окно жизни секрета в env — только openssl enc
 
     # Step 1.5: ciphertext не должен быть пустым (silently-empty openssl output =
     # битый infile / openssl error, который пайплайн мог не поймать).
@@ -620,7 +667,7 @@ _hmac_envelope_create() {
     {
         printf 'LAZ2' \
         && cat "$cipher_tmp" \
-        && openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp"
+        && _hmac_sha256_file "$k_mac" "$cipher_tmp"
     } > "$_part" || _wrc=1
     local _want=$((4 + _cipher_sz + 32))
     local _got
@@ -703,7 +750,7 @@ _hmac_envelope_verify() {
     fi
 
     local computed
-    computed=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp" | _to_hex)
+    computed=$(_hmac_sha256_file "$k_mac" "$cipher_tmp" | _to_hex)
     local stored
     stored=$(tail -c 32 "$file" | _to_hex)
 
@@ -769,7 +816,7 @@ _hmac_envelope_decrypt() {
             return 2
         fi
         local computed stored
-        computed=$(openssl dgst -sha256 -mac HMAC -macopt "hexkey:$k_mac" -binary "$cipher_tmp" | _to_hex)
+        computed=$(_hmac_sha256_file "$k_mac" "$cipher_tmp" | _to_hex)
         stored=$(tail -c 32 "$infile" | _to_hex)
         if [[ -z "$computed" ]]; then
             log_message "ERROR" "HMAC decrypt: MAC не вычислен (ошибка чтения/openssl, не порча) — $infile"
@@ -786,8 +833,9 @@ _hmac_envelope_decrypt() {
         # MAC OK → decrypt тот же cipher_tmp (не extract ещё раз).
         # №6 (симметрия с _hmac_envelope_create): пароль через env, не через herestring —
         # herestring материализуется во временный файл; env: читаем только владельцем.
+        # 6.0.4: без trap RETURN (он глобальный и затирал trap снятия блокировки вызывающего) —
+        # между export и unset нет ни одного return, unset выполняется на любом исходе openssl.
         export LAZARUS_ENC_PW="$password"
-        trap 'unset LAZARUS_ENC_PW' RETURN
         ( umask 077 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -in "$cipher_tmp" -out "$outfile" \
             -pass env:LAZARUS_ENC_PW ) 2> "$SILENT_LOG"
@@ -800,8 +848,7 @@ _hmac_envelope_decrypt() {
 
     elif [[ "$_magic8" == "Salted__" ]]; then
         # === v1 legacy path: нет MAC, decrypt напрямую (№6: пароль через env, см. v2-ветку) ===
-        export LAZARUS_ENC_PW="$password"
-        trap 'unset LAZARUS_ENC_PW' RETURN
+        export LAZARUS_ENC_PW="$password"   # unset явно ниже (без trap RETURN — см. v2-ветку)
         ( umask 077 && openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
             -in "$infile" -out "$outfile" \
             -pass env:LAZARUS_ENC_PW ) 2> "$SILENT_LOG"
@@ -2230,10 +2277,15 @@ check_for_updates() {
         
         local REMOTE_CONTENT=""
         for attempt in $(seq 1 $MAX_RETRIES); do
+            # 6.0.4: rc загрузки проверяется, --fail (как в install_script). Раньше обрыв по
+            # --max-time (curl rc=28) отдавал ЧАСТИЧНОЕ тело с верным shebang и VERSION — его ставили
+            # как обновление, и каждый cron-запуск падал на синтаксисе до main (без TG-алертов).
+            # Неполный/ошибочный ответ = источник недоступен. max-time 60 — как в install_script
+            # (~1 МБ по медленному каналу).
             if command -v curl > "$SILENT_LOG" 2>&1; then
-                REMOTE_CONTENT=$(curl $CURL_SILENT -L --connect-timeout $TIMEOUT --max-time 30 "$FETCH_URL" 2> "$SILENT_LOG")
+                REMOTE_CONTENT=$(curl $CURL_SILENT --fail -L --connect-timeout $TIMEOUT --max-time 60 "$FETCH_URL" 2> "$SILENT_LOG") || REMOTE_CONTENT=""
             elif command -v wget > "$SILENT_LOG" 2>&1; then
-                REMOTE_CONTENT=$(wget $WGET_SILENT -O- --timeout=$TIMEOUT "$FETCH_URL" 2> "$SILENT_LOG")
+                REMOTE_CONTENT=$(wget $WGET_SILENT -O- --timeout=$TIMEOUT "$FETCH_URL" 2> "$SILENT_LOG") || REMOTE_CONTENT=""
             else
                 print_message "ERROR" "Нет curl или wget для проверки обновлений."
                 read -erp "Enter..." dummy; return
@@ -2314,7 +2366,7 @@ check_for_updates() {
         print_message "WARN" "Доступно обновление!"
         read -erp "Обновить скрипт сейчас? (y/N): " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
-            perform_update "$BEST_CONTENT"
+            perform_update "$BEST_CONTENT" "$BEST_URL"
         else
             print_message "INFO" "Обновление отменено."
             read -erp "Enter..." dummy
@@ -2323,7 +2375,7 @@ check_for_updates() {
         echo -e "${YELLOW}Внимание: Версия на сервере старее или такая же.${RESET}"
         read -erp "Все равно загрузить версию с сервера? (y/N): " choice
         if [[ "$choice" =~ ^[Yy]$ ]]; then
-            perform_update "$BEST_CONTENT"
+            perform_update "$BEST_CONTENT" "$BEST_URL"
         else
             print_message "INFO" "Отменено."
             read -erp "Enter..." dummy
@@ -2400,6 +2452,8 @@ check_updates_silent() {
 
 perform_update() {
     local CONTENT="$1"
+    # 6.0.4: источник загрузки (BEST_URL) — для сверки с <URL>.sha256; пусто — сверка пропускается.
+    local SRC_URL="${2:-}"
     local SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
     local BACKUP_PATH="$INSTALL_DIR/${SCRIPT_NAME}.backup"
     
@@ -2432,11 +2486,59 @@ perform_update() {
     # переживали любое обновление). rename подменяет только запись каталога: живые процессы
     # дочитывают старый inode, новый файл сразу root:root 755. Провал на любом шаге оставляет
     # текущую версию нетронутой; временный файл снимает EXIT-trap, если выход случится раньше rm.
-    local _new=""
+    local _new="" _why=""
     _new=$(umask 077 && mktemp "$INSTALL_DIR/.${SCRIPT_NAME}.update.XXXXXX" 2> "$SILENT_LOG") || _new=""
     [[ -n "$_new" ]] && register_sensitive_tmp "$_new"
-    if [[ -n "$_new" ]] && printf '%s\n' "$CONTENT" > "$_new" && chmod 755 "$_new" \
-        && { chown root:root "$_new" 2> "$SILENT_LOG" || true; } && mv -f "$_new" "$SCRIPT_PATH"; then
+    if [[ -z "$_new" ]] || ! printf '%s\n' "$CONTENT" > "$_new"; then
+        _why="Не удалось записать файл обновления!"
+    elif ! bash -n "$_new" 2> "$SILENT_LOG"; then
+        # 6.0.4: обрыв загрузки внутри конструкции (кавычка/функция/if) — синтаксис не сходится.
+        # Такой файл под рабочим именем валил бы каждый cron-запуск ещё до main (без TG-алертов).
+        _why="Загруженный файл повреждён (bash -n: синтаксическая ошибка — обрыв загрузки?)."
+    fi
+    # 6.0.4: SHA256-манифест <URL>.sha256 — как в install_script: опубликован и валиден → обязан
+    # совпасть, иначе отказ; недоступен/невалиден → WARN и обновление продолжается (манифест сейчас
+    # не публикуется — отказ сломал бы обновление всем). Обрыв на границе функций, который bash -n
+    # не видит, ловят --fail и rc загрузки в check_for_updates. $(…) в check_for_updates срезает
+    # хвостовые переводы строки, поэтому сверяем два варианта: файл как записан (контент + один \n —
+    # так заканчивается lazarus-backup в репозитории) и контент без завершающего \n.
+    if [[ -z "$_why" && -n "$SRC_URL" ]]; then
+        local _sha_tmp="" _sha_exp="" _sha_act="" _sha_act0=""
+        _sha_tmp=$(umask 077 && mktemp "${TMPDIR:-/tmp}/lazarus_update_sha.XXXXXX" 2> "$SILENT_LOG") || _sha_tmp=""
+        if [[ -n "$_sha_tmp" ]]; then
+            register_sensitive_tmp "$_sha_tmp"
+            local _sha_url; _sha_url="${SRC_URL}.sha256?t=$(date +%s)"
+            if command -v curl > "$SILENT_LOG" 2>&1; then
+                curl $CURL_SILENT --fail -L --connect-timeout 10 --max-time 20 "$_sha_url" -o "$_sha_tmp" 2> "$SILENT_LOG" || : > "$_sha_tmp"
+            elif command -v wget > "$SILENT_LOG" 2>&1; then
+                wget $WGET_SILENT -O "$_sha_tmp" --timeout=10 "$_sha_url" 2> "$SILENT_LOG" || : > "$_sha_tmp"
+            else
+                : > "$_sha_tmp"
+            fi
+            [[ -s "$_sha_tmp" ]] && _sha_exp=$(awk '{print tolower($1); exit}' "$_sha_tmp" 2> "$SILENT_LOG")
+            rm -f "$_sha_tmp"; unregister_sensitive_tmp "$_sha_tmp"
+        fi
+        if [[ -z "$_sha_exp" ]] || ! command -v sha256sum > "$SILENT_LOG" 2>&1; then
+            print_message "WARN" "SHA256 manifest недоступен — integrity не проверена."
+        elif [[ ! "$_sha_exp" =~ ^[a-f0-9]{64}$ ]]; then
+            print_message "WARN" "SHA256 manifest невалидный, пропускаем проверку."
+        else
+            _sha_act=$(sha256sum "$_new" 2> "$SILENT_LOG" | awk '{print tolower($1); exit}')
+            _sha_act0=$(printf '%s' "$CONTENT" | sha256sum 2> "$SILENT_LOG" | awk '{print tolower($1); exit}')
+            if [[ "$_sha_act" != "$_sha_exp" && "$_sha_act0" != "$_sha_exp" ]]; then
+                print_message "ERROR" "SHA256 mismatch! Скрипт может быть скомпрометирован или повреждён."
+                echo -e "  ${RED}Expected:${RESET} $_sha_exp"
+                echo -e "  ${RED}Actual:  ${RESET} $_sha_act"
+                _why="Загруженный файл не совпал с SHA256-манифестом."
+            else
+                debug_log "UPDATE" "SHA256 verified: $_sha_exp"
+            fi
+        fi
+    fi
+    if [[ -z "$_why" ]] && ! { chmod 755 "$_new" && { chown root:root "$_new" 2> "$SILENT_LOG" || true; } && mv -f "$_new" "$SCRIPT_PATH"; }; then
+        _why="Не удалось записать файл обновления!"
+    fi
+    if [[ -z "$_why" ]]; then
         unregister_sensitive_tmp "$_new"
         print_message "SUCCESS" "Обновление завершено!"
         log_message "SUCCESS" "Script updated to new version"
@@ -2446,7 +2548,8 @@ perform_update() {
         exec "$SCRIPT_PATH"
     else
         if [[ -n "$_new" ]]; then rm -f "$_new"; unregister_sensitive_tmp "$_new"; fi
-        print_message "ERROR" "Не удалось записать файл обновления! Текущая версия не изменена."
+        print_message "ERROR" "$_why Текущая версия не изменена."
+        log_message "ERROR" "Script update refused/failed: $_why"
         read -erp "Enter..." dummy
         return 1
     fi
@@ -10928,6 +11031,10 @@ _backup_remote_target() {
         [[ "$BACKUP_LOG_FILES" != "true" ]] && _tarcmd="$_tarcmd --exclude='*.log' --exclude='*.log.*' --exclude='*.log-*'"
         _tarcmd="$_tarcmd -C $_parent_q $_name_q"
         print_message "INFO" "Удалённая архивация файлов ($BOT_PATH)..."
+        # 6.0.4: tar каталога стека (.env с паролями БД/токенами) — sensitive с первого байта, как
+        # FILE_DIR у локального create_backup: TERM/Ctrl+C между tar и combine иначе оставлял его в
+        # BACKUP_DIR до sweep. Снимается там, где файл удаляется (ошибка tar, после combine).
+        register_sensitive_tmp "$BACKUP_DIR/$FILE_DIR"
         _run_pipe_with_timeout "$TAR_TIMEOUT_SEC" "remote-tar" \
             '$1 "$2" 2> "$4" | $5 > "$3"' \
             "$_ssh" "$_tarcmd" "$BACKUP_DIR/$FILE_DIR" "$SILENT_LOG" "$_comp_pipe"
@@ -10939,6 +11046,7 @@ _backup_remote_target() {
             rm -f "$BACKUP_DIR/$FILE_DB" "$BACKUP_DIR/$FILE_VERSION" ${FILE_GLOBALS:+"$BACKUP_DIR/$FILE_GLOBALS"} "$BACKUP_DIR/$FILE_DIR"
             [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
             unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"   # #review#2
+            unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DIR"
             return 1
         fi
     fi
@@ -10967,6 +11075,7 @@ _backup_remote_target() {
     [[ -n "$FILE_BILLING" ]] && rm -f "$BACKUP_DIR/$FILE_BILLING"
     # #review#2: дампы rm'нуты (вошли в combine) → снимаем их регистрацию (plaintext-combine _plain_final остаётся под защитой до шифрования).
     unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DB"; [[ -n "$FILE_GLOBALS" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_GLOBALS"; [[ -n "$FILE_BILLING" ]] && unregister_sensitive_tmp "$BACKUP_DIR/$FILE_BILLING"
+    unregister_sensitive_tmp "$BACKUP_DIR/$FILE_DIR"   # 6.0.4: tar стека вошёл в combine и rm'нут
     if [[ $_crc -ne 0 ]]; then
         print_message "ERROR" "Combine удалённого архива провален (rc=$_crc)."
         rm -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1
@@ -10995,10 +11104,15 @@ _backup_remote_target() {
                 echo -e "${RED}${BOLD}Архив содержит дамп БД. Отправить НЕЗАШИФРОВАННЫМ? Введите PLAINTEXT:${RESET}"
                 local _pc=""; read -erp "> " _pc; [[ "$_pc" == "PLAINTEXT" ]] && _ship=true
             fi
-            if [[ "$_ship" != "true" ]]; then rm -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; return 1; fi
+            # 6.0.4: после шифрования — явный release_lock перед каждым return, как в create_backup
+            # (страховка: RETURN-trap один на шелл, и любая вложенная функция, поставившая свой,
+            # оставляла лок взятым до выхода из меню). Двойной release безопасен.
+            if [[ "$_ship" != "true" ]]; then rm -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL"; unregister_sensitive_tmp "$_plain_final"; [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock; return 1; fi
             if ! mv -f "$_plain_final" "$BACKUP_DIR/$FILE_FINAL" 2> "$SILENT_LOG"; then
                 print_message "ERROR" "Не удалось переименовать удалённый архив в штатное имя: $FILE_FINAL"
-                rm -f "$_plain_final"; unregister_sensitive_tmp "$_plain_final"; return 1
+                rm -f "$_plain_final"; unregister_sensitive_tmp "$_plain_final"
+                [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
+                return 1
             fi
             ENC_STATUS="⚠️ UNENCRYPTED"
         fi
@@ -11035,11 +11149,13 @@ _backup_remote_target() {
         _rdf_bk=$(df -Ph "$BACKUP_DIR" 2> "$SILENT_LOG" | awk 'NR==2 {print $4}')
         print_message "ERROR" "Проверка удалённого архива НЕ выполнена (ошибка ввода-вывода / нет места в TMPDIR) — архив не признан битым: $FILE_FINAL; свободно: TMPDIR ${TMPDIR:-/tmp} — ${_rdf_tmp:-?}, BACKUP_DIR — ${_rdf_bk:-?}. Ротация пропущена."
         log_message "ERROR" "remote backup verify NOT PERFORMED (I/O / no space in TMPDIR): $FILE_FINAL (kept, rotation skipped; free TMPDIR=${_rdf_tmp:-?} BACKUP_DIR=${_rdf_bk:-?})"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
     if [[ "$VERIFY_OK" != "true" ]]; then
         print_message "ERROR" "Удалённый архив ПОВРЕЖДЁН (verify failed): $FILE_FINAL — ротация пропущена."
         log_message "ERROR" "remote backup verify FAILED: $FILE_FINAL (kept, rotation skipped)"
+        [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
         return 1
     fi
     print_message "SUCCESS" "Удалённый бэкап создан и валиден: $FILE_FINAL ($SIZE)"
@@ -11077,6 +11193,8 @@ _backup_remote_target() {
 $ENC_STATUS${_SIDECAR_MISS:+
 ⚠️ Неполный архив: ${_SIDECAR_MISS}}" "plain" || true
     fi
+    # Освобождаем блокировку явно (как в create_backup), не полагаясь только на RETURN-trap.
+    [[ "$LOCK_ACQUIRED" == "true" ]] && release_lock
     return 0
 }
 
